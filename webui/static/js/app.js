@@ -25393,8 +25393,8 @@ function showSyscallRuleDraft(draft, options) {
             `<p>Writes <code>${escapeHtml(file)}</code> into the folder Rustinel reads its rules from. Rustinel loads it within about 2 seconds, without a restart. ` +
             'A rebuilt VM does not have it.</p>' +
             `<button type="button" class="btn btn-sm btn-primary" onclick="applySyscallRule(${jsArg(name)})"${opts.busy ? ' disabled' : ''}>APPLY TO THIS VM</button></div>` +
-            '<div class="syscall-draft-action syscall-draft-repo"><div class="syscall-draft-action-title">IN THE REPO · permanent</div>' +
-            '<p>Saves the same rule as a file and writes nothing on this VM. Commit it under <code>rules/yara/</code>: only a committed copy survives a rebuilt VM.</p>' +
+            '<div class="syscall-draft-action syscall-draft-repo"><div class="syscall-draft-action-title">IN THE REPO · reviewable</div>' +
+            '<p>Saves the same rule as a file and writes nothing on this VM. Commit it under <code>rules/yara/</code> to keep it in version control and reviewable. Whether a committed rule is loaded again after a rebuild is not yet verified.</p>' +
             `<a class="btn btn-sm btn-outline" href="${escapeHtml(`/api/syscalls/rule/download?name=${encodeURIComponent(name)}&text=${encodeURIComponent(text)}`)}" ` +
             `download="${escapeHtml(`${name}.yar`)}">DOWNLOAD FOR THE REPO</a></div></div>`;
     }
@@ -26356,7 +26356,7 @@ async function applySyscallRule(name) {
     if (r.ok) {
         const seconds = Number(r.data.reload_seconds) > 0 ? Number(r.data.reload_seconds) : 2;
         st.note = { tone: 'ok', text: `Written${path ? ` to ${path}` : ''}. Rustinel loads it within about ${seconds} seconds. This copy lives on this VM only: ` +
-                    'a rebuilt VM does not have it, so download the rule as well and commit it under rules/yara/.' };
+                    'a rebuilt VM does not have it. Download the rule as well and commit it under rules/yara/ to keep it in version control; whether a committed rule is loaded again after a rebuild is not yet verified.' };
     } else if (r.status === 409 && r.data.status === 'exists') {
         st.note = { tone: 'info', text: `A rule of this name is there already${path ? ` (${path})` : ''}: it is the same stub, build and view. It was left alone. Nothing was written.` };
     } else {

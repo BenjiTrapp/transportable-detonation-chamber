@@ -150,7 +150,7 @@ Read-only measurement of the syscall stubs of a process against a baseline NTSle
 | GET / POST / DELETE | `/api/syscalls/hook-baseline` | The hooks known on this host, as (syscall, owner) pairs per build and view / record the hooks of a PID (`pid`; only on a host known to be clean, and only a jump into a module, never a patch) / forget one set (`build` and `view` together) or all. Known hooks stay in the scan but no longer score |
 | POST | `/api/syscalls/rule` | Draft a detection rule and write nothing. Params: a `hit` of `/api/syscalls/stubs` (optionally with `sample`), with `view` and `build` (default: this system's), gives a YARA rule `{kind, name, text, target}` that names its build and view; a `deviation` of `/api/syscalls/scan` with `view` gives an entry for `webui/syscall_signatures.json` and the catalog entries that already cover it. A known hook is refused |
 | POST | `/api/syscalls/rule/apply` | Write a YARA draft (the body of the draft, nothing else is accepted) as `<name>.yar` into the directory Rustinel reads (`C:\tools\detection-rules\yara-combined\tdc`); it is loaded within about two seconds. `409` when the rule is already there, `403` outside that directory |
-| GET | `/api/syscalls/rule/download` | A YARA draft as a file, to be committed under `rules/yara/` (the applied copy is lost with the VM). Params: `name` and `text` of the draft |
+| GET | `/api/syscalls/rule/download` | A YARA draft as a file, to be committed under `rules/yara/` so it is version-controlled and reviewable (the applied copy is lost with the VM; whether a committed rule is loaded again after a rebuild is not yet verified). Params: `name` and `text` of the draft |
 
 ## Proxy Endpoints
 
