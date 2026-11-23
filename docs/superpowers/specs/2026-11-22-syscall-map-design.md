@@ -287,6 +287,14 @@ Drei Ziele, in dieser Rangfolge:
    `MemoryBaseline` unberührt. Die Liste wird über eine eigene Route aufgenommen
    und ist im Tab sichtbar und löschbar.
 
+**Eine Regel gibt es nur für einen Stub.** Die Oberfläche hat keine Anmeldung,
+und die CSRF-Sperre lässt Clients ohne Header durch: Malware in der VM kann die
+Routen rufen. Entwurf und Übernahme verlangen darum, dass die Bytes genau ein
+Stub der Form ihrer Sicht sind und die genannte Nummer laden, und dass der
+Regelname der aus Syscall, Sicht und Bytes gebildete ist. Das Verzeichnis nimmt
+höchstens `RULES_MAX` Regeldateien, und ist es selbst ein Link oder eine
+Junction, wird nicht hindurch geschrieben.
+
 **Nichts wird ungefragt geschrieben.** „Regel erzeugen" zeigt den Entwurf, der
 Nutzer übernimmt ihn. Erzeugte Regeln sind als erzeugt markiert und nennen
 Herkunft, Zeitpunkt, Build **und Sicht**. Die Sicht gehört dazu, weil die
@@ -472,7 +480,16 @@ Der Scan läuft nicht nur von Hand im Tab, sondern als Stufe einer Detonation.
 - Ihre Befunde gehen durch `memory_evidence.collect()` in den Gesamt-Score,
   erscheinen im VERDICT FLOW und in der Score-Historie.
 - Der System-Sweep (`/api/memory/sweep`) nimmt den Syscall-Scan als weiteres
-  Werkzeug auf.
+  Werkzeug auf, **aber nur auf Anfrage** (`"syscalls": true`). Ohne diesen
+  Schlüssel bleibt er aus: SWEEP und „Sweep as baseline" senden ihn nicht, und
+  eine Baseline-Aufnahme darf keine Syscall-Befunde in die Host-Baseline
+  schreiben, solange nicht gezeigt ist, dass eine saubere VM damit sauber
+  durchläuft.
+- Ein Teilergebnis der Stufe (`partial`, fehlgeschlagene Eigentümer-Abfragen,
+  eine unvollständige Stub-Suche) und eine Zahl von `diverged`-Stubs erscheinen
+  in den Gründen des Urteils, wie NOT OBSERVED: keins davon ist ein Beleg für
+  einen sauberen Prozess. Die Stufe hat im Memory-Reiter der Detonation einen
+  eigenen Block, mit dem Grund, wenn sie sich übersprungen hat.
 - `_update_preconditions` in `webui/app.py` muss einen laufenden Syscall-Scan
   **und eine laufende Baseline-Extraktion** kennen, damit ein Werkzeug-Update
   keins von beiden unterbricht.
@@ -533,6 +550,11 @@ schlagen `test_readme_documents_every_api_route_and_nothing_else` und
     und die Messung emulierter Samples wäre still wirkungslos. Sind sie gleich,
     wird die x64-Baseline **gelöscht** — eine fehlende Baseline behandeln
     Tasks 7 und 9 anständig, eine falsche nicht.
+  - **Die Form der Stubs entscheidet unabhängig davon.** Eine Baseline, deren
+    Stubs nicht überwiegend die Form ihrer Sicht haben (x64: `4C 8B D1 B8`,
+    ARM64: `SVC`), wird weder gespeichert noch geladen. Das hängt weder von der
+    Reihenfolge der Extraktionen noch davon ab, dass die Datei der anderen Sicht
+    existiert, und deckt eine nicht löschbare Doppelgängerin ab.
   - **Derselbe Schutz muss zur Laufzeit gelten.** Die Extraktion auf Abruf
     (Ziel 2) würde die gelöschte Datei sonst beim nächsten Tab-Besuch mit
     demselben falschen Inhalt neu schreiben. Eine x64-Extraktion, deren

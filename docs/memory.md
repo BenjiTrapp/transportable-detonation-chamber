@@ -135,6 +135,17 @@ memory after two hops. A relay that cannot be read, or whose target cannot be
 looked up, is not guessed past: the stub is `diverged` and counts as a failed
 owner lookup, which marks the scan partial.
 
+Memory no file backs is a private allocation or a mapped section with no file
+behind it (a pagefile-backed section, the classic target of
+`NtMapViewOfSection`). An image region whose file name cannot be had is a failed
+lookup, not an owner nobody has: an image is file-backed by definition, and the
+name query fails easily under the limited access right.
+
+**What the region query cannot see.** Module stomping overwrites a legitimate
+DLL in place and keeps its image type and path, so a hook into a stomped DLL
+reads as `hooked` with that DLL's name. The scan cannot tell that from an EDR,
+which is why the state is called hooked (file-backed module) and weighs little.
+
 Hooks the EDR installs everywhere are recorded once, on a host you believe is
 clean (RECORD THE HOOKS OF THIS RUN AS KNOWN, or `POST /api/syscalls/hook-baseline`): pairs of a
 syscall and the module that owns the jump, kept per build and view in
@@ -181,6 +192,14 @@ its rules without a restart, so it should pick the rule up within about two
 seconds, **but that is not yet verified on a VM**: look in Rustinel's log for the
 reload before you trust the rule. The applied copy is lost with the VM.
 
+A rule is drafted, applied or downloaded only for bytes that are exactly one
+syscall stub of its view (`mov r10, rcx; mov eax, …; syscall` on x64, `SVC; RET`
+on ARM64) that loads the number the rule names, with the name the syscall, view
+and bytes make. The web UI has no login, so a process inside the VM can call
+these routes: eight zero bytes or an MZ header are refused. The folder takes at
+most 200 rule files (HTTP 507 after that), and no rule is written if `tdc` itself
+is a link or junction.
+
 DOWNLOAD FOR THE REPO gives the same rule as a file to commit under `rules/yara/`,
 so that it is version-controlled and reviewable.
 **Whether a committed rule is loaded again after a rebuild is not yet verified.**
@@ -210,6 +229,10 @@ Two notices look alike and are not.
   report every x64 process wrongly, so that baseline was discarded on purpose
   and nothing is broken. Emulated x64 processes cannot be measured here, and
   the arm64 view still works. Asking again gives the same answer.
+- **Unusable: the stubs do not have the shape of the view.** A baseline is used
+  only when most of its stubs look like its view's (`4C 8B D1 B8` on x64, `SVC`
+  on ARM64). An x64 file that holds ARM64 stubs, left by an older installer or
+  one that could not be deleted, is refused rather than measured by; delete it.
 
 The detonation stage (**Syscalls** in the table at the top) needs only the
 baseline file, not NTSleuth. It skips itself with its reason when there is no
