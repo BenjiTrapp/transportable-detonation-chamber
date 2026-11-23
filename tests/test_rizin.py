@@ -4960,6 +4960,41 @@ def test_a_patch_that_a_restart_lost_and_one_that_waits_are_one_entry_of_the_pro
     assert _project_patches_of(project) == f"{stack:x}:41:r", "one entry, the one the answer shows"
 
 
+def test_a_patch_a_restart_lost_at_the_address_of_one_that_waits_but_with_other_bytes_is_kept(
+        sessions, sample, fake, tmp_path, monkeypatch):
+    """The key of the project line is the address **and** the bytes: a lost patch beside a waiting one at the same
+    address but with other bytes is another patch, and keyed by the address alone it would leave the project
+    without a word."""
+    import rizin_sessions
+
+    timers = Timers()
+    monkeypatch.setenv("FAKE_RIZIN_SLOW", "aar:60")
+    path = sample("hang7.exe", b"MZ hang 7")
+    stack = rizin_sessions.ESIL_STACK_ADDR + 0x80
+    first = sessions(analysis_limit=1.0, step_grace=0.5, big_file=1, timer=timers)
+    opened = first.open(path, "tab")
+    session = first.get(opened["session"])
+    _wait_state(session, "done")
+    session.patch(0x140001441, "90")
+    timers.fire()
+    project = tmp_path / "projects" / (opened["file"]["sha256"] + ".rzdb")
+    _plant_patches(project, [(stack, "41", True)])  # waits
+    first.close(opened["session"])
+    assert session.wait_closed(30)
+
+    mgr = sessions(analysis_limit=1.0, step_grace=0.5, big_file=1, timer=timers)
+    session = mgr.get(mgr.open(path, "tab2")["session"])
+    _wait_state(session, "done")
+    session.emulation_start(0x140001440)
+    session.patch(stack, "42")  # the same address, other bytes: live, and the waiting one is still not applied
+    session.analyze_full()  # rizin restarts and the stack is not mapped in the new one: the live patch is lost
+    _wait_state(session, "stopped")
+    assert session._lost == [(stack, "42", False)] and session._waiting == [(stack, "41", True)]
+    session.comment(0x1400014B7, "after the restart")
+    timers.fire()
+    assert _project_patches_of(project) == f"{stack:x}:41:r,{stack:x}:42", "both: they are two patches"
+
+
 def _project_patches_of(project):
     return project.read_text(encoding="utf-8", errors="surrogateescape").split("\npatches=")[1].split("\n")[0]
 
@@ -4997,6 +5032,34 @@ def rizin_sessions_reason():
     import rizin_sessions
 
     return rizin_sessions._PATCH_WAITING_REASON
+
+
+def test_a_rizin_that_times_out_over_the_maps_costs_no_answer_and_ends_the_session(rz, monkeypatch):
+    """The other half of the death test above: a read that times out kills rizin first (RizinPipe._answer), then
+    raises RizinTimeout -- the same answer, the same ended session."""
+    import rizin_sessions
+
+    path, sid = _patched_over_a_run(rz)
+    rz.close(sid)
+    sid = rz.open(path)["session"]
+    rz.wait_done(sid)
+    session = rz.mgr.get(sid)
+    real = rizin_sessions.RizinPipe.cmdj
+
+    def slow_maps(pipe, text, *args, **kwargs):
+        if text == "omlj":
+            pipe._kill()  # what a timed-out read does before it raises
+            raise rizin_sessions.RizinTimeout("rizin did not answer in time")
+        return real(pipe, text, *args, **kwargs)
+
+    monkeypatch.setattr(rizin_sessions.RizinPipe, "cmdj", slow_maps)
+    response = rz.get(f"/api/rizin/{sid}/patches")
+    assert response.status_code == 200, response.get_json()
+    answer = response.get_json()
+    assert answer["patches"] == [] and [(w["addr"], w["after"]) for w in answer["waiting"]] == [(0x140001441, "90")]
+    assert answer["waiting"][0]["reason"] == rizin_sessions_reason()
+    assert session.closed is True
+    assert rz.get(f"/api/rizin/{sid}/patches").status_code == 404
 
 
 def test_a_replay_that_fails_over_the_maps_still_keeps_what_it_held_back(rz, monkeypatch):
