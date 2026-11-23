@@ -15,11 +15,12 @@ Regressions covered:
     colour that is missing in a theme, or an intact stub louder than a deviation in one of them
 """
 
+import os
 import re
 from html.parser import HTMLParser
 
 from test_frontend import SOURCE, _run_node as _run, needs_node
-from test_theme import (INDEX_HTML, STYLE_CSS, THEME_CSS, _contrast, _cyberpunk_palette, _read, _root_values, _rules,
+from test_theme import (APP_JS, INDEX_HTML, STYLE_CSS, THEME_CSS, _contrast, _cyberpunk_palette, _read, _root_values, _rules,
                         _same_value, _tab_markup)
 
 OUT = "const out = value => console.log(JSON.stringify(value));\n"
@@ -437,6 +438,7 @@ FLOW_FUNCTIONS = [
     "syscallCaptureHooks", "syscallClearHooks", "syscallSetPane", "syscallModel", "syscallRepaintCells", "syscallShowDraft",
     "syscallCopyText", "syscallTargetProcess", "syscallStubsModel", "renderSyscallStubs", "renderSyscallStubsPanel", "runSyscallStubs",
     "syscallRequestDraft", "syscallDraftStubRule",
+    "syscallHookKey", "syscallHookPairs", "syscallHookDifference", "syscallHookDrift",
 ]
 FLOW_CONSTS = ["SYSCALL_STATES", "SYSCALL_STATE_COLORS", "SYSCALL_STATE_HELP", "SYSCALL_MODULES", "SYSCALL_MAP",
                "SYSCALL_ROWS_MAX", "SYSCALL_PAGE", "SYSCALL_POLL_MS", "SYSCALL_VIEW_NAMES", "syscallState",
@@ -1595,43 +1597,130 @@ def test_the_known_hooks_are_read_with_the_tab_and_listed():
     assert r["head"] == "1 known"
 
 
+# The hook list as the server keeps it: a recording adds the hooks of the process as the server measures them just then
+HOOK_SERVER = r"""
+const REVIEWED = { name: 'Nt9', owner: 'edr.dll' };
+const hookServer = (recorded = [REVIEWED]) => {
+    const entries = [...HOOKS.entries]; const calls = [];
+    routes['/api/syscalls/hook-baseline'] = (url, options) => {
+        if (options && options.method === 'POST') {
+            calls.push('record');
+            for (const r of recorded) entries.push({ syscall: r.name, owner: r.owner, build: '26220.5770', view: 'arm64' });
+            return { body: { pid: 4242, build: '26220.5770', view: 'arm64', added: recorded.length, entries: entries.length, partial: false } };
+        }
+        return { body: { entries, problem: null } };
+    };
+    return calls;
+};
+const agree = () => { globalThis.confirm = question => { asked.push(question); return true; }; };
+const asked = [];
+"""
+
+
 @needs_node
-def test_hooks_of_a_run_are_recorded_only_after_the_precondition_was_confirmed():
-    r = _panels(r"""
+def test_the_hooks_that_are_recorded_are_the_ones_of_the_scan_the_analyst_reviewed():
+    r = _panels(HOOK_SERVER + r"""
       (async () => {
         initSyscalls(); syscallsTabShown(); await settle();
         const beforeScan = requests.length;
         const noScan = await syscallCaptureHooks();
         const asksWithoutScan = requests.length - beforeScan;
         await scanned();
-        const asked = []; let answer = false;
+        const calls = hookServer();
+        let answer = false;
         globalThis.confirm = question => { asked.push(question); return answer; };
-        routes['/api/syscalls/hook-baseline'] = (url, options) => options && options.method === 'POST'
-            ? { body: { pid: 4242, build: '26220.5770', view: 'arm64', added: 1, entries: 2, partial: false } } : { body: HOOKS };
         const before = requests.length;
         const declined = await syscallCaptureHooks();
-        const afterDecline = requests.slice(before).map(q => q.method);
+        const afterDecline = requests.slice(before).length;
         answer = true;
+        const mark = requests.length;
         const done = await syscallCaptureHooks();
-        out({ noScan, asksWithoutScan, declined, afterDecline, done, asked, requests: requests.slice(before).map(q => [q.method, q.url, q.body]),
+        out({ noScan, asksWithoutScan, declined, afterDecline, done, asked, requests: requests.slice(mark).map(q => [q.method, q.url, q.body]),
               html: els['syscall-hooks'].innerHTML });
       })();""")
     assert r["noScan"] is False and r["asksWithoutScan"] == 0, "without a scan there is no run to record"
-    assert r["declined"] is False and r["afterDecline"] == [], "a declined question records nothing"
+    assert r["declined"] is False and r["afterDecline"] == 0, "a declined question measures and records nothing"
     assert r["done"] is True
-    assert [(m, u) for m, u, _ in r["requests"]] == [("POST", "/api/syscalls/hook-baseline"), ("GET", "/api/syscalls/hook-baseline")]
-    assert r["requests"][0][2] == {"pid": 4242}, "the process the last scan was of"
+    kinds = [(m, u.split("?")[0], b and sorted(b)) for m, u, b in r["requests"]]
+    assert kinds == [("POST", "/api/syscalls/scan", ["modules", "pid"]), ("POST", "/api/syscalls/hook-baseline", ["pid"]),
+                     ("GET", "/api/syscalls/hook-baseline", None)], "the process is measured again and compared before anything is recorded"
+    assert r["requests"][1][2] == {"pid": 4242}
     assert len(r["asked"]) == 2 and "believe is clean" in r["asked"][0] and "PID 4242" in r["asked"][0]
     assert "1 hooked stub that is not known yet" in r["asked"][0], "the known hook is not counted again"
-    assert "Recorded 1 new hook" in r["html"] and "scan again" in r["html"].lower()
+    assert "Nt9" in r["asked"][0] and "edr.dll" in r["asked"][0], "the question names the hooks that will be recorded"
+    assert "Recorded 1 new hook" in r["html"] and "Nt9" in r["html"] and "syscall-draft-result-ok" in r["html"]
+    assert "scan again" in r["html"].lower()
+
+
+@needs_node
+def test_a_hook_that_appeared_since_the_scan_is_not_recorded_and_the_analyst_is_told_which():
+    r = _panels(HOOK_SERVER + r"""
+      (async () => {
+        await scanned(); agree();
+        const calls = hookServer();
+        // the sample dropped another module-backed hook after the scan was reviewed
+        const again = scanWithDeviations(); again.deviations = [...DEVS, dev('Nt15', 'hooked', { target_owner: 'dropped.dll' })];
+        routes['/api/syscalls/scan'] = { body: again };
+        const done = await syscallCaptureHooks();
+        out({ done, calls, html: els['syscall-hooks'].innerHTML, busy: syscallState.hooks.busy });
+      })();""")
+    assert r["done"] is False and r["calls"] == [], "nothing is recorded"
+    assert "Nothing was recorded" in r["html"] and "syscall-draft-result-error" in r["html"]
+    assert "Nt15" in r["html"] and "dropped.dll" in r["html"] and "no longer those of the scan you reviewed" in r["html"]
+    assert r["busy"] is False and " disabled" not in re.search(r"<button[^>]*syscallCaptureHooks[^>]*>", r["html"]).group(0)
+
+
+@needs_node
+def test_a_pid_that_now_belongs_to_another_process_is_not_recorded():
+    r = _panels(HOOK_SERVER + r"""
+      (async () => {
+        await scanned(); agree();
+        const calls = hookServer();
+        routes['/api/syscalls/scan'] = { body: { ...scanWithDeviations(), process: 'C:\\Windows\\System32\\other.exe' } };
+        const done = await syscallCaptureHooks();
+        out({ done, calls, html: els['syscall-hooks'].innerHTML });
+      })();""")
+    assert r["done"] is False and r["calls"] == []
+    assert "other.exe" in r["html"] and "sample.exe" in r["html"] and "reused" in r["html"]
+
+
+@needs_node
+def test_a_hook_that_is_gone_or_a_measurement_that_fails_records_nothing_either():
+    r = _panels(HOOK_SERVER + r"""
+      (async () => {
+        await scanned(); agree();
+        const calls = hookServer();
+        routes['/api/syscalls/scan'] = { body: { ...scanWithDeviations(), deviations: DEVS.filter(d => d.name !== 'Nt9') } };
+        const gone = await syscallCaptureHooks(); const goneHtml = els['syscall-hooks'].innerHTML;
+        routes['/api/syscalls/scan'] = { status: 504, body: { error: 'the scan took too long' } };
+        const failed = await syscallCaptureHooks();
+        out({ gone, failed, calls, goneHtml, html: els['syscall-hooks'].innerHTML });
+      })();""")
+    assert r["gone"] is False and r["failed"] is False and r["calls"] == []
+    assert "Nt9" in r["goneHtml"] and "Nothing was recorded" in r["goneHtml"]
+    assert "could not be measured again" in r["html"] and "the scan took too long" in r["html"]
+
+
+@needs_node
+def test_a_hook_the_server_recorded_that_was_not_reviewed_is_said_loudly_with_the_way_back():
+    r = _panels(HOOK_SERVER + r"""
+      (async () => {
+        await scanned(); agree();
+        // the two measurements agree, but the server's own measurement a moment later found one more
+        hookServer([REVIEWED, { name: 'Nt21', owner: 'late.dll' }]);
+        const done = await syscallCaptureHooks();
+        out({ done, html: els['syscall-hooks'].innerHTML });
+      })();""")
+    assert r["done"] is True
+    assert "syscall-draft-result-error" in r["html"] and "did not review" in r["html"] and "Nt21" in r["html"] and "late.dll" in r["html"]
+    assert "FORGET THIS BUILD AND VIEW" in r["html"] and "syscall-draft-result-ok" not in r["html"]
 
 
 @needs_node
 def test_a_failed_recording_says_so_and_can_be_tried_again():
-    r = _panels(r"""
+    r = _panels(HOOK_SERVER + r"""
       (async () => {
-        await scanned();
-        globalThis.confirm = () => true;
+        await scanned(); agree();
         routes['/api/syscalls/hook-baseline'] = (url, options) => options && options.method === 'POST'
             ? { status: 500, body: { error: 'cannot write the hook allowlist: Access is denied' } } : { body: HOOKS };
         await syscallCaptureHooks();
@@ -1639,6 +1728,36 @@ def test_a_failed_recording_says_so_and_can_be_tried_again():
       })();""")
     assert "syscall-draft-result-error" in r["html"] and "Access is denied" in r["html"]
     assert " disabled" not in re.search(r"<button[^>]*syscallCaptureHooks[^>]*>", r["html"]).group(0)
+
+
+HOOK_PAIR_FUNCTIONS = ["syscallHookPairs", "syscallHookDifference", "syscallHookDrift", "syscallHookKey"]
+
+
+@needs_node
+def test_only_the_hooks_that_the_server_would_record_are_the_reviewed_ones():
+    r = _run_node(HOOK_PAIR_FUNCTIONS, r"""
+      const d = (name, state, extra = {}) => ({ name, module: 'ntdll.dll', state, target_owner: 'EDR.dll', ...extra });
+      out(syscallHookPairs({ deviations: [d('NtA', 'hooked'), d('NtA', 'hooked'), d('NtB', 'patched', { target_owner: 'private' }),
+        d('NtC', 'hooked', { allowlisted: true }), d('NtD', 'hooked', { target_owner: 'private' }), d('NtE', 'hooked', { target_owner: null }),
+        d('NtUserF', 'hooked', { module: 'win32u.dll' }), d('NtG', 'diverged'), d('NtH', 'unreadable', { target_owner: null }), null] }));""")
+    assert r == [{"name": "NtA", "owner": "EDR.dll"}], "ntdll only (that is all the server measures), a module owner, not known, once"
+
+
+@needs_node
+def test_a_difference_in_hooks_names_what_is_new_and_what_is_gone_and_a_same_measurement_has_none():
+    r = _run_node(HOOK_PAIR_FUNCTIONS, r"""
+      const scan = (names, extra = {}) => ({ pid: 5, process: 'C:\\a\\x.exe', build: '1', view: 'arm64',
+        deviations: names.map(n => ({ name: n, module: 'ntdll.dll', state: 'hooked', target_owner: 'e.dll' })), ...extra });
+      out({ same: syscallHookDrift(scan(['NtA', 'NtB']), scan(['NtB', 'NtA'])), more: syscallHookDrift(scan(['NtA']), scan(['NtA', 'NtC'])),
+            less: syscallHookDrift(scan(['NtA', 'NtB']), scan(['NtA'])), pid: syscallHookDrift(scan(['NtA']), scan(['NtA'], { process: 'C:\\b\\y.exe' })),
+            view: syscallHookDrift(scan(['NtA']), scan(['NtA'], { view: 'x64' })),
+            diff: syscallHookDifference(['a|1', 'b|1'], ['b|1', 'c|1']) });""")
+    assert r["same"] == ""
+    assert "NtC" in r["more"] and "new since" in r["more"] and "gone since" not in r["more"]
+    assert "NtB" in r["less"] and "gone since" in r["less"]
+    assert "x.exe" in r["pid"] and "y.exe" in r["pid"] and "reused" in r["pid"]
+    assert "x64" in r["view"] and "arm64" in r["view"]
+    assert r["diff"] == {"extra": ["c|1"], "missing": ["a|1"]}
 
 
 @needs_node
@@ -1978,6 +2097,39 @@ def test_the_search_that_cannot_find_an_image_or_reach_the_process_says_so_and_s
 
 
 @needs_node
+def test_the_file_is_searched_in_the_view_the_process_has_not_the_one_of_the_map():
+    """An emulated x64 process on an arm64 host: the map shows arm64, the process x64. The file is the sample's, so it is x64."""
+    r = _panels(STUBS_FLOW + r"""
+      (async () => {
+        await searchable();
+        routes['/api/syscalls/stubs'] = (url, options) => { const body = JSON.parse(options.body);
+            return body.pid ? { body: { mode: 'process', pid: body.pid, view: 'x64', build: '26220.5770', partial: false, note: '', hits: [] } }
+                            : { body: { mode: 'file', path: body.path, view: body.view, build: '26220.5770', partial: false, note: '', hits: [] } }; };
+        const mapView = syscallState.baseline.view;
+        await runSyscallStubs();
+        out({ mapView, posts: requests.filter(q => q.url.includes('/stubs')).map(q => q.body) });
+      })();""")
+    assert r["mapView"] == "arm64"
+    assert r["posts"][1] == {"path": "C:\\Users\\x\\sample.exe", "view": "x64"}
+
+
+@needs_node
+def test_a_process_that_has_exited_is_not_searched_but_its_file_is_and_the_note_says_why():
+    r = _panels(STUBS_FLOW + r"""
+      (async () => {
+        await searchable();
+        // chosen while it ran, gone by the time STUBS is pressed: the PID may be another process by now
+        PROCESSES['4242'].exit_time = '2026-11-23T01:00:00Z'; syscallState.targets = PROCESSES;
+        await runSyscallStubs();
+        out({ posts: requests.filter(q => q.url.includes('/stubs')).map(q => q.body), body: els['syscall-stubs-body'].innerHTML });
+      })();""")
+    assert r["posts"] == [{"path": "C:\\Users\\x\\sample.exe", "view": "arm64"}], "the PID is not measured: it may belong to another process"
+    assert "has exited" in r["body"] and "may belong to another process" in r["body"]
+    assert "No image path" not in r["body"], "the path is known"
+    assert "file offset 0x400" in r["body"]
+
+
+@needs_node
 def test_the_search_needs_a_target_and_runs_once_at_a_time():
     r = _panels(STUBS_FLOW + r"""
       (async () => {
@@ -2099,7 +2251,7 @@ def test_every_element_the_block_reads_is_in_the_page():
 
 def test_the_assets_moved_on_and_the_switch_in_the_tab_bar_is_wired():
     html = _read(INDEX_HTML)
-    for asset, minimum in (("style.css", 86), ("theme-cyberpunk.css", 37), ("app.js", 124)):
+    for asset, minimum in (("style.css", 86), ("theme-cyberpunk.css", 37), ("app.js", 125)):
         version = int(re.search(rf"{re.escape(asset)}\?v=(\d+)", html).group(1))
         assert version >= minimum, f"{asset} was changed and kept its ?v="
     assert re.search(r"if \(tabName === 'syscalls'\)[^\n]*syscallsTabShown\(\)", SOURCE)
@@ -2220,3 +2372,17 @@ def test_the_detail_the_deviations_and_the_known_hooks_are_in_the_work_area_and_
     # apply (this VM, now) and download (the repo, for good) are told apart by their own accents
     rules = _rules(STYLE_CSS)
     assert _declared(rules[".syscall-draft-vm"], "border-left-color") != _declared(rules[".syscall-draft-repo"], "border-left-color")
+
+
+def test_the_front_end_has_no_german_in_it():
+    """The UI text and every identifier and comment are English. The plan and the spec are German, and this is where
+    it leaks: a comment copied from them. Umlauts, and the words that give German away."""
+    words = ("und nicht wird werden eine keine oder aber für regel erzeugen datei sicht befund abweichung übernehmen "
+             "schreibt muss kann soll wurde dieser diese noch sind").split()
+    giveaway = re.compile(r"(?<![\w.$#-])(?:%s)(?![\w.$#-])" % "|".join(words), re.I)
+    problems = []
+    for path in (APP_JS, INDEX_HTML, STYLE_CSS, THEME_CSS):
+        for number, line in enumerate(_read(path).splitlines(), 1):
+            if re.search("[äöüÄÖÜß]", line) or giveaway.search(line):
+                problems.append(f"{os.path.basename(path)}:{number}: {line.strip()[:100]}")
+    assert not problems, "German in the front end:\n" + "\n".join(problems)

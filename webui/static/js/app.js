@@ -25402,18 +25402,64 @@ function showSyscallRuleDraft(draft, options) {
     return html + '</section>';
 }
 
+// The key of a hook as the list keeps it: the syscall and the lower-case owner
+function syscallHookKey(name, owner) {
+    return `${name}|${String(owner).trim().toLowerCase()}`;
+}
+
+// The hooks of a scan that recording would add, as the server would take them: a hooked stub of ntdll (the one module
+// the server measures when it records) that a module owns, and that the list does not know. One pair once.
+function syscallHookPairs(scan) {
+    const pairs = new Map();
+    for (const d of Array.isArray(scan && scan.deviations) ? scan.deviations : []) {
+        if (d && d.state === 'hooked' && d.allowlisted !== true && String(d.module || '').toLowerCase() === 'ntdll.dll'
+            && typeof d.target_owner === 'string' && d.target_owner.trim() && d.target_owner !== 'private') {
+            pairs.set(syscallHookKey(d.name, d.target_owner), { name: String(d.name), owner: d.target_owner });
+        }
+    }
+    return [...pairs.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// What the keys `actual` have that `expected` has not (extra) and the other way round (missing)
+function syscallHookDifference(expected, actual) {
+    const have = new Set(expected), got = new Set(actual);
+    return { extra: [...got].filter(k => !have.has(k)).sort(), missing: [...have].filter(k => !got.has(k)).sort() };
+}
+
+// Why a scan taken now cannot stand in for the one the analyst reviewed, or '' when it can: another build or view,
+// another process behind the PID (it was reused), other hooks than those that were reviewed
+function syscallHookDrift(reviewed, now) {
+    const reasons = [];
+    if (String(now.build || '') !== String(reviewed.build || '') || String(now.view || '') !== String(reviewed.view || '')) {
+        reasons.push(`it is measured as build ${now.build}, ${now.view} view now, and was build ${reviewed.build}, ${reviewed.view} view`);
+    }
+    if (String(now.process || '').toLowerCase() !== String(reviewed.process || '').toLowerCase()) {
+        reasons.push(`PID ${reviewed.pid} is ${now.process || 'unknown'} now and was ${reviewed.process || 'unknown'}: the PID was reused`);
+    }
+    const label = key => key.replace('|', ' → ');
+    const diff = syscallHookDifference(syscallHookPairs(reviewed).map(p => syscallHookKey(p.name, p.owner)),
+                                       syscallHookPairs(now).map(p => syscallHookKey(p.name, p.owner)));
+    if (diff.extra.length) reasons.push(`new since: ${diff.extra.map(label).join(', ')}`);
+    if (diff.missing.length) reasons.push(`gone since: ${diff.missing.map(label).join(', ')}`);
+    return reasons.length ? `The hooks of PID ${reviewed.pid} are no longer those of the scan you reviewed (${reasons.join('; ')}).` : '';
+}
+
 // The sentence under the warning of the hook control: what pressing it records, and what that costs when the host is not clean
 function syscallHookWarning(scan) {
     const what = scan && scan.pid
         ? `This records the hooks that PID ${scan.pid}${scan.name ? ` (${scan.name})` : ''} shows as known, whoever installed them: from then on they stop counting as evidence in every process on this host, `
         : 'Scan a process first. This records the hooks of that run as known, whoever installed them, so that from then on they stop counting as evidence in every process on this host, ';
-    return what + 'and recording the hooks of an infected host hides real findings until the list is cleared. A patched stub is never recorded.';
+    return what + 'and recording the hooks of an infected host hides real findings until the list is cleared. A patched stub is never recorded. ' +
+           'The process is measured again first, and nothing is recorded if its hooks are no longer those of this scan.';
 }
 
 function syscallCaptureQuestion(scan) {
     const n = Number(scan && scan.hookable) || 0;
+    const pairs = Array.isArray(scan && scan.pairs) ? scan.pairs : [];
+    const named = pairs.slice(0, 8).map(p => `  ${p.name} → ${p.owner}`).join('\n') + (pairs.length > 8 ? `\n  and ${pairs.length - 8} more` : '');
     return 'Record the hooks of this run as known?\n\n' +
-           `PID ${scan && scan.pid}${scan && scan.name ? ` (${scan.name})` : ''} shows ${n} hooked stub${n === 1 ? '' : 's'} that ${n === 1 ? 'is' : 'are'} not known yet. ` +
+           `PID ${scan && scan.pid}${scan && scan.name ? ` (${scan.name})` : ''} shows ${n} hooked stub${n === 1 ? '' : 's'} that ${n === 1 ? 'is' : 'are'} not known yet` +
+           `${named ? `:\n${named}\n` : '. '}` +
            'From then on they stop counting as evidence in every process on this host, whoever installed them.\n\n' +
            'Only do this on a host you believe is clean: recording the hooks of an infected host hides real findings until the list is cleared.';
 }
@@ -26150,7 +26196,7 @@ function syscallCloseDraft() {
     renderSyscallDraft();
 }
 
-// Regel erzeugen: the deviation as the scan returned it goes to the server, which drafts a signature entry and writes
+// Draft rule: the deviation as the scan returned it goes to the server, which drafts a signature entry and writes
 // nothing. A refusal (a hook the allowlist knows, a stub without bytes) is shown where the draft would be.
 async function syscallDraftRule(name) {
     const scan = syscallState.scan;
@@ -26179,14 +26225,15 @@ async function syscallRequestDraft(body) {
 // STUBS: the process in `pid` (its private, executable memory) and then its image file, each by a request of its own.
 // The process search skips the sample's own mapped image, so a sample that unpacks in place is caught by the file
 // alone. The file is searched in the view the process search reports, or the view of the map when the process cannot
-// be searched (it is gone), and not at all without an image path.
+// be searched (it has exited), and not at all without an image path. The path of a process that has exited is still
+// the path of the sample, so its file is searched.
 function syscallTargetProcess(pid) {
     for (const proc of Object.values(syscallState.targets && typeof syscallState.targets === 'object' ? syscallState.targets : {})) {
-        if (proc && !proc.exit_time && !String(proc.key === undefined ? '' : proc.key).includes('@') && String(proc.pid) === String(pid)) {
-            return { name: String(proc.name || proc.image || ''), image: typeof proc.image === 'string' ? proc.image : '' };
+        if (proc && !String(proc.key === undefined ? '' : proc.key).includes('@') && String(proc.pid) === String(pid)) {
+            return { name: String(proc.name || proc.image || ''), image: typeof proc.image === 'string' ? proc.image : '', exited: !!proc.exit_time };
         }
     }
-    return { name: '', image: '' };
+    return { name: '', image: '', exited: false };
 }
 
 // What the two searches found, as renderSyscallStubs wants it: the hits of both in one list (each with where it came
@@ -26259,9 +26306,15 @@ async function runSyscallStubs() {
     const post = body => syscallApi('/api/syscalls/stubs', {
         method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
     });
-    const proc = await post({ pid });
-    st.sources.process = proc.ok ? { ok: true, data: proc.data, sample: target.name } : { ok: false, error: syscallErrorText(proc) };
-    const view = (proc.ok && proc.data.view) || (syscallState.baseline && syscallState.baseline.view) || '';
+    // a process that has exited is not measured: its memory is gone, and its PID may be another process's by now
+    let proc = null;
+    if (target.exited) {
+        st.sources.process = { skipped: `PID ${pid} has exited: its memory is gone, and the PID may belong to another process by now, so only its file was searched.` };
+    } else {
+        proc = await post({ pid });
+        st.sources.process = proc.ok ? { ok: true, data: proc.data, sample: target.name } : { ok: false, error: syscallErrorText(proc) };
+    }
+    const view = (proc && proc.ok && proc.data.view) || (syscallState.baseline && syscallState.baseline.view) || '';
     if (!target.image) {
         st.sources.file = { skipped: 'No image path is known for this process, so its file was not searched.' };
     } else if (!view) {
@@ -26312,8 +26365,8 @@ async function applySyscallRule(name) {
     return r.ok;
 }
 
-// The known hooks and the scan on the map, as renderHookAllowlist wants them. hookable counts the hooked stubs of the
-// scan that the list does not know yet and that a module owns: what recording would add.
+// The known hooks and the scan on the map, as renderHookAllowlist wants them. pairs are the hooks that recording would
+// add (the hooked ntdll stubs of the scan that a module owns and the list does not know), hookable their number.
 function syscallHooksModel() {
     const h = syscallState.hooks, baseline = syscallState.baseline, scan = syscallState.scan;
     const model = {
@@ -26323,9 +26376,10 @@ function syscallHooksModel() {
     if (scan) {
         const hooked = (Array.isArray(scan.deviations) ? scan.deviations : [])
             .filter(d => d && d.state === 'hooked' && typeof d.target_owner === 'string' && d.target_owner && d.target_owner !== 'private');
-        const hookable = hooked.filter(d => d.allowlisted !== true).length;
-        model.scan = { pid: scan.pid, name: String(scan.process || '').split(/[\\/]/).pop(), hookable, known: hooked.length - hookable,
-                       allowlist: scan.allowlist || null };
+        const pairs = syscallHookPairs(scan);
+        const hookable = pairs.length;
+        model.scan = { pid: scan.pid, name: String(scan.process || '').split(/[\\/]/).pop(), hookable, pairs,
+                       known: hooked.filter(d => d.allowlisted === true).length, allowlist: scan.allowlist || null };
     }
     return model;
 }
@@ -26356,30 +26410,61 @@ async function syscallLoadHooks() {
     return r.ok;
 }
 
-// RECORD THE HOOKS OF THIS RUN AS KNOWN: the hooked stubs of the process the last scan was of become known hooks,
-// whoever installed them, so this asks first and says what it costs on a host that is not clean.
+// RECORD THE HOOKS OF THIS RUN AS KNOWN. The server records the hooks it measures in the process when the request
+// arrives, not the ones the analyst looked at, so the label would not be true by itself. Before anything is sent the
+// process is measured again and compared with the scan that was reviewed (the build and view, the process behind the
+// PID, the hooks); if they differ nothing is recorded and the difference is said. After the recording the entries that
+// are new in the list are compared once more with the reviewed ones, because the server measured again. It asks first
+// and says what it costs on a host that is not clean.
 async function syscallCaptureHooks() {
-    const h = syscallState.hooks, model = syscallHooksModel();
+    const h = syscallState.hooks, model = syscallHooksModel(), reviewed = syscallState.scan;
     if (h.busy || !model.scan || !(model.scan.hookable > 0)) return false;
     if (typeof confirm !== 'function' || !confirm(syscallCaptureQuestion(model.scan))) return false;
+    const pid = model.scan.pid, expected = model.scan.pairs.map(p => syscallHookKey(p.name, p.owner));
+    const stop = text => {
+        h.busy = false;
+        h.note = { tone: 'error', text };
+        renderSyscallHooks();
+        return false;
+    };
     h.busy = true;
-    h.note = null;
+    h.note = { tone: 'info', text: `Measuring PID ${pid} again, to check that its hooks are still those you reviewed…` };
     renderSyscallHooks();
-    const r = await syscallApi('/api/syscalls/hook-baseline', {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pid: model.scan.pid }),
+    const now = await syscallApi('/api/syscalls/scan', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pid, modules: ['ntdll.dll'] }),
     });
+    if (!now.ok) return stop(`Nothing was recorded: PID ${pid} could not be measured again (${syscallErrorText(now)}). Scan it again and review the result.`);
+    const drift = syscallHookDrift(reviewed, now.data);
+    if (drift) return stop(`Nothing was recorded. ${drift} Scan it again and review the new result.`);
+    const known = new Set(h.entries.map(e => `${syscallHookKey(e.syscall, e.owner)}|${e.build}|${e.view}`));
+    const r = await syscallApi('/api/syscalls/hook-baseline', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pid }),
+    });
+    if (!r.ok) return stop(syscallErrorText(r));
+    const loaded = await syscallLoadHooks();
     h.busy = false;
-    if (r.ok) {
-        const added = Number(r.data.added) || 0;
-        h.note = { tone: 'ok', text: (added ? `Recorded ${added} new hook${added === 1 ? '' : 's'} of PID ${model.scan.pid} for build ${r.data.build}, ${r.data.view} view.`
-                                            : `No new hook: those of PID ${model.scan.pid} were known already.`) +
-                 ` The list holds ${Number(r.data.entries) || 0} for it. Scan again: the stubs on the map are not marked as known yet.` +
-                 (r.data.partial ? ' The measurement was partial.' : '') };
+    const label = key => key.replace('|', ' → ');
+    const recorded = h.entries.filter(e => e.build === r.data.build && e.view === r.data.view
+        && !known.has(`${syscallHookKey(e.syscall, e.owner)}|${e.build}|${e.view}`)).map(e => syscallHookKey(e.syscall, e.owner));
+    const diff = syscallHookDifference(expected, recorded);
+    const where = `PID ${pid}, build ${r.data.build}, ${r.data.view} view`;
+    if (!loaded) {
+        h.note = { tone: 'error', text: `The server recorded ${Number(r.data.added) || 0} hook(s) of ${where}, but the list could not be read again to check them against the scan you reviewed.` };
+    } else if (diff.extra.length) {
+        h.note = { tone: 'error', text: `Recorded hooks that you did not review: ${diff.extra.map(label).join(', ')} (${where}). The server measured the process again and found them; ` +
+                   'they are not in the scan you looked at. FORGET THIS BUILD AND VIEW undoes it (the whole set of that build and view, earlier entries too).' };
+    } else if (diff.missing.length) {
+        h.note = { tone: 'warn', text: `Not recorded, although the scan showed them: ${diff.missing.map(label).join(', ')} (${where}). The server did not find them when it measured again.` };
+    } else if (!recorded.length) {
+        h.note = { tone: 'ok', text: `No new hook: those of ${where} were known already.` };
     } else {
-        h.note = { tone: 'error', text: syscallErrorText(r) };
+        const added = recorded.length;
+        h.note = { tone: 'ok', text: `Recorded ${added} new hook${added === 1 ? '' : 's'} of ${where}: ${recorded.map(label).join(', ')}. ` +
+                   `The list holds ${Number(r.data.entries) || 0} for it. Scan again: the stubs on the map are not marked as known yet.` +
+                   (r.data.partial ? ' The measurement was partial.' : '') };
     }
-    await syscallLoadHooks();
-    return r.ok;
+    renderSyscallHooks();
+    return true;
 }
 
 // FORGET: the known hooks of the build and view on the map ('this') or all of them ('all'), after a question
