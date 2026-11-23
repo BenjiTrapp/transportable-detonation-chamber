@@ -771,7 +771,12 @@ def _reader_from(baseline, patched, drop=None, build=None, fail_after=None, view
         image[sc.rva:sc.rva + len(live)] = live
         target = syscall_baseline.jump_target(live, _MODULE_BASES[sc.module] + sc.rva, view)
         if owner is not None and target is not None:
-            regions.insert(0, (target, 4, _owner_region(owner)))
+            if owner == "private":
+                # code no file backs, and no relay: what runs there is the patch itself
+                ranges.insert(0, (target, bytearray(b"\xcc" * 0x40)))
+                regions.insert(0, (target, 0x40, _PRIVATE))
+            else:
+                regions.insert(0, (target, 4, _owner_region(owner)))
     cut = None
     if fail_after is not None:
         addrs = sorted(_MODULE_BASES[sc.module] + sc.rva for sc in baseline.syscalls.values())
@@ -1019,6 +1024,132 @@ def test_an_arm64_ldr_br_hook_is_followed_through_its_literal(arm64_baseline):
     reader = _reader_from(arm64_baseline, patched={"NtWriteVirtualMemory": (live.hex(), None)})
     s = syscall_scan.measure(arm64_baseline, _with_edr_at_target(reader))["states"]["NtWriteVirtualMemory"]
     assert (s["state"], s["pattern"], s["target_owner"]) == ("hooked", "LDR x16; BR x16", "edrhook.dll")
+
+
+# MinHook and Detours do not jump from the stub into their DLL: they jump to a relay they allocated with
+# VirtualAlloc near the target, private memory, and only the relay jumps on to the hooking DLL. ARM64 hookers relay
+# by necessity, a B reaching no further than 128 MB.
+_RELAY = 0x7FF80F000000
+_RELAY2 = 0x7FF80F100000
+
+
+def _private_code(reader, addr, code):
+    """`code` at `addr` in private memory of `reader`, found before any other range or region there."""
+    reader._ranges.insert(0, (addr, bytearray(code)))
+    reader._regions.insert(0, (addr, max(len(code), 0x40), _PRIVATE))
+    return reader
+
+
+def _x64_rel32(src, dst):
+    disp = (dst - (src + 5)) & 0xFFFFFFFF
+    return "e9" + disp.to_bytes(4, "little").hex()
+
+
+def _x64_minhook_relay(target):
+    # FF 25 00000000 <target:8>, the relay MinHook writes: jmp [rip+0] with the address right behind it
+    return bytes.fromhex("ff2500000000") + target.to_bytes(8, "little") + b"\xcc" * 18
+
+
+def _x64_relay_reader(baseline, relay_code, name="NtWriteVirtualMemory"):
+    sc = baseline.syscalls[name]
+    stub = _MODULE_BASES["ntdll.dll"] + sc.rva
+    reader = _reader_from(baseline, patched={name: (_x64_rel32(stub, _RELAY), None)})
+    if relay_code is not None:
+        _private_code(reader, _RELAY, relay_code)
+    else:
+        reader._regions.insert(0, (_RELAY, 0x40, _PRIVATE))
+    return reader
+
+
+def test_an_x64_hook_through_a_private_relay_is_owned_by_the_module_the_relay_jumps_to(x64_baseline):
+    reader = _with_edr_at_target(_x64_relay_reader(x64_baseline, _x64_minhook_relay(_EDR_TARGET)))
+    out = syscall_scan.measure(x64_baseline, reader)
+    s = out["states"]["NtWriteVirtualMemory"]
+    assert (s["state"], s["pattern"], s["target_owner"]) == ("hooked", "JMP rel32", "edrhook.dll")
+    assert s["relay"] == [{"address": _RELAY, "owner": "private", "pattern": "JMP [rip]"}]
+    assert (out["owner_errors"], out["partial"]) == (0, False)
+
+
+def test_an_arm64_hook_through_a_private_relay_is_owned_by_the_module_the_relay_jumps_to(arm64_baseline):
+    sc = arm64_baseline.syscalls["NtWriteVirtualMemory"]
+    stub = _MODULE_BASES["ntdll.dll"] + sc.rva
+    b = 0x14000000 | ((_RELAY - stub) // 4) & 0x03FFFFFF
+    reader = _reader_from(arm64_baseline, patched={"NtWriteVirtualMemory": (_words(b, 0xD65F03C0).hex(), None)})
+    _private_code(reader, _RELAY, _words(0x58000050, 0xD61F0200) + _EDR_TARGET.to_bytes(8, "little"))
+    s = syscall_scan.measure(arm64_baseline, _with_edr_at_target(reader))["states"]["NtWriteVirtualMemory"]
+    assert (s["state"], s["pattern"], s["target_owner"]) == ("hooked", "B", "edrhook.dll")
+    assert s["relay"] == [{"address": _RELAY, "owner": "private", "pattern": "LDR x16; BR x16"}]
+
+
+def test_a_relay_of_two_hops_is_followed_to_its_module(x64_baseline):
+    relay = bytes.fromhex(_x64_rel32(_RELAY, _RELAY2)) + b"\xcc" * 27
+    reader = _x64_relay_reader(x64_baseline, relay)
+    _private_code(reader, _RELAY2, _x64_minhook_relay(_EDR_TARGET))
+    s = syscall_scan.measure(x64_baseline, _with_edr_at_target(reader))["states"]["NtWriteVirtualMemory"]
+    assert (s["state"], s["target_owner"]) == ("hooked", "edrhook.dll")
+    assert [hop["address"] for hop in s["relay"]] == [_RELAY, _RELAY2]
+
+
+def test_a_relay_chain_longer_than_the_bound_ends_in_private_memory_and_is_patched(x64_baseline):
+    third = 0x7FF80F200000
+    reader = _x64_relay_reader(x64_baseline, bytes.fromhex(_x64_rel32(_RELAY, _RELAY2)) + b"\xcc" * 27)
+    _private_code(reader, _RELAY2, bytes.fromhex(_x64_rel32(_RELAY2, third)) + b"\xcc" * 27)
+    _private_code(reader, third, _x64_minhook_relay(_EDR_TARGET))
+    out = syscall_scan.measure(x64_baseline, _with_edr_at_target(reader))
+    s = out["states"]["NtWriteVirtualMemory"]
+    assert (s["state"], s["target_owner"]) == ("patched", "private")
+    assert len(s["relay"]) == syscall_scan.MAX_RELAY_HOPS
+    assert out["owner_errors"] == 0
+
+
+def test_private_code_that_is_no_jump_is_patched(x64_baseline):
+    out = syscall_scan.measure(x64_baseline, _x64_relay_reader(x64_baseline, b"\x48\x31\xc0\xc3" + b"\xcc" * 28))
+    s = out["states"]["NtWriteVirtualMemory"]
+    assert (s["state"], s["target_owner"], s["relay"]) == ("patched", "private", [])
+    assert out["owner_errors"] == 0
+
+
+def test_a_relay_that_cannot_be_read_is_no_licence_to_guess(x64_baseline):
+    out = syscall_scan.measure(x64_baseline, _x64_relay_reader(x64_baseline, None))
+    s = out["states"]["NtWriteVirtualMemory"]
+    assert (s["state"], s["target_owner"]) == ("diverged", None)
+    assert s["relay"] == [{"address": _RELAY, "owner": "private", "pattern": None}]
+    assert (out["owner_errors"], out["partial"]) == (1, True)
+
+
+def test_a_relay_whose_pointer_cannot_be_read_is_a_failed_lookup(x64_baseline):
+    # jmp [rip+0x1000]: the pointer lies where nothing is mapped
+    reader = _x64_relay_reader(x64_baseline, bytes.fromhex("ff2500100000") + b"\xcc" * 26)
+    out = syscall_scan.measure(x64_baseline, _with_edr_at_target(reader))
+    assert out["states"]["NtWriteVirtualMemory"]["state"] == "diverged"
+    assert (out["owner_errors"], out["partial"]) == (1, True)
+
+
+def test_a_relay_whose_target_region_cannot_be_queried_is_a_failed_lookup(x64_baseline):
+    out = syscall_scan.measure(x64_baseline, _x64_relay_reader(x64_baseline, _x64_minhook_relay(0x7FFA77770000)))
+    assert out["states"]["NtWriteVirtualMemory"]["state"] == "diverged"
+    assert (out["owner_errors"], out["partial"]) == (1, True)
+
+
+def test_a_relay_back_into_ntdll_is_diverged_by_its_final_owner(x64_baseline):
+    sc = x64_baseline.syscalls["NtAllocateVirtualMemory"]
+    reader = _x64_relay_reader(x64_baseline, _x64_minhook_relay(_MODULE_BASES["ntdll.dll"] + sc.rva))
+    s = syscall_scan.measure(x64_baseline, reader)["states"]["NtWriteVirtualMemory"]
+    assert (s["state"], s["target_owner"]) == ("diverged", "ntdll.dll")
+    assert len(s["relay"]) == 1
+
+
+def test_a_hook_into_a_module_directly_has_no_relay(arm64_baseline):
+    reader = _reader_from(arm64_baseline, patched={"NtWriteVirtualMemory": ("0500001400000000", "edr.dll")})
+    assert syscall_scan.measure(arm64_baseline, reader)["states"]["NtWriteVirtualMemory"]["relay"] == []
+
+
+def test_a_relayed_hook_scores_as_a_hook_and_says_through_what():
+    findings = memory_evidence.from_syscall_scan(_result_with(
+        relay=[{"address": _RELAY, "owner": "private", "pattern": "JMP [rip]"}], pattern="JMP rel32"))
+    assert [f["kind"] for f in findings] == ["syscall_stub_hooked"]
+    assert "relay" in findings[0]["detail"]
+    assert findings[0]["relay"] == [{"address": _RELAY, "owner": "private", "pattern": "JMP [rip]"}]
 
 
 def test_the_owner_is_only_asked_for_a_stub_that_differs(arm64_baseline):

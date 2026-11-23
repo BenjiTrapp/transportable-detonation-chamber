@@ -117,11 +117,23 @@ The difference between hooked and patched is the spine of the feature, and it is
 decided by **who owns the jump target**, not by the instruction pattern. On a
 machine with an EDR, hooks in `ntdll` are normal: the product installs them in
 every process it watches. Counting them as evidence would make every clean host
-look malicious. A hook jumps into a module the loader mapped from a file; a patch
-jumps into memory somebody allocated, and nothing legitimate does that. So the
-owner of the target is looked up with a region query for each stub that differs,
-and a stub that merely jumps back into `ntdll` is `diverged`, because it is
-neither.
+look malicious. So the owner of the target is looked up with a region query for
+each stub that differs, and a stub that merely jumps back into `ntdll` is
+`diverged`, because it is neither.
+
+**A first hop into private memory is not malice by itself.** MinHook and
+Microsoft Detours, the most common x64 hooking libraries, write `E9 rel32` into
+the stub and land on a relay they allocated near the target with
+`VirtualAlloc`: private memory. Only the relay jumps on (`FF 25`) to the hooking
+DLL. ARM64 hookers relay by necessity, because a `B` reaches only 128 MB. EDRs,
+overlay and capture software and the browser sandboxes hook this way. So when the
+first target is private and its bytes are one of the known jump forms, the scan
+follows it, up to two hops, and judges the stub by the **final** owner; the
+relays it passed are listed with the stub. Private code that is no jump is the
+code that runs, and stays `patched`; so does a chain that is still in private
+memory after two hops. A relay that cannot be read, or whose target cannot be
+looked up, is not guessed past: the stub is `diverged` and counts as a failed
+owner lookup, which marks the scan partial.
 
 Hooks the EDR installs everywhere are recorded once, on a host you believe is
 clean (RECORD THE HOOKS OF THIS RUN AS KNOWN, or `POST /api/syscalls/hook-baseline`): pairs of a

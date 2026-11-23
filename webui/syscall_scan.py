@@ -17,7 +17,7 @@ from typing import NamedTuple
 
 from syscall_baseline import (READ_LEN, STATE_DIVERGED, STATE_HOOKED, STATE_INTACT,
                               STATE_PATCHED, STATE_UNREADABLE, OWNER_PRIVATE, Baseline,
-                              Syscall, classify_stub, jump_pointer, jump_target)
+                              Syscall, classify_stub, jump_pattern, jump_pointer, jump_target)
 
 MEM_COMMIT = 0x1000
 MEM_IMAGE = 0x1000000
@@ -133,23 +133,65 @@ class ScanRefused(Exception):
         self.reason = reason
 
 
-def _target_owner(reader: ProcessReader, live: bytes, addr: int,
-                  view: str) -> tuple[str | None, bool]:
-    """`(owner, failed)`. `failed` when there is a jump but its owner could not be
-    looked up: an unreadable pointer or a region query that failed. Changed bytes with
-    no jump have no target to ask about, which is no failure."""
-    target = jump_target(live, addr, view)
-    if target is None:
-        pointer = jump_pointer(live, addr, view)
-        if pointer is None:
-            return None, False
-        size = _POINTER_LEN[view]
-        word = _read_exact(reader, pointer, size)
-        if word is None:
-            return None, True
-        target = int.from_bytes(word, "little")
-    region = reader.region(target)
+def _resolve_jump(reader: ProcessReader, code: bytes, addr: int,
+                  view: str) -> tuple[int | None, bool]:
+    """`(target, failed)` of the hook jump at the start of `code`, which lies at `addr`. A jump that reads its
+    target from memory is followed through its pointer; a pointer that cannot be read is `failed`. No jump at
+    all is `(None, False)`: nothing to ask about, which is no failure."""
+    target = jump_target(code, addr, view)
+    if target is not None:
+        return target, False
+    pointer = jump_pointer(code, addr, view)
+    if pointer is None:
+        return None, False
+    word = _read_exact(reader, pointer, _POINTER_LEN[view])
+    if word is None:
+        return None, True
+    return int.from_bytes(word, "little"), False
+
+
+def _lookup_owner(reader: ProcessReader, addr: int) -> tuple[str | None, bool]:
+    """`(owner, failed)` of the memory at `addr`; `failed` when the region query does not answer."""
+    region = reader.region(addr)
     return owner_from_region(region), region is None
+
+
+# How many relays are followed from the first target on. MinHook and Microsoft Detours, the most common x64 hooking
+# libraries, do not jump from the stub into their DLL: they write `E9 rel32` to a relay they allocate near the target
+# with VirtualAlloc, private memory, and only the relay jumps on (`FF 25`) to the hooking DLL. ARM64 hookers relay by
+# necessity, a `B` reaching no further than 128 MB. Judged by its first hop, every EDR, overlay and browser sandbox
+# that hooks this way would read as patched. Two hops cover a relay and a relay of a relay; a chain that is still in
+# private memory after them has no module to explain it.
+MAX_RELAY_HOPS = 2
+
+
+def _target_owner(reader: ProcessReader, live: bytes, addr: int,
+                  view: str) -> tuple[str | None, bool, list[dict]]:
+    """`(owner, failed, relay)`. `owner` is who holds the final target of the hook jump, following up to
+    MAX_RELAY_HOPS relays in private memory whose bytes are a jump themselves; `relay` lists each relay passed
+    (`address`, `owner`, the `pattern` of its jump). `failed` when there is a jump but an owner on the way could not
+    be looked up: an unreadable pointer, an unreadable relay, or a region query that failed. A hop that fails is not
+    guessed past: the owner is then None. Changed bytes with no jump have no target to ask about, which is no
+    failure; private code that is no jump is the code that runs, and stays private."""
+    relay: list[dict] = []
+    target, failed = _resolve_jump(reader, live, addr, view)
+    if target is None:
+        return None, failed, relay
+    owner, failed = _lookup_owner(reader, target)
+    while owner == OWNER_PRIVATE and not failed and len(relay) < MAX_RELAY_HOPS:
+        code = _read_exact(reader, target, READ_LEN[view])
+        if code is None:
+            relay.append({"address": target, "owner": owner, "pattern": None})
+            return None, True, relay
+        following, failed = _resolve_jump(reader, code, target, view)
+        if following is None and not failed:
+            break
+        relay.append({"address": target, "owner": owner, "pattern": jump_pattern(code, view)})
+        if failed:
+            return None, True, relay
+        target = following
+        owner, failed = _lookup_owner(reader, target)
+    return (None if failed else owner), failed, relay
 
 
 def _state(reader: ProcessReader, sc: Syscall, live: bytes | None, addr: int,
@@ -157,8 +199,9 @@ def _state(reader: ProcessReader, sc: Syscall, live: bytes | None, addr: int,
     # the owner lookup costs a region query; an intact or unreadable stub needs none
     out, failed = classify_stub(sc, live, view, None), False
     if out["state"] not in (STATE_INTACT, STATE_UNREADABLE):
-        owner, failed = _target_owner(reader, live, addr, view)
+        owner, failed, relay = _target_owner(reader, live, addr, view)
         out = classify_stub(sc, live, view, owner)
+        out["relay"] = relay
     out.update(name=sc.name, module=sc.module, number=sc.number, rva=sc.rva)
     return out, failed
 

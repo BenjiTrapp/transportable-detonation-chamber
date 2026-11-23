@@ -149,9 +149,11 @@ KINDS = {
         "baseline_exempt": True,
         "label": "Randomly named pipe",
     },
-    # Syscall stubs. A stub that jumps into private memory has no benign
-    # explanation, so a patched stub weighs what a disk/memory diff weighs and
-    # needs no second opinion. A hook into a module is what EDR products do to
+    # Syscall stubs. A stub whose jump ends in private memory is weighed like a
+    # disk/memory diff and needs no second opinion. "Ends": a first hop into
+    # private memory is no finding by itself, because MinHook and Detours relay
+    # through private memory into their DLL, so the scan follows such relays
+    # and names the final owner. A hook into a module is what EDR products do to
     # every process they watch: it is weak evidence, kept below
     # CORROBORATION_MIN_WEIGHT so it can never vouch for another source. Known
     # EDR hooks never get this far: the hook allowlist marks them in the scan
@@ -523,10 +525,12 @@ def from_syscall_scan(result, process=""):
         name = dev.get("name") or ""
         owner = (dev.get("target_owner") or "").lower()
         pattern = dev.get("pattern")
+        relay = dev.get("relay") if isinstance(dev.get("relay"), list) else []
+        via = f" via {len(relay)} private relay{'s' if len(relay) != 1 else ''}" if relay else ""
         out.append(MemoryFinding(
             source="syscalls", kind=kind, process=process,
             detail=f"{name} -> {owner or 'unresolved target'}"
-                   + (f" ({pattern})" if pattern else ""),
+                   + (f" ({pattern})" if pattern else "") + via,
             identity=(name.lower(), owner),
             extra={
                 "syscall": name,
@@ -535,6 +539,7 @@ def from_syscall_scan(result, process=""):
                 "rva": dev.get("rva"),
                 "pattern": pattern,
                 "target_owner": dev.get("target_owner"),
+                "relay": relay,
                 "expected": dev.get("expected"),
                 "actual": dev.get("actual"),
                 "number_matches": dev.get("number_matches"),

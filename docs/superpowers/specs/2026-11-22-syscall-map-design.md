@@ -161,7 +161,23 @@ gehört**, nicht das Befehlsmuster:
 - Zeigt es in ein geladenes, auf der Platte hinterlegtes Modul, das nicht
   `ntdll` ist, heißt das `hooked`. Das ist der Normalfall bei installiertem EDR.
 - Zeigt es in privaten, nicht von einer Datei gedeckten Speicher, heißt das
-  `patched`. Das ist das Signal.
+  `patched`. Das ist das Signal — gemeint ist der **letzte** Eigentümer nach dem
+  folgenden Punkt, nicht der erste Sprung.
+- **Ein erster Sprung in privaten Speicher ist für sich noch kein Befund.**
+  MinHook und Microsoft Detours, die beiden verbreitetsten x64-Hook-Bibliotheken,
+  schreiben `E9 rel32` in den Stub und landen auf einem Relay, das sie mit
+  `VirtualAlloc` nahe am Ziel anlegen — privatem Speicher. Erst das Relay springt
+  (`FF 25`) in die Hook-DLL. ARM64-Hooker brauchen ein Relay zwangsläufig, weil
+  `B` nur ±128 MB reicht. EDRs, Overlay- und Aufnahme-Software und die Sandboxen
+  von Chromium/Edge und Firefox hooken so. Darum gilt: Liegt das erste Ziel in
+  privatem oder nicht dateigedecktem Speicher und sind seine Bytes eine der
+  bekannten Sprungformen, folgt die Messung diesem Sprung, **höchstens zwei
+  Sprünge weit**, und entscheidet nach dem **letzten** Eigentümer. Die
+  durchlaufenen Relays stehen im Ergebnis. Privater Code, der kein Sprung ist,
+  bleibt `patched`, ebenso eine Kette, die nach zwei Sprüngen noch in privatem
+  Speicher steht. Ist ein Relay nicht lesbar oder sein Ziel nicht erfragbar,
+  wird nicht geraten: der Stub ist `diverged` und zählt als fehlgeschlagene
+  Eigentümer-Abfrage.
 - Zeigt es in `ntdll` selbst oder in das Modul des Stubs, heißt das `diverged`:
   `hooked` ist für ein fremdes, dateigedecktes Modul reserviert und `patched`
   für privaten Speicher. Ein modulinterner Sprung ist keins von beidem und wird

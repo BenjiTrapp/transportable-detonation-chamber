@@ -392,6 +392,12 @@ def jump_pointer(live: bytes, base: int, view: str) -> int | None:
     return hit[2] if hit else None
 
 
+def jump_pattern(live: bytes, view: str) -> str | None:
+    """The name of the hook jump at the start of `live` (`JMP [rip]`, `B`, ...), None when there is none."""
+    hit = _find_hook(live, 0, view)
+    return hit[0] if hit else None
+
+
 def _live_number(live: bytes, view: str) -> int | None:
     """The syscall number the live stub loads, None where the stub does not show it."""
     if view == "x64":
