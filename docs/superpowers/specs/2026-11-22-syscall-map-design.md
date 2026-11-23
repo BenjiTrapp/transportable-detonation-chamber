@@ -57,7 +57,9 @@ Oberfläche englisch. Aufbau von oben nach unten:
   - **Ziel:** eine Prozessauswahl (PID und Name, aus `/api/processes`), dazu
     **SCAN**. Ohne Ziel zeigt die Karte nur die Baseline.
   - **Filter** (Name, Nummer, Modul) wirkt auf beide Ansichten.
-  - **Modul-Umschalter** ntdll / win32u / beide.
+  - **Modul-Umschalter** ntdll / win32u / beide — angeboten werden nur die
+    Module, für die die geladene Baseline Einträge hat. Eine Wahl, die nur jede
+    Zelle dimmen könnte, gibt es nicht.
 - **Hauptfläche links, Ansicht MAP:**
   - Eine Zelle je Syscall, nach Syscall-Nummer sortiert, in einem Band je
     Modul — `ntdll.dll` und `win32u.dll` —, jedes mit Überschrift und Anzahl.

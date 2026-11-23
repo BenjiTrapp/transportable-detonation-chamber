@@ -26009,8 +26009,25 @@ function syscallRenderAll() {
     renderSyscallStubsPanel();
 }
 
+// The modules the filter offers: those the loaded baseline has entries for, so no choice can only dim every cell.
+// Without a baseline, the modules a baseline may hold. A chosen module that is no longer offered is let go.
+function syscallSyncModuleFilter() {
+    const modules = syscallState.baseline ? syscallState.bands.map(band => band.module) : SYSCALL_MODULES;
+    if (syscallState.module && !modules.includes(syscallState.module)) syscallState.module = '';
+    const select = document.getElementById('syscall-module-filter');
+    if (!select) return;
+    const key = modules.join('|');
+    if (select.dataset.key !== key) {
+        select.dataset.key = key;
+        select.innerHTML = `<option value="">${modules.length === 2 ? 'both modules' : 'every module'}</option>`
+            + modules.map(m => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join('');
+    }
+    select.value = syscallState.module;
+}
+
 // The filter changed (or the baseline did): which cells match, then the map and the catalog
 function syscallApplyFilter() {
+    syscallSyncModuleFilter();
     const items = syscallState.baseline ? syscallState.baseline.items : [];
     syscallState.match = syscallMatchSet(items, syscallState.query, syscallState.module);
     renderSyscallMap();

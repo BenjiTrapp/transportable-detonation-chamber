@@ -448,7 +448,7 @@ FLOW_FUNCTIONS = [
     "syscallCaptureHooks", "syscallClearHooks", "syscallSetPane", "syscallModel", "syscallRepaintCells", "syscallShowDraft",
     "syscallCopyText", "syscallTargetProcess", "syscallStubsModel", "renderSyscallStubs", "renderSyscallStubsPanel", "runSyscallStubs",
     "syscallRequestDraft", "syscallDraftStubRule",
-    "syscallHookKey", "syscallHookPairs", "syscallHookDifference", "syscallHookDrift", "syscallWin32uMissing",
+    "syscallHookKey", "syscallHookPairs", "syscallHookDifference", "syscallHookDrift", "syscallWin32uMissing", "syscallSyncModuleFilter",
 ]
 FLOW_CONSTS = ["SYSCALL_STATES", "SYSCALL_STATE_COLORS", "SYSCALL_STATE_HELP", "SYSCALL_MODULES", "SYSCALL_WIN32U_TITLE", "SYSCALL_MAP",
                "SYSCALL_ROWS_MAX", "SYSCALL_PAGE", "SYSCALL_POLL_MS", "SYSCALL_VIEW_NAMES", "syscallState",
@@ -935,6 +935,30 @@ def test_the_filter_dims_the_map_and_narrows_the_catalog():
     assert r["none"]["drawn"] == 600, "nothing matches and every cell is still there"
     assert "500 of 1,100" in r["module"]["head"]
     assert r["module"]["ntdllDimmed"] == [0.18], "the whole ntdll band is dimmed, not drawn away"
+
+
+@needs_node
+def test_the_module_filter_offers_only_the_modules_the_baseline_holds():
+    r = _flow(r"""
+      (async () => {
+        const NTDLL = ALL.filter(a => a.module === 'ntdll.dll');
+        const only = url => { const q = new URL(url, 'http://x').searchParams, offset = +q.get('offset') || 0, limit = +q.get('limit') || 200;
+                              return { body: { items: NTDLL.slice(offset, offset + limit), total: NTDLL.length, offset, limit,
+                                               build: '26200.9974', view: 'x64', symbols: true } }; };
+        initSyscalls(); syscallsTabShown(); await settle();
+        const full = els['syscall-module-filter'].innerHTML;
+        els['syscall-module-filter'].value = 'win32u.dll'; syscallOnFilter();
+        routes['/api/syscalls/baseline'] = only;
+        await syscallRefresh(true); await settle();
+        const canvas = canvases().find(c => c.dataset.module === 'ntdll.dll');
+        out({ full, lean: els['syscall-module-filter'].innerHTML, value: els['syscall-module-filter'].value, module: syscallState.module,
+              alphas: [...new Set(canvas.calls.map(c => c.alpha))] });
+      })();""")
+    values = lambda html: re.findall(r'<option value="([^"]*)"', html)
+    assert values(r["full"]) == ["", "ntdll.dll", "win32u.dll"]
+    assert values(r["lean"]) == ["", "ntdll.dll"], "a module with no entries in the baseline is not offered"
+    assert r["value"] == "" and r["module"] == "", "a chosen module the baseline no longer holds is let go"
+    assert r["alphas"] == [0.75], "so the map is not left dimmed all over"
 
 
 @needs_node
