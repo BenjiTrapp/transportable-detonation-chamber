@@ -47,7 +47,7 @@ Mehrere Stellen sagen heute, `import_present` sei unbekannt und jeder Direct-Sys
 
 ## Review Focus
 
-- **Ein Import-Name, den die kuratierte Tabelle nicht kennt:** `import_present` bleibt `None`, niemals `False`. Sonst gilt ein gewöhnliches Programm als belegte Umgehung, nur weil seine API nicht in der Tabelle steht — ein falscher Beleg ist schlimmer als ein Hinweis. → Task 1, Step 7.
+- **Ein Import-Name, den die kuratierte Tabelle nicht kennt:** `import_present` bleibt `None`, niemals `False`. Sonst gilt ein gewöhnliches Programm als belegte Umgehung, nur weil seine API nicht in der Tabelle steht — ein falscher Beleg ist schlimmer als ein Hinweis. → Task 1, Step 8.
 - **Der Cache gehört zu einem anderen Build oder einer anderen Architektur:** Laden verweigern und sagen, statt einen x64-Importgraphen für eine ARM64-VM zu zeichnen. → Task 5, Step 5.
 - **Ein Forwarder zeigt im Kreis** (`a!f → b!f → a!f`) oder auf sich selbst: Die Auflösung bricht ab und nennt den Kreis als Endgrund. → Task 4, Step 10.
 - **Eine Datei in System32 ist kein PE, gesperrt oder abgeschnitten:** Sie wird übersprungen und mit Grund gezählt, die Extraktion läuft weiter. Bei rund 4.000 Dateien darf eine kaputte den Cache nicht verhindern. → Task 2, Step 10.
@@ -93,7 +93,7 @@ Stufe 1 trägt hier ihren ganzen Nutzen: ohne ein Pixel Graph wird aus jedem Dir
 - Consumes: `syscall_scan.find_stubs_in_bytes(data, baseline, imports, *, expanded_imports)` und `find_stubs_in_process(reader, baseline, imports, *, expanded_imports)` aus Plan 1 — beide nehmen `expanded_imports` schon und sind der einzige Ort, der `False` erzeugen darf. `app.py:_pe_import_names(data)`, `app.py:_image_path_for_pid(pid)`.
 - Produces:
   - `win32_to_nt.load_table(path: str | None = None) -> Table`, einmal geladen und gehalten; `path=None` nimmt `webui/win32_to_nt.json`.
-  - `class Table` mit `entries: tuple[Entry, ...]`, `nt_for(win32: str) -> Entry | None` (ohne Rücksicht auf Groß- und Kleinschreibung), `expand(names: set[str] | None) -> set[str] | None` — die Namen plus jedes `nt` einer getroffenen Win32-Funktion, und `None` bleibt `None`.
+  - `class Table` mit `entries: tuple[Entry, ...]`, `nt_for(win32: str) -> Entry | None` (ohne Rücksicht auf Groß- und Kleinschreibung), `expand(names: set[str] | None) -> set[str] | None` — die Namen plus jedes `nt` einer getroffenen Win32-Funktion, und `None` bleibt `None`; `missing_from(syscall_names: Iterable[str]) -> tuple[str, ...]` — welche `nt`-Namen diese Syscall-Menge nicht hält.
   - `class Entry` mit `win32: str`, `nt: str`, `source: str`, `note: str`.
   - `win32_to_nt.SOURCES = ("zw-alias", "documented", "observed")`.
 
@@ -129,18 +129,40 @@ Welche Einträge: **nur** Win32-Funktionen, die in `app.py:SUSPICIOUS_IMPORTS` s
 Vier Tests, die eine falsche Zeile fangen, ohne dass jemand sie liest:
 
 ```python
-def test_every_nt_name_in_the_table_is_a_syscall_of_the_baseline_fixture():
-    # a typo in an nt name is a mapping to nothing; the baseline is the only judge of the name
+def test_every_nt_name_has_the_shape_of_a_syscall_name():
+    # "Nt" + CamelCase, no whitespace, no duplicates: catches a garbled row
 def test_every_win32_name_is_one_tdc_already_calls_suspicious():
     # the table is not a win32 dictionary (non-goal): win32 or nt must appear in SUSPICIOUS_IMPORTS
 def test_a_zw_alias_entry_is_exactly_that_rename():
     # source "zw-alias" and nt != "Nt" + win32[2:] is a mislabelled source
 def test_every_entry_names_a_source_from_the_vocabulary_and_no_win32_name_twice():
+    # "documented" and "observed" additionally require a non-empty note: the row
+    # carries the citation a human can check, which is the only real guard on a name
 ```
 
-- [ ] **Step 6: Lauf lassen, Zeilen reparieren bis grün**
+**Nicht** gegen die Baseline-Fixture prüfen. Die hält sechs Syscalls, und eine auf
+die Tabelle hin erweiterte Fixture wäre zirkulär: wer Tabelle und Fixture
+schreibt, prüft sich selbst. Die Namen prüft die echte Baseline, über Step 6.
 
-- [ ] **Step 7: Der Test, der den falschen Beleg verhindert**
+- [ ] **Step 6: `missing_from(syscall_names)` — der Namensprüfer, der auf der VM beißt**
+
+`Table.missing_from(syscall_names: Iterable[str]) -> tuple[str, ...]` nennt jeden
+`nt`-Namen, den diese Syscall-Menge nicht hält. Eine Menge von Namen, kein
+`Baseline`-Objekt: `win32_to_nt.py` bleibt dadurch abhängigkeitsfrei, und der Aufrufer
+schreibt `table.missing_from(baseline.syscalls)`. In der CI gegen eine kleine
+synthetische Menge getestet, auf der VM gegen die echte Baseline: dort muss das
+Ergebnis leer sein, und Task 11 hält es im Bericht fest. Die Funktion ist kein
+Testwerkzeug — Task 7 braucht genau dieses Wissen für sein drittes sichtbares Ende
+(„ntdll exportiert sie, aber kein Syscall dieses Builds trägt den Namen").
+
+```python
+def test_missing_from_lists_the_nt_names_a_set_of_syscalls_does_not_hold():
+def test_missing_from_is_empty_for_a_set_that_holds_them_all():
+```
+
+- [ ] **Step 7: Lauf lassen, Zeilen reparieren bis grün**
+
+- [ ] **Step 8: Der Test, der den falschen Beleg verhindert**
 
 Das ist die Zeile aus **Review Focus**. Eine Win32-Funktion ohne Eintrag darf `import_present` nicht auf `False` kippen:
 
@@ -159,9 +181,9 @@ Der dritte und vierte Test sind der Kern: genau der Fall, den Plan 1 nicht entsc
 
 **Achtung — `expand` darf nicht alles einsammeln.** `Table.expand` fügt nur die `nt`-Namen der *getroffenen* Win32-Namen hinzu. Ein leerer oder fehlender Treffer darf nicht dazu führen, dass die ganze Tabelle in die Menge wandert: dann wäre nie etwas ein Beleg.
 
-- [ ] **Step 8: `expand` und `nt_for` so umsetzen, dass diese vier Tests grün sind**
+- [ ] **Step 9: `expand` und `nt_for` so umsetzen, dass diese vier Tests grün sind**
 
-- [ ] **Step 9: Die vier Aufrufstellen in `app.py` versorgen**
+- [ ] **Step 10: Die vier Aufrufstellen in `app.py` versorgen**
 
 Alle vier bekommen `expanded_imports=win32_to_nt.load_table().expand(imports)`:
 
@@ -172,7 +194,7 @@ Alle vier bekommen `expanded_imports=win32_to_nt.load_table().expand(imports)`:
 | `api_syscalls_stubs`, Zweig `path` | `_pe_import_names(content)`, schon vorhanden |
 | `api_syscalls_stubs`, Zweig `pid` | `_pe_import_names` des Prozessabbilds über `_image_path_for_pid(pid)`; ist es nicht lesbar, bleiben beide `None` |
 
-- [ ] **Step 10: Routen- und Stufentests dafür**
+- [ ] **Step 11: Routen- und Stufentests dafür**
 
 ```python
 def test_the_stubs_route_proves_a_bypass_for_a_file_that_does_not_import_the_path():
@@ -180,15 +202,15 @@ def test_the_detonation_stage_proves_a_bypass_for_the_sample_file():
 def test_a_process_whose_image_cannot_be_read_keeps_import_present_unknown():
 ```
 
-- [ ] **Step 11: Deploy-Wege und Dateibaum**
+- [ ] **Step 12: Deploy-Wege und Dateibaum**
 
 `webui/win32_to_nt.py` und `webui/win32_to_nt.json` in `scripts/deploy-utm.py` `FILES`, `Makefile` (`deploy:` und `deploy-app`), `make.ps1` (`'deploy'` und `'deploy-app'`); das `.py` zusätzlich in den Dateibaum in `docs/troubleshooting.md`.
 
-- [ ] **Step 12: Jede Aussage nachziehen, die jetzt falsch ist**
+- [ ] **Step 13: Jede Aussage nachziehen, die jetzt falsch ist**
 
 Je Stelle ein Satz, der sagt, was gilt: ein Beleg entsteht für eine Funktion **mit** Eintrag, und ohne Eintrag bleibt es ein Hinweis. Die Stellen stehen oben unter **Files**. In `docs/memory.md` betrifft es die Tabellenzeile zu `direct_syscall_stub` und den Abschnitt darunter; in der Spec Ziel 7a, wo „wartet daher auf Plan 2" steht.
 
-- [ ] **Step 13: Der Test, der diese Aussagen festnagelt**
+- [ ] **Step 14: Der Test, der diese Aussagen festnagelt**
 
 ```python
 def test_no_shipped_text_still_says_the_win32_to_nt_table_is_missing():
@@ -196,7 +218,7 @@ def test_no_shipped_text_still_says_the_win32_to_nt_table_is_missing():
     # phrases that Plan 1 left behind, so the next change cannot quietly resurrect them
 ```
 
-- [ ] **Step 14: Ganze Suite und Commit**
+- [ ] **Step 15: Ganze Suite und Commit**
 
 Run: `make -s unit-test` (Vordergrund, einmal)
 
@@ -642,7 +664,7 @@ Das ist Ziel 7, „der Weg nach unten", und die Abfrage, um die es im ganzen Pla
 - Test: `tests/test_binary_graph.py`
 
 **Interfaces:**
-- Consumes: `Graph`, `win32_to_nt.Table` aus Task 1, `syscall_baseline.Baseline` aus Plan 1.
+- Consumes: `Graph`, `win32_to_nt.Table` aus Task 1 — darin `nt_for` für den letzten Sprung und `missing_from` für das dritte sichtbare Ende —, `syscall_baseline.Baseline` aus Plan 1.
 - Produces:
   - `path_to_syscall(graph, table, baseline, module, function) -> Answer` — die Kette als geschichteter Pfad, der letzte Sprung als `Edge` mit `kind="reaches_syscall"` und `origin="curated"`, der Zielknoten mit `kind="syscall"` und `label` aus Name und Nummer.
   - `QUERIES` bekommt `"path-to-syscall"`.
@@ -917,8 +939,9 @@ git commit -m "docs(binary-graph): the GRAPH view in the README, the help and th
 Deploy über `scripts/deploy-utm.py`, dann von Hand:
 
 1. `scripts/build-binary-graph.ps1` läuft durch und nennt Zahlen, die plausibel sind — rund 4.000 Binaries, und `api_sets_resolved` ist nicht 0.
-2. `GET /api/binary-graph/query?q=path-to-syscall&module=kernel32.dll&function=WriteProcessMemory` endet bei `NtWriteVirtualMemory` mit der Nummer, die die Baseline nennt.
-3. Beide Themes, 1920 und 1280 px, echte Eingaben über CDP in eigenem Chrome mit frischem Profil.
-4. Ein Sample mit einem Direct-Syscall-Stub zeigt jetzt **einen Beleg** statt eines Hinweises — und ein gewöhnliches Programm, das die Win32-Funktion importiert, zeigt weiterhin keinen.
+2. **`table.missing_from(baseline.syscalls)` gegen die echte Baseline ist leer.** Das ist die einzige Prüfung, die die kuratierten Nt-Namen wirklich beurteilt: in der CI kann nur die Form geprüft werden, hier die Namen. Jeder genannte Name ist entweder ein Tippfehler in der Tabelle oder eine Funktion, die dieser Build nicht hat — beides gehört in den Bericht, mit welcher der beiden Ursachen es war.
+3. `GET /api/binary-graph/query?q=path-to-syscall&module=kernel32.dll&function=WriteProcessMemory` endet bei `NtWriteVirtualMemory` mit der Nummer, die die Baseline nennt.
+4. Beide Themes, 1920 und 1280 px, echte Eingaben über CDP in eigenem Chrome mit frischem Profil.
+5. Ein Sample mit einem Direct-Syscall-Stub zeigt jetzt **einen Beleg** statt eines Hinweises — und ein gewöhnliches Programm, das die Win32-Funktion importiert, zeigt weiterhin keinen.
 
-Punkt 4 ist die Abnahme des ganzen Plans. Was dort gemessen wird, gehört in den Prüfbericht, nicht nur ins Protokoll.
+Punkt 5 ist die Abnahme des ganzen Plans. Was dort gemessen wird, gehört in den Prüfbericht, nicht nur ins Protokoll.
