@@ -445,14 +445,17 @@ git commit -m "feat(binary-graph): resolve api-set names from the ApiSetMap, and
 - Produces:
   - `MAX_HOPS = 16`
   - `@dataclass(frozen=True) class Hop`: `module: str`, `function: str`, `via: str` (`"forwards_to"` | `"resolves_to"`).
-  - `@dataclass(frozen=True) class Resolution`: `hops: tuple[Hop, ...]`, `module: str | None`, `function: str | None`, `reason: str` — `reason` ist `"defined"`, `"missing"`, `"cycle"`, `"unresolved-api-set"` oder `"too-many-hops"`. `module`/`function` sind nur bei `"defined"` gesetzt.
+  - `@dataclass(frozen=True) class Resolution`: `hops: tuple[Hop, ...]`, `module: str | None`, `function: str | None`, `reason: str` — `reason` ist `"defined"`, `"missing"`, `"cycle"`, `"unresolved-api-set"` oder `"too-many-hops"`. `module`/`function` sind nur bei `"defined"` gesetzt. Dazu `partial: bool = False`: ein Binary auf der Kette hatte eine abgeschnittene Tabelle (`BinaryInfo.partial`), also ist ein `missing` hier **nicht sicher** — Task 7 darf dann nicht „kein Modul definiert sie" sagen, ohne den Schnitt zu nennen.
   - `split_forwarder(raw: str) -> tuple[str, str]` — `"NTDLL.RtlAllocateHeap"` → `("ntdll.dll", "RtlAllocateHeap")`.
   - `resolve_export(binaries: dict[str, BinaryInfo], api_sets: dict[str, tuple[str, ...]], module: str, function: str) -> Resolution`.
 
-- [ ] **Step 1: Den Test für `split_forwarder` schreiben — mit der Falle**
+- [ ] **Step 1: Den Test für `split_forwarder` schreiben — mit der echten Falle**
 
 ```python
-def test_a_forwarder_is_split_at_its_last_dot_so_an_api_set_name_survives():
+def test_a_forwarder_to_a_dll_whose_name_holds_dots_splits_at_the_last_one():
+    assert split_forwarder("Windows.Storage.SomeFunction") == (
+        "windows.storage.dll", "SomeFunction")
+def test_an_api_set_forwarder_keeps_its_hyphenated_name():
     assert split_forwarder("api-ms-win-core-heap-l1-1-0.HeapAlloc") == (
         "api-ms-win-core-heap-l1-1-0.dll", "HeapAlloc")
 def test_a_plain_module_forwarder_gains_the_dll_suffix_and_is_lower_cased():
@@ -461,7 +464,10 @@ def test_a_forwarder_to_an_ordinal_keeps_the_hash_form():
     assert split_forwarder("NTDLL.#8") == ("ntdll.dll", "#8")
 ```
 
-Die Falle ist der erste Test: ein Api-Set-Name enthält selbst Punkte. Am ersten Punkt zu trennen zerlegt `api-ms-win-core-heap-l1-1-0` in Unsinn.
+Die Falle ist der **erste** Test, nicht der api-set. API-Set-Namen sind mit Bindestrichen
+gebaut und tragen genau einen Punkt, also trennen erster und letzter Punkt dort gleich —
+ein Test darauf unterscheidet nichts. Was unterscheidet, sind Modulnamen mit Punkten wie
+`Windows.Storage.dll`: am ersten Punkt getrennt ergeben sie Unsinn.
 
 - [ ] **Step 2: Lauf lassen und den Fehlschlag sehen**
 
@@ -767,9 +773,10 @@ Der zweite und dritte Test sind das Anti-Ziel als Test: die Oberfläche darf ein
 def test_a_win32_function_without_a_curated_entry_ends_with_no_curated_transition_known():
 def test_a_chain_that_never_reaches_ntdll_says_so_and_keeps_the_hops_it_has():
 def test_a_curated_nt_name_the_baseline_does_not_hold_says_so_instead_of_dropping_the_path():
+def test_a_chain_cut_short_by_a_partial_table_does_not_claim_that_nothing_defines_it():
 ```
 
-„Sichtbar enden statt stillschweigend verschwinden" ist die Forderung der Spec. Der dritte Fall tritt auf, wenn die Baseline zu einem anderen Build gehört oder `--no-symbols` lief.
+„Sichtbar enden statt stillschweigend verschwinden" ist die Forderung der Spec. Der dritte Fall tritt auf, wenn die Baseline zu einem anderen Build gehört oder `--no-symbols` lief. Der vierte liest `Resolution.partial` aus Task 4: ein `missing`, das aus einer abgeschnittenen Tabelle kommt, ist kein Beweis für „niemand definiert das".
 
 - [ ] **Step 6: Umsetzen, lauf lassen — grün**
 
