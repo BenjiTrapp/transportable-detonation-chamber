@@ -336,6 +336,8 @@ def test_the_limits_the_rizin_page_names_are_the_code():
     # the gutter and the lines of DISASSEMBLY have no way in for the keyboard
     lines = APP_JS[APP_JS.index("function rizinDisasmHtml"):APP_JS.index("function rizinAnalysisText")]
     assert 'class="rizin-gutter' in lines and "tabindex" not in lines
+    decompiler = APP_JS[APP_JS.index("function rizinDecompilerHtml"):APP_JS.index("function rizinDecompilerHolds")]
+    assert 'class="rizin-dec-gutter' in decompiler and "tabindex" not in decompiler
     # rizin keeps 4094 characters of a stdin line and cuts what is longer (measured: 4093 and 4094 land, 4095 does not).
     # The page says "longer than", and the cap leaves the longest `wx` the server sends well inside the line
     assert "longer than 4094" in _plain(HELP) and "cuts what is longer" in rizin and "reaches 4094" not in rizin
@@ -1446,6 +1448,8 @@ def test_the_help_and_the_guide_say_the_same_where_they_say_it_twice():
         "no watchpoint",
         "ignore esil.timeout",                                        # R74: the three unbounded ESIL commands
         "over bytes a run changed",                                   # R72: a hand patch over run-written bytes
+        "on the lowest address of the line",                          # the gutter of DECOMPILER: where a click sets one
+        "belongs to several lines of C marks all of them",            # and that each of those lines shows it
     ]
     for claim in shared:
         assert claim.lower() in help_text.lower(), "the in-tab help no longer says %r" % claim

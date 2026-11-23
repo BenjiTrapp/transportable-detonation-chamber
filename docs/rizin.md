@@ -135,12 +135,18 @@ A click in the gutter left of an address in DISASSEMBLY sets a breakpoint (●)
 or removes it. The gutter is the narrow column at the left edge of every line,
 a faint ○ where there is no breakpoint (stronger under the pointer); the cell
 between it and the address is for the ≠ of a line patched by hand, and is not
-a button. The console does the same with `db @ <addr>` and
-`db- @ <addr>`. BREAKPOINTS lists them with the function they are in and a ✕.
-A breakpoint is set or it is not: there is no "off", because `dbd` does not
-keep rizin from stopping there (measured), and a breakpoint that rizin lists
-as disabled says "off, still stops a run". Breakpoints are kept in the
-project.
+a button. DECOMPILER has the same gutter before the C of each line that has an
+address (the signature and a brace have none): a click sets the breakpoint on
+the lowest address of the line, so a run stops before this line, and the hover
+text names that address; if another address of the line has one already, a
+click removes that one. An instruction that belongs to several lines of C marks
+all of them, and a click on any of them removes it. To stop at a call in the
+middle of a line, set the breakpoint in DISASSEMBLY. The console does the same
+with `db @ <addr>` and `db- @ <addr>`. BREAKPOINTS lists them with the function
+they are in and a ✕. A breakpoint is set or it is not: there is no "off",
+because `dbd` does not keep rizin from stopping there (measured), and a
+breakpoint that rizin lists as disabled says "off, still stops a run".
+Breakpoints are kept in the project.
 
 ### API calls
 
@@ -460,7 +466,8 @@ development; without rz-ghidra DECOMPILER says "Decompiler not available
   all fit), a breakpoint or patch row whose address is above 2^53 shows `?` and
   cannot be clicked. Remove it in the console with `db- @ <addr>` or
   `wc- <addr> <addr+1>`, which the allowlist permits.
-- The gutter and the DISASSEMBLY lines cannot be reached with the keyboard.
+- The gutters and the lines of DISASSEMBLY and DECOMPILER
+  cannot be reached with the keyboard.
   Breakpoints are set by a click, or in the console with `db @ <addr>`.
 - Full analysis analyses variables less than `aaa` does (the toolbar's note
   says so).

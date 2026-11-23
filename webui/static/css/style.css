@@ -9753,8 +9753,10 @@ table[data-sortable] > thead > tr > th:focus-visible {
    line patched by hand (≠). Each is a fixed width, set apart from the line's text, so that the columns stay in line
    whether a line has a mark or not; neither is text to copy.
    The three marks of a line are three shapes, none of them colour alone: this ● in the gutter, the PC's ▶ and dashed
-   edge, the current line's solid bar. */
-.rizin-gutter {
+   edge, the current line's solid bar. DECOMPILER's gutter (.rizin-dec-gutter, before the C of a line with an
+   address) is this same cell, so it shares each rule. */
+.rizin-gutter,
+.rizin-dec-gutter {
     display: inline-block;
     width: 2ch;
     vertical-align: top;
@@ -9763,17 +9765,21 @@ table[data-sortable] > thead > tr > th:focus-visible {
     cursor: pointer;
     user-select: none;
 }
-.rizin-gutter-busy .rizin-gutter {
+.rizin-gutter-busy .rizin-gutter,
+.rizin-gutter-busy .rizin-dec-gutter {
     cursor: progress;
 }
-.rizin-gutter:not(.on)::before {
+.rizin-gutter:not(.on)::before,
+.rizin-dec-gutter:not(.on)::before {
     content: "○";
     color: var(--text-dim);
 }
-.rizin-gutter:not(.on):hover::before {
+.rizin-gutter:not(.on):hover::before,
+.rizin-dec-gutter:not(.on):hover::before {
     color: var(--text-secondary);
 }
-.rizin-gutter.on {
+.rizin-gutter.on,
+.rizin-dec-gutter.on {
     font-weight: 700;
 }
 .rz-pm {
@@ -9875,6 +9881,14 @@ table[data-sortable] > thead > tr > th:focus-visible {
     padding: 0 10px;
     white-space: pre;
     color: var(--c-slate-300);
+}
+/* The place of the gutter on a line without an address (the signature, a brace): empty, as wide as the cell, so that
+   the C of every line starts on the same column */
+.rizin-dec-pad {
+    display: inline-block;
+    width: 2ch;
+    vertical-align: top;
+    user-select: none;
 }
 .rizin-dec-line.rizin-dec-jump {
     cursor: pointer;

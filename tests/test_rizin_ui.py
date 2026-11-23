@@ -7389,6 +7389,400 @@ def test_rizin_gutter_shows_a_faint_resting_marker_that_is_not_a_breakpoint_in_b
     assert ".rz-pm::before" not in classic and prefix + ".rz-pm::before" not in layout, "the patch cell is empty at rest"
 
 
+# --- the gutter in DECOMPILER ------------------------------------------------------------------------------------------
+#
+# The same gesture as DISASSEMBLY's: a cell before the C of each line that has an address, a click in it sets or
+# removes the breakpoint on the line's lowest address (rizinDecompilerStops) and moves nowhere. Where the work is: the
+# lines are drawn again only when the C changes, and a breakpoint changes no C.
+
+DEC_GUTTER_SETUP = EMU_SETUP + r"""
+    const dec = $('rizin-decompiler'), dis = $('rizin-disasm');
+    const cl = i => dec.querySelector(`.rizin-dec-line[data-line="${i}"]`);
+    const cell = i => cl(i).querySelector('[data-rizin-gutter]');
+    const lineOf = el => Number(el.closest('.rizin-dec-line').getAttribute('data-line'));
+    const on = () => dec.querySelectorAll('.rizin-dec-gutter.on').map(lineOf);
+    const current = () => dec.querySelectorAll('.rizin-dec-line.current').map(l => Number(l.getAttribute('data-line')));
+    const sent = from => calls.slice(from).filter(c => c[0] !== 'GET').map(c => [c[0], c[1].replace('/api/rizin/S1', ''), c[2]]);
+    const decs = () => count('GET', '/api/rizin/S1/decompile');
+    const lists = () => count('GET', '/api/rizin/S1/breakpoints');
+    const showDecompiler = async () => {
+        click(tab('decompiler'));
+        await until(() => !dec.hidden && dec.querySelectorAll('.rizin-dec-line').length > 0, 'the C'); await quiet();
+    };
+    const showDisasm = async () => { click(tab('disasm')); await until(() => !dis.hidden, 'the disassembly'); await quiet(); };
+    const disBp = () => addrs(dis, '.rizin-op.bp');
+    const server = () => (S.breakpoints || []).map(b => b.addr);
+"""
+
+
+@needs_node
+def test_rizin_decompiler_gutter_toggles_a_breakpoint_without_seeking():
+    # INTENT: the cell stands in every line of C that has an address and in none without (there, an empty place of the same
+    # size so that the C of every line starts on the same column, with no ○ and nothing to click); a click in it sets the
+    # breakpoint on the line's LOWEST address (0x1400014b9 + 0x1400014bc, and 0x140001521 + 0x140001529 whose `offset` is
+    # the higher one) with one POST and no other request, a second click removes it with one DELETE, and neither moves the
+    # place (no POST /seek, seek, the current line and the history stay). A click on the line beside the gutter keeps
+    # jumping to `offset`, not to the lowest address, and sends nothing about breakpoints; a click on the empty place does
+    # nothing. A refusal leaves the line unmarked and says why in the toolbar. Nothing of rizin's becomes markup.
+    r = _scripted(DEC_GUTTER_SETUP + r"""
+        await showDecompiler();
+        const rows = () => dec.querySelectorAll('.rizin-dec-line');
+        r.lines = rows().map(l => ({ addr: l.getAttribute('data-addr'), cells: l.querySelectorAll('[data-rizin-gutter]').map(c => c.getAttribute('data-rizin-gutter')),
+                                    gutters: l.querySelectorAll('.rizin-dec-gutter').length, pads: l.querySelectorAll('.rizin-dec-pad').length,
+                                    first: l.children[0].className, glyph: l.children[0].textContent }));
+        r.titles = { unset: cell(7).getAttribute('title'), line: cl(7).getAttribute('title') };
+        r.markup = { tags: [...dec.walk()].map(e => e.tagName).filter(t => !['DIV', 'SPAN'].includes(t)),
+                     handlers: [...dec.walk()].flatMap(e => Object.keys(e.attrs)).filter(a => a.startsWith('on')) };
+        // A line is the current one before the clicks in the gutter: they must not take it away
+        click(cl(4));
+        await until(() => rizinState.seek === '0x1400014be', 'a click on a line'); await quiet();
+        const history = JSON.stringify(rizinState.history);
+        r.before = { seek: rizinState.seek, current: current() };
+        let f = calls.length;
+        click(cell(7));
+        await until(() => on().length === 1, 'the breakpoint'); await quiet();
+        r.set = { sent: sent(f), all: calls.slice(f).length, seeks: posts(f, '/seek').length, seek: rizinState.seek, current: current(),
+                  history: JSON.stringify(rizinState.history) === history, on: on(), glyph: cell(7).textContent, server: server(),
+                  title: cell(7).getAttribute('title'), aria: cell(7).getAttribute('aria-label'), cellAddr: cell(7).getAttribute('data-rizin-gutter') };
+        f = calls.length;
+        click(cell(7));
+        await until(() => on().length === 0, 'the breakpoint is gone'); await quiet();
+        r.unset = { sent: sent(f), all: calls.slice(f).length, seeks: posts(f, '/seek').length, seek: rizinState.seek, current: current(),
+                    glyph: cell(7).textContent, server: server(), aria: cell(7).getAttribute('aria-label') };
+        // The line beside the gutter: today's jump, to `offset` (0x140001529), not to the lowest address
+        f = calls.length;
+        click(cl(7).querySelector('.rz-kw'));
+        await until(() => rizinState.seek === '0x140001529', 'the jump'); await quiet();
+        r.jump = { seeks: posts(f, '/seek').map(c => c[2].addr), bp: calls.slice(f).filter(c => c[1].includes('/breakpoints')).length, on: on(), current: current() };
+        // The empty place of a line without an address, and its text
+        f = calls.length;
+        click(cl(1).querySelector('.rizin-dec-pad'));
+        click(cl(8).querySelector('.rizin-dec-pad'));
+        click(cl(1));
+        await quiet();
+        r.pad = { requests: calls.length - f, seek: rizinState.seek, on: on() };
+        // A refusal
+        S.setBreakpoint = () => [400, { refused: 'the address is in no map' }];
+        f = calls.length;
+        click(cell(2));
+        await until(() => $('rizin-state').textContent.includes('no map'), 'the reason'); await quiet();
+        r.refused = { on: on(), state: $('rizin-state').textContent.replace(/\s+/g, ' ').trim(), requests: sent(f).length,
+                      note: rizinState.note.includes('0x1400014b9') };
+        S.setBreakpoint = undefined;
+    """)
+    assert "error" not in r, r.get("error")
+    assert [l["addr"] for l in r["lines"]] == [None, None, "0x1400014b9", "0x1400014be", "0x1400014be", None, None, "0x140001529", None]
+    assert [l["cells"] for l in r["lines"]] == [[], [], ["0x1400014b9"], ["0x1400014be"], ["0x1400014be"], [], [], ["0x140001521"], []], \
+        "a line without an address has a cell to click, or a line with one does not, or the cell is not its lowest address"
+    assert [l["pads"] for l in r["lines"]] == [1, 1, 0, 0, 0, 1, 1, 0, 1] and [l["gutters"] for l in r["lines"]] == [0, 0, 1, 1, 1, 0, 0, 1, 0], \
+        "a line without an address has no empty place of the cell's size (its C would start two characters to the left), or has a ○ to aim at"
+    assert [l["first"] for l in r["lines"]] == ["rizin-dec-pad", "rizin-dec-pad", "rizin-dec-gutter", "rizin-dec-gutter", "rizin-dec-gutter",
+                                                "rizin-dec-pad", "rizin-dec-pad", "rizin-dec-gutter", "rizin-dec-pad"], \
+        "the cell is not the first thing in each line"
+    assert all(l["glyph"] == "" for l in r["lines"]), "a breakpoint is shown where none is set (the ○ is the stylesheet's)"
+    assert r["titles"] == {"unset": "Click to set a breakpoint before this line, at 0x140001521", "line": "0x140001521 0x140001529"}, \
+        "the hover text of the cell does not name the address the click uses (and it is not the one of the line)"
+    assert r["markup"] == {"tags": [], "handlers": []}, "text from rz-ghidra became markup"
+    assert r["before"] == {"seek": "0x1400014be", "current": [4]}
+    assert r["set"]["sent"] == [["POST", "/breakpoints", {"addr": "0x140001521"}]] and r["set"]["all"] == 1, \
+        "a click is one POST with the lowest address as a string, and no other request: " + str(r["set"])
+    assert r["set"]["seeks"] == 0 and r["set"]["seek"] == "0x1400014be" and r["set"]["current"] == [4] and r["set"]["history"], \
+        "a click in the gutter moved the place: " + str(r["set"])
+    assert r["set"]["on"] == [7] and r["set"]["glyph"] == "●" and r["set"]["server"] == [0x140001521] and r["set"]["aria"] == "breakpoint"
+    assert r["set"]["title"] == "Breakpoint at 0x140001521: click to remove it" and r["set"]["cellAddr"] == "0x140001521"
+    assert r["unset"]["sent"] == [["DELETE", "/breakpoints", {"addr": "0x140001521"}]] and r["unset"]["all"] == 1 \
+        and r["unset"]["seeks"] == 0 and r["unset"]["seek"] == "0x1400014be" and r["unset"]["current"] == [4], r["unset"]
+    assert r["unset"]["glyph"] == "" and r["unset"]["server"] == [] and r["unset"]["aria"] is None
+    assert r["jump"] == {"seeks": ["0x140001529"], "bp": 0, "on": [], "current": [7]}, \
+        "a click beside the gutter no longer jumps to `offset`, or sent something about breakpoints: " + str(r["jump"])
+    assert r["pad"] == {"requests": 0, "seek": "0x140001529", "on": []}, "a click on a line without an address did something"
+    assert r["refused"]["on"] == [] and "the address is in no map" in r["refused"]["state"] and r["refused"]["requests"] == 1 \
+        and r["refused"]["note"], "a refusal marked the line, or did not say why: " + str(r["refused"])
+
+
+@needs_node
+def test_rizin_decompiler_gutter_follows_the_disassembly_and_the_console():
+    # INTENT: DECOMPILER and DISASSEMBLY read the one list the marks hold. A breakpoint set in DISASSEMBLY's gutter shows in
+    # DECOMPILER's cell of the line it is on, with that address in the cell (the line's other address is not the one); one
+    # set here shows in DISASSEMBLY; one set by the console while DECOMPILER is in sight shows without a click; neither
+    # side asks for the list again (no GET /breakpoints) or for the C again. A line with two addresses that both carry a
+    # breakpoint needs two clicks, each removing the lowest one that is set, and is marked until the last is gone. An
+    # instruction that belongs to two lines of C (0x1400014be) marks both, and a click on either removes it.
+    r = _scripted(DEC_GUTTER_SETUP + r"""
+        await showDecompiler();
+        const disGutter = addr => dis.querySelector(`.rizin-op[data-addr="${addr}"] [data-rizin-gutter]`);
+        const cellAddr = i => cell(i).getAttribute('data-rizin-gutter');
+        const L = lists(), D = decs();
+        // Set in DISASSEMBLY (0x1400014bc is the higher of the two addresses of line 2)
+        await showDisasm();
+        click(disGutter('0x1400014bc'));
+        await until(() => disBp().length === 1, 'the breakpoint in DISASSEMBLY'); await quiet();
+        await showDecompiler();
+        r.fromDisasm = { on: on(), cell: cellAddr(2), title: cell(2).getAttribute('title'), glyph: cell(2).textContent,
+                         lists: lists() - L, decs: decs() - D };
+        // Removed from here: exactly that one, though 0x1400014b9 is the line's lowest
+        let f = calls.length;
+        click(cell(2));
+        await until(() => on().length === 0, 'removed'); await quiet();
+        r.removed = { sent: sent(f), server: server() };
+        await showDisasm();
+        r.inDisasm = disBp();
+        await showDecompiler();
+        // Set here, shown in DISASSEMBLY
+        click(cell(2));
+        await until(() => on().length === 1, 'set'); await quiet();
+        r.cellAfter = cellAddr(2);
+        await showDisasm();
+        r.setHere = disBp();
+        await showDecompiler();
+        click(cell(2));
+        await until(() => on().length === 0, 'cleared'); await quiet();
+        // The console while DECOMPILER is in sight: its answer says that something changed
+        S.console = (cmd, s) => {
+            const m = /^db(-?) @ (0x[0-9a-f]+)$/.exec(cmd);
+            if (!m) return null;
+            const at = parseInt(m[2], 16);
+            s.breakpoints = (s.breakpoints || []).filter(b => b.addr !== at);
+            if (!m[1]) s.breakpoints.push({ addr: at, enabled: true });
+            return [200, { output: '', seek: s.seek ?? 0x1400014b7, function: 'sym.main', truncated: false, changed: true }];
+        };
+        const L2 = lists();
+        await rizinConsoleRun('db @ 0x1400014b9'); await quiet();
+        r.console = { on: on(), cell: cellAddr(2), lists: lists() - L2 };
+        // Both addresses of the line carry one: marked at the lowest, then at the other, then not
+        await rizinConsoleRun('db @ 0x1400014bc'); await quiet();
+        r.both = { on: on(), cell: cellAddr(2), server: server() };
+        f = calls.length;
+        click(cell(2));
+        await until(() => server().length === 1, 'the lowest goes'); await quiet();
+        r.firstClick = { sent: sent(f), on: on(), cell: cellAddr(2) };
+        f = calls.length;
+        click(cell(2));
+        await until(() => server().length === 0, 'the other goes'); await quiet();
+        r.secondClick = { sent: sent(f), on: on() };
+        // One instruction, two lines of C (3 and 4 both end at 0x1400014be)
+        click(cell(3));
+        await until(() => on().length === 2, 'both lines'); await quiet();
+        r.shared = { on: on(), cells: [cellAddr(3), cellAddr(4)], titles: [cell(3).getAttribute('title'), cell(4).getAttribute('title')] };
+        f = calls.length;
+        click(cell(4));
+        await until(() => on().length === 0, 'both lines are clear'); await quiet();
+        r.sharedGone = { sent: sent(f), on: on(), server: server() };
+        r.requests = { lists: lists() - L2, decs: decs() };
+    """)
+    assert "error" not in r, r.get("error")
+    assert r["fromDisasm"] == {"on": [2], "cell": "0x1400014bc", "title": "Breakpoint at 0x1400014bc: click to remove it",
+                               "glyph": "●", "lists": 0, "decs": 0}, \
+        "a breakpoint set in DISASSEMBLY is not shown here, is shown on the wrong address, or the list or the C was asked for again: " + str(r["fromDisasm"])
+    assert r["removed"] == {"sent": [["DELETE", "/breakpoints", {"addr": "0x1400014bc"}]], "server": []}, \
+        "a click removed another address than the one that carries the breakpoint: " + str(r["removed"])
+    assert r["inDisasm"] == [] and r["setHere"] == ["0x1400014b9"] and r["cellAfter"] == "0x1400014b9", \
+        "a breakpoint set here is not in DISASSEMBLY, or removing one there did not clear it here: " + str(r)
+    assert r["console"] == {"on": [2], "cell": "0x1400014b9", "lists": 1}, \
+        "a breakpoint of the console does not show without a click (the list is read once for its answer): " + str(r["console"])
+    assert r["both"] == {"on": [2], "cell": "0x1400014b9", "server": [0x1400014b9, 0x1400014bc]}
+    assert r["firstClick"] == {"sent": [["DELETE", "/breakpoints", {"addr": "0x1400014b9"}]], "on": [2], "cell": "0x1400014bc"}, \
+        "the line is not marked until the last of its breakpoints is gone: " + str(r["firstClick"])
+    assert r["secondClick"] == {"sent": [["DELETE", "/breakpoints", {"addr": "0x1400014bc"}]], "on": []}
+    assert r["shared"] == {"on": [3, 4], "cells": ["0x1400014be", "0x1400014be"],
+                           "titles": ["Breakpoint at 0x1400014be: click to remove it"] * 2}, \
+        "an instruction that belongs to two lines of C marks only one: " + str(r["shared"])
+    assert r["sharedGone"] == {"sent": [["DELETE", "/breakpoints", {"addr": "0x1400014be"}]], "on": [], "server": []}
+    assert r["requests"]["decs"] >= 1
+
+
+@needs_node
+def test_rizin_decompiler_gutter_does_not_go_stale_on_a_toggle():
+    # INTENT (Review Focus 5): the lines of C are drawn again only when the C changes, and a breakpoint changes no C, so
+    # the mark has to come with the list itself. After a click in the gutter the lines carry the new mark (set, then
+    # removed), and the same holds for a list that changed elsewhere (the pane, the console) while DECOMPILER is in sight
+    # and while it is hidden (it catches up once shown). What was there stays: the scroll position (also when the line at
+    # the top of the view is the second of two that share an address, which a lookup by address alone would take for the
+    # first: the view would creep up by a line with each click), the current line (the second of the two, the one that was
+    # clicked), and the C itself, which is not asked for again. A message the pane shows instead of lines (the code could
+    # not be loaded) is not written over by a list.
+    r = _scripted(LAID_OUT + r"""
+        // 80 lines; 40 and 41 share an instruction
+        DECOMPILED['sym.main'] = [cline('int main(void)'), cline('{'),
+            ...Array.from({ length: 77 }, (_, i) => cline(`    step${i}();`, 0x140001600 + 8 * i)), cline('}')];
+        DECOMPILED['sym.main'][41] = cline('    again();', DECOMPILED['sym.main'][40].offset);
+        const dec = $('rizin-decompiler');
+        const S = { analysis: 'done', done: ['aaa'] };
+        serve('S1', S);
+        opens['C:\\x\\s.exe'] = S;
+        await openInRizin('C:\\x\\s.exe');
+        await until(() => rizinState.landed, 'landed'); await quiet();
+        const cl = i => dec.querySelector(`.rizin-dec-line[data-line="${i}"]`);
+        const cell = i => cl(i).querySelector('[data-rizin-gutter]');
+        const lineOf = el => Number(el.closest('.rizin-dec-line').getAttribute('data-line'));
+        const on = () => dec.querySelectorAll('.rizin-dec-gutter.on').map(lineOf);
+        const current = () => dec.querySelectorAll('.rizin-dec-line.current').map(l => Number(l.getAttribute('data-line')));
+        const decs = () => count('GET', '/api/rizin/S1/decompile');
+        const server = () => (S.breakpoints || []).map(b => b.addr);
+        click(tab('decompiler'));
+        await until(() => dec.querySelectorAll('.rizin-dec-line').length === 80, 'the C'); await quiet();
+        // The second of the two lines is clicked (it stays the current one), and scrolled to so that it is at the top of the view
+        click(cl(41));
+        await until(() => rizinState.seek === '0x140001730', 'the click'); await quiet();
+        dec.scrollTop = 41 * 20 + 7;
+        const shared = DECOMPILED['sym.main'][40].offset;
+        const gen = rizinState.decompiler.gen, D = decs(), nodes = cl(41);
+        r.start = { current: current(), top: dec.scrollTop, on: on() };
+        const state = () => ({ on: on(), current: current(), top: dec.scrollTop, gen: rizinState.decompiler.gen, decs: decs() - D, server: server() });
+        // A click in the gutter of the line at the top of the view
+        click(cell(41));
+        await until(() => on().length === 2, 'both lines marked'); await quiet();
+        r.set = { ...state(), redrawn: cl(41) !== nodes, glyphs: [cell(40).textContent, cell(41).textContent], cell: cell(41).getAttribute('data-rizin-gutter') };
+        click(cell(41));
+        await until(() => on().length === 0, 'both lines clear'); await quiet();
+        r.unset = { ...state(), glyphs: [cell(40).textContent, cell(41).textContent] };
+        // A list that changed elsewhere, DECOMPILER in sight: another line (10), then a breakpoint of no line of the C
+        S.breakpoints = [{ addr: DECOMPILED['sym.main'][10].offset, enabled: true }];
+        await rizinLoadMarks(true); await quiet();
+        r.elsewhere = state();
+        S.breakpoints = [{ addr: 0x1400014b7, enabled: true }];
+        await rizinLoadMarks(true); await quiet();
+        r.unrelated = state();
+        // Hidden: the list changes (a breakpoint set on line 20), and once shown the lines carry it, where they were
+        click(tab('disasm')); await quiet();
+        S.breakpoints = [{ addr: DECOMPILED['sym.main'][20].offset, enabled: true }];
+        await rizinLoadMarks(true); await quiet();
+        click(tab('decompiler')); await quiet();
+        r.hidden = state();
+        // The pane says something instead of lines (another function whose C could not be loaded): a list does not write over it
+        S.decompile = () => [500, { error: 'rz-ghidra broke' }];
+        await go('0x140001490'); await quiet();
+        r.message = { text: dec.textContent, lines: dec.querySelectorAll('.rizin-dec-line').length };
+        S.breakpoints = [];
+        await rizinLoadMarks(true); await quiet();
+        r.messageAfter = { text: dec.textContent, lines: dec.querySelectorAll('.rizin-dec-line').length };
+        r.shared = shared;
+    """)
+    assert "error" not in r, r.get("error")
+    shared = r["shared"]
+    assert r["start"] == {"current": [41], "top": 41 * 20 + 7, "on": []}, "the setup: the second of the two lines is the current one"
+    top = 41 * 20 + 7
+    assert r["set"]["on"] == [40, 41] and r["set"]["glyphs"] == ["●", "●"] and r["set"]["server"] == [shared] and r["set"]["cell"] == hex(shared), \
+        "the mark is stale after a click: " + str(r["set"])
+    assert r["set"]["redrawn"] is True, "the test does not draw the lines again, so it cannot tell a stale mark from a fresh one"
+    assert r["unset"]["on"] == [] and r["unset"]["glyphs"] == ["", ""] and r["unset"]["server"] == [], "the mark is stale after the second click: " + str(r["unset"])
+    for step in ("set", "unset"):
+        assert r[step]["top"] == top, f"a click in the gutter cost the scroll position ({step}): " + str(r[step])
+        assert r[step]["current"] == [41], f"a click in the gutter moved the current line ({step}): " + str(r[step])
+        assert r[step]["decs"] == 0, f"the C was asked for again after a click in the gutter ({step})"
+    assert r["elsewhere"]["on"] == [10] and r["elsewhere"]["top"] == top and r["elsewhere"]["current"] == [41] and r["elsewhere"]["decs"] == 0, \
+        "a list that changed elsewhere does not show, or cost the scroll position or the current line: " + str(r["elsewhere"])
+    assert r["unrelated"]["on"] == [] and r["unrelated"]["top"] == top and r["unrelated"]["current"] == [41]
+    assert r["hidden"]["on"] == [20] and r["hidden"]["top"] == top and r["hidden"]["current"] == [41], \
+        "a list that changed while DECOMPILER was hidden was not there when it was shown: " + str(r["hidden"])
+    assert r["message"]["lines"] == 0 and "could not be loaded" in r["message"]["text"], r["message"]
+    assert r["messageAfter"] == r["message"], "a list wrote over the message the pane shows instead of lines: " + str(r["messageAfter"])
+
+
+@needs_node
+def test_rizin_decompiler_gutter_drops_a_click_while_a_request_is_out():
+    # INTENT (Review Focus 4): one request at a time. While one is out (marks.busy) a click in any gutter of DECOMPILER is
+    # dropped, not queued: one POST, and a click on another line's cell neither adds a breakpoint nor takes the first one
+    # away; and the pointer says so IN THIS PANE (rizin-gutter-busy on #rizin-decompiler, as on #rizin-disasm), which is gone
+    # again with the answer, so that a click after it is taken.
+    r = _scripted(DEC_GUTTER_SETUP + r"""
+        await showDecompiler();
+        S.actDelay = 60;
+        const f = calls.length;
+        click(cell(2));
+        r.out = { dec: dec.classList.contains('rizin-gutter-busy'), dis: dis.classList.contains('rizin-gutter-busy'), busy: rizinState.marks.busy };
+        click(cell(2)); click(cell(3)); click(cell(7));
+        r.dropped = { posts: sent(f).map(c => [c[0], c[2].addr]), on: on(), dec: dec.classList.contains('rizin-gutter-busy') };
+        await until(() => on().length === 1, 'the answer'); await quiet();
+        r.answered = { sent: sent(f).map(c => [c[0], c[2].addr]), on: on(), server: server(), dec: dec.classList.contains('rizin-gutter-busy'),
+                       dis: dis.classList.contains('rizin-gutter-busy'), busy: rizinState.marks.busy };
+        // The cue is gone, so a click is taken again
+        S.actDelay = 1;
+        click(cell(7));
+        await until(() => on().length === 2, 'the next click'); await quiet();
+        r.next = { on: on(), server: server() };
+    """)
+    assert "error" not in r, r.get("error")
+    assert r["out"] == {"dec": True, "dis": True, "busy": True}, \
+        "a click that is dropped while one request is out says nothing in this pane (no cue on DECOMPILER): " + str(r["out"])
+    assert r["dropped"] == {"posts": [["POST", "0x1400014b9"]], "on": [], "dec": True}, \
+        "a click while a request was out was taken (or queued): " + str(r["dropped"])
+    assert r["answered"] == {"sent": [["POST", "0x1400014b9"]], "on": [2], "server": [0x1400014b9], "dec": False, "dis": False, "busy": False}, \
+        "the cue stays after the answer, or the dropped clicks left something: " + str(r["answered"])
+    assert r["next"] == {"on": [2, 7], "server": [0x1400014b9, 0x140001521]}
+
+
+@needs_node
+def test_rizin_decompiler_gutter_cell_shifts_nothing():
+    # INTENT: the cell takes the same room whether the line has a mark or not, whether it has an address or not, and with no
+    # `breakpoints` at all: without its cell (a gutter or an empty place, the first thing in each line) the markup of the lines
+    # is the same with and without a breakpoint, so the C and the data-addr of a line stay where they are. A line whose address
+    # no `0x…` can hold (a JSON number past 2^64) gets the empty place, not a cell that names `null`.
+    r = _run(r"""
+        const lines = [cline('int main(void)'), cline('{'), cline('    if (a) {', 0x1400015b9, 0x1400015bf), cline('        x();', 0x1400015c0),
+                       cline('    y = <b>1</b>;', 1e30), cline('}')];
+        const plain = rizinDecompilerHtml(lines, { current: '0x1400015c0', breakpoints: [] });
+        const marked = rizinDecompilerHtml(lines, { current: '0x1400015c0', breakpoints: [0x1400015bf, 0x1400015c0] });
+        const cellRe = /<span class="rizin-dec-(?:gutter|pad)[^"]*"[^>]*>[^<]*<\/span>/g;
+        const bare = html => html.replace(cellRe, '<CELL>');
+        console.log(JSON.stringify({
+            plain, marked, bare: bare(plain), bareMarked: bare(marked),
+            startsWithCell: (html => html.split('</div>').filter(Boolean).map(l => /^<div [^>]*><CELL>/.test(bare(l))))(plain),
+            noOptions: [rizinDecompilerHtml(lines), rizinDecompilerHtml(lines, {})].map(h => [(h.match(/data-rizin-gutter/g) || []).length, (h.match(/ on"/g) || []).length]),
+            nulls: /null|undefined|NaN/.test(plain + marked),
+            cells: (plain.match(/data-rizin-gutter="[^"]*"/g) || []),
+        }));
+    """, SORT_DOM + _rizin_prelude() + r"""
+        const cline = (text, ...addrs) => ({ text, offset: addrs.length ? addrs[0] : null, offsets: [...addrs].sort((a, b) => a - b) });
+    """)
+    assert r["plain"] != r["marked"], "the breakpoint is not in the markup, so the next assertion proves nothing"
+    assert r["bare"] == r["bareMarked"], "a mark changes more than the cell: the C or the data-addr of a line moved"
+    assert r["startsWithCell"] == [True] * 6, "a line does not start with a cell (a gutter or an empty place)"
+    assert r["cells"] == ['data-rizin-gutter="0x1400015b9"', 'data-rizin-gutter="0x1400015c0"'], \
+        "the line with an address a 0x… cannot hold has a cell, or another one does not"
+    assert r["noOptions"] == [[2, 0], [2, 0]], "without options the cells are missing or a breakpoint is made up"
+    assert r["nulls"] is False
+
+
+def test_rizin_decompiler_gutter_looks_like_the_disassembly_gutter_in_both_themes():
+    # INTENT: DECOMPILER's cell has the glyphs and colours of DISASSEMBLY's in both sheets (a faint ○ at rest, stronger under
+    # the pointer, a red bold ● when set with the glow of Cyberpunk, and the busy pointer), and its empty place is as wide as
+    # the cell, so that the C of a line starts on the same column with or without an address or a mark. A reviewer who takes
+    # the resting rule from either sheet, or the busy pointer, fails here; so does a rule of the pseudo-element that takes room.
+    classic, layout = _rules(STYLE_CSS), _rules(THEME_CSS)
+    prefix = '[data-theme="cyberpunk"] '
+    for rules, pre in ((classic, ""), (layout, prefix)):
+        for rule in (".rizin-dec-gutter", ".rizin-dec-gutter.on", ".rizin-dec-gutter:not(.on)::before", ".rizin-dec-gutter:not(.on):hover::before",
+                     ".rizin-gutter-busy .rizin-dec-gutter"):
+            assert rules.get(pre + rule), f"{pre + rule} has no rule"
+        # the same colours as the disassembly's cell, whatever they are
+        for rule in (".rizin-gutter", ".rizin-gutter:not(.on)::before", ".rizin-gutter:not(.on):hover::before", ".rizin-gutter-busy .rizin-gutter"):
+            twin = rule[:rule.rindex(".rizin-gutter")] + ".rizin-dec-gutter" + rule[rule.rindex(".rizin-gutter") + len(".rizin-gutter"):]
+            for prop in ("color", "cursor", "content"):
+                assert _declared(rules.get(pre + rule), prop) == _declared(rules.get(pre + twin), prop), f"{pre + twin} differs from {pre + rule} in {prop}"
+        resting, pointed = rules[pre + ".rizin-dec-gutter:not(.on)::before"], rules[pre + ".rizin-dec-gutter:not(.on):hover::before"]
+        assert _declared(resting, "color") == ("var(--cp-text-dim)" if pre else "var(--text-dim)")
+        assert _declared(pointed, "color") == ("var(--cp-text-muted)" if pre else "var(--text-secondary)")
+        assert _declared(rules[pre + ".rizin-gutter-busy .rizin-dec-gutter"], "cursor") == "progress"
+        for prop in ("position", "width", "min-width", "margin", "padding", "font-size", "display", "float", "letter-spacing"):
+            assert _declared(resting, prop) is None and _declared(pointed, prop) is None, f"the marker declares {prop}: the columns could shift"
+    assert _declared(classic[".rizin-dec-gutter:not(.on)::before"], "content") == '"○"'
+    assert _declared(classic[".rizin-dec-gutter.on"], "font-weight") == "700" and _declared(classic[".rizin-dec-gutter"], "color") == "var(--accent-red)"
+    assert _declared(layout[prefix + ".rizin-dec-gutter"], "color") == "var(--cp-red)" and "text-shadow" in layout[prefix + ".rizin-dec-gutter.on"]
+    # nothing of a mark takes room: the cell and the empty place are one width, and neither is text to copy
+    cell, pad = classic[".rizin-dec-gutter"], classic[".rizin-dec-pad"]
+    assert _declared(cell, "display") == _declared(pad, "display") == "inline-block"
+    assert _declared(cell, "width") == _declared(pad, "width") == _declared(classic[".rizin-gutter"], "width") == "2ch", \
+        "the cell and the empty place are not one width, so the C of lines with and without an address would not line up"
+    assert _declared(cell, "user-select") == _declared(pad, "user-select") == "none", "a copied line carries the marks"
+    assert _declared(classic[".rizin-dec-gutter.on"], "width") is None and _declared(classic[".rizin-dec-gutter.on"], "padding") is None
+    assert _declared(classic.get(".rizin-dec-pad"), "cursor") is None, "the empty place looks like something to click"
+    assert ".rizin-dec-pad::before" not in classic and prefix + ".rizin-dec-pad::before" not in layout, "the empty place has a ○"
+    html = _read(INDEX_HTML)
+    assert "style.css?v=88" not in html and 'theme-layout.css?v=11"' not in html and "app.js?v=130" not in html, \
+        "asset versions not raised for the gutter of DECOMPILER"
+
+
 @needs_node
 def test_rizin_menu_patches_an_instruction_and_runs_to_here():
     # INTENT: from the right-click menu of a line, NOP out, Flip the jump, Always jump and Kill the call each POST /patch with

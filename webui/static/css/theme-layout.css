@@ -2172,19 +2172,24 @@
 [data-theme] .rizin-op.pc::before {
     color: var(--cp-orange);
 }
-[data-theme] .rizin-gutter {
+[data-theme] .rizin-gutter,
+[data-theme] .rizin-dec-gutter {
     color: var(--cp-red);
 }
-[data-theme] .rizin-gutter:not(.on)::before {
+[data-theme] .rizin-gutter:not(.on)::before,
+[data-theme] .rizin-dec-gutter:not(.on)::before {
     color: var(--cp-text-dim);
 }
-[data-theme] .rizin-gutter:not(.on):hover::before {
+[data-theme] .rizin-gutter:not(.on):hover::before,
+[data-theme] .rizin-dec-gutter:not(.on):hover::before {
     color: var(--cp-text-muted);
 }
-[data-theme] .rizin-gutter-busy .rizin-gutter {
+[data-theme] .rizin-gutter-busy .rizin-gutter,
+[data-theme] .rizin-gutter-busy .rizin-dec-gutter {
     cursor: progress;
 }
-[data-theme] .rizin-gutter.on {
+[data-theme] .rizin-gutter.on,
+[data-theme] .rizin-dec-gutter.on {
     text-shadow: 0 0 6px rgba(var(--cp-red-rgb), .6);
 }
 [data-theme] .rz-pm {

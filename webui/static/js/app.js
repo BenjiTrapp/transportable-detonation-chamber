@@ -22167,24 +22167,34 @@ function rizinMovePc(container, selector, addrs) {
 }
 
 // What a scrolled list shows at its top: the first row in sight (its
-// data-addr) and how far it is from the top, to put it back there when the
-// list is drawn again. At the top the list stays at the top.
+// data-addr, and its place among the rows) and how far it is from the top, to
+// put it back there when the list is drawn again. At the top the list stays at
+// the top.
 function rizinScrollAnchor(container) {
     const top = container.scrollTop;
-    if (!Number.isFinite(top) || top <= 0) return { top: 0, addr: null, delta: 0 };
-    for (const row of Array.from(container.children)) {
-        const addr = row.getAttribute('data-addr');
+    if (!Number.isFinite(top) || top <= 0) return { top: 0, addr: null, delta: 0, index: 0 };
+    const rows = Array.from(container.children);
+    for (let index = 0; index < rows.length; index++) {
+        const row = rows[index], addr = row.getAttribute('data-addr');
         if (addr && Number.isFinite(row.offsetTop) && row.offsetTop + row.offsetHeight > top) {
-            return { top, addr, delta: row.offsetTop - top };
+            return { top, addr, delta: row.offsetTop - top, index };
         }
     }
-    return { top, addr: null, delta: 0 };
+    return { top, addr: null, delta: 0, index: 0 };
 }
 
 // The list drawn again: the same row at the same height, else the same scroll
-// position (rows that came in above the ones in sight push the list on)
+// position (rows that came in above the ones in sight push the list on). Of
+// several rows with the address (lines of C that share an instruction) the one
+// nearest the place the row had, or the list would creep up with each redraw.
 function rizinRestoreScroll(container, anchor) {
-    const row = anchor.addr ? Array.from(container.children).find(r => r.getAttribute('data-addr') === anchor.addr) : null;
+    const rows = Array.from(container.children);
+    let row = null, gap = Infinity;
+    if (anchor.addr) {
+        rows.forEach((r, i) => {
+            if (r.getAttribute('data-addr') === anchor.addr && Math.abs(i - (anchor.index || 0)) < gap) [row, gap] = [r, Math.abs(i - (anchor.index || 0))];
+        });
+    }
     const top = row && Number.isFinite(row.offsetTop) ? row.offsetTop - anchor.delta : anchor.top;
     container.scrollTop = Math.max(0, top);
 }
@@ -24390,19 +24400,30 @@ function rizinCHtml(text) {
 
 // The lines of DECOMPILER: rz-ghidra's C, each with its index in data-line; a line with an address (its
 // offset, as pdgo shows it) carries it in data-addr and all its addresses on hover. current (an address)
-// marks its line (rizinDecompilerMark), line is the line clicked.
+// marks its line (rizinDecompilerMark), line is the line clicked. Before the text of each line stands the
+// gutter, as in DISASSEMBLY: a cell with data-rizin-gutter (the address a click acts on, which its hover
+// text names) where the line has an address, and where it has none (the signature, a brace) an empty cell
+// of the same width, so that the C of every line starts on the same column. breakpoints are the addresses
+// of the list the marks hold (numbers): a line shows one when any of its addresses carries one.
 function rizinDecompilerHtml(lines, options) {
-    const { current = null, line = null } = options || {};
+    const { current = null, line = null, breakpoints = [] } = options || {};
     const list = Array.isArray(lines) ? lines : [];
     const mark = rizinDecompilerMark(list, current, line);
+    const stops = rizinDecompilerStops(list, breakpoints);
     let html = '';
     list.forEach((item, i) => {
         const text = item && item.text !== null && item.text !== undefined ? String(item.text) : '';
         const addr = rizinHex(item && item.offset);
         const all = rizinLineOffsets(item).sort((a, b) => a - b).map(rizinHex).filter(Boolean);
+        const stop = stops[i] && stops[i].addr ? stops[i] : null;
+        const gutter = stop
+            ? `<span class="rizin-dec-gutter${stop.set ? ' on' : ''}" data-rizin-gutter="${escapeHtml(stop.addr)}" title="${escapeHtml(stop.set
+                ? `Breakpoint at ${stop.addr}: click to remove it` : `Click to set a breakpoint before this line, at ${stop.addr}`)}"`
+                + `${stop.set ? ' aria-label="breakpoint"' : ''}>${stop.set ? '●' : ''}</span>`
+            : '<span class="rizin-dec-pad"></span>';
         html += `<div class="rizin-dec-line${i === mark ? ' current' : ''}${addr ? ' rizin-dec-jump' : ''}" data-line="${i}"`
             + (addr ? ` data-addr="${addr}" title="${escapeHtml(all.join(' '))}"` : '')
-            + `>${text ? rizinCHtml(text) : ' '}</div>`;
+            + `>${gutter}${text ? rizinCHtml(text) : ' '}</div>`;
     });
     return html;
 }
@@ -24515,7 +24536,8 @@ async function rizinLoadDecompiler(force) {
 // DECOMPILER: the C when it holds the current place, else why not (problem: busy or an error; else it is
 // on its way). The same C at another place in it only moves the mark (a selection stays); a jump brings
 // the marked line into sight, and C drawn again for the same function keeps the lines in sight where they
-// are.
+// are. The same holds when the list of breakpoints changed (rizinSetLists): the gutter's marks are drawn
+// with the lines.
 function rizinRenderDecompiler(problem) {
     const pane = document.getElementById('rizin-decompiler');
     if (!pane) return;
@@ -24545,11 +24567,14 @@ function rizinRenderDecompiler(problem) {
     const prefer = rizinState.jumpFrom === 'decompiler' && click && click.addr === seek ? click.line : null;
     const jumped = rizinState.decompilerJump !== rizinState.jumpSeq;
     rizinState.decompilerJump = rizinState.jumpSeq;
-    const shown = JSON.stringify([sid, dec.gen]);
+    // The breakpoints are part of what is shown, as in DISASSEMBLY: another list draws the lines again (a toggle
+    // changes neither the C nor its generation), and the anchor below keeps the lines in sight where they are
+    const breakpoints = rizinState.marks.breakpoints || [];
+    const shown = JSON.stringify([sid, dec.gen, breakpoints]);
     if (shown !== rizinState.decompilerShown) {
         const place = JSON.stringify([sid, dec.function]);
         const anchor = place === rizinState.decompilerAt && !jumped ? rizinScrollAnchor(pane) : null;
-        pane.innerHTML = rizinDecompilerHtml(dec.lines, { current: seek, line: prefer });
+        pane.innerHTML = rizinDecompilerHtml(dec.lines, { current: seek, line: prefer, breakpoints });
         rizinState.decompilerShown = shown;
         if (anchor) {
             rizinRestoreScroll(pane, anchor);
@@ -24568,7 +24593,8 @@ function rizinRenderDecompiler(problem) {
     if (jumped) rizinReveal(pane, pane.querySelector('.rizin-dec-line.current'));
 }
 
-// A click on a line of C with an address jumps there (not when it ends a selection of text); Reopen opens
+// A click on a line of C with an address jumps there (not when it ends a selection of text), a click in the
+// gutter before it sets or removes the breakpoint at the address of its cell and moves nowhere; Reopen opens
 // the file again, Decompile again asks for the function whose decompile ended a session
 function rizinOnDecompilerClick(event) {
     const el = event.target && event.target.closest ? event.target : null;
@@ -24576,6 +24602,8 @@ function rizinOnDecompilerClick(event) {
     if (el.closest('[data-action="reopen"]')) return rizinReopen();
     if (el.closest('[data-action="decompile-again"]')) return rizinDecompileAgain();
     if (typeof window.getSelection === 'function' && String(window.getSelection())) return false;
+    const gutter = el.closest('[data-rizin-gutter]');
+    if (gutter) return rizinToggleBreakpoint(gutter.getAttribute('data-rizin-gutter'));
     const line = el.closest('[data-addr]');
     const addr = line ? rizinHex(line.getAttribute('data-addr')) : null;
     if (!addr) return false;
@@ -25716,8 +25744,8 @@ async function rizinDetonatePatched(path, name) {
     return true;
 }
 
-// --- Breakpoints and patches in DISASSEMBLY ---
-// The gutter (a click sets or removes a breakpoint) and the patch entries of the right-click menu (rizinMenuAct) act
+// --- Breakpoints and patches in DISASSEMBLY (and the gutter of DECOMPILER) ---
+// The gutter (a click sets or removes a breakpoint, in DISASSEMBLY and in DECOMPILER) and the patch entries of the right-click menu (rizinMenuAct) act
 // on one address; what DISASSEMBLY marks (rizinState.marks) is the list each route answers: asked for once for each
 // file, again when forced, and taken from the answer of every change. A breakpoint is set or removed: rizin 0.9.1's
 // dbd does not stop a breakpoint from stopping a run, so there is no switch. Addresses go out as "0x…" strings; the
@@ -25744,6 +25772,9 @@ function rizinSetLists(lists) {
     }
     rizinRenderEmuPane();
     if (rizinPageHolds(rizinState.disasm)) rizinRenderDisasm();
+    // The C in sight shows the breakpoints too (decompilerAt is empty while the pane says something instead of
+    // lines, which a list must not overwrite); hidden, it takes them once it is shown again
+    if (rizinState.decompilerAt && rizinCodeOnScreen('decompiler')) rizinRenderDecompiler();
     return true;
 }
 
@@ -25775,8 +25806,9 @@ async function rizinToggleBreakpoint(addr) {
     if (!sid || !at || marks.busy) return false;
     marks.busy = true;
     // One request at a time: while it is out a click in the gutter of any line is not taken, and the pointer says so
-    const pane = document.getElementById('rizin-disasm');
-    if (pane) pane.classList.add('rizin-gutter-busy');
+    // in both views that have a gutter
+    const panes = ['rizin-disasm', 'rizin-decompiler'].map(id => document.getElementById(id)).filter(Boolean);
+    panes.forEach(pane => pane.classList.add('rizin-gutter-busy'));
     try {
         if (marks.breakpoints === null && !(await rizinLoadMarks(true))) {
             if (sid === rizinState.session && rizinState.ui.state !== 'busy') {
@@ -25801,7 +25833,7 @@ async function rizinToggleBreakpoint(addr) {
         return true;
     } finally {
         if (sid === rizinState.session) marks.busy = false;
-        if (pane && !marks.busy) pane.classList.remove('rizin-gutter-busy');
+        if (!marks.busy) panes.forEach(pane => pane.classList.remove('rizin-gutter-busy'));
     }
 }
 
