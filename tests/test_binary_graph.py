@@ -822,8 +822,10 @@ def _api_set_map(mapping, version=6):
     entries, values, hashes = b"", b"", b""
     for index, (alias, hosts) in enumerate(mapping.items()):
         alias_at, alias_len = name(alias)
-        entries += struct.pack("<6I", 0, alias_at, alias_len, alias_len - 2 * len("-1-0"),
-                               values_at + len(values), len(hosts))
+        # HashedLength is packed to the documented rule, the name up to but not including its last hyphen, and still
+        # ignored on read (Geoff Chappell's "The API Set Schema"; NtUtilsLibrary, NtUtils.ApiSets.pas)
+        hashed_len = 2 * len(alias.rpartition("-")[0])
+        entries += struct.pack("<6I", 0, alias_at, alias_len, hashed_len, values_at + len(values), len(hosts))
         hashes += struct.pack("<2I", 0, index)
         for host in hosts:
             importer, module = host if isinstance(host, tuple) else ("", host)
@@ -844,7 +846,7 @@ def test_the_packer_lays_the_map_out_as_the_version_6_table_says():
     data = _api_set_map({"api-x-1-0": ("a.dll",), "api-y-1-0": ("b.dll", "c.dll")})
     assert struct.unpack_from("<7I", data) == (6, len(data), 0, 2, 28, 28 + 2 * 24, 31)
     flags, name_at, name_len, hashed_len, value_at, value_count = struct.unpack_from("<6I", data, 28 + 24)
-    assert (flags, name_len, hashed_len, value_count) == (0, 2 * len("api-y-1-0"), 2 * len("api-y"), 2)
+    assert (flags, name_len, hashed_len, value_count) == (0, 2 * len("api-y-1-0"), 2 * len("api-y-1"), 2)    # up to, not including, the last hyphen
     assert data[name_at:name_at + name_len].decode("utf-16-le") == "api-y-1-0"
     _, _, _, host_at, host_len = struct.unpack_from("<5I", data, value_at + 20)
     assert data[host_at:host_at + host_len].decode("utf-16-le") == "c.dll"
