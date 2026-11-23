@@ -17014,7 +17014,7 @@ function firewallTabShown() {
 }
 
 // --- The decision toasts ---
-// A download from the chamber is blocked at once and then asked about (spec, "Der Download-Fall"). The deadline
+// A download from the chamber is blocked at once and then asked about (spec, the download case). The deadline
 // is the server's: when it runs out, the server keeps the block and fetches the file itself, whether a browser is
 // open or not. So the countdown only shows what is going to happen anyway; nothing here is the way the default
 // is taken, and a closed page changes no outcome. Every tab asks /pending (fwPendingPoll), and the FIREWALL
@@ -25485,8 +25485,9 @@ function renderHookAllowlist(state) {
         rows = `<tr data-sort-skip><td colspan="4" class="view-table-empty">${escapeHtml(why)}</td></tr>`;
     }
     const hookable = scan ? Number(scan.hookable) || 0 : 0;
-    const record = !scan || hookable === 0 || st.busy === true;
-    const recordTitle = !scan ? 'Scan a process first: the hooks of that run are what gets recorded'
+    const record = !scan || hookable === 0 || st.busy === true || st.loaded !== true;
+    const recordTitle = st.loaded !== true ? 'The known hooks have not been read yet: recording waits for them'
+        : !scan ? 'Scan a process first: the hooks of that run are what gets recorded'
         : hookable === 0 ? 'The last scan found no hook that is not known already' : 'Record the hooks of the last scan as known (asks first)';
     const forgetThis = !st.scope || !entries.length || st.busy === true;
     const forgetAll = !entries.length || st.busy === true;
@@ -26419,6 +26420,14 @@ async function syscallLoadHooks() {
 async function syscallCaptureHooks() {
     const h = syscallState.hooks, model = syscallHooksModel(), reviewed = syscallState.scan;
     if (h.busy || !model.scan || !(model.scan.hookable > 0)) return false;
+    // what is new in the list afterwards is told from what was there by the list as it is now: without it every known
+    // hook would look like one the analyst did not review
+    if (!h.loaded && !(await syscallLoadHooks())) {
+        h.note = { tone: 'error', text: 'Nothing was recorded: the list of known hooks has not been read, so what is new in it could not be told from what was there. ' +
+                   `Try again when it can be read${h.error ? ` (${h.error})` : ''}.` };
+        renderSyscallHooks();
+        return false;
+    }
     if (typeof confirm !== 'function' || !confirm(syscallCaptureQuestion(model.scan))) return false;
     const pid = model.scan.pid, expected = model.scan.pairs.map(p => syscallHookKey(p.name, p.owner));
     const stop = text => {

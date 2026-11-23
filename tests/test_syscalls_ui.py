@@ -20,7 +20,7 @@ import re
 from html.parser import HTMLParser
 
 from test_frontend import SOURCE, _run_node as _run, needs_node
-from test_theme import (APP_JS, INDEX_HTML, STYLE_CSS, THEME_CSS, _contrast, _cyberpunk_palette, _read, _root_values, _rules,
+from test_theme import (APP_JS, INDEX_HTML, LAYOUT_CSS, STYLE_CSS, THEME_CSS, _contrast, _cyberpunk_palette, _read, _root_values, _rules,
                         _same_value, _tab_markup)
 
 OUT = "const out = value => console.log(JSON.stringify(value));\n"
@@ -1717,6 +1717,48 @@ def test_a_hook_the_server_recorded_that_was_not_reviewed_is_said_loudly_with_th
 
 
 @needs_node
+def test_nothing_is_recorded_while_the_list_of_known_hooks_has_not_been_read():
+    """With no list read, every hook already known would look like one the analyst did not review, and the way back that
+    the note names would wipe a list that was built on a clean host."""
+    r = _panels(HOOK_SERVER + r"""
+      (async () => {
+        initSyscalls(); syscallsTabShown(); await settle();
+        await scanned(); agree();
+        // the list cannot be read
+        routes['/api/syscalls/hook-baseline'] = { status: 500, body: { error: 'the allowlist cannot be read' } };
+        await syscallLoadHooks();
+        const loadedBefore = syscallState.hooks.loaded;
+        const mark = requests.length;
+        syscallState.hooks.loaded = false;
+        const refused = await syscallCaptureHooks();
+        const asked = requests.slice(mark).map(q => [q.method, q.url]);
+        const html = els['syscall-hooks'].innerHTML;
+        const button = /<button[^>]*syscallCaptureHooks[^>]*>/.exec(html)[0];
+        // the list can be read again: it is read first, and what is known is not taken for new
+        const calls = hookServer();
+        syscallState.hooks.loaded = false;
+        const done = await syscallCaptureHooks();
+        out({ loadedBefore, refused, asked, html, button, done, calls, after: els['syscall-hooks'].innerHTML });
+      })();""")
+    assert r["refused"] is False
+    assert all(not (m == "POST" or u.startswith("/api/syscalls/scan")) for m, u in r["asked"]), "no measurement, no recording"
+    assert "has not been read" in r["html"] and "syscall-draft-result-error" in r["html"]
+    assert "FORGET" not in re.sub(r"<button.*?</button>", "", r["html"], flags=re.S), "no way back is suggested for a false alarm"
+    assert " disabled" in r["button"], "and the button waits"
+    assert r["done"] is True and r["calls"] == ["record"]
+    assert "did not review" not in r["after"] and "Recorded 1 new hook" in r["after"], "NtBar was known: it is not counted as recorded"
+
+
+@needs_node
+def test_the_record_button_is_off_until_the_list_has_loaded():
+    r = _run_node(HOOK_FUNCTIONS, r"""
+      const scan = { pid: 5, name: 'a.exe', hookable: 2 };
+      const find = html => /<button[^>]*syscallCaptureHooks[^>]*>/.exec(html)[0];
+      out({ unread: find(renderHookAllowlist({ entries: [], loaded: false, scan })), read: find(renderHookAllowlist({ entries: [], loaded: true, scan })) });""")
+    assert " disabled" in r["unread"] and " disabled" not in r["read"]
+
+
+@needs_node
 def test_a_failed_recording_says_so_and_can_be_tried_again():
     r = _panels(HOOK_SERVER + r"""
       (async () => {
@@ -2251,7 +2293,7 @@ def test_every_element_the_block_reads_is_in_the_page():
 
 def test_the_assets_moved_on_and_the_switch_in_the_tab_bar_is_wired():
     html = _read(INDEX_HTML)
-    for asset, minimum in (("style.css", 86), ("theme-cyberpunk.css", 37), ("app.js", 125)):
+    for asset, minimum in (("style.css", 87), ("theme-cyberpunk.css", 37), ("app.js", 126)):
         version = int(re.search(rf"{re.escape(asset)}\?v=(\d+)", html).group(1))
         assert version >= minimum, f"{asset} was changed and kept its ?v="
     assert re.search(r"if \(tabName === 'syscalls'\)[^\n]*syscallsTabShown\(\)", SOURCE)
@@ -2374,15 +2416,45 @@ def test_the_detail_the_deviations_and_the_known_hooks_are_in_the_work_area_and_
     assert _declared(rules[".syscall-draft-vm"], "border-left-color") != _declared(rules[".syscall-draft-repo"], "border-left-color")
 
 
+# The words that give German away, the plain ones a German speaker writes most among them. A word counts in lower case
+# or capitalised (not as DiE, a tool's name) and with punctuation after it ("einer Regel."); a name that holds it
+# (renderer, a.die) does not.
+GERMAN_WORDS = ("der die das ein eine einer einen und oder aber nicht kein keine ist sind wird werden wurde mit ohne von dem den "
+                "des wenn dann nur noch auch wir nach bei zum zur für über sich hier nichts gibt zurueck zurück wert liste prozess "
+                "regel erzeugen datei sicht befund abweichung übernehmen schreibt muss kann soll dieser diese").split()
+GERMAN = re.compile(r"(?<![\w$#.-])(?:%s)(?![\w$#-])" % "|".join(f"{w}|{w.capitalize()}" for w in GERMAN_WORDS))
+
+
+def test_the_guard_against_german_catches_the_comments_a_german_speaker_writes():
+    for line in ("// Das ist der Wert, den wir lesen", "// Gibt die Liste zurueck, wenn nichts da ist", "// Nur die Hooks von dem Prozess",
+                 "// Entwurf einer Regel.", "/* Regel erzeugen: der Entwurf */", "// Wert für den Prozess", "<!-- Die Karte, nach dem Scan -->",
+                 "// Das Ergebnis ist da; es wird nicht gespeichert", "// Übernehmen schreibt in das Verzeichnis"):
+        assert GERMAN.search(line) or re.search("[äöüÄÖÜß]", line), line
+    for line in ("// --- Detection Results (cards like DiE) ---", "// the renderer draws it", "const n = state.die.size;",
+                 "// Draft rule: the deviation as the scan returned it", "// A syscall is chosen, on the map or in the catalog."):
+        assert not GERMAN.search(line), line
+
+
 def test_the_front_end_has_no_german_in_it():
     """The UI text and every identifier and comment are English. The plan and the spec are German, and this is where
     it leaks: a comment copied from them. Umlauts, and the words that give German away."""
-    words = ("und nicht wird werden eine keine oder aber für regel erzeugen datei sicht befund abweichung übernehmen "
-             "schreibt muss kann soll wurde dieser diese noch sind").split()
-    giveaway = re.compile(r"(?<![\w.$#-])(?:%s)(?![\w.$#-])" % "|".join(words), re.I)
     problems = []
-    for path in (APP_JS, INDEX_HTML, STYLE_CSS, THEME_CSS):
+    for path in (APP_JS, INDEX_HTML, STYLE_CSS, THEME_CSS, LAYOUT_CSS):
         for number, line in enumerate(_read(path).splitlines(), 1):
-            if re.search("[äöüÄÖÜß]", line) or giveaway.search(line):
+            if re.search("[äöüÄÖÜß]", line) or GERMAN.search(line):
                 problems.append(f"{os.path.basename(path)}:{number}: {line.strip()[:100]}")
     assert not problems, "German in the front end:\n" + "\n".join(problems)
+
+
+def test_every_tone_a_note_can_have_has_its_accent_in_both_themes():
+    """A note's tone is ok, info, warn or error: each has a rule for its accent, in tokens that both themes define."""
+    rules = _rules(STYLE_CSS)
+    classic, cyberpunk = _root_values(), _cyberpunk_palette()
+    for tone in ("ok", "info", "warn", "error"):
+        body = rules.get(f".syscall-draft-result-{tone}")
+        assert body, f"no accent for the tone {tone}"
+        token = re.search(r"border-left-color:\s*var\((--[\w-]+)\)", body)
+        assert token, tone
+        assert token.group(1) in classic and token.group(1) in cyberpunk, (tone, token.group(1))
+    tones = set(re.findall(r"tone: '(\w+)'", _block())) - {"ok", "info", "warn", "error"}
+    assert not tones, f"a tone with no accent: {tones}"

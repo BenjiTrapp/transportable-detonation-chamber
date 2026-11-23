@@ -13029,6 +13029,9 @@ button.logs-trunc:hover { color: var(--accent-orange); text-decoration: underlin
 .syscall-draft-result-info {
     border-left-color: var(--severity-info);
 }
+.syscall-draft-result-warn {
+    border-left-color: var(--severity-medium);
+}
 .syscall-draft-result-error {
     border-left-color: var(--severity-critical);
     color: var(--severity-critical);
