@@ -153,7 +153,10 @@ function onThemeChange() {
     _themeColorCache.clear();
     if (state.activeTab === 'graph') renderGraph();
     if (state.activeTab === 'tracing') renderRtraceTimeline();
-    if (state.activeTab === 'syscalls') renderSyscallMap();
+    if (state.activeTab === 'syscalls') {
+        renderSyscallMap();
+        renderBinaryGraph();
+    }
     renderDashboard();
     FileMapView.repaint();
 }
@@ -25947,7 +25950,7 @@ function renderSyscallNotices() {
     host.hidden = notices.length === 0;
 }
 
-// SCAN waits for a target and while a scan runs; the toggle shows the surface that is on
+// SCAN waits for a target and while a scan runs; the toggles show the surface that is on
 function renderSyscallToolbar() {
     const scan = document.getElementById('syscall-scan');
     if (scan) {
@@ -25967,6 +25970,9 @@ function renderSyscallToolbar() {
         const button = document.getElementById(`syscall-view-${name}`);
         if (button) button.setAttribute('aria-pressed', name === syscallState.view ? 'true' : 'false');
     }
+    // the narrow toggle names the surface that takes turns with the detail panel
+    const pane = document.getElementById('syscall-pane-map');
+    if (pane) pane.textContent = syscallState.view.toUpperCase();
     const win32u = document.getElementById('syscall-win32u');
     if (win32u) {
         const missing = syscallWin32uMissing(syscallState.baseline);
@@ -26013,6 +26019,7 @@ function syscallRenderAll() {
     renderSyscallScan();
     renderSyscallLegend();
     renderSyscallMap();
+    renderBinaryGraph();
     renderSyscallRows();
     syscallSyncDetail();
     renderSyscallDetailPanel();
@@ -26038,13 +26045,14 @@ function syscallSyncModuleFilter() {
     select.value = syscallState.module;
 }
 
-// The filter changed (or the baseline did): which cells match, then the map and the catalog
+// The filter changed (or the baseline did): which cells match, then the map, the catalog and the graph
 function syscallApplyFilter() {
     syscallSyncModuleFilter();
     const items = syscallState.baseline ? syscallState.baseline.items : [];
     syscallState.match = syscallMatchSet(items, syscallState.query, syscallState.module);
     renderSyscallMap();
     renderSyscallRows();
+    renderBinaryGraph();
 }
 
 function syscallOnFilter() {
@@ -26055,9 +26063,10 @@ function syscallOnFilter() {
     syscallApplyFilter();
 }
 
-// A syscall is chosen, on the map or in the catalog. The map rings it and the catalog marks it.
+// A syscall is chosen, on the map, in the catalog or in the graph. The map rings it, the catalog and the graph mark it.
 function syscallSelect(name) {
     syscallState.selected = String(name || '');
+    binaryGraphFollowMap(syscallState.selected);
     renderSyscallMap();
     renderSyscallRows();
     renderSyscallDeviationPanel();
@@ -26211,8 +26220,10 @@ function renderSyscallDetailPanel() {
     const host = document.getElementById('syscall-detail-body');
     if (!host) return;
     const detail = syscallState.detail;
+    const graphItem = binaryGraphDetailItem();
     let html;
-    if (!syscallState.selected || !detail.name) html = renderSyscallDetail(null);
+    if (graphItem) html = binaryGraphDetailHtml(graphItem);
+    else if (!syscallState.selected || !detail.name) html = renderSyscallDetail(null);
     else if (detail.loading) html = `<p class="syscall-empty">Loading ${escapeHtml(detail.name)}…</p>`;
     else if (detail.error) html = `<p class="syscall-empty syscall-empty-error">${escapeHtml(detail.error)}</p>`;
     else html = renderSyscallDetail(syscallDetailModel());
@@ -26655,12 +26666,15 @@ function syscallSetPane(name) {
         const button = document.getElementById(`syscall-pane-${other}`);
         if (button) button.setAttribute('aria-pressed', other === name ? 'true' : 'false');
     }
-    if (name === 'map') renderSyscallMap();
+    if (name === 'map') {
+        renderSyscallMap();
+        renderBinaryGraph();
+    }
     return true;
 }
 
-// MAP / GRAPH: the surface that is on. GRAPH comes with the binary graph; until then its button is disabled and a
-// view that has no enabled button is not switched to.
+// MAP / GRAPH: the surface that is on; a view whose button is missing or disabled is not switched to. The detail
+// panel follows: a node or an edge chosen in the graph is described only while the graph shows.
 function syscallSetView(name) {
     if (!SYSCALL_VIEW_NAMES.includes(name)) return false;
     const button = document.getElementById(`syscall-view-${name}`);
@@ -26671,6 +26685,9 @@ function syscallSetView(name) {
         if (surface) surface.hidden = other !== name;
     }
     renderSyscallToolbar();
+    if (name === 'map') renderSyscallMap();
+    else renderBinaryGraph();
+    renderSyscallDetailPanel();
     return true;
 }
 
@@ -26689,6 +26706,7 @@ function initSyscalls() {
         host.addEventListener('click', syscallOnMapClick);
         if (typeof ResizeObserver !== 'undefined') new ResizeObserver(() => requestAnimationFrame(syscallResized)).observe(host);
     }
+    binaryGraphOnQuery();
     syscallRenderAll();
 }
 
@@ -26700,4 +26718,475 @@ function syscallsTabShown() {
     syscallLoadTargets();
     syscallLoadHooks();
     syscallRefresh();
+}
+
+// --- GRAPH: the binary graph's answers as layered paths ------------------------------------------------------------
+// One question to /api/binary-graph/query, drawn left to right with one layer per hop. An edge's origin is its claim:
+// "derived" is read from the binaries, "curated" is the word of the hand-curated Win32 to Nt table. The curated hop
+// is drawn dashed, in its own colour and tagged in words, named in the legend and said in the detail panel: a reader
+// who takes it for a derived edge draws wrong conclusions from the graph.
+// Red stays the map's: a syscall whose stub deviated in the last scan is drawn in the map's colour of its state, and so
+// is every edge on a path into it. A filter match gets a ring of its own (--graph-match), never a deviation tone.
+
+// The box of a node and the room between layers and rows, in px; the dash of a curated edge; how many characters of
+// a label fit in a box
+const BINARY_GRAPH = { boxW: 176, boxH: 40, gapX: 76, gapY: 14, pad: 16, curatedDash: '6 4', labelMax: 24, subMax: 28, max: 400 };
+const BINARY_GRAPH_SYSCALL = 'syscall:';
+// node kind -> its colour and what the legend calls it; a function has no colour of its own and takes the text's
+const BINARY_GRAPH_KINDS = {
+    dll: { color: '--graph-node-dll', name: 'DLL' },
+    exe: { color: '--graph-node-exe', name: 'EXE' },
+    'api-set': { color: '--graph-node-apiset', name: 'api set' },
+    function: { color: '--text-secondary', name: 'function' },
+    syscall: { color: '--graph-node-syscall', name: 'syscall' },
+};
+// query -> the parameter the start field and the function field are sent as ('' where the query reads none), with
+// their placeholders
+const BINARY_GRAPH_QUERIES = {
+    'path-to-syscall': { first: 'module', second: 'function', firstHint: 'Module, such as kernel32.dll', secondHint: 'Function, such as OpenProcess' },
+    importers: { first: 'module', second: 'function', firstHint: 'Module that is imported', secondHint: 'Only this function (optional)' },
+    imports: { first: 'module', second: '', firstHint: 'Module whose imports to draw', secondHint: '' },
+    'syscall-callers': { first: 'syscall', second: '', firstHint: 'Syscall, such as NtOpenProcess', secondHint: '' },
+    forwarders: { first: 'module', second: '', firstHint: 'Module whose forwarders to follow', secondHint: '' },
+    shared: { first: 'module', second: 'other', firstHint: 'One module', secondHint: 'The other module' },
+};
+const BINARY_GRAPH_EDGE_WORDS = {
+    imports: 'imports', forwards_to: 'forwards to', resolves_to: 'resolves to', reaches_syscall: 'reaches syscall',
+};
+
+// `module` is what the start field holds, whichever parameter the query sends it as; `function` the second field's
+const binaryGraphState = { answer: null, query: 'path-to-syscall', module: '', function: '', depth: 1, loading: false, selected: null, note: '', nodes: [], edges: [] };
+// numbers the queries, of which only the last answer counts
+const binaryGraphRequests = { seq: 0 };
+
+// The layers: a node one layer right of the deepest node that has an edge into it, so a path runs left to right in
+// the order of its hops. In a layer, the nodes keep the answer's order, then move toward the middle of those that
+// lead to them. A node of a cycle is put right of what of it was placed. { boxes: [{ id, node, layer, x, y, w, h, root }],
+// edges (as given: an edge is known by its index in them), width, height }
+function binaryGraphLayout(nodes, edges, roots) {
+    const g = BINARY_GRAPH;
+    const ids = [], byId = new Map();
+    for (const node of Array.isArray(nodes) ? nodes : []) {
+        if (node && typeof node.id === 'string' && !byId.has(node.id)) {
+            ids.push(node.id);
+            byId.set(node.id, node);
+        }
+    }
+    const known = new Set(ids);
+    const list = Array.isArray(edges) ? edges : [];
+    const links = list.filter(e => e && known.has(e.source) && known.has(e.target) && e.source !== e.target);
+    const into = new Map(ids.map(id => [id, 0])), out = new Map(ids.map(id => [id, []]));
+    for (const e of links) {
+        into.set(e.target, into.get(e.target) + 1);
+        out.get(e.source).push(e.target);
+    }
+    const layer = new Map(), left = new Map(into);
+    const queue = ids.filter(id => into.get(id) === 0);
+    for (const id of queue) layer.set(id, 0);
+    for (let i = 0; i < queue.length; i++) {
+        const id = queue[i];
+        for (const target of out.get(id)) {
+            layer.set(target, Math.max(layer.get(target) || 0, layer.get(id) + 1));
+            left.set(target, left.get(target) - 1);
+            if (left.get(target) === 0) queue.push(target);
+        }
+    }
+    for (const id of ids) if (!layer.has(id)) layer.set(id, 0);
+    const count = ids.length ? Math.max(...layer.values()) + 1 : 0;
+    const columns = Array.from({ length: count }, () => []);
+    for (const id of ids) columns[layer.get(id)].push(id);
+    const row = new Map();
+    columns.forEach((column, i) => {
+        if (i > 0) {
+            const centre = id => {
+                const from = links.filter(e => e.target === id && row.has(e.source)).map(e => row.get(e.source));
+                return from.length ? from.reduce((a, b) => a + b, 0) / from.length : Infinity;
+            };
+            const at = new Map(column.map((id, k) => [id, [centre(id), k]]));
+            column.sort((a, b) => (at.get(a)[0] - at.get(b)[0]) || (at.get(a)[1] - at.get(b)[1]));
+        }
+        column.forEach((id, k) => row.set(id, k));
+    });
+    const tallest = columns.reduce((most, column) => Math.max(most, column.length), 0);
+    const pitch = g.boxH + g.gapY;
+    const boxes = [];
+    columns.forEach((column, i) => {
+        const offset = (tallest - column.length) * pitch / 2;
+        column.forEach((id, k) => boxes.push({ id, node: byId.get(id), layer: i, x: g.pad + i * (g.boxW + g.gapX), y: g.pad + offset + k * pitch, w: g.boxW, h: g.boxH }));
+    });
+    const rootSet = new Set(Array.isArray(roots) ? roots : []);
+    for (const box of boxes) box.root = rootSet.has(box.id);
+    return {
+        boxes, edges: list,
+        width: count ? 2 * g.pad + count * g.boxW + (count - 1) * g.gapX : 0,
+        height: tallest ? 2 * g.pad + tallest * g.boxH + (tallest - 1) * g.gapY : 0,
+    };
+}
+
+// How an edge is drawn: a derived edge solid in the muted line colour, the curated one dashed in its own. A tone (the
+// state of a deviating syscall it leads to) takes the colour; the dash stays, the curated hop is still curated.
+function binaryGraphEdgeLook(edge, tone) {
+    const curated = edge && edge.origin === 'curated';
+    const look = curated ? { color: themeColor('--graph-edge-curated'), width: 2, dash: BINARY_GRAPH.curatedDash }
+                         : { color: themeColor('--text-muted'), width: 1.5, dash: '' };
+    if (tone && SYSCALL_STATE_COLORS[tone]) {
+        look.color = themeColor(SYSCALL_STATE_COLORS[tone]);
+        look.width += 0.5;
+    }
+    return look;
+}
+
+// How a node's box is drawn: the colour of its kind, or of the state its stub deviated to
+function binaryGraphNodeLook(node, tone) {
+    const kind = BINARY_GRAPH_KINDS[node && node.kind];
+    if (tone && SYSCALL_STATE_COLORS[tone]) {
+        return { stroke: themeColor(SYSCALL_STATE_COLORS[tone]), fill: themeColor(SYSCALL_STATE_COLORS[tone], 0.18), width: 2.5 };
+    }
+    return { stroke: themeColor(kind ? kind.color : '--text-muted'), fill: themeColor('--bg-secondary'), width: 1.5 };
+}
+
+// The deviations of a scan on the answer: the state of each syscall node whose stub is not intact, and for each edge
+// the state of a deviating syscall it leads to (the most severe, where it leads to several). `states` is the scan's
+// name -> state, or null without one. { nodes: Map id -> state, edges: Map index -> state }
+function binaryGraphTones(nodes, edges, states) {
+    const tones = { nodes: new Map(), edges: new Map() };
+    if (!states) return tones;
+    const list = Array.isArray(edges) ? edges : [];
+    const worse = (a, b) => (SYSCALL_SEVERITY_RANK[a] ?? 2) <= (SYSCALL_SEVERITY_RANK[b] ?? 2) ? a : b;
+    for (const node of Array.isArray(nodes) ? nodes : []) {
+        if (!node || node.kind !== 'syscall' || typeof node.id !== 'string' || !node.id.startsWith(BINARY_GRAPH_SYSCALL)) continue;
+        const state = states.get(node.id.slice(BINARY_GRAPH_SYSCALL.length));
+        if (!state || state === 'intact' || !SYSCALL_STATE_COLORS[state]) continue;
+        tones.nodes.set(node.id, state);
+        // back along the edges from the syscall: every edge on a path into it
+        const seen = new Set([node.id]), queue = [node.id];
+        for (let i = 0; i < queue.length; i++) {
+            list.forEach((e, k) => {
+                if (!e || e.target !== queue[i]) return;
+                tones.edges.set(k, tones.edges.has(k) ? worse(tones.edges.get(k), state) : state);
+                if (!seen.has(e.source)) {
+                    seen.add(e.source);
+                    queue.push(e.source);
+                }
+            });
+        }
+    }
+    return tones;
+}
+
+// The nodes the filter of the tab matches: a syscall node as its cell on the map does, any other node by its name.
+// `match` is the map's set of matching names (null without a filter), `query` the filter's text.
+function binaryGraphMatches(nodes, match, query) {
+    const found = new Set();
+    if (!match) return found;
+    const text = String(query || '').trim().toLowerCase();
+    for (const node of Array.isArray(nodes) ? nodes : []) {
+        if (!node || typeof node.id !== 'string') continue;
+        if (node.kind === 'syscall') {
+            if (node.id.startsWith(BINARY_GRAPH_SYSCALL) && match.has(node.id.slice(BINARY_GRAPH_SYSCALL.length))) found.add(node.id);
+        } else if (text && node.id.toLowerCase().includes(text)) {
+            found.add(node.id);
+        }
+    }
+    return found;
+}
+
+// A text cut to `max` characters
+function binaryGraphCut(text, max) {
+    const value = String(text ?? '');
+    return value.length > max ? value.slice(0, max - 1) + '…' : value;
+}
+
+// The SVG of a layout. model: { tones (binaryGraphTones), match (a set of node ids), selected (an id or null) }
+function binaryGraphSvg(layout, model) {
+    if (!layout || !Array.isArray(layout.boxes) || !layout.boxes.length) return '';
+    const g = BINARY_GRAPH;
+    const m = model || {};
+    const tones = m.tones || { nodes: new Map(), edges: new Map() };
+    const match = m.match || new Set();
+    const c = v => String(Math.round(v * 10) / 10);
+    const at = new Map(layout.boxes.map(box => [box.id, box]));
+    let svg = `<svg class="binary-graph-svg" xmlns="http://www.w3.org/2000/svg" width="${c(layout.width)}" height="${c(layout.height)}" `
+        + `viewBox="0 0 ${c(layout.width)} ${c(layout.height)}" role="img" aria-label="${escapeHtml(`${layout.boxes.length} nodes of the binary graph, one layer per hop`)}"><g class="binary-graph-edges">`;
+    (Array.isArray(layout.edges) ? layout.edges : []).forEach((edge, index) => {
+        const from = edge && at.get(edge.source), to = edge && at.get(edge.target);
+        if (!from || !to || from === to) return;
+        const tone = tones.edges.get(index) || '';
+        const look = binaryGraphEdgeLook(edge, tone);
+        const x1 = from.x + from.w, y1 = from.y + from.h / 2, x2 = to.x, y2 = to.y + to.h / 2;
+        const bend = Math.max(24, Math.abs(x2 - x1) / 2);
+        const d = `M${c(x1)} ${c(y1)}C${c(x1 + bend)} ${c(y1)} ${c(x2 - bend)} ${c(y2)} ${c(x2)} ${c(y2)}`;
+        const origin = edge.origin === 'curated' ? 'curated' : 'derived';
+        const id = `edge:${index}`;
+        const words = `${edge.source} ${BINARY_GRAPH_EDGE_WORDS[edge.kind] || edge.kind} ${edge.target} · ${origin === 'curated'
+            ? 'curated: from the Win32 to Nt table, not read from any binary' : 'derived: read from the binaries'}${edge.label ? ` · ${edge.label}` : ''}`;
+        svg += `<g class="binary-graph-edge binary-graph-edge-${origin}${m.selected === id ? ' selected' : ''}" onclick="binaryGraphSelect(${jsArg(id)})">`
+            + `<title>${escapeHtml(words)}</title>`
+            + `<path class="binary-graph-edge-hit" d="${d}"></path>`
+            + `<path class="binary-graph-edge-line binary-graph-edge-${origin}" data-edge="${jsInt(index)}" data-origin="${origin}" `
+            + `data-source="${escapeHtml(edge.source)}" data-target="${escapeHtml(edge.target)}"${tone ? ` data-tone="${cssToken(tone)}"` : ''} d="${d}" fill="none" `
+            + `stroke="${look.color}" stroke-width="${c(m.selected === id ? look.width + 1.5 : look.width)}"${look.dash ? ` stroke-dasharray="${look.dash}"` : ''}></path>`
+            + `<path class="binary-graph-arrow" d="M${c(x2 - 8)} ${c(y2 - 4)}L${c(x2)} ${c(y2)}L${c(x2 - 8)} ${c(y2 + 4)}Z" fill="${look.color}"></path>`;
+        // the word stays in the curated colour on a path in a deviation tone: the tone says "deviated", the tag "curated"
+        if (origin === 'curated') {
+            svg += `<text class="binary-graph-edge-tag" x="${c((x1 + x2) / 2)}" y="${c((y1 + y2) / 2 - 6)}" text-anchor="middle" fill="${themeColor('--graph-edge-curated')}">curated</text>`;
+        }
+        svg += '</g>';
+    });
+    svg += '</g><g class="binary-graph-nodes">';
+    for (const box of layout.boxes) {
+        const node = box.node || { id: box.id, label: box.id, kind: '' };
+        const tone = tones.nodes.get(box.id) || '';
+        const look = binaryGraphNodeLook(node, tone);
+        const bang = box.id.indexOf('!');
+        let sub = '';
+        if (node.kind === 'function' && bang > 0) sub = box.id.slice(0, bang);
+        else if (Number(node.in_degree) > 0) sub = `imported by ${Number(node.in_degree).toLocaleString('en-US')}`;
+        else sub = (BINARY_GRAPH_KINDS[node.kind] || { name: node.kind || '' }).name;
+        // a syscall's label is "NtClose (ntdll.dll, 0xf)": the name on the first line, the module and number under it
+        let label = String(node.label ?? box.id);
+        const paren = node.kind === 'syscall' ? label.indexOf(' (') : -1;
+        if (paren > 0) {
+            sub = label.slice(paren + 2).replace(/\)$/, '');
+            label = label.slice(0, paren);
+        }
+        const flags = (m.selected === box.id ? ' selected' : '') + (match.has(box.id) ? ' match' : '') + (box.root ? ' root' : '');
+        const words = [box.id, node.label && node.label !== box.id ? node.label : '', node.category ? `suspicious import: ${node.category}` : ''].filter(Boolean).join(' · ');
+        svg += `<g class="binary-graph-node binary-graph-node-${cssToken(node.kind)}${flags}" data-id="${escapeHtml(box.id)}" data-layer="${jsInt(box.layer)}"`
+            + `${tone ? ` data-tone="${cssToken(tone)}"` : ''} onclick="binaryGraphSelect(${jsArg(box.id)})"><title>${escapeHtml(words)}</title>`;
+        if (match.has(box.id)) {
+            svg += `<rect class="binary-graph-match-ring" x="${c(box.x - 5)}" y="${c(box.y - 5)}" width="${c(box.w + 10)}" height="${c(box.h + 10)}" rx="6" `
+                + `fill="none" stroke="${themeColor('--graph-match')}" stroke-width="2"></rect>`;
+        }
+        if (m.selected === box.id) {
+            svg += `<rect class="binary-graph-selected-ring" x="${c(box.x - 2.5)}" y="${c(box.y - 2.5)}" width="${c(box.w + 5)}" height="${c(box.h + 5)}" rx="5" `
+                + `fill="none" stroke="${themeColor('--text-primary')}" stroke-width="1.5"></rect>`;
+        }
+        svg += `<rect class="binary-graph-box" x="${c(box.x)}" y="${c(box.y)}" width="${c(box.w)}" height="${c(box.h)}" rx="4" `
+            + `fill="${look.fill}" stroke="${look.stroke}" stroke-width="${c(look.width)}"></rect>`
+            + `<text class="binary-graph-label" x="${c(box.x + 8)}" y="${c(box.y + 16)}" fill="${themeColor('--text-primary')}">${escapeHtml(binaryGraphCut(label, g.labelMax))}</text>`
+            + `<text class="binary-graph-sub" x="${c(box.x + 8)}" y="${c(box.y + 31)}" fill="${themeColor('--text-muted')}">${escapeHtml(binaryGraphCut(sub, g.subMax))}</text>`
+            + '</g>';
+    }
+    return svg + '</g></svg>';
+}
+
+// The legend under the graph: the kinds of node, the two origins of an edge with the stroke each is drawn in, a
+// deviation and a filter match
+function binaryGraphLegend() {
+    const item = (key, mark, text, help) =>
+        `<span class="syscall-legend-item binary-graph-legend-item" data-legend="${cssToken(key)}" title="${escapeHtml(help)}">${mark}<span>${escapeHtml(text)}</span></span>`;
+    const box = (stroke, fill, extra) => `<svg class="binary-graph-legend-mark" width="18" height="12" viewBox="0 0 18 12" aria-hidden="true">${extra || ''}`
+        + `<rect x="2" y="2" width="14" height="8" rx="2" fill="${fill}" stroke="${stroke}" stroke-width="1.5"></rect></svg>`;
+    const line = (origin, look) => `<svg class="binary-graph-legend-mark" width="30" height="12" viewBox="0 0 30 12" aria-hidden="true">`
+        + `<line data-origin="${origin}" x1="1" y1="6" x2="29" y2="6" stroke="${look.color}" stroke-width="${look.width}"${look.dash ? ` stroke-dasharray="${look.dash}"` : ''}></line></svg>`;
+    const parts = Object.entries(BINARY_GRAPH_KINDS).map(([kind, k]) =>
+        item(`node-${kind}`, box(themeColor(k.color), themeColor('--bg-secondary')), k.name, `A node of the kind ${k.name}.`));
+    parts.push(item('edge-derived', line('derived', binaryGraphEdgeLook({ origin: 'derived' })), 'derived: read from the binaries',
+        'An import, a forwarder or an api-set resolution that the import and export tables of the binaries themselves say.'));
+    parts.push(item('edge-curated', line('curated', binaryGraphEdgeLook({ origin: 'curated' })),
+        'curated: from the hand-curated Win32 to Nt table, not read from any binary',
+        'The step from a Win32 function to its Nt syscall is the word of a hand-curated table. No binary of this system was read to draw it.'));
+    parts.push(item('deviation', box(themeColor(SYSCALL_STATE_COLORS.patched), themeColor(SYSCALL_STATE_COLORS.patched, 0.18)),
+        'deviated in the last scan, and the path to it, in the colour of its state on the map',
+        'A syscall whose stub the last scan of this view did not find intact, coloured as on the map, and every edge on a path into it.'));
+    parts.push(item('match', box(themeColor('--text-muted'), themeColor('--bg-secondary'),
+        `<rect x="0.5" y="0.5" width="17" height="11" rx="3" fill="none" stroke="${themeColor('--graph-match')}" stroke-width="1"></rect>`),
+        'filter match', 'A node the filter of the tab matches: its name, or for a syscall its name or number as on the map.'));
+    return parts.join('');
+}
+
+// What the line above the graph says: the note of an answer that has nodes, and that it was cut, if it was.
+// { tone, html } with html '' when there is nothing to say.
+function binaryGraphStatus() {
+    const st = binaryGraphState, a = st.answer;
+    if (st.loading || !a || !st.nodes.length) return { tone: 'info', html: '' };
+    let html = '';
+    if (a.truncated) {
+        const total = Number(a.total) || 0;
+        html += `<strong class="binary-graph-cut">Not the whole answer: it had ${escapeHtml(total.toLocaleString('en-US'))} parts and was cut at `
+            + `${escapeHtml(BINARY_GRAPH.max)} nodes, ${escapeHtml(st.nodes.length.toLocaleString('en-US'))} are drawn. Whole parts were dropped, never half a path: `
+            + 'a node that is missing here is not shown, which does not mean it is not imported.</strong> ';
+    }
+    if (st.note) html += `<span class="binary-graph-note">${escapeHtml(st.note)}</span>`;
+    const stamp = [a.build ? `build ${a.build}` : '', a.arch || ''].filter(Boolean).join(' · ');
+    if (stamp) html += ` <span class="syscall-muted">${escapeHtml(stamp)}</span>`;
+    return { tone: a.truncated ? 'warn' : 'info', html };
+}
+
+// What the graph draws besides the layout: the deviations of the last scan (only of the view the graph was built
+// for: a scan of another view says nothing about these syscalls), the filter's matches and the selection
+function binaryGraphModel() {
+    const st = binaryGraphState, scan = syscallState.scan, a = st.answer;
+    const fits = scan && a && String(scan.view || '').toLowerCase() === String(a.arch || '').toLowerCase();
+    return {
+        tones: binaryGraphTones(st.nodes, st.edges, fits ? syscallState.states : null),
+        match: binaryGraphMatches(st.nodes, syscallState.match, syscallState.query),
+        selected: st.selected,
+    };
+}
+
+function renderBinaryGraph() {
+    const st = binaryGraphState;
+    const status = document.getElementById('binary-graph-status');
+    if (status) {
+        const s = binaryGraphStatus();
+        status.innerHTML = s.html;
+        status.className = `binary-graph-status binary-graph-status-${cssToken(s.tone)}`;
+        status.hidden = !s.html;
+    }
+    const legend = document.getElementById('binary-graph-legend');
+    if (legend) legend.innerHTML = binaryGraphLegend();
+    const host = document.getElementById('binary-graph-canvas');
+    if (!host) return;
+    if (st.loading || !st.nodes.length) {
+        const text = st.loading ? 'Asking the binary graph…'
+            : st.note || 'Choose a query and its start, then QUERY: the answer is drawn here, one layer per hop.';
+        const error = !st.loading && !st.answer && st.note;
+        host.innerHTML = `<p class="syscall-empty${error ? ' syscall-empty-error' : ''}">${escapeHtml(text)}</p>`;
+        return;
+    }
+    host.innerHTML = binaryGraphSvg(binaryGraphLayout(st.nodes, st.edges, st.answer ? st.answer.roots : []), binaryGraphModel());
+}
+
+// The fields of the query bar: their placeholders, and the second one only where the query reads it
+function binaryGraphOnQuery() {
+    const select = document.getElementById('binary-graph-query');
+    const name = select && BINARY_GRAPH_QUERIES[select.value] ? select.value : 'path-to-syscall';
+    binaryGraphState.query = name;
+    const q = BINARY_GRAPH_QUERIES[name];
+    const first = document.getElementById('binary-graph-module'), second = document.getElementById('binary-graph-function');
+    if (first) first.setAttribute('placeholder', q.firstHint);
+    if (second) {
+        second.setAttribute('placeholder', q.secondHint);
+        second.disabled = !q.second;
+        second.hidden = !q.second;
+    }
+}
+
+function binaryGraphSubmit(event) {
+    if (event && typeof event.preventDefault === 'function') event.preventDefault();
+    binaryGraphRun();
+}
+
+// QUERY: the bar's fields as the query's parameters. A newer query overtakes the answer of an older one.
+async function binaryGraphRun() {
+    const st = binaryGraphState;
+    const read = id => {
+        const el = document.getElementById(id);
+        return el ? String(el.value || '').trim() : '';
+    };
+    const select = read('binary-graph-query');
+    st.query = BINARY_GRAPH_QUERIES[select] ? select : st.query;
+    st.module = read('binary-graph-module');
+    st.function = read('binary-graph-function');
+    const q = BINARY_GRAPH_QUERIES[st.query];
+    const params = new URLSearchParams({ q: st.query });
+    if (st.module) params.set(q.first, st.module);
+    if (q.second && st.function) params.set(q.second, st.function);
+    const seq = ++binaryGraphRequests.seq;
+    st.loading = true;
+    renderBinaryGraph();
+    const r = await syscallApi(`/api/binary-graph/query?${params}`);
+    if (seq !== binaryGraphRequests.seq) return false;
+    st.loading = false;
+    const keep = st.selected && st.selected.startsWith(BINARY_GRAPH_SYSCALL) ? st.selected : null;
+    if (r.ok) {
+        st.answer = r.data;
+        st.nodes = Array.isArray(r.data.nodes) ? r.data.nodes.filter(n => n && typeof n.id === 'string') : [];
+        st.edges = Array.isArray(r.data.edges) ? r.data.edges.filter(e => e && typeof e.source === 'string' && typeof e.target === 'string') : [];
+        st.note = typeof r.data.note === 'string' ? r.data.note : '';
+    } else {
+        st.answer = null;
+        st.nodes = [];
+        st.edges = [];
+        st.note = syscallErrorText(r);
+    }
+    st.selected = keep;
+    renderBinaryGraph();
+    renderSyscallDetailPanel();
+    return r.ok;
+}
+
+// What a graph id names: { node } or { edge, index, source, target } (an edge is 'edge:<index>'), or null
+function binaryGraphItem(id) {
+    const st = binaryGraphState, key = String(id || '');
+    const node = st.nodes.find(n => n.id === key);
+    if (node) return { node };
+    const edge = /^edge:(\d+)$/.exec(key);
+    const e = edge ? st.edges[Number(edge[1])] : null;
+    if (!e) return null;
+    return { edge: e, index: Number(edge[1]), source: st.nodes.find(n => n.id === e.source) || null, target: st.nodes.find(n => n.id === e.target) || null };
+}
+
+// A node or an edge is chosen in the graph. A syscall is chosen as on the map (and the map marks its cell); anything
+// else is described in the shared detail panel.
+function binaryGraphSelect(id) {
+    const item = binaryGraphItem(id);
+    if (!item) return false;
+    if (item.node && item.node.kind === 'syscall' && item.node.id.startsWith(BINARY_GRAPH_SYSCALL)) {
+        syscallSelect(item.node.id.slice(BINARY_GRAPH_SYSCALL.length));
+        return true;
+    }
+    binaryGraphState.selected = String(id);
+    renderBinaryGraph();
+    renderSyscallDetailPanel();
+    const body = document.getElementById('syscall-detail-body');
+    if (body) body.scrollTop = 0;
+    if (typeof window.matchMedia === 'function' && window.matchMedia(SYSCALL_NARROW).matches) syscallSetPane('detail');
+    return true;
+}
+
+// The map chose a syscall (or let go of one): the graph marks its node, if it draws one
+function binaryGraphFollowMap(name) {
+    const st = binaryGraphState;
+    if (name) st.selected = BINARY_GRAPH_SYSCALL + name;
+    else if (st.selected && st.selected.startsWith(BINARY_GRAPH_SYSCALL)) st.selected = null;
+    renderBinaryGraph();
+}
+
+// The item the detail panel describes for the graph: what is chosen there, unless it is a syscall (the panel's own)
+// or the map is showing
+function binaryGraphDetailItem() {
+    const st = binaryGraphState;
+    if (syscallState.view !== 'graph' || !st.selected || st.selected.startsWith(BINARY_GRAPH_SYSCALL)) return null;
+    return binaryGraphItem(st.selected);
+}
+
+// The detail of a node or an edge of the graph, as the answer has it. An edge says where its claim comes from: a
+// curated one that it is the table's word and not read from any binary.
+function binaryGraphDetailHtml(item) {
+    if (!item) return '';
+    const facts = rows => `<dl class="syscall-facts">${rows.map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(v)}</dd>`).join('')}</dl>`;
+    const title = text => `<div class="syscall-detail-name"><span class="syscall-detail-sc">${escapeHtml(text)}</span></div>`;
+    if (item.node) {
+        const n = item.node, bang = n.id.indexOf('!');
+        const rows = [['Kind', (BINARY_GRAPH_KINDS[n.kind] || { name: n.kind || 'unknown' }).name], ['Id', n.id]];
+        let note = '';
+        if (n.kind === 'function' && bang > 0) {
+            rows.push(['Module', n.id.slice(0, bang)]);
+            note = '<p class="syscall-detail-note">A function is drawn as module!function, with the module as the importer or forwarder wrote it. '
+                + 'The graph draws no edge from a module to its functions: an edge is an import, a forwarder, an api-set resolution or the step to a syscall.</p>';
+        } else {
+            rows.push(['Imported by', `${(Number(n.in_degree) || 0).toLocaleString('en-US')} binaries of System32`]);
+        }
+        if (n.category) rows.push(['Suspicious import', n.category]);
+        return title(n.label || n.id) + facts(rows) + note;
+    }
+    const e = item.edge;
+    const name = node => node ? node.label || node.id : '';
+    const rows = [['From', item.source ? `${name(item.source)} (${item.source.id})` : e.source],
+                  ['To', item.target ? `${name(item.target)} (${item.target.id})` : e.target]];
+    let note;
+    if (e.origin === 'curated') {
+        rows.push(['Origin', 'curated, not derived']);
+        note = '<p class="binary-graph-curated-note"><strong>Curated, not derived.</strong> This step is not read from any binary: the mapping from '
+            + `${escapeHtml(name(item.source) || e.source)} to ${escapeHtml(name(item.target) || e.target)} comes from the hand-curated Win32 to Nt table. `
+            + 'It is that table\'s word that the function ends in this syscall, not an import, export or forwarder of a file on this system.</p>';
+    } else {
+        rows.push(['Origin', 'derived']);
+        note = '<p class="syscall-detail-note">Derived: read from the binaries themselves, from their import and export tables and the api-set map of this system.</p>';
+    }
+    if (e.label) rows.push(['Label', e.label]);
+    return title(BINARY_GRAPH_EDGE_WORDS[e.kind] || e.kind) + facts(rows) + note;
 }

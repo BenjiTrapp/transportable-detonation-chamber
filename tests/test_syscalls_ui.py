@@ -10,7 +10,7 @@ Regressions covered:
   * a scan that is refused, times out or cannot be reached leaving the measurement of an earlier scan on the map,
     SCAN left on while one runs or with no target, win32u scanned unasked, a late answer of another scan
   * the baseline read again at every visit of the tab, an extraction nobody asks about again
-  * GRAPH that can be switched to before the binary graph exists
+  * a view switched to whose button is disabled or that the tab does not have
   * the tab missing in the tab bar or the guide, a script that reads an element the page does not have, a state
     colour that is missing in a theme, or an intact stub louder than a deviation in one of them
 """
@@ -449,10 +449,17 @@ FLOW_FUNCTIONS = [
     "syscallCopyText", "syscallTargetProcess", "syscallStubsModel", "renderSyscallStubs", "renderSyscallStubsPanel", "runSyscallStubs",
     "syscallRequestDraft", "syscallDraftStubRule",
     "syscallHookKey", "syscallHookPairs", "syscallHookDifference", "syscallHookDrift", "syscallWin32uMissing", "syscallSyncModuleFilter",
+    # the GRAPH surface (tests/test_binary_graph_ui.py): the map's choice and filter reach it
+    "binaryGraphLayout", "binaryGraphEdgeLook", "binaryGraphNodeLook", "binaryGraphTones", "binaryGraphMatches", "binaryGraphCut",
+    "binaryGraphSvg", "binaryGraphLegend", "binaryGraphStatus", "binaryGraphModel", "renderBinaryGraph", "binaryGraphOnQuery",
+    "binaryGraphSubmit", "binaryGraphRun", "binaryGraphItem", "binaryGraphSelect", "binaryGraphFollowMap", "binaryGraphDetailItem",
+    "binaryGraphDetailHtml",
 ]
 FLOW_CONSTS = ["SYSCALL_STATES", "SYSCALL_STATE_COLORS", "SYSCALL_STATE_HELP", "SYSCALL_MODULES", "SYSCALL_WIN32U_TITLE", "SYSCALL_MAP",
                "SYSCALL_ROWS_MAX", "SYSCALL_PAGE", "SYSCALL_POLL_MS", "SYSCALL_VIEW_NAMES", "syscallState",
-               "SYSCALL_DOC_URL", "SYSCALL_WINGRAPH_URL", "SYSCALL_SYSTEM_DIR", "SYSCALL_NARROW", "SYSCALL_PANE_NAMES", "SYSCALL_SEVERITY_RANK"]
+               "SYSCALL_DOC_URL", "SYSCALL_WINGRAPH_URL", "SYSCALL_SYSTEM_DIR", "SYSCALL_NARROW", "SYSCALL_PANE_NAMES", "SYSCALL_SEVERITY_RANK",
+               "BINARY_GRAPH", "BINARY_GRAPH_SYSCALL", "BINARY_GRAPH_KINDS", "BINARY_GRAPH_QUERIES", "BINARY_GRAPH_EDGE_WORDS",
+               "binaryGraphState", "binaryGraphRequests"]
 
 # Just enough page for the tab: elements that hold children, attributes and listeners, a canvas that writes down
 # what is painted on it, a fetch that answers from a table of routes, and timers that wait to be fired
@@ -500,7 +507,6 @@ const ids = ['syscalls-subtitle', 'syscall-view-map', 'syscall-view-graph', 'sys
              'syscall-deviations', 'syscall-deviations-head', 'syscall-hooks', 'syscall-hooks-head',
              'syscall-stubs', 'syscall-stubs-body', 'syscall-stubs-head', 'syscall-stubs-run', 'syscall-lower'];
 const els = Object.fromEntries(ids.map(id => [id, Object.assign(new Node('div'), { id })]));
-els['syscall-view-graph'].disabled = true;
 els['syscall-map'].parentElement = Object.assign(new Node('div'), { boxWidth: 800 });
 els['syscall-tip'].hidden = true;
 els['syscall-draft'].hidden = true;
@@ -971,16 +977,20 @@ def test_the_module_filter_offers_only_the_modules_the_baseline_holds():
 
 
 @needs_node
-def test_the_toggle_has_map_pressed_and_graph_switched_off():
+def test_the_toggle_has_map_pressed_and_switches_only_to_a_view_it_has():
     r = _flow(r"""
       initSyscalls();
       const pressed = () => [els['syscall-view-map'].attrs['aria-pressed'], els['syscall-view-graph'].attrs['aria-pressed']];
       syscallRenderAll();
       const first = pressed();
-      out({ first, graph: syscallSetView('graph'), after: pressed(), view: syscallState.view,
+      const graph = syscallSetView('graph'), after = pressed(), view = syscallState.view;
+      // a disabled button is not switched to
+      syscallSetView('map'); els['syscall-view-graph'].disabled = true;
+      out({ first, graph, after, view, disabled: syscallSetView('graph'), still: syscallState.view,
             unknown: syscallSetView('__proto__'), map: syscallSetView('map'), surface: els['syscall-surface-map'].hidden });""")
     assert r["first"] == ["true", "false"]
-    assert r["graph"] is False and r["after"] == ["true", "false"] and r["view"] == "map", "GRAPH is disabled in this plan"
+    assert r["graph"] is True and r["after"] == ["false", "true"] and r["view"] == "graph"
+    assert r["disabled"] is False and r["still"] == "map"
     assert r["unknown"] is False and r["map"] is True and r["surface"] is False
 
 
@@ -1010,10 +1020,12 @@ def test_a_theme_change_repaints_the_map_while_its_tab_is_open():
       globalThis.renderGraph = () => calls.push('graph'); globalThis.renderRtraceTimeline = () => calls.push('timeline');
       globalThis.renderDashboard = () => calls.push('dashboard'); globalThis.FileMapView = { repaint: () => calls.push('filemap') };
       globalThis.renderSyscallMap = () => calls.push('syscalls');
+      globalThis.renderBinaryGraph = () => calls.push('binary-graph');
       onThemeChange();
       const open = [...calls]; calls.length = 0; state.activeTab = 'alerts'; onThemeChange();
       out({ open, closed: calls, cache: _themeColorCache.size });""")
     assert "syscalls" in r["open"] and "syscalls" not in r["closed"] and r["cache"] == 0
+    assert "binary-graph" in r["open"] and "binary-graph" not in r["closed"], "the GRAPH surface takes the new colours too"
 
 
 # --- The detail panel, the deviation list and the rule draft -----------------------
@@ -2368,13 +2380,12 @@ def test_the_tab_sits_after_rizin_and_has_its_head_and_the_toggle():
     tab = _tab_markup("syscalls")
     assert re.search(r'<h2 data-info="[^"]+">Syscalls</h2>', tab)
     assert 'class="content-subtitle" id="syscalls-subtitle"' in tab
-    # The toggle: MAP pressed and on, GRAPH shown and switched off until the binary graph exists
+    # The toggle: MAP pressed and on, GRAPH beside it and not pressed (tests/test_binary_graph_ui.py has the rest)
     assert re.search(r'role="group"[^>]*aria-label="Surface"', tab)
     map_button = re.search(r'<button[^>]*id="syscall-view-map"[^>]*>MAP</button>', tab).group(0)
     graph_button = re.search(r'<button[^>]*id="syscall-view-graph"[^>]*>GRAPH</button>', tab).group(0)
     assert 'aria-pressed="true"' in map_button and "disabled" not in map_button
-    assert 'aria-pressed="false"' in graph_button and " disabled" in graph_button
-    assert 'title="comes with the binary graph"' in graph_button
+    assert 'aria-pressed="false"' in graph_button
     assert "syscallSetView('map')" in map_button
     # Above the work area: the toolbar (target and SCAN, the filter), the notices and the line a scan leaves
     order = ["syscall-toolbar", "syscall-notices", "syscall-scan-result", "syscall-work"]
@@ -2388,8 +2399,9 @@ def test_every_element_the_block_reads_is_in_the_page():
     ids |= {f"syscall-view-{n}" for n in ("map", "graph")} | {f"syscall-surface-{n}" for n in ("map",)}
     assert {"syscall-map", "syscall-legend", "syscall-rows", "syscall-target", "syscall-scan", "syscall-tip"} <= ids
     page = set(re.findall(r'\bid="([^"]+)"', tab))
-    # the surface of GRAPH is the binary graph's: it is inserted when that exists
-    assert not sorted(ids - page - {"syscall-surface-graph"}), sorted(ids - page)
+    ids |= {"syscall-surface-graph"} | set(re.findall(r"getElementById\('(binary-graph-[\w-]+)'\)", _block()))
+    assert {"binary-graph-canvas", "binary-graph-legend", "binary-graph-status"} <= ids
+    assert not sorted(ids - page), sorted(ids - page)
     # an inline handler names a function of the block
     handlers = set(re.findall(r'on\w+="(\w+)\(', tab))
     assert handlers and all(re.search(rf"^(async )?function {h}\(", SOURCE, re.M) for h in handlers), handlers
@@ -2508,8 +2520,9 @@ def test_the_detail_the_deviations_and_the_known_hooks_are_in_the_work_area_and_
     for needle in ('id="syscall-detail"', 'id="syscall-detail-body"', 'id="syscall-draft"', 'id="syscall-lower"',
                    'id="syscall-deviations"', 'id="syscall-hooks"', 'id="syscall-stubs"', 'id="syscall-stubs-body"'):
         assert needle in work, needle
-    # panels in the manner of the Rizin tab: a section with a head and a title that explains itself
-    assert len(re.findall(r'<h3 class="syscall-panel-title" data-info="[^"<&]{1,300}">', tab)) == 4
+    # panels in the manner of the Rizin tab: a section with a head and a title that explains itself (the fifth is the
+    # query bar of the GRAPH surface)
+    assert len(re.findall(r'<h3 class="syscall-panel-title" data-info="[^"<&]{1,300}">', tab)) == 5
     assert "syscallSetPane('map')" in tab and "syscallSetPane('detail')" in tab
     assert re.search(r'<button[^>]*id="syscall-stubs-run"[^>]*onclick="runSyscallStubs\(\)"', tab)
     assert re.search(r'id="syscall-stubs"[^>]*\shidden', tab), "the list of hits is there once a search was run"

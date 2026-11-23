@@ -19,9 +19,9 @@
             document.documentElement.dataset.theme = 'cyberpunk';
         }
     </script>
-    <link rel="stylesheet" href="/static/css/style.css?v=87">
+    <link rel="stylesheet" href="/static/css/style.css?v=88">
     <link rel="stylesheet" href="/static/css/theme-layout.css?v=5">
-    <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=37">
+    <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=38">
 </head>
 <body>
     <!-- Global loading overlay (shown on slow fetches) -->
@@ -1256,8 +1256,8 @@
                  module (block SYSCALLS of app.js). The toolbar in one line that wraps, the notices (no baseline,
                  NTSleuth missing), the line a scan leaves, then the work area: the map with its legend and the
                  catalog under it, each scrolling in itself. The detail panel stands to the right of them, the deviations
-                 and the known hooks under them; below 1400px the map and the detail panel take turns. GRAPH is the
-                 binary graph's, switched off for now. -->
+                 and the known hooks under them; below 1400px the map and the detail panel take turns. GRAPH puts the
+                 binary graph's answers in the map's place: a query bar, the layered paths and their legend. -->
             <div class="tab-content" id="tab-syscalls">
                 <div class="content-header">
                     <h2 data-info="Every syscall of ntdll.dll and win32u.dll as one cell, from the NTSleuth baseline of this build. Choose a process and SCAN to colour each cell with the state its stub is in.">Syscalls</h2>
@@ -1269,7 +1269,7 @@
                 <div class="syscall-toolbar" id="syscall-toolbar">
                     <span class="chart-range syscall-switch" role="group" aria-label="Surface">
                         <button type="button" class="chart-range-btn" id="syscall-view-map" aria-pressed="true" onclick="syscallSetView('map')">MAP</button>
-                        <button type="button" class="chart-range-btn" id="syscall-view-graph" aria-pressed="false" disabled title="comes with the binary graph" onclick="syscallSetView('graph')">GRAPH</button>
+                        <button type="button" class="chart-range-btn" id="syscall-view-graph" aria-pressed="false" title="The import graph of System32: follow an import down to its syscall" onclick="syscallSetView('graph')">GRAPH</button>
                     </span>
                     <span class="chart-range syscall-switch syscall-pane-switch" role="group" aria-label="Pane">
                         <button type="button" class="chart-range-btn" id="syscall-pane-map" aria-pressed="true" onclick="syscallSetPane('map')">MAP</button>
@@ -1306,9 +1306,30 @@
                             <div class="syscall-rows" id="syscall-rows"></div>
                         </div>
                     </div>
+                    <div class="syscall-main binary-graph" id="syscall-surface-graph" hidden>
+                        <div class="binary-graph-panel">
+                            <form class="binary-graph-bar" id="binary-graph-bar" onsubmit="binaryGraphSubmit(event)">
+                                <h3 class="syscall-panel-title" data-info="One question to the import graph of this system's System32, drawn left to right with one layer per hop. A solid edge is read from the binaries, a dashed one marked curated comes from the hand-curated Win32 to Nt table.">BINARY GRAPH</h3>
+                                <select id="binary-graph-query" class="filter-select" aria-label="Query" onchange="binaryGraphOnQuery()">
+                                    <option value="path-to-syscall">path to syscall</option>
+                                    <option value="importers">importers</option>
+                                    <option value="imports">imports</option>
+                                    <option value="syscall-callers">syscall callers</option>
+                                    <option value="forwarders">forwarders</option>
+                                    <option value="shared">shared dependencies</option>
+                                </select>
+                                <input type="text" id="binary-graph-module" class="filter-input" placeholder="Module, such as kernel32.dll" aria-label="Start node" autocomplete="off" spellcheck="false">
+                                <input type="text" id="binary-graph-function" class="filter-input" placeholder="Function, such as OpenProcess" aria-label="Function" autocomplete="off" spellcheck="false">
+                                <button type="submit" class="btn btn-sm btn-primary" id="binary-graph-run">QUERY</button>
+                            </form>
+                            <div class="binary-graph-status" id="binary-graph-status" role="status" hidden></div>
+                            <div class="binary-graph-canvas" id="binary-graph-canvas"></div>
+                            <div class="syscall-legend binary-graph-legend" id="binary-graph-legend"></div>
+                        </div>
+                    </div>
                     <section class="syscall-panel syscall-detail" id="syscall-detail" aria-label="Syscall detail">
                         <div class="syscall-panel-head">
-                            <h3 class="syscall-panel-title" data-info="The syscall chosen on the map or in the catalog: number, address, signature and parameters from the baseline, and after a scan the stub bytes read with the differences marked, the state and who the jump goes to.">DETAIL</h3>
+                            <h3 class="syscall-panel-title" data-info="The syscall chosen on the map, in the catalog or in the graph: number, address, signature and parameters from the baseline, and after a scan the stub bytes with the differences marked. A module, function or edge chosen in the graph is described here too.">DETAIL</h3>
                         </div>
                         <div class="syscall-detail-body" id="syscall-detail-body"></div>
                         <div class="syscall-draft" id="syscall-draft" hidden></div>
@@ -1880,6 +1901,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
         <div id="decision-toasts" class="decision-stack" role="region" aria-label="Firewall decisions"></div>
     </div>
 
-    <script src="/static/js/app.js?v=139"></script>
+    <script src="/static/js/app.js?v=140"></script>
 </body>
 </html>

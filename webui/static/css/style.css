@@ -159,6 +159,20 @@
     --graph-pipe-rgb: 0, 229, 255;
     --graph-detonated: #d4ff00;
     --graph-detonated-rgb: 212, 255, 0;
+    /* The binary graph of the SYSCALLS tab: a kind of node each, the curated edge (the word of the Win32 to Nt
+       table, not of a binary) and a filter match; neither of the last two may look like a deviation state */
+    --graph-node-dll: #9b8cff;
+    --graph-node-dll-rgb: 155, 140, 255;
+    --graph-node-exe: #34f5a0;
+    --graph-node-exe-rgb: 52, 245, 160;
+    --graph-node-apiset: #4d8dff;
+    --graph-node-apiset-rgb: 77, 141, 255;
+    --graph-node-syscall: #e8ecff;
+    --graph-node-syscall-rgb: 232, 236, 255;
+    --graph-edge-curated: #ff2bd6;
+    --graph-edge-curated-rgb: 255, 43, 214;
+    --graph-match: #d4ff00;
+    --graph-match-rgb: 212, 255, 0;
     --pe-code: #4d8dff;
     --pe-data: #34f5a0;
     --pe-readonly: #6c7399;
@@ -12511,6 +12525,98 @@ button.logs-trunc:hover { color: var(--accent-orange); text-decoration: underlin
 }
 .syscall-catalog {
     flex: 2 1 0;
+}
+/* The GRAPH surface: the query bar, the line an answer leaves, the layered paths (scrolling in themselves, never
+   squeezed: a path keeps the size it is readable at) and the legend */
+.binary-graph-panel {
+    flex: 1 1 0;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    background: var(--bg-card);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+}
+.binary-graph-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 8px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border-primary);
+}
+.binary-graph-bar .filter-input {
+    flex: 1 1 180px;
+    min-width: 0;
+}
+.binary-graph-bar .filter-input[hidden] {
+    display: none;
+}
+.binary-graph-status {
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border-primary);
+    border-left: 3px solid var(--border-primary);
+    font-size: 12px;
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
+}
+.binary-graph-status[hidden] {
+    display: none;
+}
+.binary-graph-status-warn {
+    border-left-color: var(--severity-medium);
+}
+.binary-graph-cut {
+    color: var(--text-primary);
+    font-weight: 600;
+}
+.binary-graph-canvas {
+    flex: 1 1 0;
+    min-height: 120px;
+    overflow: auto;
+}
+.binary-graph-svg {
+    display: block;
+}
+.binary-graph-svg text {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    white-space: pre;
+    pointer-events: none;
+}
+.binary-graph-svg .binary-graph-sub,
+.binary-graph-svg .binary-graph-edge-tag {
+    font-size: 10px;
+}
+.binary-graph-edge-tag {
+    font-weight: 600;
+    letter-spacing: 0.04em;
+}
+.binary-graph-node,
+.binary-graph-edge {
+    cursor: pointer;
+}
+.binary-graph-edge-hit {
+    fill: none;
+    stroke: transparent;
+    stroke-width: 12px;
+    pointer-events: stroke;
+}
+.binary-graph-legend {
+    border-top: 1px solid var(--border-primary);
+    border-bottom: 0;
+}
+.binary-graph-legend-mark {
+    flex: 0 0 auto;
+}
+.binary-graph-curated-note {
+    margin: 8px 0;
+    padding: 6px 8px;
+    border-left: 3px solid var(--graph-edge-curated);
+    background: rgba(var(--graph-edge-curated-rgb), 0.08);
+    font-size: 12px;
+    color: var(--text-primary);
 }
 .syscall-legend {
     display: flex;
