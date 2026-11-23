@@ -30,9 +30,21 @@
 #   C:\tools\ntsleuth\tdc-release.txt
 #       first line the release tag, then one "<file> sha256:<hash>" line per binary
 #
-# Each view is then self-tested (--lookup NtCreateProcess has to print a syscall
-# number) and its baseline is kept. The marker is written only when all of that
-# worked, so the tool updates keep offering the update until it does.
+# Each view is then self-tested (extract, then --lookup NtCreateProcess has to
+# print a syscall number). The marker is written when that worked, so the tool
+# updates keep offering the update until it does. The baselines are stored after
+# the marker and do not gate it.
+#
+# Exit codes: 1 for what must never leave a bad install behind (a failed
+# download, a missing or mismatching checksum, a binary that cannot be copied,
+# an unsupported architecture). Everything after the verified install, the
+# self-test and the baselines, only warns and exits 0: NTSleuth is an addition
+# to the chamber, so provisioning goes on and the SYSCALLS tab reports what is
+# missing.
+#
+# On ARM64 the two baselines are compared: ntsleuth-x64.exe has to see the x64
+# view of ntdll.dll, and if its extraction equals the ARM64 one the script says
+# so loudly.
 #
 # Run as Administrator
 #
@@ -100,10 +112,13 @@ try {
     $number = [string]$cv.CurrentBuildNumber
     if ($number -match '^[0-9]+$') { $build = "$number.$ubr" }
 } catch { $build = $null }
-if (-not $build) { Stop-Install "The build of this system cannot be read from the registry (CurrentBuildNumber, UBR)" }
+if (-not $build) {
+    Write-Host "[!] The build of this system cannot be read from the registry (CurrentBuildNumber, UBR): no baseline can be named" -ForegroundColor Yellow
+}
 
 # A baseline is a file the web UI finds by name; the name has to be the one it looks for.
 function Test-Baseline([string]$View) {
+    if (-not $build) { return $false }
     $name = "ntsleuth-$build-$View.json"
     if ($name -notmatch '^ntsleuth-[0-9A-Za-z.]+-(arm64|x64)\.json$') { return $false }
     $file = Get-Item -Path "$BaselineDir\$name" -ErrorAction SilentlyContinue
@@ -209,7 +224,7 @@ try {
 Remove-Item $Staging -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host "[+] NTSleuth $Tag installed to $InstallDir" -ForegroundColor Green
 
-# --- Self-test and first baselines ---
+# --- Self-test, marker, baselines ---
 function Test-SymbolServer {
     $client = New-Object System.Net.Sockets.TcpClient
     try {
@@ -256,7 +271,10 @@ if ($symbols) {
     Write-Host "[!] Symbol server $SymbolServer not reachable: extracting with --no-symbols (parameter table incomplete)" -ForegroundColor Yellow
 }
 
+# Self-test: each view has to extract and to look NtCreateProcess up. The extractions are kept in memory;
+# the baselines are stored from them afterwards, once the marker is written.
 $selfTestOk = $true
+$extractions = @{}
 foreach ($view in $Views) {
     $exe = "$InstallDir\ntsleuth-$view.exe"
     Write-Host "[*] Self-testing ntsleuth-$view.exe..." -ForegroundColor Yellow
@@ -285,47 +303,94 @@ foreach ($view in $Views) {
         $selfTestOk = $false
         continue
     }
-
-    # Keep the extraction as the baseline of this build and view. Written beside its final name and moved
-    # over it, so the web UI never reads half a file.
     try {
-        $utf8 = New-Object System.Text.UTF8Encoding($false)
-        $json = [IO.File]::ReadAllText($OutputJson, $utf8)
+        $json = [IO.File]::ReadAllText($OutputJson, (New-Object System.Text.UTF8Encoding($false)))
         if ($json.TrimStart()[0] -ne '{') { throw "the JSON does not start with an object" }
-        # The web UI reads "symbols": false as "the parameter table is incomplete"
-        if (-not $symbols) { $json = '{"symbols":false,' + $json.TrimStart().Substring(1) }
-        $target = "$BaselineDir\ntsleuth-$build-$view.json"
-        [IO.File]::WriteAllText("$target.tmp", $json, $utf8)
-        Move-Item -Path "$target.tmp" -Destination $target -Force -ErrorAction Stop
+        $extractions[$view] = $json
     } catch {
-        Remove-Item "$BaselineDir\ntsleuth-$build-$view.json.tmp" -Force -ErrorAction SilentlyContinue
-        Write-Host "[!] The $view baseline could not be stored: $($_.Exception.Message)" -ForegroundColor Red
-        $selfTestOk = $false
-        continue
-    }
-    if (Test-Baseline $view) {
-        Write-Host "[+] Baseline: $BaselineDir\ntsleuth-$build-$view.json" -ForegroundColor Green
-    } else {
-        Write-Host "[!] $BaselineDir\ntsleuth-$build-$view.json is missing or empty after the extraction" -ForegroundColor Red
+        Write-Host "[!] The $view extraction cannot be read: $($_.Exception.Message)" -ForegroundColor Red
         $selfTestOk = $false
     }
 }
 Remove-Item "$InstallDir\output" -Recurse -Force -ErrorAction SilentlyContinue
 
-if (-not $selfTestOk) {
-    Write-Host "[!] NTSleuth is installed, but the self-test failed (see above); no marker is written, so the update stays on offer" -ForegroundColor Red
-    exit 1
+# --- Marker: the tag first, as the tool updates read the first line only ---
+# Written when the binaries are verified, installed and work. The baselines below do not gate it: a baseline
+# that fails leaves a good install, and the update must not stay on offer for that.
+if ($selfTestOk) {
+    $markerLines = @($Tag)
+    foreach ($asset in $Assets) { $markerLines += "$asset sha256:$($hashes[$asset])" }
+    Set-Content -Path "$InstallDir\tdc-release.txt" -Value $markerLines -Encoding ASCII
+} else {
+    Write-Host "[!] NTSleuth is installed, but the self-test failed (see above): no marker is written, so the update stays on offer" -ForegroundColor Red
 }
 
-# --- Marker: the tag first, as the tool updates read the first line only ---
-$markerLines = @($Tag)
-foreach ($asset in $Assets) { $markerLines += "$asset sha256:$($hashes[$asset])" }
-Set-Content -Path "$InstallDir\tdc-release.txt" -Value $markerLines -Encoding ASCII
+# --- Baselines ---
+# From here on nothing ends the script with an error: the chamber is provisioned without them, the tab says
+# "no baseline", and the web UI extracts one on demand.
+# A fingerprint of what tells the views apart: the RVA and stub bytes of every entry. The extraction's
+# metadata (times, order of keys) is no part of it.
+function Get-ViewFingerprint([string]$Json) {
+    $parts = @([regex]::Matches($Json, '"(?:rva|stub_bytes)"\s*:\s*(?:\d+|"[0-9A-Fa-f]*")') | ForEach-Object { $_.Value })
+    if ($parts.Count -eq 0) { return "" }
+    $sha = [System.Security.Cryptography.SHA256]::Create()
+    return ([BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes(($parts -join "`n")))) -replace "-", "")
+}
+
+$stored = @()
+foreach ($view in $Views) {
+    if (-not $extractions.ContainsKey($view)) {
+        Write-Host "[!] No baseline for the $view view: its extraction did not work" -ForegroundColor Yellow
+        continue
+    }
+    if (-not $build) { continue }
+    # Written beside its final name and moved over it, so the web UI never reads half a file.
+    $target = "$BaselineDir\ntsleuth-$build-$view.json"
+    try {
+        $json = $extractions[$view]
+        # The web UI reads "symbols": false as "the parameter table is incomplete"
+        if (-not $symbols) { $json = '{"symbols":false,' + $json.TrimStart().Substring(1) }
+        [IO.File]::WriteAllText("$target.tmp", $json, (New-Object System.Text.UTF8Encoding($false)))
+        Move-Item -Path "$target.tmp" -Destination $target -Force -ErrorAction Stop
+    } catch {
+        Remove-Item "$target.tmp" -Force -ErrorAction SilentlyContinue
+        Write-Host "[!] The $view baseline could not be stored: $($_.Exception.Message)" -ForegroundColor Yellow
+        continue
+    }
+    if (Test-Baseline $view) {
+        Write-Host "[+] Baseline: $target" -ForegroundColor Green
+        $stored += $view
+    } else {
+        Write-Host "[!] $target is missing or empty after the extraction" -ForegroundColor Yellow
+    }
+}
+
+# On ARM64 the x64 binary has to see the other view of ntdll.dll. If both extractions are the same, the x64
+# baseline is the ARM64 one under another name, and every measurement of an emulated x64 sample would be
+# made against the wrong reference.
+if ($isArm64 -and $extractions.ContainsKey("arm64") -and $extractions.ContainsKey("x64")) {
+    $armPrint = Get-ViewFingerprint $extractions["arm64"]
+    $x64Print = Get-ViewFingerprint $extractions["x64"]
+    if (-not $armPrint -or -not $x64Print) {
+        Write-Host "[!] The arm64 and x64 extractions could not be compared (no RVA or stub bytes found)" -ForegroundColor Yellow
+    } elseif ($armPrint -eq $x64Print) {
+        Write-Host "[!] BASELINES IDENTICAL: ntsleuth-x64.exe reports the same RVAs and stub bytes as ntsleuth-arm64.exe." -ForegroundColor Red
+        Write-Host "    It did not see the x64 view of ntdll.dll. Do not trust the x64 baseline: syscall measurements" -ForegroundColor Red
+        Write-Host "    of emulated x64 samples would run against the ARM64 stubs." -ForegroundColor Red
+    } else {
+        Write-Host "[+] The arm64 and x64 views differ, as they must" -ForegroundColor Green
+    }
+}
 
 Write-Host "`n[+] NTSleuth installation complete!" -ForegroundColor Green
 Write-Host "    Release:    $Tag" -ForegroundColor Gray
 Write-Host "    Executable: $($Assets -join ', ') in $InstallDir" -ForegroundColor Gray
-Write-Host "    Baselines:  $BaselineDir (build $build)" -ForegroundColor Gray
+if ($stored.Count -gt 0) {
+    Write-Host "    Baselines:  $BaselineDir (build $build, $($stored -join ', '))" -ForegroundColor Gray
+} else {
+    Write-Host "    Baselines:  none stored; the SYSCALLS tab says so and extracts one on demand" -ForegroundColor Yellow
+}
 if ($isArm64) {
     Write-Host "    NOTE: ntsleuth-x64.exe runs under x64 emulation; it extracts the view emulated x64 samples run against." -ForegroundColor Gray
 }
+exit 0

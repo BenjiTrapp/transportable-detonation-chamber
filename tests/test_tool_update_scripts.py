@@ -445,18 +445,69 @@ def test_ntsleuth_stops_on_a_checksum_it_cannot_confirm_before_installing_anythi
     assert "Remove-Item $Staging" in _function_body(script, "Stop-Install")
 
 
-def test_ntsleuth_marker_is_written_last_and_holds_tag_then_hashes():
+def test_ntsleuth_marker_follows_the_self_test_and_precedes_the_baselines():
     script = _script("ntsleuth")
     marker = script.index('Set-Content -Path "$InstallDir\\tdc-release.txt"')
-    # a failed self-test or baseline leaves no marker, so the updater keeps offering the update
-    assert marker > script.index('"--lookup", "NtCreateProcess"')
-    assert marker > script.rindex("Test-Baseline $view")
-    assert re.search(r"if \(-not \$selfTestOk\) \{.*?exit 1.*?\}", script[:marker], re.S)
+    # a failed self-test leaves no marker, so the updater keeps offering the update
+    assert script.index('"--lookup", "NtCreateProcess"') < marker
+    assert re.search(r"if \(\$selfTestOk\) \{\s*\$markerLines", script[marker - 200:marker + 50])
+    # the baselines do not gate it: they are stored after it, and nothing of them is in front of it
+    assert marker < script.index("[IO.File]::WriteAllText") and marker < script.index("Move-Item -Path \"$target.tmp\"")
+    assert "Test-Baseline $view" not in script[:marker].split("function Test-Baseline")[-1].split("# --- Self-test")[-1]
     # the marker of the old release goes before its binaries are replaced
     assert script.index('Remove-Item "$InstallDir\\tdc-release.txt"') < script.index("Copy-Item")
     # the tag is the first line, which is all the updater reads
     assert re.search(r"\$markerLines\s*=\s*@\(\$Tag\)", script)
     assert "sha256:" in script
+
+
+def test_ntsleuth_only_a_download_a_checksum_or_the_copy_end_the_script_with_an_error():
+    script = _script("ntsleuth")
+    installed = script.index("installed to $InstallDir")
+    before, after = script[:installed], script[installed:]
+    # what runs after the verified install can only warn
+    assert "Stop-Install" not in after and not re.search(r"(?m)^[^#\n]*\bexit 1\b", after)
+    assert after.rstrip().endswith("exit 0")
+    # and everything that ends in error is in front of it
+    for needle in ("Download of $file failed", "SHA-256 mismatch for", "has no SHA-256 for", "Copying to $InstallDir failed"):
+        assert needle in before, needle
+    assert "exit 1" in _function_body(script, "Stop-Install")
+
+
+def _powershell_function(name):
+    import shutil
+    import subprocess
+    pwsh = shutil.which("pwsh") or ("/opt/homebrew/bin/pwsh" if os.path.exists("/opt/homebrew/bin/pwsh") else None)
+    if not pwsh:
+        pytest.skip("pwsh not installed")
+    return pwsh, _function_body(_script("ntsleuth"), name)
+
+
+def test_ntsleuth_fingerprint_tells_the_views_apart_and_ignores_the_metadata():
+    import subprocess
+    pwsh, body = _powershell_function("Get-ViewFingerprint")
+    cmd = ("function Get-ViewFingerprint([string]$Json) {\n" + body + "}\n"
+           "function J($rva, $stub, $ms) { '{\"metadata\":{\"extraction_time_ms\":' + $ms + '},\"syscalls\":[{\"name\":\"A\",\"rva\":' + $rva "
+           "+ ',\"stub_bytes\":\"' + $stub + '\"}]}' }\n"
+           "$a = Get-ViewFingerprint (J 5392 'a10900d4c0035fd6' 402)\n"
+           "$b = Get-ViewFingerprint (J 5392 'a10900d4c0035fd6' 977)\n"
+           "$c = Get-ViewFingerprint (J 5392 '4c8bd1b8c0000000' 402)\n"
+           "$d = Get-ViewFingerprint (J 5400 'a10900d4c0035fd6' 402)\n"
+           "\"same=$($a -eq $b) stub=$($a -ne $c) rva=$($a -ne $d) empty=[$(Get-ViewFingerprint '{}')]\"")
+    proc = subprocess.run([pwsh, "-NoProfile", "-Command", cmd], capture_output=True, text=True, timeout=60)
+    assert proc.stdout.strip() == "same=True stub=True rva=True empty=[]", proc.stdout + proc.stderr
+
+
+def test_ntsleuth_says_so_loudly_when_the_two_arm64_baselines_are_the_same():
+    script = _script("ntsleuth")
+    at = script.index("BASELINES IDENTICAL")
+    block = script[script.rindex("if ($isArm64 -and", 0, at):at + 600]
+    assert "$extractions.ContainsKey(\"arm64\")" in block and "$extractions.ContainsKey(\"x64\")" in block
+    assert re.search(r"\$armPrint\s+-eq\s+\$x64Print", block)
+    # red, not a quiet note; and a comparison that could not be made is said too
+    assert "-ForegroundColor Red" in script[at - 10:at + 400] and "could not be compared" in script
+    # the baselines of an ARM64 install are compared in memory, from what NTSleuth printed, not from file names
+    assert "Get-ViewFingerprint $extractions" in script
 
 
 def test_ntsleuth_baselines_are_named_and_placed_as_the_web_ui_looks_for_them():
