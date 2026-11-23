@@ -4811,6 +4811,14 @@ def test_diverged_stubs_are_named_in_the_verdict_and_do_not_read_as_clean(tdc, t
     assert results["memory_evidence"]["syscalls_diverged"] == 1
 
 
+def test_the_diverged_reason_fits_a_jump_into_ntdll_whose_owner_was_resolved(tdc, target, fake_baseline_dir):
+    entry = _stage_entry(tdc, target, fake_baseline_dir, owner="ntdll.dll")
+    assert entry["counts"]["diverged"] == 1
+    [reason] = [r for r in tdc._compute_verdict({"syscalls": entry}, [])["reasons"] if "diverged" in r]
+    assert "no owner of a jump could be resolved" not in reason
+    assert "could not be resolved" in reason and "ntdll" in reason
+
+
 def _walkable(reader):
     """`reader` with free memory behind everything it maps, so that a walk of its regions covers user space."""
     reader._regions.append((0, syscall_scan._USER_SPACE_END, syscall_scan.Region(0x10000, 0, None)))

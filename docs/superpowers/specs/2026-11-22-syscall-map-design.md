@@ -779,8 +779,8 @@ hat so entschieden:
    kuratiert. Daraus folgt die Markierungspflicht in Ziel 6 und das Anti-Ziel,
    eine kuratierte Kante nicht als abgeleitete auszugeben.
 2. **Der Scanner für Stubs außerhalb von ntdll ist dabei**, nicht in einer
-   späteren Phase. Daher Ziel 7a, ein dritter `KINDS`-Eintrag und eine eigene
-   Route.
+   späteren Phase. Daher Ziel 7a, ein eigener `KINDS`-Eintrag
+   (`direct_syscall_stub`) und eine eigene Route.
 3. **Der Scan läuft als Stufe einer Detonation**, nicht nur von Hand. Daher
    Ziel 7b mit Stufenliste, `collect()`, VERDICT FLOW, Sweep und
    `_update_preconditions`.
@@ -827,15 +827,21 @@ hat so entschieden:
   hält schon fest, dass die das auf ARM64 nicht kann.
 - Verglichen wird ein Stub-**Präfix** je Architektur, nicht NTSleuths 32-Byte-
   Fenster, weil das in den nächsten Stub hineinreicht.
-- Fünf Zustände statt vier: `diverged` für „Bytes weichen ab, Ziel nicht
-  auflösbar", damit dieser Fall nicht stumm als `intact` durchgeht.
+- Fünf Zustände statt vier: `diverged` für „Bytes weichen ab, und nichts
+  unterscheidet Hook von Patch" — kein Sprung, ein nicht auflösbares Ziel oder
+  ein direkter Sprung in `ntdll` oder das Modul des Stubs —, damit dieser Fall
+  nicht stumm als `intact` durchgeht.
 - Der Live-Scan nimmt standardmäßig nur `ntdll`; `win32u` ist zuschaltbar.
 - `hooked` gegen `patched` wird am **letzten** Besitzer des Sprungziels
   entschieden, nach höchstens zwei privaten Relays, und dafür kommen
   `VirtualQueryEx` und `GetMappedFileNameW` dazu. Ein überschriebenes Modul
   (Module Stomping) sieht auch diese Abfrage nicht; `hooked` heißt darum
   „dateigedecktes Modul", nicht „EDR-Hook".
-- Zwei neue `KINDS`-Einträge statt eines, weil Hook und Patch verschieden wiegen.
+- Drei neue `KINDS`-Einträge für die Messung statt eines —
+  `syscall_stub_patched`, `syscall_stub_hooked` und `syscall_stub_renumbered` —,
+  weil Hook, Patch und ein Stub mit fremder Nummer verschieden wiegen. Dazu
+  kommt `direct_syscall_stub` aus Ziel 7a, vom Nutzer entschieden; zusammen
+  sind es vier.
 - **Kein `baseline_exempt`** — das Flag macht einen Befund immun gegen die
   Baseline. EDR-Hooks werden stattdessen über eine eigene,
   prozessunabhängige Hook-Eigentümer-Liste schon vor dem Scorer gefiltert, weil

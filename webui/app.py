@@ -4735,8 +4735,9 @@ def _syscall_verdict_reasons(stage, evidence, reasons, only_source=False):
     diverged = max(0, int(counts.get("diverged") or 0) - renumbered)
     if diverged:
         evidence["syscalls_diverged"] = diverged
-        reasons.append(f"{diverged} syscall stub{'s' if diverged != 1 else ''} diverged: the bytes changed, and no "
-                       "owner of a jump could be resolved - not scored, and not evidence of being clean")
+        reasons.append(f"{diverged} syscall stub{'s' if diverged != 1 else ''} diverged: the bytes changed, and nothing "
+                       "tells a hook from a patch - there is no jump to follow, its owner could not be resolved, or it "
+                       "goes straight into ntdll or the stub's own module - not scored, and not evidence of being clean")
 
 
 def _compute_verdict(results, matching_alerts):
