@@ -69,6 +69,7 @@ Diese Fälle gelten als Fehlschlag, auch wenn das Update technisch durchläuft:
 | `rustinel` | Rustinel | release `Karib0u/rustinel` | `rustinel.exe --version` | `install-rustinel.ps1 -Force -Version <neu>` | 1.1.1 | Task Rustinel, nssm-Dienst Rustinel |
 | `fibratus` | Fibratus | release `rabbitstack/fibratus` | `fibratus.exe version` | `install-fibratus.ps1 -Force -Version <neu>` | 3.0.0 | Dienst fibratus |
 | `rizin` | Rizin (Cutter) | release `rizinorg/cutter` | `C:\tools\cutter\tdc-package.txt` (`Cutter-v<x>-…`) | `install-rizin.ps1 -Version <neu> -PackageSha256 <digest>` | Cutter 2.5.0 | Rizin-Sitzungen schließen |
+| `ntsleuth` | NTSleuth | release `xaitax/NTSleuth` | `C:\tools\ntsleuth\tdc-release.txt` (erste Zeile: das Datums-Tag `v<yyyy.mm.dd>-<hash>`) | `install-ntsleuth.ps1 -Force` | – | – |
 | `sysmon` | Sysmon | sysinternals | `ETag` von `https://download.sysinternals.com/files/Sysmon.zip` gegen Marker | `install-sysmon.ps1 -Force` | – | (Skript selbst) |
 | `sysmon_config` | Sysmon config | sysinternals | `ETag` der SwiftOnSecurity-Config gegen Marker | `install-sysmon.ps1` (lädt die Config neu, wenn Sysmon läuft) | – | – |
 

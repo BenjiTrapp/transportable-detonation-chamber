@@ -158,6 +158,11 @@ Vagrant.configure("2") do |config|
     path: "scripts/install-rizin.ps1",
     privileged: true
 
+  config.vm.provision "ntsleuth",
+    type: "shell",
+    path: "scripts/install-ntsleuth.ps1",
+    privileged: true
+
   config.vm.provision "webui",
     type: "shell",
     path: "scripts/install-webui.ps1",

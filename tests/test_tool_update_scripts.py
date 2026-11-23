@@ -1,5 +1,6 @@
 """The install scripts the tool updates call: -Force, version pins, release markers."""
 
+import json
 import os
 import re
 
@@ -7,8 +8,9 @@ import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-FORCE_SCRIPTS = ["capa", "beaconeye", "process-dump", "scanner-tools", "rustinel", "fibratus", "aether", "sysmon"]
-MARKER_SCRIPTS = ["capa", "beaconeye", "process-dump", "scanner-tools", "rustinel", "fibratus"]
+FORCE_SCRIPTS = ["capa", "beaconeye", "process-dump", "scanner-tools", "rustinel", "fibratus", "aether", "sysmon",
+                 "ntsleuth"]
+MARKER_SCRIPTS = ["capa", "beaconeye", "process-dump", "scanner-tools", "rustinel", "fibratus", "ntsleuth"]
 
 
 def _read(*parts):
@@ -204,7 +206,7 @@ def test_logging_script_parses():
     assert proc.returncode == 0, proc.stdout + proc.stderr
 
 
-ARCH_SCRIPTS = ["sysmon", "fibratus", "rustinel", "rizin", "hunt-sleeping-beacons"]
+ARCH_SCRIPTS = ["sysmon", "fibratus", "rustinel", "rizin", "hunt-sleeping-beacons", "ntsleuth"]
 REGISTRY_ARCH = r"HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment"
 
 
@@ -400,3 +402,128 @@ def test_sysmon_version_parse_takes_the_first_token_not_the_first_char():
     # ('15.22' | Where-Object)[0] is the char '1'; the token list must be wrapped in @()
     code = _sysmon_code()
     assert re.search(r"\$first = @\(\$Text", code)
+
+
+# --- install-ntsleuth.ps1 ---------------------------------------------------
+
+def _function_body(script, name):
+    m = re.search(r"(?m)^function %s\b[^\n]*\{\n(.*?)^\}" % re.escape(name), script, re.S)
+    assert m, f"no function {name}"
+    return m.group(1)
+
+
+def test_install_ntsleuth_takes_force_and_version():
+    script = _script("ntsleuth")
+    params = _param_block(script)
+    assert re.search(r"\[switch\]\s*\$Force\b", params) and re.search(r"\[string\]\s*\$Version\b", params)
+    assert "checksums.txt" in script
+
+
+def test_ntsleuth_keeps_the_release_names_and_installs_both_views_on_arm64():
+    script = _script("ntsleuth")
+    # the release ships no plain ntsleuth.exe; Task 7 calls ntsleuth-<view>.exe
+    assert "ntsleuth.exe" not in script
+    assert re.search(r'\$Views\s*=\s*@\("arm64",\s*"x64"\)', script)
+    assert re.search(r'\$Views\s*=\s*@\("x64"\)', script)
+    assert 'ntsleuth-$view.exe' in script
+    # the OS architecture comes from the registry: a child of an emulated x64 process sees AMD64 in its environment
+    assert re.search(r"Session Manager\\Environment", script) and "PROCESSOR_ARCHITECTURE" in script
+
+
+def test_ntsleuth_stops_on_a_checksum_it_cannot_confirm_before_installing_anything():
+    script = _script("ntsleuth")
+    assert "exit 1" in _function_body(script, "Stop-Install")
+    copy = re.search(r"(?m)^[^#\n]*\bCopy-Item\b[^\n]*\$InstallDir[^\n]*$", script)
+    assert copy and "-ErrorAction Stop" in copy.group(0)
+    for needle in ("SHA-256 mismatch", "no SHA-256 for"):
+        at = script.index(needle)
+        # the refusal is a call to Stop-Install, and it comes before the first byte reaches C:\tools\ntsleuth
+        assert "Stop-Install" in script[at - 200:at + 400], needle
+        assert at < copy.start(), needle
+    # nothing downloaded survives a refusal
+    assert re.search(r"Get-FileHash[^\n]*-Algorithm SHA256", script)
+    assert "Remove-Item $Staging" in _function_body(script, "Stop-Install")
+
+
+def test_ntsleuth_marker_is_written_last_and_holds_tag_then_hashes():
+    script = _script("ntsleuth")
+    marker = script.index('Set-Content -Path "$InstallDir\\tdc-release.txt"')
+    # a failed self-test or baseline leaves no marker, so the updater keeps offering the update
+    assert marker > script.index('"--lookup", "NtCreateProcess"')
+    assert marker > script.rindex("Test-Baseline $view")
+    assert re.search(r"if \(-not \$selfTestOk\) \{.*?exit 1.*?\}", script[:marker], re.S)
+    # the marker of the old release goes before its binaries are replaced
+    assert script.index('Remove-Item "$InstallDir\\tdc-release.txt"') < script.index("Copy-Item")
+    # the tag is the first line, which is all the updater reads
+    assert re.search(r"\$markerLines\s*=\s*@\(\$Tag\)", script)
+    assert "sha256:" in script
+
+
+def test_ntsleuth_baselines_are_named_and_placed_as_the_web_ui_looks_for_them():
+    import syscall_baseline
+    script = _script("ntsleuth")
+    app = _read("webui", "app.py")
+    assert 'NTSLEUTH_DIR = r"C:\\tools\\ntsleuth"' in app
+    assert re.search(r'\$InstallDir\s*=\s*"C:\\tools\\ntsleuth"', script)
+    assert 'NTSLEUTH_BASELINE_DIR = os.path.join(NTSLEUTH_DIR, "baseline")' in app
+    assert re.search(r'\$BaselineDir\s*=\s*"\$InstallDir\\baseline"', script)
+    # <build> is CurrentBuildNumber.UBR, as _current_os_build writes it
+    assert "CurrentBuildNumber" in script and "UBR" in script
+    assert 'f"{number}.{revision}"' in app and '"$number.$ubr"' in script
+    template = re.search(r'"(\$BaselineDir\\ntsleuth-\$build-\$view\.json)"', script)
+    assert template, "the baseline file name is not built from build and view"
+    name = template.group(1).split("\\")[-1].replace("$build", "26220.5770").replace("$view", "arm64")
+    assert name == "ntsleuth-26220.5770-arm64.json"
+    assert syscall_baseline.parse_baseline_name(name) == ("26220.5770", "arm64")
+    # the extraction is run as the web UI runs it, from the install dir and in NTSleuth's own output folder
+    assert '"--auto-params", "--format", "json"' in script and '"--no-symbols"' in script
+    assert '"$InstallDir\\output\\syscalls.json"' in script and '"output\\syscalls.json"' not in script
+
+
+def test_ntsleuth_baseline_of_a_run_without_symbols_says_so_in_the_form_the_web_ui_reads():
+    import syscall_baseline
+    script = _script("ntsleuth")
+    prefix = '{"symbols":false,'
+    assert prefix in script
+    # NTSleuth's own top level is an object ({"metadata", "modules", "os_info", "syscalls"}, keys sorted)
+    raw = json.dumps({"metadata": {}, "syscalls": [{
+        "name": "NtCreateProcess", "module": "ntdll.dll", "syscall_number": 192, "rva": 7236,
+        "is_true_syscall": True, "stub_bytes": "011800d4c0035fd6"}]}, indent=2, sort_keys=True)
+    marked = json.loads(prefix + raw.lstrip()[1:])
+    parsed = syscall_baseline.parse_baseline(marked, "26220.5770", "arm64")
+    assert parsed.symbols is False and "NtCreateProcess" in parsed.syscalls
+    assert syscall_baseline.parse_baseline(json.loads(raw), "26220.5770", "arm64").symbols is True
+
+
+def test_ntsleuth_self_test_needs_a_number_not_an_exit_code():
+    script = _script("ntsleuth")
+    # --lookup exits 0 when the name is missing or the JSON unreadable, so the output has to be read
+    assert '"--lookup", "NtCreateProcess"' in script
+    assert re.search(r"\\\[Number\\\]", script)
+    assert "x1b" in script, "the output is coloured with escape codes; they sit inside the label"
+    # every view gets the name it will be looked up under, checked on disk afterwards
+    body = _function_body(script, "Test-Baseline")
+    assert "Get-Item" in body and ".Length -gt 0" in body
+    assert re.search(r"-notmatch '\^ntsleuth-", body)
+
+
+def test_ntsleuth_is_provisioned_in_all_three_places_before_the_web_ui():
+    for name, marker in (("Vagrantfile", "scripts/install-ntsleuth.ps1"), ("Vagrantfile.utm", "scripts/install-ntsleuth.ps1"),
+                         ("scripts/setup-macos-utm.sh", '"install-ntsleuth.ps1"')):
+        text = _read(*name.split("/"))
+        assert text.count(marker) == 1, name
+        webui = "scripts/install-webui.ps1" if name.startswith("Vagrantfile") else '"install-webui.ps1"'
+        assert text.index(marker) < text.index(webui), name
+
+
+def test_ntsleuth_script_parses():
+    import shutil
+    import subprocess
+    pwsh = shutil.which("pwsh") or ("/opt/homebrew/bin/pwsh" if os.path.exists("/opt/homebrew/bin/pwsh") else None)
+    if not pwsh:
+        pytest.skip("pwsh not installed")
+    path = os.path.join(ROOT, "scripts", "install-ntsleuth.ps1")
+    cmd = ("$e = $null; [void][System.Management.Automation.Language.Parser]::ParseFile("
+           f"'{path}', [ref]$null, [ref]$e); if ($e) {{ $e | ForEach-Object {{ $_.Message }}; exit 1 }}")
+    proc = subprocess.run([pwsh, "-NoProfile", "-Command", cmd], capture_output=True, text=True, timeout=60)
+    assert proc.returncode == 0, proc.stdout + proc.stderr

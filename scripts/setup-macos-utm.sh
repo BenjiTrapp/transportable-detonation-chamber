@@ -331,6 +331,7 @@ SCRIPTS=(
     "install-capa.ps1"
     "install-re-tools.ps1"
     "install-rizin.ps1"
+    "install-ntsleuth.ps1"
     "install-webui.ps1"
     "configure-logging.ps1"
     "configure-services.ps1"
