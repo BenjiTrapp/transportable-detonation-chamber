@@ -26064,7 +26064,10 @@ function syscallLowerNote() {
         add('DIRECT SYSCALL STUBS', 'syscall-stubs-head', model && model.partial ? 'not complete' : '');
     }
     const hooks = syscallState.hooks;
-    add('KNOWN HOOKS', 'syscall-hooks-head', hooks.error || hooks.problem ? 'could not be read' : '');
+    // two causes, two words: `error` is a read that failed (a count beside it is the last good one, not current),
+    // `problem` is a list that was read and is unusable. "Could not be read" was wrong for both.
+    add('KNOWN HOOKS', 'syscall-hooks-head',
+        hooks.error ? 'the last read failed' : hooks.problem ? 'unusable' : '');
     return parts.join(' · ');
 }
 
@@ -28302,11 +28305,15 @@ function binaryGraphMetricsStatus() {
             + 'the counts that read tables are lower bounds, and the number of isolated binaries is an upper one.</strong> ';
     }
     // `skipped` is of the same class as `partial` and belongs beside it: the figures table, its only other home, is
-    // what EXPLORE folds away, and a file the build could not read at all is a hole no count of the table shows
+    // what EXPLORE folds away. What is missing is the skipped file's own imports and exports; a binary that imports
+    // one is still counted, because _reach deliberately links to a file nobody could read rather than claim an
+    // absence over it. And `skipped` also counts a name that is a duplicate in another case, which was passed over
+    // rather than unreadable - hence "not read", not "could not be read".
     const lost = typeof f.skipped === 'number' && f.skipped > 0 ? f.skipped : 0;
     if (lost) {
-        html += `<strong class="binary-graph-cut">${escapeHtml(lost.toLocaleString('en-US'))} ${lost === 1 ? 'file of System32 could not be read' : 'files of System32 could not be read'} at all when the graph was built: `
-            + 'they are in no count and in no answer.</strong> ';
+        html += `<strong class="binary-graph-cut">${escapeHtml(lost.toLocaleString('en-US'))} ${lost === 1 ? 'file of System32 was' : 'files of System32 were'} not read when the graph was built: `
+            + `what ${lost === 1 ? 'it imports and exports is' : 'they import and export is'} in no count and in no answer, though a binary that imports `
+            + `${lost === 1 ? 'it' : 'one of them'} still is.</strong> `;
     }
     const stamp = [f.build ? `build ${f.build}` : '', f.arch || ''].filter(Boolean).join(' · ');
     if (stamp) html += `<span class="syscall-muted">${escapeHtml(stamp)}</span>`;

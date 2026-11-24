@@ -465,8 +465,9 @@ panels keep a bar that names them, carries each one's count as it is written, an
 says when a stub search was not complete or the hook list could not be read at
 all — a stub run in the graph view writes the proof of this whole feature into
 that row. ⇱ leaves the figures' own line standing, the one that says how many
-binaries had a table cut short and how many files could not be read at all; only
-the rows go. A scan's own result line sits outside both views and is never
+binaries had a table cut short and how many were not read at all — of a file the
+build passed over, its own imports and exports are missing, while a binary that
+imports it is still counted. Only the rows go. A scan's own result line sits outside both views and is never
 folded. What a fold does hide is the detail behind a count, and the bar is a
 pointer to it, not a replacement. A fold or unfold by
 hand is kept from then on. The canvas zooms with the wheel, `+` and `−`, FIT

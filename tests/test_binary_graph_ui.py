@@ -725,7 +725,7 @@ def test_the_curated_edge_and_the_match_do_not_look_like_a_deviation():
 
 def test_the_assets_moved_on():
     html = _read(INDEX_HTML)
-    for asset, minimum in (("style.css", 94), ("theme-cyberpunk.css", 38), ("app.js", 161)):
+    for asset, minimum in (("style.css", 94), ("theme-cyberpunk.css", 38), ("app.js", 162)):
         version = int(re.search(rf"{re.escape(asset)}\?v=(\d+)", html).group(1))
         assert version >= minimum, f"{asset} was changed and kept its ?v="
 
@@ -2284,8 +2284,13 @@ def test_a_file_the_graph_could_not_read_at_all_is_said_beside_the_cut_tables():
         await binaryGraphMetricsLoad(true);
         out({ none, some, both: els['binary-graph-metrics-status'].innerHTML });
       })();""")
-    assert "skipped" not in r["none"].lower() and "could not be read" not in r["none"], r["none"]
-    assert "5" in r["some"] and "could not be read" in r["some"], r["some"]
+    assert "skipped" not in r["none"].lower() and "not read" not in r["none"], r["none"]
+    assert "5" in r["some"] and "not read" in r["some"], r["some"]
+    # found in the re-review: _reach deliberately links an importer to a file nobody could read rather than claim an
+    # absence over it, so edges, most_imported and isolated do count it. Only its own imports and exports are gone.
+    assert "in no count" in r["some"] and "still is" in r["some"], \
+        "what is missing is the skipped file's own imports and exports, not every trace of it"
+    assert "could not be read" not in r["some"], "skipped also counts a duplicate name in another case, passed over"
     assert "7" in r["both"] and "5" in r["both"], r["both"]
-    assert r["both"].index("cut short") < r["both"].index("could not be read"), \
-        "the cut tables first, then the files that were not read at all"
+    assert r["both"].index("cut short") < r["both"].index("not read"), \
+        "the cut tables first, then the files that were not read"
