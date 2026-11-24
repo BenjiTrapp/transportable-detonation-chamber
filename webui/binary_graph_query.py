@@ -10,10 +10,12 @@ A colon cannot be part of a Windows file name, so a syscall id never collides wi
 
 An edge's `origin` is its claim: "derived" is read from the binaries, "curated" is the Win32 to Nt table's word. The one
 curated edge of a path to a syscall is its last (`path_to_syscall`: at most one, and only ever the last; the spec's
-sharpest anti-goal is a curated edge given out as a derived one). There is exactly one exception, decided and not
-drifted into: `metric_members("curated_transitions")`, the list of the table's own rows, where every edge is curated
-because every row of the table is a curated mapping, each labelled "curated: <its source>". No other query and no other
-figure's list carries a curated edge; tests/test_binary_graph.py enforces both halves over every query. A Win32
+sharpest anti-goal is a curated edge given out as a derived one). There are exactly two exceptions, decided and not
+drifted into. `callers_of_syscall` draws the step from ntdll's Zw export to its Nt syscall as curated, labelled
+"curated: zw-alias" as the table calls a mechanical rename, since that the one name is the other is not read from any
+binary. `metric_members("curated_transitions")`, the list of the table's own rows, has every edge curated because
+every row of the table is a curated mapping, each labelled "curated: <its source>". No other query and no other
+figure's list carries a curated edge; tests/test_binary_graph.py enforces all three over every query. A Win32
 function of that list has no module, so its id is its bare name.
 
 The figures of the whole stock (`metrics`) are numbers, not a graph; `metric_members` answers what lies behind one as an
@@ -302,7 +304,9 @@ def callers_of_syscall(graph, nt_name: str) -> Answer:
     """The normal callers of a syscall: every binary whose import reaches its stub in ntdll.dll, by importing it
     there (under its Nt or its Zw name), through a forwarder or through an api set. Only the chains the binaries
     themselves describe; a Win32 function that calls the syscall in its own code is not a chain, and the curated
-    Win32 to Nt table is not read here."""
+    Win32 to Nt table is not read here. The one edge that is not read from a binary is the step from the Zw export
+    to the syscall: that the one name is the other is a naming convention, so it is curated, labelled
+    "curated: zw-alias" as path_to_syscall labels it."""
     raw = (nt_name or "").strip()
     if len(raw) < 3 or raw[:2] not in ("Nt", "Zw"):
         return _empty(f"{raw or 'That'} is not a syscall name: a syscall name starts with Nt or Zw.")
@@ -323,7 +327,13 @@ def callers_of_syscall(graph, nt_name: str) -> Answer:
     fixed = _Part([syscall], [], [syscall.id])
     for name in names:
         fixed.nodes.append(_function_node("ntdll.dll", name))
-        fixed.edges.append(_edge(_function_id("ntdll.dll", name), syscall.id, "reaches_syscall"))
+        if name == nt:
+            fixed.edges.append(_edge(_function_id("ntdll.dll", name), syscall.id, "reaches_syscall"))
+        else:
+            # that ZwClose is NtClose is a naming convention, not read from a binary: curated, as path_to_syscall
+            # draws it
+            fixed.edges.append(Edge(_function_id("ntdll.dll", name), syscall.id, "reaches_syscall", "curated",
+                                    f"curated: {_ZW_ALIAS}"))
     parts, callers, cut_short, answers = [], set(), False, {}
     for importer in sorted(graph.binaries):
         for module, functions in graph.binaries[importer].imports.items():
@@ -867,8 +877,8 @@ def metric_members(graph, table, name: str) -> Answer:
     exports; `curated_transitions` the table's rows, each a curated edge. A figure of zero, one that cannot be had and a
     name that is none of METRICS give an empty answer with a note.
 
-    `curated_transitions` is the one list that carries curated edges, and the only answer besides `path_to_syscall`
-    that does: every row of the Win32 to Nt table is a curated mapping, so an edge for it is honest, each labelled
+    `curated_transitions` is the one list that carries curated edges, and the only answer besides `path_to_syscall` and
+    `callers_of_syscall` (its Zw step) that does: every row of the Win32 to Nt table is a curated mapping, so an edge for it is honest, each labelled
     "curated: <its source>" and none drawn as read from a binary. No other list may carry one."""
     if not isinstance(name, str) or name not in _MEMBERS:
         shown = name[:40] if isinstance(name, str) and name.strip() else "That name"

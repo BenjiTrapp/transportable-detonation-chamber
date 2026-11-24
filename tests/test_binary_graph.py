@@ -2333,7 +2333,12 @@ def test_the_normal_callers_of_a_syscall_are_the_modules_whose_chain_reaches_ntd
             ("kernel32.dll!CloseHandleNt", "ntdll.dll!ZwClose", "forwards_to"),
             ("ntdll.dll!ZwClose", "syscall:NtClose", "reaches_syscall"),
             ("a.exe", "ntdll.dll!NtClose", "imports")} <= _edges(got)
-    assert all(edge.origin == "derived" for edge in got.edges)
+    # that ZwClose is NtClose is a naming convention, not read from a binary: the one curated edge of this answer, as
+    # path_to_syscall draws it, and labelled as the curated table calls it
+    curated = [edge for edge in got.edges if edge.origin == "curated"]
+    assert [(e.source, e.target, e.kind, e.label) for e in curated] == [
+        ("ntdll.dll!ZwClose", "syscall:NtClose", "reaches_syscall", "curated: zw-alias")]
+    assert all(edge.origin == "derived" for edge in got.edges if edge not in curated)
     # the Zw name is the same syscall
     assert binary_graph_query.callers_of_syscall(graph, "ZwClose") == got
     _whole(got)
@@ -4190,6 +4195,10 @@ def test_both_pages_name_the_figures_route_every_figure_and_the_curated_zw_edge(
     assert help_query.index(exception[1]) < help_query.index("Every other edge"), "the help says every other edge is derived before it names the exception"
     for page in (query, help_query):
         assert "each the table's word" in page
+    # the second carrier, named before either page says the rest is derived
+    carrier = "`q=syscall-callers`", "<code>q=syscall-callers</code>"
+    assert carrier[0] in query and carrier[1] in help_query, "a page does not name the syscall callers as carrying a curated edge"
+    assert query.index(carrier[0]) < query.index("`derived`") and help_query.index(carrier[1]) < help_query.index("Every other edge")
     # what the `partial` figure counts is a binary with a table of any of three kinds cut, and both pages say so
     for page in (docs["/api/binary-graph/metrics"], helps["/api/binary-graph/metrics"]):
         assert "import, delay-load or export" in page, page
@@ -4199,7 +4208,7 @@ def test_both_pages_name_the_figures_route_every_figure_and_the_curated_zw_edge(
 def test_every_page_that_says_which_edges_are_curated_names_the_zw_one_and_the_limit():
     """The curated edge is the one thing the view must never pass off as read from a binary, and it has two kinds: the
     last hop from a Win32 function to its Nt name, and a Zw name to its Nt name. A page that names only the first reads
-    as if the second were derived, so the five pages that say which edges are curated say the same four things (curated and at most one per path, the Zw edge, and that a path ending at an Nt name is derived throughout). It cannot
+    as if the second were derived, so the five pages that say which edges are curated say the same five things (curated and at most one per path, the Zw edge, that a path ending at an Nt name is derived throughout, and that the syscall callers carry the Zw edge too). It cannot
     tell whether the sentence around the words is right, only that none of them is left out or dropped later."""
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     read = lambda *parts: open(os.path.join(root, *parts), encoding="utf-8").read()
@@ -4221,6 +4230,10 @@ def test_every_page_that_says_which_edges_are_curated_names_the_zw_one_and_the_l
         # a direct Nt import has no curated edge: said in one wording on each page, and api.md has its own
         assert re.search(derived[name], flat), f"{name} does not say that a path ending at an Nt name is derived throughout"
         assert "except one kind" not in flat and "the one dashed edge" not in flat, name
+        # the syscall callers draw the Zw step curated as well: a page that lists where curated edges appear names them
+        assert re.search(r"syscall[ -]callers[^.]{0,200}Zw|Zw[^.]{0,200}syscall[ -]callers", flat), (
+            f"{name} does not name the syscall callers as carrying the curated Zw edge")
+        assert "is the one other place" not in flat and "The one other answer with curated edges" not in flat, name
 
 
 # --- Ruling 60: a list far above the cap is not built whole ---------------------------------------------------------------
@@ -4346,6 +4359,12 @@ def test_a_curated_edge_is_only_the_last_of_a_path_and_the_rows_of_the_curated_t
             # the guard the spec's anti-goal rests on: at most one, and only ever the last
             assert len(curated) <= 1, answer.edges
             assert all(index == len(answer.edges) - 1 and edge.kind == "reaches_syscall" for index, edge in curated), answer.edges
+        elif label == "syscall-callers":
+            # the second carrier: the rename of an ntdll Zw export to its Nt syscall, and nothing else
+            assert all(edge.kind == "reaches_syscall" and edge.label == "curated: zw-alias"
+                       and edge.source.startswith("ntdll.dll!Zw") for _, edge in curated), curated
+            assert all(not (edge.source.startswith("ntdll.dll!Zw") and edge.kind == "reaches_syscall")
+                       for edge in answer.edges if edge.origin == "derived"), answer.edges
         elif label == "metric:curated_transitions":
             # the decided exception: every row of the table is one curated edge, and every edge of the list is one of them
             assert len(answer.edges) == len(curated) and curated, label
@@ -4353,9 +4372,9 @@ def test_a_curated_edge_is_only_the_last_of_a_path_and_the_rows_of_the_curated_t
         else:
             assert curated == [], (label, curated)
         assert all(edge.origin in ("derived", "curated") for edge in answer.edges), label
-    # not vacuous: the two carriers really carry curated edges in these answers, and nobody else does
-    assert set(carriers) == {"path-to-syscall", "metric:curated_transitions"}, carriers
-    assert carriers["path-to-syscall"] >= 5
+    # not vacuous: the three carriers really carry curated edges in these answers, and nobody else does
+    assert set(carriers) == {"path-to-syscall", "syscall-callers", "metric:curated_transitions"}, carriers
+    assert carriers["path-to-syscall"] >= 5 and carriers["syscall-callers"] >= 2
     rows = [a for label, a in answers if label == "metric:curated_transitions"]
     assert all(a.total == len(table.entries) for a in rows)
 
@@ -4365,7 +4384,8 @@ def test_the_exception_is_said_where_the_rule_is_and_names_the_query_and_the_rea
     the function that lists the rows. That the rule is *kept* is the test above, which looks at the answers."""
     module = binary_graph_query.__doc__
     assert "at most one, and only ever the last" in module
-    assert 'metric_members("curated_transitions")' in module and "exactly one exception" in module
+    assert 'metric_members("curated_transitions")' in module and "exactly two exceptions" in module
+    assert "callers_of_syscall" in module and "zw-alias" in module
     assert "every row of the table is a curated mapping" in module
     function = binary_graph_query.metric_members.__doc__
     assert "curated_transitions" in function and "path_to_syscall" in function and "No other list may carry one" in function

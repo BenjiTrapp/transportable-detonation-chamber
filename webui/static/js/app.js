@@ -26940,7 +26940,9 @@ function binaryGraphSvg(layout, model) {
         const d = `M${c(x1)} ${c(y1)}C${c(x1 + bend)} ${c(y1)} ${c(x2 - bend)} ${c(y2)} ${c(x2)} ${c(y2)}`;
         const origin = binaryGraphOrigin(edge);
         const id = `edge:${index}`;
-        const claim = { curated: 'curated: from the Win32 to Nt table, not read from any binary', derived: 'derived: read from the binaries',
+        const claim = { curated: edge.label === 'curated: zw-alias' ? 'curated: a naming convention, not read from any binary'
+                                                                    : 'curated: from the Win32 to Nt table, not read from any binary',
+                        derived: 'derived: read from the binaries',
                         unknown: 'origin unknown: the answer does not say where this edge comes from' }[origin];
         const words = `${edge.source} ${binaryGraphOwn(BINARY_GRAPH_EDGE_WORDS, edge.kind) || edge.kind} ${edge.target} · ${claim}${edge.label ? ` · ${edge.label}` : ''}`;
         svg += `<g class="binary-graph-edge binary-graph-edge-${origin}${m.selected === id ? ' selected' : ''}" onclick="binaryGraphSelect(${jsArg(id)})">`
@@ -27014,7 +27016,7 @@ function binaryGraphLegend(mode, edges) {
     if (!explore || drawn.has('curated')) {
         parts.push(item('edge-curated', line('curated', binaryGraphEdgeLook({ origin: 'curated' })),
             'curated: from the hand-curated Win32 to Nt table, not read from any binary',
-            'The step from a Win32 function to its Nt syscall is the word of a hand-curated table. No binary of this system was read to draw it.'));
+            'The step from a Win32 function to its Nt syscall is the word of a hand-curated table, and the step from a Zw name of ntdll to its Nt syscall a naming convention. No binary of this system was read to draw either.'));
     }
     if (!explore || drawn.has('unknown')) {
         parts.push(item('edge-unknown', line('unknown', binaryGraphEdgeLook({ origin: '' })), 'origin unknown: neither derived nor curated',
@@ -27220,9 +27222,15 @@ function binaryGraphDetailHtml(item) {
     const origin = binaryGraphOrigin(e);
     if (origin === 'curated') {
         rows.push(['Origin', 'curated, not derived']);
-        note = '<p class="binary-graph-curated-note"><strong>Curated, not derived.</strong> This step is not read from any binary: the mapping from '
-            + `${escapeHtml(name(item.source) || e.source)} to ${escapeHtml(name(item.target) || e.target)} comes from the hand-curated Win32 to Nt table. `
-            + 'It is that table\'s word that the function ends in this syscall, not an import, export or forwarder of a file on this system.</p>';
+        const from = escapeHtml(name(item.source) || e.source), to = escapeHtml(name(item.target) || e.target);
+        // a Zw name of ntdll is its Nt name by convention: no row of the table says it, and the panel must not either
+        note = e.label === 'curated: zw-alias'
+            ? '<p class="binary-graph-curated-note"><strong>Curated, not derived.</strong> This step is not read from any binary: that '
+                + `${from} is ${to} is a naming convention, a Zw name of ntdll being its Nt name, which the curated table calls zw-alias. `
+                + 'Both names are exports of ntdll; that they are one syscall is not an import, export or forwarder of a file on this system.</p>'
+            : '<p class="binary-graph-curated-note"><strong>Curated, not derived.</strong> This step is not read from any binary: the mapping from '
+                + `${from} to ${to} comes from the hand-curated Win32 to Nt table. `
+                + 'It is that table\'s word that the function ends in this syscall, not an import, export or forwarder of a file on this system.</p>';
     } else if (origin === 'derived') {
         rows.push(['Origin', 'derived']);
         note = '<p class="syscall-detail-note">Derived: read from the binaries themselves, from their import and export tables and the api-set map of this system.</p>';

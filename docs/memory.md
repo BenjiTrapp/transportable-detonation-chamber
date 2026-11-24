@@ -403,10 +403,11 @@ marked `curated`**, it is at most one per path and always the last, and the
 legend says that it is the word of the table, not read from any binary. A path that ends in an Nt stub
 which `ntdll.dll` or `win32u.dll` exports has no such edge and is derived from end
 to end. The `Zw` name of an `ntdll` function reaches the syscall of its `Nt`
-name by a curated edge as well, a naming convention that no binary states. The
-interface never presents a curated edge as a derived one; the list of the table's
-own rows (the figure *curated transitions*) is the one other place where they
-appear.
+name by a curated edge as well, a naming convention that no binary states, and
+the syscall callers draw that `Zw` step curated in the same way. The interface
+never presents a curated edge as a derived one; besides a path and the syscall
+callers, the list of the table's own rows (the figure *curated transitions*) is
+the only place where they appear.
 
 **Where the graph is incomplete it says so.** A binary whose import, delay-load or
 export table was cut short when it was read is counted as such (the figure

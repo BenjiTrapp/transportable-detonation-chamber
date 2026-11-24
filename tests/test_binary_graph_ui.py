@@ -231,6 +231,32 @@ def test_the_detail_of_a_curated_edge_says_the_mapping_comes_from_a_table():
     assert "derived" in other and "not read from any binary" not in other and "curated" not in other
 
 
+@needs_node
+def test_the_detail_and_legend_of_the_zw_edge_say_a_naming_convention_not_a_row_of_the_table():
+    # syscall-callers and path-to-syscall draw ntdll!ZwClose -> NtClose curated: no row of the table says it, a rename does
+    r = _graph_flow(r"""
+      (async () => {
+        initSyscalls(); syscallSetView('graph');
+        await ask({ body: {
+          nodes: [{ id: 'syscall:NtClose', label: 'NtClose (ntdll.dll, 0xf)', kind: 'syscall', in_degree: 0, category: '' },
+                  { id: 'ntdll.dll!ZwClose', label: 'ZwClose', kind: 'function', in_degree: 0, category: '' }],
+          edges: [{ source: 'ntdll.dll!ZwClose', target: 'syscall:NtClose', kind: 'reaches_syscall', origin: 'curated', label: 'curated: zw-alias' }],
+          truncated: false, total: 1, roots: ['syscall:NtClose'], build: '26220.5770', arch: 'arm64', created: '2026-11-22T10:00:00Z',
+          note: '1 binary reaches NtClose.' } });
+        binaryGraphSelect('edge:0');
+        out({ detail: els['syscall-detail-body'].innerHTML, legend: els['binary-graph-legend'].innerHTML,
+              canvas: els['binary-graph-canvas'].innerHTML });
+      })();""")
+    [title] = [e["text"] for e in _Elements(r["canvas"]).elements if e["tag"] == "title" and "ZwClose" in e["text"] and "curated" in e["text"]]
+    assert "naming convention" in title and "Win32 to Nt table" not in title
+    text = " ".join(re.sub(r"<[^>]+>", " ", r["detail"]).split()).lower()
+    assert "curated" in text and "not derived" in text and "not read from any binary" in text
+    assert "naming convention" in text and "zwclose" in text and "ntclose" in text
+    assert "comes from the hand-curated win32 to nt table" not in text, "no row of the table maps a Zw name"
+    legend = {e["attrs"]["data-legend"]: e for e in _Elements(r["legend"]).elements if "data-legend" in e["attrs"]}
+    assert "Zw" in legend["edge-curated"]["attrs"]["title"] and "naming convention" in legend["edge-curated"]["attrs"]["title"]
+
+
 # --- What the view says besides the drawing ------------------------------------------------------------------------
 
 @needs_node
