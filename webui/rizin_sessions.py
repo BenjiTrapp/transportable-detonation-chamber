@@ -284,8 +284,8 @@ _READ_ONLY_COMMANDS = frozenset(("wc", "wcj", "ar", "arj", "ar*", "ar=", "arr", 
 # While an analysis step holds rizin, a patch or a breakpoint goes through (it changes no bytes the step
 # reads) but its project cannot be written yet, and the project is the only place it outlives the
 # session. Said for as long as that is so (RizinSession.analysis), because closing the tab then loses it.
-_WAITING_NOTE = ("A patch or breakpoint is waiting to be saved; the project is written when the analysis "
-                 "has finished.")
+_WAITING_NOTE = ("A patch, a breakpoint or the timeline of the emulation is waiting to be saved; the project is "
+                 "written when the analysis has finished.")
 _FULL_NOTE = "Full analysis runs aaa's steps one by one; variables are analysed less than with aaa."
 # How long close() waits for the pipe to write a pending save: longer than the longest command.
 _FLUSH_WAIT = max(CONSOLE_TIMEOUT, DECOMPILE_TIMEOUT) + 5

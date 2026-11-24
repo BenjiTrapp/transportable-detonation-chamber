@@ -75,6 +75,11 @@ Regressions covered:
   * a long function whose disassembly stops after the first page, a page
     asked for twice, a late page for a place left
   * a session left running when its page goes
+  * a patch the project holds over a run's bytes drawn among the cache's, or taken out of the cache by a ✕ that asks for
+    the cache's take-back; "Apply now" drawn where no run's bytes lie under the patch, or the pane deciding what the
+    server answers; the restore button enabled or disabled by the timeline's reason instead of the offer's `refused`,
+    enabled by an offer that does not say, or left over a newer answer; a restore that says it restored what it did
+    not, counts from a block that is not there, or leaves the pane's own notice up after the session is gone
 """
 
 import json
@@ -144,6 +149,9 @@ RIZIN_FUNCTIONS = [
     "rizinLoadEmuPane", "rizinEmuPaneSay", "rizinOnEmuPaneClick", "rizinOnEmuPaneChange", "rizinSetRegister",
     "rizinUnpatch", "rizinUnbreak", "rizinReanalyze", "rizinExportPatched", "rizinEmuEmpty", "rizinEmuHandSignature",
     "rizinEmuPatchesHeadHtml",
+    # The waiting patches and the restore button (Task 6): the third group, its two ways out, the offer and the notice
+    "rizinEmuRunCovers", "rizinEmuWaitingHtml", "rizinEmuOffer", "rizinEmuRestoreHtml", "rizinEmuRestoreWords",
+    "rizinEmuTakeLists", "rizinRestoreRun", "rizinApplyWaiting", "rizinDropWaiting",
     # The hand-off of the exported copy to the Submit tab (Task 13)
     "rizinDetonatePatched",
     # The gutter and the patch menu (Task 12): the marks DISASSEMBLY draws and the lists they come from, a click in the
@@ -1149,9 +1157,23 @@ function serve(sid, s) {
     // rows. Hooks patchesAnswer, breakpointsAnswer, unpatch, unbreak, setRegister, exportCopy and reanalyze answer instead; the
     // delays listDelay and actDelay.
     const rows = list => (list || []).map(row => ({ ...row }));
+    // Task 6: what /patches answers (and the waiting variants of POST and DELETE patch, and POST restore's `patches`):
+    // the rows, what waits (s.waiting [{addr, after, reason}], integers as the route answers them) and the offer of the
+    // restore button (s.restore {actions, reason, digests, refused}; left out where a test does not set one). The hooks
+    // applyWaiting, dropWaiting and restoreRun answer instead.
+    const patchesOf = () => ({ patches: rows(s.patches), waiting: rows(s.waiting), ...(s.restore !== undefined ? { restore: s.restore } : {}) });
+    const covers = w => (s.patches || []).some(p => !p.mine && p.addr < w.addr + w.after.length / 2 && w.addr < p.addr + p.size);
     on('GET', `/api/rizin/${sid}/patches`, url => {
         if (s.ended) return ENDED;
-        return (s.patchesAnswer && s.patchesAnswer(s)) || [200, { patches: rows(s.patches), waiting: s.waiting || [] }, s.listDelay ?? 1];
+        return (s.patchesAnswer && s.patchesAnswer(s)) || [200, patchesOf(), s.listDelay ?? 1];
+    });
+    on('POST', `/api/rizin/${sid}/restore`, () => {
+        if (s.ended) return ENDED;
+        const scripted = s.restoreRun && s.restoreRun(s);
+        if (scripted) return scripted;
+        if (s.restore && typeof s.restore.refused === 'string') return [400, { refused: s.restore.refused }];
+        s.emu = { pc: 0x1400014bc, rax: 0, rbx: 0, rcx: 0, changed: [] };
+        return [200, { restored: true, reason: null, state: emuRead(s.emu), applied: [], patches: patchesOf() }, s.actDelay ?? 1];
     });
     on('GET', `/api/rizin/${sid}/breakpoints`, url => {
         if (s.ended) return ENDED;
@@ -1159,6 +1181,14 @@ function serve(sid, s) {
     });
     on('DELETE', `/api/rizin/${sid}/patch`, (url, body) => {
         if (s.ended) return ENDED;
+        if (body && body.waiting === true) {
+            const dropped = s.dropWaiting && s.dropWaiting(body, s);
+            if (dropped) return dropped;
+            const at = parseInt(body.addr, 16);
+            if (!(s.waiting || []).some(w => w.addr === at)) return [400, { refused: `no patch waits at ${body.addr}` }];
+            s.waiting = s.waiting.filter(w => w.addr !== at);
+            return [200, patchesOf(), s.actDelay ?? 1];
+        }
         const scripted = s.unpatch && s.unpatch(body, s);
         if (scripted) return scripted;
         const at = body && body.addr !== undefined ? parseInt(body.addr, 16) : null;
@@ -1213,6 +1243,19 @@ function serve(sid, s) {
         const scripted = s.patchAnswer && s.patchAnswer(body, s);
         if (scripted) return scripted;
         const at = parseInt(body.addr, 16);
+        if (body.waiting === true) {
+            const applied = s.applyWaiting && s.applyWaiting(body, s);
+            if (applied) return applied;
+            const mine = (s.waiting || []).filter(w => w.addr === at);
+            if (!mine.length) return [400, { refused: `no patch waits at ${body.addr}` }];
+            if (!mine.every(covers)) return [400, { refused: `no run's bytes lie under ${body.addr}: run the decryption first, or take the patch out` }];
+            for (const w of mine) {
+                s.patches = [...(s.patches || []), { addr: w.addr, size: w.after.length / 2, before: '00'.repeat(w.after.length / 2), after: w.after, mine: true }]
+                    .sort((a, b) => a.addr - b.addr);
+            }
+            s.waiting = s.waiting.filter(w => !mine.includes(w));
+            return [200, patchesOf(), s.actDelay ?? 1];
+        }
         let size, after;
         if (body.kind !== undefined) {
             if ((s.arch ?? 'x86') !== 'x86') return [400, { refused: `the patch kinds write x86 bytes, and this file is ${s.arch}: write the bytes by hand` }];
@@ -6480,7 +6523,7 @@ def test_rizin_emulation_pane_escapes_hostile_names():
     assert r["tags"] == [], "a name of the file became an element: " + str(r["tags"])
     assert r["on"] == [], "an event handler attribute in the pane: " + str(r["on"])
     assert r["attrNames"] == ["aria-hidden", "aria-label", "autocomplete", "class", "data-addr", "data-rizin-act", "data-rizin-group",
-                              "data-rizin-reg", "data-rizin-section", "role", "spellcheck", "title", "type", "value"], \
+                              "data-rizin-reg", "data-rizin-section", "disabled", "role", "spellcheck", "title", "type", "value"], \
         "a name of the file added an attribute: " + str(r["attrNames"])
     assert r["shown"] == {"hostile": True, "quote": True}, "the names are not shown, as text"
     assert r["where"] == {"stack": [True, True], "patch": True, "bp": True, "reg": 2, "note": True, "exported": True}, r["where"]
@@ -7097,7 +7140,8 @@ def test_rizin_emulation_pane_keeps_what_is_typed_and_where_it_is_scrolled():
 EMU_PANE_THEMED = [".rizin-emu-pane", ".rizin-emu-head", ".rizin-emu-reg", ".rizin-emu-reg.changed", ".rizin-emu-delta",
                    ".rizin-emu-reg-name", ".rizin-emu-reg-input", ".rizin-emu-fn", ".rizin-emu-hint", ".rizin-emu-bytes",
                    ".rizin-emu-group", ".rizin-emu-hand", ".rizin-emu-run", ".rizin-emu-subhead", ".rizin-emu-fate",
-                   ".rizin-emu-warn", ".rizin-emu-note", ".rizin-emu-note-error", ".rizin-emu-urgent", ".rizin-emu-export"]
+                   ".rizin-emu-warn", ".rizin-emu-note", ".rizin-emu-note-error", ".rizin-emu-urgent", ".rizin-emu-export",
+                   ".rizin-emu-waiting", ".rizin-emu-waiting .rizin-emu-fate"]
 
 
 def test_rizin_emulation_pane_styles_and_markup():
@@ -7139,9 +7183,699 @@ def test_rizin_emulation_pane_styles_and_markup():
     name = classic.get(".rizin-emu-reg-name", "")
     assert _declared(name, "text-overflow") == "ellipsis" and _declared(name, "overflow") == "hidden", "a long register name spills over its field"
     assert _declared(classic.get(".rizin-emu-head-row"), "display") == "flex", "the head of PATCHES holds a button"
+    # What waits (Task 6): a third edge, dotted against the hand-made group's solid and the run's dashed, so that the
+    # colour does not carry it alone; its reason under the row takes the whole width and wraps (the row cuts long text);
+    # and the colour in the layout sheet, which both themes read (the boot script always sets data-theme)
+    assert "dotted" in (_declared(classic.get(".rizin-emu-waiting"), "border-left") or "")
+    assert _declared(classic.get(".rizin-emu-wait .rizin-emu-wait-why"), "grid-column") == "1 / -1"
+    assert _declared(classic.get(".rizin-emu-wait .rizin-emu-wait-why"), "white-space") == "normal"
+    assert _declared(classic.get(".rizin-emu-wait"), "grid-template-columns") == "19ch minmax(0, 1fr) minmax(0, 1.3fr) auto 3.2ch", \
+        "a row of the waiting group has five cells: address, name, bytes, Apply now, ✕"
+    layout = _rules(LAYOUT_CSS)
+    assert _declared(layout.get("[data-theme] .rizin-emu-waiting"), "border-left-color") == "var(--cp-amber)", \
+        "the waiting group's edge has no colour in the sheet both themes read"
+    assert _declared(layout.get("[data-theme] .rizin-emu-waiting .rizin-emu-fate"), "color") == "var(--cp-amber)"
+    assert _declared(classic.get(".rizin-emu-waiting"), "border-left").endswith("var(--accent-yellow)")
     html = _read(INDEX_HTML)
     assert "style.css?v=82" not in html and 'theme-layout.css?v=6"' not in html and "app.js?v=121" not in html, \
         "asset versions not raised for the EMULATION pane"
+    assert "style.css?v=89" not in html and 'theme-layout.css?v=12"' not in html and "app.js?v=132" not in html, \
+        "asset versions not raised for the waiting patches and the restore button"
+
+
+# --- Task 6: the waiting patches, the restore button and its notice ----------------------------------------------
+#
+# What /patches lists as waiting is a group of its own between what was set by hand and what a run wrote, with two ways
+# out (✕ always; Apply now where a run's bytes lie under it), and the restore button reads the offer that the same answer
+# carries: `refused` (null: it would run; else the sentence it would be refused with) is the button's and nothing else is,
+# `reason` (why the timeline is not kept) is the notice's. The fake answers as the server does: the same `restore` block
+# rides GET /patches, the waiting variants of POST and DELETE /patch and POST /restore's `patches`, which is null where
+# rizin would not list the cache.
+
+WAITING_SETUP = EMU_PANE_SETUP + r"""
+    const REASON = 'set over bytes an emulation run wrote; held back, because written into the file\'s own bytes it would be decrypted over by the next run';
+    const OFFER = (over = {}) => ({ actions: 4, reason: null, digests: 2, refused: null, ...over });
+    const rows = list => (list || []).map(row => ({ ...row }));
+    const wait = at => pane.querySelector(`.rizin-emu-wait[data-addr="${at}"]`);
+    const waitRows = () => addrs(pane, '.rizin-emu-wait');
+    const btn = name => pane.querySelector(`[data-rizin-act="${name}"]`);
+    const order = () => pane.querySelectorAll('[data-rizin-group]').map(e => attr(e, 'data-rizin-group'));
+    // The state of a pane that has no emulation running, with the lists the tests set
+    const listed = async () => { S.patches = PATCHES(); S.breakpoints = BREAKPOINTS(); await showPane(); };
+"""
+
+
+@needs_node
+def test_rizin_waiting_patches_are_a_group_of_their_own_with_two_ways_out():
+    # The patches the project holds but the cache does not are one group, WAITING, between the ones set by hand and the
+    # ones a run wrote, each row with its own reason and ✕. They are no row of the cache: not among the patches, not in
+    # the count of "Clear rizin's whole cache". ✕ sends DELETE patch with waiting:true and the address -- never the address
+    # alone, which would take a write out of the cache, and never nothing, which would clear it all -- and the answer
+    # carries the lists, so nothing is asked for again. No waiting patch: no group. A name or a reason of the file is
+    # text; an address a double cannot hold has no button that could send it wrong.
+    r = _scripted(WAITING_SETUP + r"""
+        S.waiting = [{ addr: 0x140009000, after: '9090', reason: REASON + ' No map holds this address now.' },
+                     { addr: 0x140001521, after: '90', reason: REASON }];
+        S.restore = OFFER({ refused: 'the project holds no timeline of the emulation to restore' });
+        await listed();
+        r.order = order();
+        const head = text(group('waiting').querySelector('.rizin-emu-subhead'));
+        r.head = head;
+        r.rows = pane.querySelectorAll('.rizin-emu-wait').map(e => ({
+            addr: attr(e, 'data-addr'), fn: text(e.querySelector('.rizin-emu-fn')), bytes: text(e.querySelector('.rizin-emu-bytes')),
+            why: text(e.querySelector('.rizin-emu-wait-why')), acts: acts(e), title: attr(e, 'title') }));
+        r.warn = text(group('waiting').querySelector('.rizin-emu-warn'));
+        r.apart = { hand: addrs(group('hand'), '.rizin-emu-patch'), run: addrs(group('run'), '.rizin-emu-patch'),
+                    inGroups: group('waiting').querySelectorAll('.rizin-emu-patch').length, patches: pane.querySelectorAll('.rizin-emu-patch').length,
+                    handHead: text(group('hand').querySelector('.rizin-emu-subhead')) };
+        r.exportOn = !btn('export').hasAttribute('disabled');
+
+        // ✕: one request, the right body, the answer is the list
+        S.actDelay = 20;
+        let f = calls.length;
+        click(wait('0x140009000').querySelector('[data-rizin-act="drop-waiting"]'));
+        await until(() => rizinState.emuPane.busy, 'the request waits');
+        r.during = { busy: rizinState.emuPane.busy, off: pane.querySelectorAll('[data-rizin-act="drop-waiting"]').map(b => b.hasAttribute('disabled')) };
+        await until(() => !wait('0x140009000'), 'the row goes'); await quiet();
+        S.actDelay = undefined;
+        r.dropped = { deletes: calls.slice(f).filter(c => c[0] === 'DELETE').map(c => [c[1].replace('/api/rizin/S1', ''), c[2]]),
+                      lists: gets(f, '/patches').length, rows: waitRows(), said: note(), busy: rizinState.emuPane.busy,
+                      cache: addrs(pane, '.rizin-emu-patch').length };
+        // the last one: the group goes
+        f = calls.length;
+        click(wait('0x140001521').querySelector('[data-rizin-act="drop-waiting"]'));
+        await until(() => !wait('0x140001521'), 'the last row goes'); await quiet();
+        r.none = { order: order(), deletes: calls.slice(f).filter(c => c[0] === 'DELETE').map(c => c[2]), group: !!group('waiting') };
+        // a waiting patch is no write of the cache: with nothing in the cache the button that clears it stays off
+        S.waiting = [{ addr: 0x140009000, after: '90', reason: REASON }]; S.patches = [];
+        await rizinLoadEmuPane(true);
+        r.emptyCache = { off: btn('unpatch-all').hasAttribute('disabled'), rows: waitRows(), order: order() };
+        // the server refuses (nothing waits there any more): its words are said, and the list is read again
+        f = calls.length;
+        S.dropWaiting = (body, s) => { s.waiting = []; return [400, { refused: 'no patch waits at 0x140009000' }]; };
+        click(wait('0x140009000').querySelector('[data-rizin-act="drop-waiting"]')); await quiet();
+        S.dropWaiting = undefined;
+        r.refused = { said: note(), kind: attr(pane.querySelector('.rizin-emu-notice'), 'class'), lists: gets(f, '/patches').length, rows: waitRows() };
+        // rizin is busy: said, the row stays, the poll will look again; and one request at a time
+        S.waiting = [{ addr: 0x140009000, after: '90', reason: REASON }];
+        await rizinLoadEmuPane(true);
+        f = calls.length;
+        let polls = S.statusCalls;
+        S.dropWaiting = () => [409, { busy: true, step: 'console' }];
+        click(wait('0x140009000').querySelector('[data-rizin-act="drop-waiting"]')); await quiet();
+        S.dropWaiting = undefined;
+        r.busy = { said: note(), rows: waitRows(), busy: rizinState.emuPane.busy, polled: S.statusCalls > polls };
+        f = calls.length;
+        S.actDelay = 30;
+        const first = rizinDropWaiting('0x140009000');
+        const second = await rizinDropWaiting('0x140009000');
+        await first; await quiet();
+        S.actDelay = undefined;
+        r.once = { second, deletes: calls.slice(f).filter(c => c[0] === 'DELETE').length };
+        S.waiting = [{ addr: 0x140009000, after: '90', reason: REASON }];
+        await rizinLoadEmuPane(true);
+        // text of the file, an address of no exact form, and many rows
+        const HOSTILE = '<img src=x onerror=alert(1)>';
+        S.waiting = [{ addr: 0x140009000, after: HOSTILE, reason: HOSTILE }, { addr: 2 ** 60, after: '90', reason: 'far away' }];
+        await rizinLoadEmuPane(true);
+        const far = pane.querySelectorAll('.rizin-emu-wait').filter(e => !attr(e, 'data-addr'))[0];
+        r.hostile = { tags: pane.querySelectorAll('*').map(e => e.tagName).filter(t => t === 'IMG'), shown: text(pane).includes(HOSTILE),
+                      bytes: text(pane.querySelector('.rizin-emu-wait .rizin-emu-bytes')).includes(HOSTILE),
+                      far: far ? { text: text(far.querySelector('.rz-addr')), acts: acts(far), none: attr(far, 'class').includes('rizin-row-none') } : null };
+        const many = RIZIN_EMU_PANE.rows + 7;
+        S.waiting = Array.from({ length: many }, (_, i) => ({ addr: 0x140010000 + i, after: '90', reason: REASON }));
+        await rizinLoadEmuPane(true);
+        r.many = { rows: waitRows().length, cap: RIZIN_EMU_PANE.rows, more: text(group('waiting').querySelector('.rizin-emu-empty')),
+                   head: text(group('waiting').querySelector('.rizin-emu-subhead')) };
+        // another file is opened while a ✕ is out: its answer is of a file that is gone
+        S.waiting = [{ addr: 0x140009000, after: '90', reason: REASON }];
+        S.patches = PATCHES();
+        await rizinLoadEmuPane(true);
+        S.actDelay = 90;
+        const lateDrop = rizinDropWaiting('0x140009000');
+        await until(() => rizinState.emuPane.busy === 'drop-waiting', 'the request waits');
+        const U = { analysis: 'done', done: ['aaa'] };
+        serve('S3', U);
+        opens['C:\\x\\g.exe'] = U;
+        await openInRizin('C:\\x\\g.exe');
+        await until(() => rizinState.landed && rizinState.session === 'S3', 'the other file');
+        rizinState.emuPane.busy = 'export';
+        await lateDrop; await tick(20);
+        S.actDelay = undefined;
+        r.lateDrop = { marks: JSON.stringify(rizinState.marks.patched), said: note(), busy: rizinState.emuPane.busy };
+        rizinState.emuPane.busy = ''; await quiet();
+        // another file (a new session): what waits in this one, and its offer, are gone with it
+        Object.assign(rizinState.emuPane, { waiting: [{ addr: 0x140009000, after: '90', reason: REASON }], restore: OFFER() });
+        rizinReset({ session: 'S3', file: null, analysis: null });
+        r.reset = { waiting: rizinState.emuPane.waiting, restore: rizinState.emuPane.restore, rows: waitRows().length };
+    """)
+    assert "error" not in r, r.get("error")
+    assert r["order"] == ["hand", "waiting", "run"], "the three groups, or in another order: " + str(r["order"])
+    assert r["head"].startswith("WAITING · 2") and "not applied" in r["head"] and "kept with the project" in r["head"], r["head"]
+    assert sorted(row["addr"] for row in r["rows"]) == ["0x140001521", "0x140009000"]
+    by = {row["addr"]: row for row in r["rows"]}
+    assert "No map holds this address now" in by["0x140009000"]["why"] and "No map holds" not in by["0x140001521"]["why"], \
+        "each row says its own reason: " + str(by)
+    assert by["0x140001521"]["why"].startswith("set over bytes an emulation run wrote") and by["0x140001521"]["bytes"] == "1 B · 90", by["0x140001521"]
+    assert by["0x140009000"]["bytes"] == "2 B · 9090" and by["0x140001521"]["fn"] == "sym.main" and by["0x140009000"]["fn"] == "—", by
+    assert "waiting: set over bytes an emulation run wrote" in by["0x140001521"]["title"] and "0x140001521 · 1 byte · sym.main" in by["0x140001521"]["title"], by["0x140001521"]
+    assert "not in rizin's cache" in r["warn"] and "decrypt" in r["warn"], r["warn"]
+    assert r["apart"] == {"hand": ["0x1400014c0", "0x1400014d0"], "run": ["0x140001521", "0x140001522"], "inGroups": 0, "patches": 4,
+                          "handHead": "SET BY HAND · 2kept with the projectExport"}, r["apart"]
+    assert r["exportOn"] is True
+    assert r["during"] == {"busy": "drop-waiting", "off": [True, True]}, "a request out leaves the buttons on: " + str(r["during"])
+    assert r["dropped"]["deletes"] == [["/patch", {"addr": "0x140009000", "waiting": True}]], \
+        "✕ on a waiting patch did not ask for the waiting patch to go: " + str(r["dropped"]["deletes"])
+    assert r["dropped"]["lists"] == 0, "the answer carried the lists, and they were asked for again"
+    assert r["dropped"]["rows"] == ["0x140001521"] and r["dropped"]["cache"] == 4 and r["dropped"]["busy"] == "", r["dropped"]
+    assert "0x140009000" in r["dropped"]["said"] and "project" in r["dropped"]["said"] and "Removed" in r["dropped"]["said"], r["dropped"]["said"]
+    assert r["none"] == {"order": ["hand", "run"], "deletes": [{"addr": "0x140001521", "waiting": True}], "group": False}, r["none"]
+    assert r["emptyCache"] == {"off": True, "rows": ["0x140009000"], "order": ["hand", "waiting", "run"]}, r["emptyCache"]
+    assert "no patch waits at 0x140009000" in r["refused"]["said"] and "rizin-emu-note-error" in r["refused"]["kind"], r["refused"]
+    assert r["refused"]["lists"] == 1 and r["refused"]["rows"] == [], \
+        "a refusal that says nothing waits there left the row, or did not read the list again: " + str(r["refused"])
+    assert "busy" in r["busy"]["said"] and "console" in r["busy"]["said"] and r["busy"]["rows"] == ["0x140009000"] and r["busy"]["busy"] == "", r["busy"]
+    assert r["busy"]["polled"] is True, "rizin was busy and nothing asks again once it is free"
+
+    assert r["once"] == {"second": False, "deletes": 1}, "a second ✕ while one is out went out: " + str(r["once"])
+    assert r["hostile"]["tags"] == [] and r["hostile"]["shown"] is True, r["hostile"]
+    assert r["hostile"]["bytes"] is True, "the bytes of a waiting patch are text of the file as well: " + str(r["hostile"])
+    assert r["hostile"]["far"] == {"text": "?", "acts": [], "none": True}, "an address of no exact form carries a button: " + str(r["hostile"])
+    assert r["lateDrop"] == {"marks": "[]", "said": "", "busy": "export"}, \
+        "the answer of a file that was closed marked the one open now, or said something there: " + str(r["lateDrop"])
+    assert r["reset"] == {"waiting": None, "restore": None, "rows": 0}, "the other file shows what waited in this one: " + str(r["reset"])
+    assert r["many"]["rows"] == r["many"]["cap"] and "+7 more" in r["many"]["more"] and "WAITING · %d" % (RIZIN_EMU_PANE_ROWS + 7) in r["many"]["head"], r["many"]
+
+
+RIZIN_EMU_PANE_ROWS = 100
+
+
+@needs_node
+def test_rizin_apply_now_appears_only_when_a_runs_bytes_cover_the_address():
+    # "Apply now" is on a waiting row only while a row of the cache that is not the user's own -- a run's -- overlaps one
+    # of its bytes; the edges count (a run's row that ends where the patch starts, or starts where it ends, covers
+    # nothing), a patch of the user's own is no run, and a run's row taken back takes the button with it. The press is the
+    # server's to decide: the request goes out as {addr, waiting:true} whatever the pane drew, and a refusal, a busy rizin
+    # or a patch that nothing waits for any more is said in the server's words and changes nothing; an answer is the
+    # lists, which the pane takes without asking again.
+    r = _scripted(WAITING_SETUP + r"""
+        const W = (addr, after) => ({ addr, after, reason: REASON });
+        S.waiting = [W(0x140001521, '90'), W(0x140009000, '9090'), W(0x1400014c0, '90'), W(0x14000151f, '9090'),
+                     W(0x140001526, '90'), W(0x140001525, '90'), W(0x140001520, '9090'), W(0x140001523, '')];
+        S.restore = OFFER();
+        await listed();
+        const apply = () => pane.querySelectorAll('.rizin-emu-wait').filter(e => e.querySelector('[data-rizin-act="apply-waiting"]'))
+            .map(e => attr(e, 'data-addr')).sort();
+        r.offered = apply();     // 0x140001523 holds no bytes, and lies inside a run's row: no button for a patch of nothing
+        r.label = text(wait('0x140001521').querySelector('[data-rizin-act="apply-waiting"]'));
+        r.drop = pane.querySelectorAll('.rizin-emu-wait').map(e => !!e.querySelector('[data-rizin-act="drop-waiting"]')).every(Boolean);
+
+        // the run's row goes (Clear rizin's whole cache): no button is left; a run writes there again: they are back
+        S.patches = PATCHES().filter(p => p.mine);
+        await rizinLoadEmuPane(true);
+        r.noRun = apply();
+        S.patches = PATCHES();
+        await rizinLoadEmuPane(true, 'patches');
+        r.again = apply();
+
+        // the press: one request, whatever else was drawn; the answer is the lists
+        let f = calls.length;
+        S.actDelay = 20;
+        click(wait('0x140001521').querySelector('[data-rizin-act="apply-waiting"]'));
+        await until(() => rizinState.emuPane.busy, 'the request waits');
+        r.during = { busy: rizinState.emuPane.busy, said: note(), off: pane.querySelectorAll('[data-rizin-act="apply-waiting"]').map(b => b.hasAttribute('disabled')) };
+        await until(() => !wait('0x140001521'), 'the row goes'); await quiet();
+        S.actDelay = undefined;
+        r.applied = { posts: posts(f, '/patch').map(c => c[2]), lists: gets(f, '/patches').length, said: note(), busy: rizinState.emuPane.busy,
+                      views: gets(f, '/disasm').length,
+                      hand: addrs(group('hand'), '.rizin-emu-patch'), waiting: waitRows(), marks: rizinState.marks.patched.map(p => p[0]) };
+
+        // the server refuses a row that was drawn with the button: nothing changes in the pane but the words, and the
+        // list is read again (what it showed was out of date)
+        f = calls.length;
+        S.applyWaiting = () => [400, { refused: "no run's bytes lie under 0x140001525: run the decryption first, or take the patch out" }];
+        click(wait('0x140001525').querySelector('[data-rizin-act="apply-waiting"]')); await quiet();
+        S.applyWaiting = undefined;
+        r.refused = { said: note(), kind: attr(pane.querySelector('.rizin-emu-notice'), 'class'), waiting: waitRows(),
+                      hand: addrs(group('hand'), '.rizin-emu-patch'), posts: posts(f, '/patch').length, lists: gets(f, '/patches').length };
+        // an answer with the rows and without the offer or what waits is not taken for what it does not say: the lists are read again
+        r.partial = [];
+        for (const shape of ['rows', 'rows and waiting', 'rows and offer']) {
+            S.waiting.push(W(0x140001525, '90'));
+            await rizinLoadEmuPane(true);
+            f = calls.length;
+            S.applyWaiting = (body, s) => {
+                s.patches = [...s.patches, { addr: 0x140001525, size: 1, before: '00', after: '90', mine: true }].sort((a, b) => a.addr - b.addr);
+                s.waiting = s.waiting.filter(w => w.addr !== 0x140001525);
+                return [200, { patches: rows(s.patches), ...(shape === 'rows and waiting' ? { waiting: rows(s.waiting) } : {}),
+                               ...(shape === 'rows and offer' ? { restore: OFFER() } : {}) }];
+            };
+            await rizinApplyWaiting('0x140001525'); await quiet();
+            S.applyWaiting = undefined;
+            r.partial.push([shape, gets(f, '/patches').length, waitRows().includes('0x140001525'), pane.querySelector('[data-rizin-act="restore"]').hasAttribute('disabled')]);
+            S.patches = S.patches.filter(p => p.addr !== 0x140001525);
+        }
+        // any other failure (no refusal: the server broke) is said and nothing is read again
+        f = calls.length;
+        S.applyWaiting = () => [500, { error: 'rizin answered something unexpected' }];
+        await rizinApplyWaiting('0x140001520'); await quiet();
+        S.applyWaiting = undefined;
+        r.broke = { said: note(), lists: gets(f, '/patches').length };
+        // a call for a row that was drawn without the button is the same request: the pane does not decide
+        f = calls.length;
+        const direct = await rizinApplyWaiting('0x140009000'); await quiet();
+        r.direct = { ok: direct, posts: posts(f, '/patch').map(c => c[2]), said: note(), waiting: waitRows() };
+        // rizin is busy: said, nothing changes, the poll will look again
+        S.applyWaiting = () => [409, { busy: true, step: 'console' }];
+        const polls = S.statusCalls;
+        const before = waitRows();
+        click(wait('0x140001520').querySelector('[data-rizin-act="apply-waiting"]')); await quiet();
+        S.applyWaiting = undefined;
+        r.busy = { said: note(), waiting: waitRows().length === before.length, busy: rizinState.emuPane.busy, polled: S.statusCalls > polls };
+        // no address, or one of no form: no request
+        f = calls.length;
+        r.bad = [await rizinApplyWaiting('banana'), await rizinApplyWaiting(null), await rizinApplyWaiting('')];
+        r.badPosts = posts(f, '/patch').length;
+        // one at a time
+        f = calls.length;
+        S.actDelay = 30;
+        const first = rizinApplyWaiting('0x140001520');
+        const second = await rizinApplyWaiting('0x140001520');
+        await first; await quiet();
+        S.actDelay = undefined;
+        r.once = { second, posts: posts(f, '/patch').length };
+        // another file is opened while the request is out: its answer is of a file that is gone, and marks nothing in this one
+        S.actDelay = 90;
+        const late = rizinApplyWaiting('0x140001525');
+        await until(() => rizinState.emuPane.busy === 'apply-waiting', 'the request waits');
+        const T = { analysis: 'done', done: ['aaa'] };
+        serve('S2', T);
+        opens['C:\\x\\f.exe'] = T;
+        await openInRizin('C:\\x\\f.exe');
+        await until(() => rizinState.landed && rizinState.session === 'S2', 'the other file');
+        rizinState.emuPane.busy = 'export';
+        await late; await tick(20);
+        S.actDelay = undefined;
+        r.lateApply = { marks: JSON.stringify(rizinState.marks.patched), said: note(), busy: rizinState.emuPane.busy };
+        rizinState.emuPane.busy = ''; await quiet();
+    """)
+    assert "error" not in r, r.get("error")
+    assert r["offered"] == ["0x140001520", "0x140001521", "0x140001525"], \
+        "Apply now where no run's bytes lie under the patch, or not where they do: " + str(r["offered"])
+    assert r["label"] == "Apply now" and r["drop"] is True, r
+    assert r["noRun"] == [] and r["again"] == ["0x140001520", "0x140001521", "0x140001525"], (r["noRun"], r["again"])
+    assert r["during"]["busy"] == "apply-waiting" and all(r["during"]["off"]), r["during"]
+    assert r["applied"]["posts"] == [{"addr": "0x140001521", "waiting": True}], r["applied"]
+    assert r["applied"]["lists"] == 0, "the answer carried the lists, and they were asked for again"
+    assert r["applied"]["views"] >= 1, "the bytes under the patch changed and DISASSEMBLY was not asked for again"
+    assert r["applied"]["hand"] == ["0x1400014c0", "0x1400014d0", "0x140001521"] and "0x140001521" not in r["applied"]["waiting"], r["applied"]
+    assert 0x140001521 in r["applied"]["marks"], "DISASSEMBLY's marks did not take the patch"
+    assert "0x140001521" in r["applied"]["said"] and "Applied" in r["applied"]["said"] and r["applied"]["busy"] == "", r["applied"]
+    assert "run the decryption first" in r["refused"]["said"] and "rizin-emu-note-error" in r["refused"]["kind"], r["refused"]
+    assert "0x140001525" in r["refused"]["waiting"] and r["refused"]["posts"] == 1 and r["refused"]["lists"] == 1, r["refused"]
+    assert r["refused"]["hand"] == ["0x1400014c0", "0x1400014d0", "0x140001521"], "a refused patch landed in the pane: " + str(r["refused"])
+    assert r["direct"]["posts"] == [{"addr": "0x140009000", "waiting": True}] and r["direct"]["ok"] is False \
+        and "run the decryption first" in r["direct"]["said"], "the pane decided a patch may not be applied: " + str(r["direct"])
+    assert "busy" in r["busy"]["said"] and "console" in r["busy"]["said"] and r["busy"]["waiting"] is True and r["busy"]["busy"] == "" \
+        and r["busy"]["polled"] is True, r["busy"]
+    assert r["partial"] == [["rows", 1, False, False], ["rows and waiting", 1, False, False], ["rows and offer", 1, False, False]], \
+        "an answer that has the rows and not both the offer and what waits was taken for one that has them: " + str(r["partial"])
+    assert r["broke"]["said"] == "Not applied: rizin answered something unexpected" and r["broke"]["lists"] == 0, r["broke"]
+    assert r["bad"] == [False, False, False] and r["badPosts"] == 0, r
+    assert r["once"] == {"second": False, "posts": 1}, "a second press while one is out went out: " + str(r["once"])
+    assert r["lateApply"] == {"marks": "[]", "said": "", "busy": "export"}, \
+        "the answer of a file that was closed marked the one open now, or said something there: " + str(r["lateApply"])
+
+
+@needs_node
+def test_rizin_the_restore_button_says_why_it_is_not_offered():
+    # The button is on exactly where the offer's `refused` is null, and off with that sentence as its title everywhere
+    # else: a block that does not say (missing, no `refused`, an empty one, a value that is no sentence) is off. `reason`
+    # -- why the timeline is not kept -- does not decide it in either direction: it is the notice, shown whenever it is
+    # there. A request or an action of the pane out turns it off. The offer is read again after what changes it: starting
+    # or stopping the emulation, a register, a breakpoint, a patch that came without one. A press is one request, with no body.
+    r = _scripted(WAITING_SETUP + r"""
+        const HAND = 'a register was set by hand, which the timeline does not record';
+        const NONE = 'the project holds no timeline of the emulation to restore';
+        const state = () => { const b = btn('restore'); const n = pane.querySelector('.rizin-emu-restore-note');
+                              return { off: b.hasAttribute('disabled'), title: attr(b, 'title'), label: text(b), note: n ? text(n) : null }; };
+        const offer = async block => { S.restore = block; await rizinLoadEmuPane(true); return state(); };
+        await listed();
+        r.where = [pane.querySelectorAll('[data-rizin-act="restore"]').length, pane.querySelector('[data-rizin-act="restore"]').closest('.rizin-emu-col') !== null,
+                   !!pane.querySelector('[data-rizin-act="restore"]').closest('[data-rizin-section]')];
+        rizinState.analysis = { ...rizinState.analysis, note: 'Restored from the saved project.' }; rizinRenderEmuPane();
+        r.first = pane.querySelectorAll('.rizin-emu-col')[1].children[0].querySelectorAll('[data-rizin-act="restore"]').length;
+        rizinState.analysis = { ...rizinState.analysis, note: null }; rizinRenderEmuPane();
+        r.absent = await offer(undefined);
+        r.on = await offer(OFFER({ actions: 12, digests: 3 }));
+        r.one = await offer(OFFER({ actions: 1, digests: 1 }));
+        r.none = await offer(OFFER({ actions: 0, digests: 0, refused: NONE }));
+        // reason is the notice and no more: it neither turns the button on nor off
+        r.reasonOn = await offer(OFFER({ reason: HAND }));
+        r.reasonOff = await offer(OFFER({ reason: HAND, refused: NONE }));
+        r.refusedOnly = await offer(OFFER({ refused: 'the emulation is running: stop it first' }));
+        r.blankReason = [await offer(OFFER({ reason: '   ' })), await offer(OFFER({ reason: '' })), await offer(OFFER({ reason: 5 }))];
+        // an offer that does not say is no offer
+        r.noRefused = await offer({ actions: 4, reason: null, digests: 2 });
+        r.emptyRefused = await offer(OFFER({ refused: '' }));
+        r.falseRefused = await offer(OFFER({ refused: false }));
+        r.zeroRefused = await offer(OFFER({ refused: 0 }));
+        r.nonObject = await offer('yes');
+        r.listBlock = await offer([]);
+        r.noCounts = await offer({ reason: null, refused: null });
+        // the file's text, and a quote that would leave the attribute
+        const HOSTILE = '<img src=x onerror=alert(1)>', QUOTE = 'x" onmouseover="alert(1)';
+        await offer(OFFER({ reason: HOSTILE, refused: QUOTE }));
+        const all = pane.querySelectorAll('*');
+        r.hostile = { tags: all.map(e => e.tagName).filter(t => t === 'IMG'), on: all.flatMap(e => Object.keys(e.attrs)).filter(k => k.startsWith('on')),
+                      title: attr(btn('restore'), 'title'), note: text(pane.querySelector('.rizin-emu-restore-note')) };
+        // the lists could not be read: no button for an offer that is not there
+        await offer(OFFER());
+        Object.assign(rizinState.emuPane, { problem: 'could not be read' }); rizinRenderEmuPane();
+        r.problem = pane.querySelectorAll('[data-rizin-act="restore"]').length;
+        Object.assign(rizinState.emuPane, { problem: '' }); rizinRenderEmuPane();
+        // an action out, or a run in flight: off whatever the offer says
+        await offer(OFFER());
+        rizinState.emuPane.busy = 'export'; rizinRenderEmuPane(); r.busy = state();
+        rizinState.emuPane.busy = ''; rizinState.emuWait = 'step'; rizinRenderEmuPane(); r.wait = state();
+        rizinState.emuWait = ''; rizinRenderEmuPane(); r.back = state();
+
+        // one press: a POST with no body, the button off while it is out, a second press goes nowhere
+        let f = calls.length;
+        S.actDelay = 30;
+        click(btn('restore'));
+        await until(() => rizinState.emuWait === 'restore', 'the request waits');
+        r.out = { state: state(), busy: rizinState.emuPane.busy, said: note(), again: await rizinRestoreRun(), start: $('rizin-emu-start').disabled };
+        await until(() => !rizinState.emuWait, 'the answer'); await quiet();
+        S.actDelay = undefined;
+        r.press = { posts: calls.slice(f).filter(c => c[0] === 'POST' && c[1].endsWith('/restore')).map(c => c[2] ?? null), busy: rizinState.emuPane.busy,
+                    emu: rizinState.emu && rizinState.emu.running, wait: rizinState.emuWait };
+        // the emulation the restore left runs: its strip, and the offer that was read again says so
+        r.afterPress = { strip: !strip.hidden, offer: rizinState.emuPane.restore, off: state().off };
+        click(act('stop')); await until(() => strip.hidden, 'stopped'); await quiet();
+
+        // the offer is read again after what changes it (the pane is shown)
+        S.restore = OFFER({ refused: null });
+        await rizinLoadEmuPane(true);
+        let g = calls.length;
+        S.emuStart = (body, s) => { s.restore = OFFER({ refused: 'the emulation is running: stop it first' }); return null; };
+        await startAt('0x1400014bc');
+        r.started = { lists: gets(g, '/patches').length, off: state().off, title: state().title };
+        g = calls.length;
+        S.setRegister = (body, s) => { s.restore = OFFER({ reason: HAND, refused: 'the emulation is running: stop it first' }); return null; };
+        await typeInto('rax', '0x5');
+        r.register = { lists: gets(g, '/patches').length, note: state().note };
+        S.setRegister = undefined;
+        g = calls.length;
+        S.emuStop = (s) => { s.restore = OFFER({ reason: HAND, refused: 'the write cache holds more or other than the patches the file was opened with' }); return null; };
+        click(act('stop')); await until(() => strip.hidden, 'stopped'); await quiet();
+        r.stopped = { lists: gets(g, '/patches').length, title: state().title, note: state().note };
+        g = calls.length;
+        S.restore = OFFER({ reason: null, refused: NONE });
+        click(pane.querySelector('.rizin-emu-bp [data-rizin-act="unbreak"]')); await quiet();
+        r.breakpoint = { lists: gets(g, '/patches').length, note: state().note, title: state().title };
+        // a patch of the menu: its answer has no offer, so the button waits for the one that is read again
+        g = calls.length;
+        S.restore = OFFER();
+        S.actDelay = 25;
+        const patching = rizinPatchBytes('0x1400014c4', '90');
+        await until(() => rizinState.emuPane.restore === null, 'an answer with no offer');
+        r.plain = { off: state().off, title: state().title };
+        await patching; await quiet();
+        S.actDelay = undefined;
+        r.plainAfter = { lists: gets(g, '/patches').length, off: state().off };
+        // the read of the marks while the pane is away carries the offer too: the pane shown afterwards has it, and asks for nothing
+        click(tab('console')); await quiet();
+        S.restore = OFFER({ refused: 'from the read of the marks' });
+        await rizinLoadMarks(true); await quiet();
+        g = calls.length;
+        click(tab('emulation')); await until(() => rizinState.views.dock === 'emulation', 'the pane'); await quiet();
+        r.marks = { lists: gets(g, '/patches').length, title: state().title };
+        // the offer after a late read does not win over a newer answer: the first list is slow, a take-back answers in between
+        S.restore = OFFER({ refused: null });
+        S.patchesAnswer = s => (S.slow ? null : (S.slow = true, [200, { patches: rows(s.patches), waiting: [], restore: OFFER({ refused: 'an old answer' }) }, 60]));
+        const late = rizinLoadEmuPane(true);
+        await until(() => flying('/api/rizin/S1/patches'), 'the list is out');
+        rizinSetLists({ patches: S.patches, waiting: [], restore: OFFER({ refused: 'the newer answer' }) });
+        await late; await quiet();
+        S.patchesAnswer = undefined;
+        r.late = state();
+    """)
+    assert "error" not in r, r.get("error")
+    assert r["where"] == [1, True, False], "one button, in the pane, in no section of the lists: " + str(r["where"])
+    assert r["first"] == 1, "the button is the head of the column that holds the lists"
+
+    assert r["absent"]["off"] is True and r["absent"]["title"] and "NaN" not in r["absent"]["title"], \
+        "a pane with no offer enabled the button, or said nothing: " + str(r["absent"])
+    assert r["on"]["off"] is False and r["on"]["label"] == "Restore the run" and r["on"]["note"] is None, r["on"]
+    assert "12 actions" in r["on"]["title"] and "3 ranges" in r["on"]["title"] and "SHA-256" in r["on"]["title"], r["on"]["title"]
+    assert "(1 action)" in r["one"]["title"] and "(1 range)" in r["one"]["title"], r["one"]["title"]
+    assert r["none"]["off"] is True and r["none"]["title"] == "the project holds no timeline of the emulation to restore", \
+        "the sentence of the refusal is not the title, word for word: " + str(r["none"])
+    assert r["reasonOn"]["off"] is False, "the timeline's reason switched the button off: " + str(r["reasonOn"])
+    assert r["reasonOn"]["note"] and "a register was set by hand, which the timeline does not record" in r["reasonOn"]["note"] \
+        and "not kept" in r["reasonOn"]["note"], r["reasonOn"]
+    assert r["reasonOff"]["off"] is True and r["reasonOff"]["title"] == "the project holds no timeline of the emulation to restore", \
+        "the reason took the title's place: " + str(r["reasonOff"])
+    assert r["reasonOff"]["note"] == r["reasonOn"]["note"]
+    assert r["refusedOnly"]["off"] is True and r["refusedOnly"]["note"] is None, "a refusal alone made a notice: " + str(r["refusedOnly"])
+    assert [(b["off"], b["note"]) for b in r["blankReason"]] == [(False, None)] * 3, "a reason with nothing in it made a notice: " + str(r["blankReason"])
+    assert r["noCounts"]["off"] is False and "(" not in r["noCounts"]["title"], \
+        "the counts are the title's decoration, and a block without them still says `refused`: " + str(r["noCounts"])
+    for name in ("noRefused", "emptyRefused", "falseRefused", "zeroRefused", "nonObject", "listBlock"):
+        assert r[name]["off"] is True, f"{name}: an offer that does not say whether the restore would run enabled the button: {r[name]}"
+        assert r[name]["title"] == r["absent"]["title"] or name == "emptyRefused", f"{name}: an offer that is none says what it says for no offer: {r[name]}"
+    assert r["hostile"]["tags"] == [] and r["hostile"]["on"] == [], "text of the server became markup: " + str(r["hostile"])
+    assert r["hostile"]["title"] == 'x" onmouseover="alert(1)' and "<img src=x onerror=alert(1)>" in r["hostile"]["note"], r["hostile"]
+    assert r["problem"] == 0, "a button where the lists could not be read and there is no offer"
+    assert r["busy"]["off"] is True and r["wait"]["off"] is True and r["back"]["off"] is False, (r["busy"], r["wait"], r["back"])
+    assert r["out"]["state"]["off"] is True and r["out"]["busy"] == "restore" and r["out"]["again"] is False and r["out"]["start"] is True, r["out"]
+    assert r["out"]["said"].startswith("Replaying the saved timeline"), "nothing said while the replay runs: " + str(r["out"])
+    assert r["press"]["posts"] == [None] and r["press"]["busy"] == "" and r["press"]["wait"] == "" and r["press"]["emu"] is True, r["press"]
+    assert r["afterPress"]["strip"] is True and r["afterPress"]["off"] is False, \
+        "the emulation the restore left is not shown, or the button looked at it (it reads `refused` and nothing else): " + str(r["afterPress"])
+    assert r["started"]["lists"] == 1 and r["started"]["off"] is True and "running" in r["started"]["title"], r["started"]
+    assert r["register"]["lists"] == 1 and "set by hand" in (r["register"]["note"] or ""), "a register by hand: the notice came late or never: " + str(r["register"])
+    assert r["stopped"]["lists"] == 1 and "more or other" in r["stopped"]["title"], r["stopped"]
+    assert r["breakpoint"]["lists"] == 1 and r["breakpoint"]["note"] is None and "no timeline" in r["breakpoint"]["title"], r["breakpoint"]
+    assert r["plain"]["off"] is True, "a patch's answer carries no offer, and the button kept the one from before: " + str(r["plain"])
+    assert r["plainAfter"] == {"lists": 1, "off": False}, r["plainAfter"]
+    assert r["marks"] == {"lists": 0, "title": "from the read of the marks"}, \
+        "the read of the marks left the offer behind, and the pane read the lists again for it: " + str(r["marks"])
+    assert r["late"]["title"] == "the newer answer" and r["late"]["off"] is True, \
+        "a list asked for before a newer answer put its offer over it: " + str(r["late"])
+
+
+@needs_node
+def test_rizin_the_notice_says_what_was_restored_and_what_was_not():
+    # The words of a restore, in the pane's notice: restored (the timeline replayed, the SHA-256 held, how many
+    # actions and ranges, which waiting patches were written and how many still wait); not restored (the reason the
+    # server gave, and that the waiting patches wait still); a request that was refused, busy or did not say. The
+    # answer's lists are taken whole -- patches, waiting and the offer -- where the answer has them, and where `patches`
+    # is null (rizin would not list the cache) the pane reads them again and the notice does not use a block that is not
+    # there. The emulation of a restore is the one the answer's state describes.
+    words = _run(r"""
+        const out = {};
+        const block = over => ({ actions: 5, reason: null, digests: 2, refused: 'the emulation is running: stop it first', ...over });
+        const held = n => Array.from({ length: n }, (_, i) => ({ addr: 0x140002000 + i, after: '90', reason: 'r' }));
+        const ok = over => ({ restored: true, reason: null, state: { running: true }, applied: [], patches: { patches: [], waiting: [], restore: block() }, ...over });
+        out.plain = rizinEmuRestoreWords(ok());
+        out.applied = rizinEmuRestoreWords(ok({ applied: [0x140002003, 0x140002005], patches: { patches: [], waiting: held(1), restore: block() } }));
+        out.one = rizinEmuRestoreWords(ok({ applied: [0x140002003], patches: { patches: [], waiting: held(2), restore: block({ actions: 1, digests: 1 }) } }));
+        out.many = rizinEmuRestoreWords(ok({ patches: { patches: [], waiting: held(3), restore: block() } }));
+        out.noList = rizinEmuRestoreWords(ok({ patches: null, applied: [0x140002003] }));
+        out.noBlock = rizinEmuRestoreWords(ok({ patches: { patches: [], waiting: [] } }));
+        out.badBlock = rizinEmuRestoreWords(ok({ patches: { patches: [], waiting: [], restore: { actions: 'many', digests: -1 } } }));
+        out.unsafe = rizinEmuRestoreWords(ok({ applied: [2 ** 60] }));
+        out.failed = rizinEmuRestoreWords({ restored: false, reason: 'replaying the timeline left other bytes than the ones saved with it (1 of 2 saved ranges differ): nothing was applied, and the cache is as it was when the file was opened', state: null, applied: [], patches: { patches: [], waiting: [], restore: block({ refused: null }) } });
+        out.failedWaiting = rizinEmuRestoreWords({ restored: false, reason: 'the replay stopped at action 3 of 5 (run cont): it ended at the time limit.', state: null, applied: [], patches: { patches: [], waiting: held(2), restore: block({ refused: null }) } });
+        out.failedNoList = rizinEmuRestoreWords({ restored: false, reason: 'an action was refused', state: null, applied: [], patches: null });
+        out.failedNoReason = [rizinEmuRestoreWords({ restored: false }), rizinEmuRestoreWords({ restored: false, reason: '  ' }), rizinEmuRestoreWords({ restored: false, reason: 7 })];
+        out.why = rizinEmuWhy({ running: true }, { wait: 'restore' });
+        out.silent = [rizinEmuRestoreWords({}), rizinEmuRestoreWords(null), rizinEmuRestoreWords({ restored: 'yes' }), rizinEmuRestoreWords('restored')];
+        console.log(JSON.stringify(out));
+    """, SORT_DOM + _rizin_prelude())
+    assert words["plain"] == {"kind": "ok", "text": "Session restored: the saved timeline was replayed (5 actions) and the bytes it left match "
+                                                     "the SHA-256 the project holds for 2 ranges."}, words["plain"]
+    assert words["applied"]["text"].endswith("2 patches that waited were written: 0x140002003, 0x140002005. 1 still waits: no run's bytes lie under it."), words["applied"]
+    assert "1 patch that waited was written: 0x140002003. 2 still wait" in words["one"]["text"] and "(1 action)" in words["one"]["text"] \
+        and "for 1 range." in words["one"]["text"], words["one"]
+    assert words["many"]["text"].endswith("3 still wait: no run's bytes lie under them."), words["many"]
+    assert words["noList"]["kind"] == "ok" and "(" not in words["noList"]["text"] and "still wait" not in words["noList"]["text"] \
+        and "1 patch that waited was written: 0x140002003." in words["noList"]["text"], \
+        "a counted statement from a block that was not there: " + str(words["noList"])
+    assert words["noBlock"]["text"] == "Session restored: the saved timeline was replayed and the bytes it left match the SHA-256 the project holds.", words["noBlock"]
+    assert words["badBlock"] == words["noBlock"], "counts that are no counts were said: " + str(words["badBlock"])
+    assert "?" in words["unsafe"]["text"] and "written: ?." in words["unsafe"]["text"], words["unsafe"]
+    assert words["failed"]["kind"] == "error" and words["failed"]["text"].startswith("Not restored: replaying the timeline left other bytes than the ones saved with it") \
+        and words["failed"]["text"].endswith("when the file was opened.") and "still wait" not in words["failed"]["text"], words["failed"]
+    assert words["failedWaiting"]["text"].endswith("it ended at the time limit. The patches that wait still wait."), words["failedWaiting"]
+    assert words["failedNoList"]["text"] == "Not restored: an action was refused.", words["failedNoList"]
+    assert [w["text"] for w in words["failedNoReason"]] == ["Not restored: the replay did not hold."] * 3, words["failedNoReason"]
+    assert all(w == {"kind": "error", "text": "The server answered without saying whether the run was restored."} for w in words["silent"]), words["silent"]
+    assert words["why"]["kind"] == "wait" and words["why"]["text"].startswith("Replaying the saved timeline"), \
+        "the strip said a restore was a RESTORE run of its own: " + str(words["why"])
+
+    r = _scripted(WAITING_SETUP + r"""
+        const W = (addr, after) => ({ addr, after, reason: REASON });
+        const HAND = 'a register was set by hand, which the timeline does not record';
+        S.waiting = [W(0x140001521, '90'), W(0x140009000, '9090')];
+        S.restore = OFFER({ actions: 3, digests: 1 });
+        await listed();
+        const pressRestore = async () => { const f = calls.length; click(btn('restore'));
+            await until(() => !rizinState.emuWait && !rizinState.emuPane.busy && calls.slice(f).some(c => c[1].endsWith('/restore')), 'the answer'); await quiet();
+            return f; };
+        const shape = () => ({ said: note(), kind: attr(pane.querySelector('.rizin-emu-notice'), 'class'), emu: !!(rizinState.emu && rizinState.emu.running),
+                               pc: rizinEmuPc(), strip: !strip.hidden, waiting: waitRows(), hand: addrs(group('hand'), '.rizin-emu-patch'),
+                               off: btn('restore').hasAttribute('disabled'), title: attr(btn('restore'), 'title'), wait: rizinState.emuWait, busy: rizinState.emuPane.busy });
+
+        // restored: the answer's state is the emulation, its lists are the pane's, the words say what happened
+        S.restoreRun = s => {
+            s.emu = { pc: 0x1400014c4, rax: 7, rbx: 0, rcx: 0, changed: [] };
+            s.patches = [...s.patches, { addr: 0x140001521, size: 1, before: '41', after: '90', mine: true }];
+            s.waiting = s.waiting.filter(w => w.addr !== 0x140001521);
+            s.restore = OFFER({ actions: 6, digests: 2, refused: 'the emulation is running: stop it first' });
+            return [200, { restored: true, reason: null, state: emuRead(s.emu), applied: [0x140001521],
+                           patches: { patches: rows(s.patches), waiting: rows(s.waiting), restore: s.restore } }, 5];
+        };
+        let f = await pressRestore();
+        r.restored = { ...shape(), seeks: posts(f, '/seek').map(c => c[2].addr), lists: gets(f, '/patches').length, pcState: rizinState.emu.registers.find(x => x.name === 'rip').value,
+                       stripPc: $('rizin-run-pc').textContent };
+        click(act('stop')); await until(() => strip.hidden, 'stopped'); await quiet();
+
+        // not restored: the server's reason, nothing started, the waiting ones wait, the lists are the answer's
+        S.waiting = [W(0x140009000, '9090')]; S.restore = OFFER(); await rizinLoadEmuPane(true);
+        S.restoreRun = s => [200, { restored: false, reason: 'replaying the timeline left other bytes than the ones saved with it (1 of 2 saved ranges differ): nothing was applied, and the cache is as it was when the file was opened',
+                                    state: null, applied: [], patches: { patches: rows(s.patches), waiting: rows(s.waiting), restore: OFFER({ reason: HAND, refused: null }) } }, 5];
+        f = await pressRestore();
+        r.failed = { ...shape(), lists: gets(f, '/patches').length, note: pane.querySelector('.rizin-emu-restore-note') ? text(pane.querySelector('.rizin-emu-restore-note')) : null };
+
+        // `patches` is null: the words do not read a block that is not there, the pane reads the lists again, and
+        // the emulation the replay left is the one the state says
+        S.restore = OFFER({ actions: 9, digests: 9 }); await rizinLoadEmuPane(true);
+        S.restoreRun = s => { s.emu = { pc: 0x1400014bc, rax: 1, rbx: 0, rcx: 0, changed: [] };
+                              return [200, { restored: true, reason: null, state: emuRead(s.emu), applied: [], patches: null }, 5]; };
+        S.restore = OFFER({ actions: 2, digests: 1, refused: 'the emulation is running: stop it first' });
+        S.listDelay = 60;
+        f = calls.length;
+        click(btn('restore'));
+        await until(() => !rizinState.emuWait && !rizinState.emuPane.busy && calls.slice(f).some(c => c[1].endsWith('/restore')), 'the answer');
+        r.nullMid = { off: btn('restore').hasAttribute('disabled'), title: attr(btn('restore'), 'title') };    // the lists are on their way
+        await quiet();
+        S.listDelay = undefined;
+        r.nullLists = { ...shape(), lists: gets(f, '/patches').length };
+        click(act('stop')); await until(() => strip.hidden, 'stopped'); await quiet();
+
+        // not restored and no lists either: nothing to start, and the lists are read again by the pane itself
+        S.restore = OFFER({ refused: null }); await rizinLoadEmuPane(true);
+        S.restoreRun = s => [200, { restored: false, reason: 'an action was refused.', state: null, applied: [], patches: null }, 5];
+        f = await pressRestore();
+        r.failedNull = { ...shape(), lists: gets(f, '/patches').length };
+
+        // restored with no state in the answer: the emulation is read from the route, not invented
+        S.restore = OFFER(); await rizinLoadEmuPane(true);
+        S.restoreRun = s => { s.emu = { pc: 0x1400014d0, rax: 3, rbx: 0, rcx: 0, changed: [] };
+                              return [200, { restored: true, reason: null, state: null, applied: [], patches: { patches: rows(s.patches), waiting: rows(s.waiting), restore: OFFER({ refused: 'the emulation is running: stop it first' }) } }, 5]; };
+        f = await pressRestore();
+        r.noState = { ...shape(), reads: gets(f, '/emulation').length };
+        click(act('stop')); await until(() => strip.hidden, 'stopped'); await quiet();
+
+        // refused: the server's sentence, no emulation, and the offer that was out of date is read again
+        S.restore = OFFER({ refused: null }); await rizinLoadEmuPane(true);
+        S.restoreRun = s => [400, { refused: 'the write cache holds more or other than the patches the file was opened with' }];
+        f = await pressRestore();
+        r.refused = { ...shape(), lists: gets(f, '/patches').length };
+        // busy: said, nothing changes, nothing is read again
+        S.restoreRun = s => [409, { busy: true, step: 'analysis' }];
+        const polls = S.statusCalls;
+        f = await pressRestore();
+        r.busy = { ...shape(), lists: gets(f, '/patches').length, polled: S.statusCalls > polls };
+        // a reason of the file: text
+        S.restoreRun = s => [200, { restored: false, reason: '<img src=x onerror=alert(1)>', state: null, applied: [], patches: null }, 5];
+        await pressRestore();
+        r.hostile = { tags: pane.querySelectorAll('*').map(e => e.tagName).filter(t => t === 'IMG'), said: note() };
+
+        // an answer that does not say whether it restored: no emulation is taken from it
+        S.restoreRun = s => [200, { state: emuRead({ pc: 0x1400014bc, rax: 0, rbx: 0, rcx: 0, changed: [] }), applied: [], patches: null }, 5];
+        await pressRestore();
+        r.silent = shape();
+
+        // which answer wins: a list asked for before the restore answers, and answers after it, is dropped
+        S.restore = OFFER({ refused: null }); await rizinLoadEmuPane(true);
+        S.restoreRun = s => { s.emu = { pc: 0x1400014bc, rax: 1, rbx: 0, rcx: 0, changed: [] }; s.restore = OFFER({ actions: 8, refused: 'the emulation is running: stop it first' });
+                              return [200, { restored: true, reason: null, state: emuRead(s.emu), applied: [], patches: { patches: rows(s.patches), waiting: [], restore: s.restore } }, 5]; };
+        let slow = true;
+        S.patchesAnswer = s => (slow ? (slow = false, [200, { patches: rows(s.patches), waiting: rows(s.waiting), restore: OFFER({ refused: null }) }, 80]) : null);
+        const late = rizinLoadEmuPane(true);
+        await until(() => flying('/api/rizin/S1/patches'), 'the list is out');
+        await pressRestore();
+        await late; await quiet();
+        S.patchesAnswer = undefined;
+        r.order = { off: btn('restore').hasAttribute('disabled'), title: attr(btn('restore'), 'title'), waiting: waitRows() };
+        click(act('stop')); await until(() => strip.hidden, 'stopped'); await quiet();
+
+        // another file is opened while the replay runs: its answer is of a file that is gone, and changes nothing here
+        S.restore = OFFER({ refused: null }); await rizinLoadEmuPane(true);
+        S.restoreRun = s => { s.emu = { pc: 0x1400014bc, rax: 1, rbx: 0, rcx: 0, changed: [] };
+                              return [200, { restored: true, reason: null, state: emuRead(s.emu), applied: [], patches: null }, 80]; };
+        click(btn('restore'));
+        await until(() => rizinState.emuWait === 'restore', 'the replay runs');
+        const T = { analysis: 'done', done: ['aaa'], restore: OFFER({ refused: 'the project holds no timeline of the emulation to restore' }) };
+        serve('S2', T);
+        opens['C:\\x\\f.exe'] = T;
+        await openInRizin('C:\\x\\f.exe');
+        await until(() => rizinState.landed && rizinState.session === 'S2', 'the other file');
+        rizinState.emuPane.busy = 'export';                  // an action of the pane of the file that is open now, while the old answer is on its way
+        await tick(120);
+        const keptBusy = rizinState.emuPane.busy;
+        rizinState.emuPane.busy = ''; await quiet();
+        r.otherFile = { keptBusy, session: rizinState.session, emu: rizinState.emu, said: note(), wait: rizinState.emuWait, busy: rizinState.emuPane.busy,
+                        title: attr(btn('restore'), 'title'), strip: !strip.hidden };
+
+        // the session ends under the restore: the notice of the replay does not stay, and nothing is said about a restore
+        T.restoreRun = s => ENDED;
+        T.restore = OFFER({ refused: null });
+        await rizinLoadEmuPane(true);
+        click(btn('restore'));
+        await until(() => rizinState.ui.state === 'ended', 'the end'); await quiet();
+        r.ended = { said: note(), wait: rizinState.emuWait, busy: rizinState.emuPane.busy, emu: rizinState.emu };
+    """)
+    assert "error" not in r, r.get("error")
+    ok = r["restored"]
+    assert ok["emu"] is True and ok["pc"] == "0x1400014c4" and ok["strip"] is True and ok["wait"] == "" and ok["busy"] == "", ok
+    assert ok["said"] == ("Session restored: the saved timeline was replayed (6 actions) and the bytes it left match the SHA-256 the project "
+                          "holds for 2 ranges. 1 patch that waited was written: 0x140001521. 1 still waits: no run's bytes lie under it."), ok["said"]
+    assert "rizin-emu-note-ok" in ok["kind"] and ok["waiting"] == ["0x140009000"] and ok["hand"] == ["0x1400014c0", "0x1400014d0", "0x140001521"], ok
+    assert ok["lists"] == 0, "the answer carried the lists, and they were asked for again: " + str(ok)
+    assert ok["off"] is True and "running" in ok["title"], "the offer of the answer is the offer of the button: " + str(ok)
+    assert ok["pcState"] == "0x1400014c4" and "0x1400014c4" in ok["stripPc"] and ok["seeks"] == ["0x1400014c4"], ok
+    bad = r["failed"]
+    assert bad["said"].startswith("Not restored: replaying the timeline left other bytes") and bad["said"].endswith("The patches that wait still wait."), bad["said"]
+    assert "rizin-emu-note-error" in bad["kind"] and bad["emu"] is False and bad["strip"] is False and bad["waiting"] == ["0x140009000"], bad
+    assert bad["off"] is False and bad["lists"] == 0 and "set by hand" in (bad["note"] or ""), "the failed answer's offer was not taken: " + str(bad)
+    assert r["nullMid"]["off"] is True and "not in the answer" in r["nullMid"]["title"], \
+        "while the lists the answer did not carry are on their way the button kept the offer of before: " + str(r["nullMid"])
+    ft = r["failedNull"]
+    assert ft["said"] == "Not restored: an action was refused." and ft["lists"] == 1 and ft["emu"] is False, "no lists and no restore: " + str(ft)
+    assert r["silent"]["emu"] is False and r["silent"]["said"] == "The server answered without saying whether the run was restored." \
+        and "rizin-emu-note-error" in r["silent"]["kind"], "an answer that does not say it restored started the emulation: " + str(r["silent"])
+    nul = r["nullLists"]
+    assert nul["emu"] is True and nul["said"].startswith("Session restored: the saved timeline was replayed and the bytes it left match") \
+        and "(" not in nul["said"], "a count was said from a block that was not there: " + nul["said"]
+    assert nul["lists"] == 1 and nul["off"] is True and "running" in nul["title"], "the lists were not read again after a null `patches`: " + str(nul)
+    ns = r["noState"]
+    assert ns["emu"] is True and ns["reads"] == 1 and ns["pc"] == "0x1400014d0" and ns["strip"] is True, "no state in the answer: " + str(ns)
+    rf = r["refused"]
+    assert rf["said"] == "Not restored: the write cache holds more or other than the patches the file was opened with" and "rizin-emu-note-error" in rf["kind"], rf
+    assert rf["emu"] is False and rf["lists"] == 1 and rf["wait"] == "" and rf["busy"] == "", rf
+    bz = r["busy"]
+    assert "busy" in bz["said"] and "analysis" in bz["said"] and bz["lists"] == 0 and bz["emu"] is False and bz["wait"] == "" and bz["polled"] is True, bz
+    assert r["hostile"]["tags"] == [] and "<img src=x onerror=alert(1)>" in r["hostile"]["said"], r["hostile"]
+    assert r["order"]["off"] is True and "running" in r["order"]["title"] and r["order"]["waiting"] == [], \
+        "the older list answered after the restore and put its offer over it: " + str(r["order"])
+    assert r["otherFile"] == {"keptBusy": "export", "session": "S2", "emu": None, "said": "", "wait": "", "busy": "", "title": "the project holds no timeline of the emulation to restore", "strip": False}, \
+        "the answer of a file that was closed changed the one open now: " + str(r["otherFile"])
+    assert r["ended"] == {"said": "", "wait": "", "busy": "", "emu": None}, "the end of the session left the replay's notice up, or said it was not restored: " + str(r["ended"])
 
 
 # --- Task 12: breakpoints in the gutter, the patches and Run to here in the menu -------------------------------
@@ -8274,7 +9008,9 @@ def test_rizin_gutter_marks_take_the_newest_list_and_only_where_a_line_starts():
         U.listDelay = 100;
         const old = rizinLoadEmuPane(true);
         await tick(10);
-        rizinSetLists({ patches: [{ addr: 0x1400014bc, size: 2, before: '7e05', after: '9090', mine: true }] });
+        // the server holds what its answer says (an answer with no offer makes the pane read the patches again: Task 6)
+        U.patches = [{ addr: 0x1400014bc, size: 2, before: '7e05', after: '9090', mine: true }];
+        rizinSetLists({ patches: U.patches });
         const rowsNow = () => addrs($('rizin-emulation'), '.rizin-emu-patch');
         r.answer = rowsNow();
         await old; await tick(20);
@@ -8373,7 +9109,9 @@ def test_rizin_gutter_marks_survive_a_slow_read_and_the_reads_are_not_doubled():
         "an old read wiped a patch from the gutter and from the pane's list of what is the user's: " + str(r["afterStalePane"])
     assert r["reload"] == [1, 1], "a forced reload with the pane closed reads each list once: " + str(r["reload"])
     assert r["reloadOpen"] == [1, 1], "a forced reload with the pane open reads each list more than once (the pane's and the marks'): " + str(r["reloadOpen"])
-    assert r["takeBack"] == [0, 0], "taking a patch back read the lists again after its answer carried them: " + str(r["takeBack"])
+    # (Task 6: the answer of a take-back carries the rows and no offer of the restore button, which the take-back changes
+    # -- the timeline that made the patch is dropped --, so the pane reads the patches once more and the breakpoints not at all)
+    assert r["takeBack"] == [1, 0], "taking a patch back read the breakpoints again, or the patches more than once: " + str(r["takeBack"])
     assert r["takeBackHidden"] == [0, 0], "a take-back with the pane closed read the marks' lists again: " + str(r["takeBackHidden"])
     assert r["landing"] == [1, 1], "landing reads each list once: " + str(r["landing"])
 

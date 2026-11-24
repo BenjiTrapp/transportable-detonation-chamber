@@ -20913,7 +20913,7 @@ const RIZIN_EMU = {
 // to a note that may be long, so the pane puts it first (a test holds the two to the same words)
 const RIZIN_EMU_PANE = {
     rows: 100,
-    urgent: 'A patch or breakpoint is waiting to be saved; the project is written when the analysis has finished.',
+    urgent: 'A patch, a breakpoint or the timeline of the emulation is waiting to be saved; the project is written when the analysis has finished.',
 };
 // The patches of the right-click menu: the kinds that act on one instruction (rizin_emulation.PATCH_KINDS), the
 // most bytes the field takes (rizin_emulation.MAX_PATCH_BYTES: a patch is one write, one command line, and rizin's
@@ -21057,8 +21057,10 @@ const rizinState = {
     // The EMULATION pane's lists: the session they are of (at), patches [{addr, size, before, after, mine}] and
     // breakpoints [{addr, enabled}] as the routes answer them (integers: they are bounded by the file's layout),
     // why they could not be read (problem), wanted again when the pane is shown (stale), the newest request (seq),
-    // the words of the last action ({kind, text}), the export's answer (exported) and what waits (busy)
-    emuPane: { at: '', patches: null, breakpoints: null, problem: '', stale: false, seq: 0, notice: null, exported: null, busy: '' },
+    // the words of the last action ({kind, text}), the export's answer (exported) and what waits (busy). waiting is what
+    // /patches lists as held back ([{addr, after, reason}]) and restore the offer of the restore button ({actions, reason,
+    // digests, refused}); both come in the answer that brings patches, and null (not read) means no button
+    emuPane: { at: '', patches: null, waiting: null, restore: null, breakpoints: null, problem: '', stale: false, seq: 0, notice: null, exported: null, busy: '' },
     emuPaneShown: '',   // the markup the pane shows, so that only a change writes
     // What DISASSEMBLY marks: the breakpoints (their addresses) and the ranges patched by hand ([addr, size]), integers
     // as the routes answer them (bounded by the file's layout), null until the file's lists are known; seq: the
@@ -21362,8 +21364,8 @@ function rizinReset(described) {
         emu: null, emuWait: '', emuNote: '', emuShown: {}, emuPaneShown: '',
     });
     rizinState.emuSeq++;            // an answer of the old session's emulation is dropped
-    Object.assign(rizinState.emuPane, { at: '', patches: null, breakpoints: null, problem: '', stale: false, notice: null,
-                                        exported: null, busy: '' });
+    Object.assign(rizinState.emuPane, { at: '', patches: null, waiting: null, restore: null, breakpoints: null, problem: '', stale: false,
+                                        notice: null, exported: null, busy: '' });
     rizinState.emuPane.seq++;       // a late list of the old session is dropped
     Object.assign(rizinState.marks, { breakpoints: null, patched: null, busy: false });
     rizinState.marks.seq++;         // so is a late list of the marks
@@ -24880,6 +24882,7 @@ function rizinEmuWhy(emu, options) {
         const label = RIZIN_EMU.labels[wait] || wait.toUpperCase();
         return { kind: 'wait', text: wait === 'start' ? 'Starting the emulation…' : wait === 'stop' ? 'Leaving the emulation…'
             : wait === 'register' ? 'Setting a register…'
+            : wait === 'restore' ? 'Replaying the saved timeline: it runs the file\'s code again, and each run ends by itself (esil.timeout).'
             : `Running ${label}: a run ends by itself (esil.timeout) and cannot be interrupted.` };
     }
     if (note) return { kind: 'note', text: note };
@@ -25141,6 +25144,7 @@ async function rizinEmuStart() {
     if (pc && pc !== rizinState.seek) await rizinSeek(pc, 'emulation');
     rizinRenderPcMarks();
     await rizinEmuAssist();
+    await rizinLoadEmuPane(true, 'patches');       // a running emulation changes what the restore button may do
     return true;
 }
 
@@ -25163,6 +25167,7 @@ async function rizinEmuStop() {
         return false;
     }
     rizinEmuLeave();
+    await rizinLoadEmuPane(true, 'patches');       // and so does leaving it
     return true;
 }
 
@@ -25338,11 +25343,13 @@ function rizinEmuPatchesHeadHtml(patches, busy) {
         + `Clear rizin's whole cache</button></span></div>`;
 }
 
-// The patches in two groups, apart on the page: what was set by hand (kept with the project, exported, taken back one
-// by one) and what a run wrote (it ends with the session: the group says so before it hurts, and carries Re-analyse).
-// rizin has one write cache for both: the button that clears all of it is in the head of PATCHES, outside both groups.
+// The patches in three groups, apart on the page: what was set by hand (kept with the project, exported, taken back one
+// by one), what waits (kept with the project, but not in the cache: rizinEmuWaitingHtml, only where something waits)
+// and what a run wrote (it ends with the session: the group says so before it hurts, and carries Re-analyse).
+// rizin has one write cache for the first and the last: the button that clears all of it is in the head of PATCHES,
+// outside the groups.
 function rizinEmuPatchesHtml(patches, functions, options) {
-    const { exported = null, busy = '' } = options || {};
+    const { exported = null, busy = '', waiting = null } = options || {};
     const rows = (Array.isArray(patches) ? patches : []).filter(row => row && typeof row === 'object');
     const hand = rows.filter(row => row.mine === true), run = rows.filter(row => row.mine !== true);
     const off = on => (on ? ' disabled' : '');
@@ -25391,6 +25398,7 @@ function rizinEmuPatchesHtml(patches, functions, options) {
         + `<span class="rizin-emu-actions"><button type="button" class="rizin-tool" data-rizin-act="export"${off(!hand.length || busy)} `
         + `title="Write a copy of the file with these patches in it, and a note beside it">Export</button>`
         + `</span></div>${overLine}${result}${list(hand, true, 'Nothing set by hand.')}</div>`
+        + rizinEmuWaitingHtml(waiting, rows, functions, { busy })
         + `<div class="rizin-emu-group rizin-emu-run" data-rizin-group="run"><div class="rizin-emu-subhead">`
         + `<span class="rizin-emu-group-title">WRITTEN BY THE RUN · ${run.length}${run.length ? ` · ${written} B` : ''}</span>`
         + `<span class="rizin-emu-fate">these end with the session</span>`
@@ -25400,10 +25408,117 @@ function rizinEmuPatchesHtml(patches, functions, options) {
         + `${list(run, false, 'Nothing written by a run.')}</div>`;
 }
 
+// Whether a write of the cache that is not the user's own (a run's: mine is not true) overlaps one of the `size` bytes at
+// addr (integers: the rows of /patches). Nothing but "may the button be drawn": the server asks the same of the same rows
+// when the button is pressed, and the press is its to answer -- a row that ends where the patch starts, or starts where
+// it ends, covers nothing, and an address a double cannot hold exactly covers nothing here rather than something wrong.
+function rizinEmuRunCovers(rows, addr, size) {
+    if (!Number.isSafeInteger(addr) || !Number.isSafeInteger(size) || size < 1 || !Number.isSafeInteger(addr + size)) return false;
+    return (Array.isArray(rows) ? rows : []).some(row => row && typeof row === 'object' && row.mine !== true
+        && Number.isSafeInteger(row.addr) && Number.isSafeInteger(row.size) && Number.isSafeInteger(row.addr + row.size)
+        && row.addr < addr + size && addr < row.addr + row.size);
+}
+
+// What waits: the patches the project holds that were set over bytes a run wrote and are not in the cache (the open ran
+// before any run, so they would have gone into the file's own, still encrypted bytes, and the next decryption would run
+// over them). A group of its own with the reason of each row and two ways out: ✕ takes it out of the project, Apply now
+// writes it -- drawn only where a run's bytes lie under it (rizinEmuRunCovers over the rows of the cache), and the
+// server decides again when it is pressed. Nothing waits: no group. Every text here is the server's or the file's:
+// escaped.
+function rizinEmuWaitingHtml(waiting, patches, functions, options) {
+    const { busy = '' } = options || {};
+    const entries = (Array.isArray(waiting) ? waiting : []).filter(entry => entry && typeof entry === 'object');
+    if (!entries.length) return '';
+    const off = on => (on ? ' disabled' : '');
+    const line = entry => {
+        const addr = rizinEmuRowAddr(entry.addr), fn = rizinEmuFunctionAt(functions, entry.addr);
+        const bytes = typeof entry.after === 'string' ? entry.after : '';
+        const size = Math.floor(bytes.length / 2), why = typeof entry.reason === 'string' ? entry.reason : '';
+        const title = `${addr || 'an address that cannot be shown exactly'} · ${size} byte${size === 1 ? '' : 's'}${fn ? ` · ${fn}` : ''} · waiting: ${why}`;
+        const apply = addr && rizinEmuRunCovers(patches, entry.addr, size);
+        return `<div class="rizin-row rizin-emu-row rizin-emu-wait${addr ? '' : ' rizin-row-none'}"${addr ? ` data-addr="${addr}"` : ''} title="${escapeHtml(title)}">`
+            + `<span class="rz-addr">${escapeHtml(addr || '?')}</span><span class="rizin-emu-fn">${escapeHtml(fn || '—')}</span>`
+            + `<span class="rizin-emu-bytes">${size} B · ${escapeHtml(rizinEmuBytes(bytes))}</span>`
+            + (apply ? `<button type="button" class="rizin-tool" data-rizin-act="apply-waiting"${off(busy)} title="A run's bytes lie under this patch again: write it into the cache now. `
+                + `The server checks that once more." aria-label="Apply the waiting patch at ${addr} now">Apply now</button>` : '<span></span>')
+            + (addr ? `<button type="button" class="rizin-tool rizin-emu-del" data-rizin-act="drop-waiting"${off(busy)} title="Remove this patch from the project: it will not come back when the file is opened again" `
+                + `aria-label="Remove the waiting patch at ${addr} from the project">✕</button>` : '<span></span>')
+            + `<span class="rizin-emu-note rizin-emu-wait-why">${escapeHtml(why)}</span></div>`;
+    };
+    const more = entries.length - RIZIN_EMU_PANE.rows;
+    return `<div class="rizin-emu-group rizin-emu-waiting" data-rizin-group="waiting"><div class="rizin-emu-subhead">`
+        + `<span class="rizin-emu-group-title">WAITING · ${entries.length}</span><span class="rizin-emu-fate">not applied · kept with the project</span></div>`
+        + `<div class="rizin-emu-warn" role="note">These are not in rizin's cache: written into the file's own bytes, which are still encrypted, the next decryption `
+        + `would run over them. Apply now is there once a run's bytes lie under a patch; ✕ removes one from the project.</div>`
+        + entries.slice(0, RIZIN_EMU_PANE.rows).map(line).join('')
+        + (more > 0 ? rizinEmuEmpty(`+${more} more waiting, not shown here`) : '') + '</div>';
+}
+
+// The offer of the restore button as /patches (and the routes that carry the same block) answer it: {refused, reason,
+// actions, digests} where `refused` says whether the button may run (null) or why not (a sentence); null where the
+// answer is none -- no block, no `refused`, or one that is neither null nor text: a button that cannot tell is off.
+// reason (why the timeline is not kept) is the notice's and is never read for the button.
+function rizinEmuOffer(restore) {
+    if (!restore || typeof restore !== 'object' || Array.isArray(restore)) return null;
+    if (restore.refused !== null && typeof restore.refused !== 'string') return null;
+    const count = n => (Number.isSafeInteger(n) && n >= 0 ? n : null);
+    return { refused: restore.refused, reason: typeof restore.reason === 'string' && restore.reason.trim() ? restore.reason.trim() : null,
+             actions: count(restore.actions), digests: count(restore.digests) };
+}
+
+// The restore button, and the notice of why the timeline is not kept. The button is on where the offer's `refused` is
+// null and no action of the pane is out, and off with the sentence of the refusal as its title everywhere else; the
+// reason is shown whenever there is one, whatever the button says. Both texts are the server's: escaped.
+function rizinEmuRestoreHtml(restore, options) {
+    const { busy = '', wait = '' } = options || {};
+    const offer = rizinEmuOffer(restore), plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+    let title = 'The offer of the restore comes with the patches and was not in the answer: it is read again with the next one.';
+    let disabled = true;
+    if (offer && offer.refused !== null) {
+        title = offer.refused || 'The server refused the restore without saying why.';
+    } else if (offer && (busy || wait)) {
+        title = 'An action of the pane is out: the restore is there again once it has ended.';
+    } else if (offer) {
+        disabled = false;
+        title = 'Replay the saved timeline of the emulation'
+            + `${offer.actions === null ? '' : ` (${plural(offer.actions, 'action')})`} and check the bytes it leaves against the SHA-256 the project holds`
+            + `${offer.digests === null ? '' : ` (${plural(offer.digests, 'range')})`}. This runs the file's code in the emulator again.`;
+    }
+    const note = offer && offer.reason
+        ? `<div class="rizin-emu-note rizin-emu-warn rizin-emu-restore-note" role="note">The way to this state is not kept in the project: ${escapeHtml(offer.reason.replace(/[.\s]+$/, ''))}.</div>` : '';
+    return `<div class="rizin-emu-restore"><button type="button" class="rizin-tool" data-rizin-act="restore"${disabled ? ' disabled' : ''} `
+        + `title="${escapeHtml(title)}">Restore the run</button></div>${note}`;
+}
+
+// What a POST restore that was answered says, as {kind, text} for the pane's notice: restored (the timeline replayed and
+// the SHA-256 held: how many actions and ranges where the answer's block says, which waiting patches were written, how
+// many still wait), or not (the reason the server gave, and that the waiting ones wait still), or neither where the
+// answer does not say. Nothing is counted from a block the answer does not have.
+function rizinEmuRestoreWords(data) {
+    const d = data && typeof data === 'object' ? data : {};
+    const list = d.patches && typeof d.patches === 'object' ? d.patches : null;
+    const waiting = list && Array.isArray(list.waiting) ? list.waiting.length : 0;
+    const offer = list ? rizinEmuOffer(list.restore) : null;
+    const count = (n, word, many = `${word}s`) => `${n} ${n === 1 ? word : many}`;
+    if (d.restored === true) {
+        const applied = (Array.isArray(d.applied) ? d.applied : []).map(addr => rizinEmuRowAddr(addr) || '?');
+        let text = `Session restored: the saved timeline was replayed${offer && offer.actions !== null ? ` (${count(offer.actions, 'action')})` : ''}`
+            + ` and the bytes it left match the SHA-256 the project holds${offer && offer.digests !== null ? ` for ${count(offer.digests, 'range')}` : ''}.`;
+        if (applied.length) text += ` ${count(applied.length, 'patch', 'patches')} that waited ${applied.length === 1 ? 'was' : 'were'} written: ${applied.join(', ')}.`;
+        if (waiting) text += ` ${waiting} still ${waiting === 1 ? 'waits' : 'wait'}: no run's bytes lie under ${waiting === 1 ? 'it' : 'them'}.`;
+        return { kind: 'ok', text };
+    }
+    if (d.restored === false) {
+        const why = typeof d.reason === 'string' && d.reason.trim() ? d.reason.trim().replace(/[.\s]+$/, '') : 'the replay did not hold';
+        return { kind: 'error', text: `Not restored: ${why}.${waiting ? ' The patches that wait still wait.' : ''}` };
+    }
+    return { kind: 'error', text: 'The server answered without saying whether the run was restored.' };
+}
+
 // The pane: registers and stack on the left, breakpoints and patches on the right, each column scrolling in itself.
 // patches and breakpoints are null while they load (problem says why they could not be read instead).
 function rizinEmuPaneHtml(emu, patches, breakpoints, options) {
-    const { functions = null, note = '', notice = null, exported = null, problem = '', busy = '' } = options || {};
+    const { functions = null, note = '', notice = null, exported = null, problem = '', busy = '', wait = '', waiting = null, restore = null } = options || {};
     const regs = emu && emu.running === true && Array.isArray(emu.registers) ? emu.registers.filter(reg => reg && reg.name !== undefined) : [];
     const changed = new Set(emu && Array.isArray(emu.changed) ? emu.changed.map(String) : []);
     const marked = regs.filter(reg => changed.has(String(reg.name))).length;
@@ -25416,10 +25531,11 @@ function rizinEmuPaneHtml(emu, patches, breakpoints, options) {
     return '<div class="rizin-emu-col">'
         + section('registers', head('REGISTERS', regs.length ? `${regs.length}${marked ? ` · Δ ${marked} changed` : ''}` : ''), rizinEmuRegistersHtml(emu))
         + section('stack', head('STACK', sp ? `from ${sp}` : ''), rizinEmuStackHtml(emu))
-        + '</div><div class="rizin-emu-col">' + said + notes
+        + '</div><div class="rizin-emu-col">'
+        + (ready ? rizinEmuRestoreHtml(restore, { busy, wait }) : '') + said + notes
         + (ready
             ? section('breakpoints', head('BREAKPOINTS', String(breakpoints.length)), rizinEmuBreakpointsHtml(breakpoints, functions))
-                + section('patches', rizinEmuPatchesHeadHtml(patches, busy), rizinEmuPatchesHtml(patches, functions, { exported, busy }))
+                + section('patches', rizinEmuPatchesHeadHtml(patches, busy), rizinEmuPatchesHtml(patches, functions, { exported, busy, waiting }))
             : rizinEmuEmpty(problem || 'Loading…'))
         + '</div>';
 }
@@ -25434,7 +25550,8 @@ function rizinRenderEmuPane() {
     const html = !sid ? '<div class="rizin-empty">No file open.</div>'
         : rizinEmuPaneHtml(rizinState.emu, ready ? ui.patches : null, ready ? ui.breakpoints : null, {
             functions: rizinState.functions, note: rizinState.analysis ? rizinState.analysis.note : '', notice: ui.notice,
-            exported: ui.exported, problem: ui.problem, busy: ui.busy });
+            exported: ui.exported, problem: ui.problem, busy: ui.busy, wait: rizinState.emuWait, waiting: ready ? ui.waiting : null,
+            restore: ready ? ui.restore : null });
     if (html === rizinState.emuPaneShown) return;
     const active = document.activeElement;
     const field = active && el.contains(active) && active.getAttribute ? active.getAttribute('data-rizin-reg') : null;
@@ -25479,10 +25596,13 @@ async function rizinLoadEmuPane(force, what) {
         return false;
     }
     rizinState.retry.delete('emuPane');
-    Object.assign(pane, { at: sid, patches: Array.isArray(patches.data && patches.data.patches) ? patches.data.patches : [], problem: '', stale: false });
+    // What waits and the offer of the restore button come in the answer of the patches: one read, one state
+    const list = patches.data && typeof patches.data === 'object' ? patches.data : {};
+    Object.assign(pane, { at: sid, patches: Array.isArray(list.patches) ? list.patches : [], waiting: Array.isArray(list.waiting) ? list.waiting : [],
+                          restore: list.restore ?? null, problem: '', stale: false });
     if (breakpoints) pane.breakpoints = Array.isArray(breakpoints.data) ? breakpoints.data : [];
     // The marks of DISASSEMBLY take what the pane read (the patches it holds are the same rows)
-    rizinSetLists({ patches: pane.patches, breakpoints: breakpoints ? pane.breakpoints : undefined });
+    rizinSetLists({ patches: pane.patches, waiting: pane.waiting, restore: pane.restore, breakpoints: breakpoints ? pane.breakpoints : undefined });
     rizinRenderEmuPane();
     return true;
 }
@@ -25508,6 +25628,9 @@ function rizinOnEmuPaneClick(event) {
             const copy = rizinState.emuPane.exported;
             return copy ? rizinDetonatePatched(copy.path, copy.name) : false;
         }
+        if (act === 'restore') return rizinRestoreRun();
+        if (act === 'apply-waiting') return rizinApplyWaiting(addr);
+        if (act === 'drop-waiting') return rizinDropWaiting(addr);
         if (act === 'unpatch-all') return rizinUnpatch();
         if (act === 'unpatch') return rizinUnpatch(addr);
         if (act === 'unbreak') return rizinUnbreak(addr);
@@ -25565,6 +25688,7 @@ async function rizinSetRegister(name, value) {
     await rizinLoadEmulation(true);
     const pc = rizinEmuPc();
     if (pc && pc !== before) await rizinSeek(pc, 'emulation');
+    await rizinLoadEmuPane(true, 'patches');       // a register set by hand spoils the timeline: the notice says so now
     return true;
 }
 
@@ -25599,7 +25723,7 @@ async function rizinUnpatch(addr) {
         return false;
     }
     Object.assign(pane, { at: sid, patches: Array.isArray(r.data.patches) ? r.data.patches : pane.patches, problem: '', stale: false });
-    rizinSetLists({ patches: r.data.patches });
+    rizinSetLists({ patches: r.data.patches });     // the answer has no offer: the pane reads the lists again (rizinSetLists)
     // wc- <addr> <addr+1> removes every write that overlaps the address, so a patch set over bytes a run wrote takes
     // the run's whole row with it -- up to a copied or decrypted stage. The server names those rows; saying only
     // "took the patch back" would leave the pane claiming less than happened.
@@ -25657,6 +25781,121 @@ async function rizinReanalyze() {
         + `${count(r.data.functions, 'function')}, ${count(r.data.strings, 'string')}. They end with the session, like the bytes.`);
     await rizinReloadViews(['emulation', 'emuPane']);
     return true;
+}
+
+// Take what a route answered with the patches ({patches, waiting, restore}: GET /patches, the waiting variants of POST
+// and DELETE patch, and POST restore's `patches`) into the pane and DISASSEMBLY's marks, as the newest answer there is
+// (rizinSetLists drops the request of the pane that is still out). Without the rows -- null, as POST restore answers
+// where rizin would not list the cache -- there is nothing to take: the pane's offer is dropped and its lists are stale,
+// for whoever draws the views next (a jump asks for a stale pane) or, failing that, the caller, which reads them.
+function rizinEmuTakeLists(answer) {
+    const pane = rizinState.emuPane;
+    if (answer && typeof answer === 'object' && Array.isArray(answer.patches)) {
+        // The offer and what waits are taken together or not at all: an answer that has the rows and not both of them is
+        // one that cannot say what the pane shows beside them, and rizinSetLists reads the lists again for it
+        const whole = Array.isArray(answer.waiting) && answer.restore && typeof answer.restore === 'object';
+        return rizinSetLists({ patches: answer.patches, ...(whole ? { waiting: answer.waiting, restore: answer.restore } : {}) });
+    }
+    pane.restore = null;
+    pane.stale = true;
+    rizinRenderEmuPane();
+    return false;
+}
+
+// Apply now: the server writes the patches that wait at addr ("0x…") into the cache -- it decides whether a run's bytes
+// lie under it, and says why not in a sentence that is shown as it is. The press is sent whatever the row looked like:
+// the pane draws the button, the server answers it. The answer is the lists.
+async function rizinApplyWaiting(addr) {
+    const sid = rizinState.session, pane = rizinState.emuPane, at = rizinHex(addr);
+    if (!sid || !at || pane.busy) return false;
+    pane.busy = 'apply-waiting';
+    rizinEmuPaneSay(`Writing the waiting patch at ${at}…`, 'wait');
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/patch`, { method: 'POST', body: { addr: at, waiting: true } });
+    if (sid !== rizinState.session) return false;
+    pane.busy = '';
+    if (!r.ok) {
+        rizinEmuPaneSay(r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); the patch at ${at} was not written. Try again once it is free.`
+            : `Not applied: ${r.error}`, 'error');
+        if (r.state === 'busy') rizinPollSoon();
+        else if (r.state === 'refused') await rizinLoadEmuPane(true, 'patches');       // what was drawn is out of date
+        return false;
+    }
+    rizinEmuTakeLists(r.data);
+    rizinEmuPaneSay(`Applied the waiting patch at ${at}: it is in rizin's cache now, over the bytes the run wrote.`);
+    await rizinReloadViews(['emuPane', 'marks']);     // the bytes under it changed; the answer carried the lists
+    if (pane.stale) await rizinLoadEmuPane(true, 'patches');
+    return true;
+}
+
+// ✕ on a waiting patch: it goes out of the list and the project (the other way out of waiting; nothing in the cache is
+// touched). The request says `waiting`, so that it is never the take-back of a write at that address.
+async function rizinDropWaiting(addr) {
+    const sid = rizinState.session, pane = rizinState.emuPane, at = rizinHex(addr);
+    if (!sid || !at || pane.busy) return false;
+    pane.busy = 'drop-waiting';
+    rizinEmuPaneSay(`Removing the waiting patch at ${at}…`, 'wait');
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/patch`, { method: 'DELETE', body: { addr: at, waiting: true } });
+    if (sid !== rizinState.session) return false;
+    pane.busy = '';
+    if (!r.ok) {
+        rizinEmuPaneSay(r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); the patch at ${at} stays. Try again once it is free.`
+            : `Not removed: ${r.error}`, 'error');
+        if (r.state === 'busy') rizinPollSoon();
+        else if (r.state === 'refused') await rizinLoadEmuPane(true, 'patches');
+        return false;
+    }
+    rizinEmuTakeLists(r.data);
+    rizinEmuPaneSay(`Removed the waiting patch at ${at} from the project: it does not come back when the file is opened again.`);
+    if (pane.stale) await rizinLoadEmuPane(true, 'patches');
+    return true;
+}
+
+// Restore the run: the project's timeline is replayed (one request that holds rizin like a run, and a run in flight
+// holds the pane's other actions off until it is answered) and the server proves the bytes it left. The notice says
+// what happened (rizinEmuRestoreWords); the answer's lists are the pane's; the emulation the replay left running is the
+// answer's state, and the views follow its PC. Nothing is decided here: a refusal is the server's sentence.
+async function rizinRestoreRun() {
+    const sid = rizinState.session, pane = rizinState.emuPane;
+    if (!sid || pane.busy || rizinState.emuWait) return false;
+    const seq = ++rizinState.emuSeq;
+    pane.busy = 'restore';
+    rizinState.emuWait = 'restore';
+    rizinState.emuNote = '';
+    rizinEmuPaneSay('Replaying the saved timeline…', 'wait');
+    rizinRenderRunStrip();
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/restore`, { method: 'POST' });
+    if (sid !== rizinState.session) return false;
+    pane.busy = '';
+    if (seq !== rizinState.emuSeq) {                 // the emulation was left under the request: the session is gone
+        rizinEmuPaneSay('');
+        return false;
+    }
+    rizinState.emuWait = '';
+    if (!r.ok) {
+        rizinEmuPaneSay(r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); nothing was restored. Try again once it is free.`
+            : `Not restored: ${r.error}`, 'error');
+        rizinRenderRunStrip();
+        if (r.state === 'busy') rizinPollSoon();
+        else if (r.state === 'refused') await rizinLoadEmuPane(true, 'patches');       // the offer that allowed it was out of date
+        return false;
+    }
+    const d = r.data, words = rizinEmuRestoreWords(d);
+    const state = d.state && typeof d.state === 'object' && d.state.running === true ? d.state : null;
+    if (d.restored === true) {
+        rizinState.emu = { ...(state || { running: true, pc: null, registers: [], changed: [], stack: [], stopped: null }), ran: '', assist: null };
+    }
+    rizinEmuTakeLists(d.patches);
+    rizinEmuPaneSay(words.text, words.kind);
+    rizinRenderRunStrip();
+    if (d.restored === true) {
+        if (!state) await rizinLoadEmulation(true);
+        const pc = rizinEmuPc();
+        if (pc) await rizinSeek(pc, 'emulation');       // every view at the PC, over the bytes the replay left
+        else rizinRenderPcMarks();
+        await rizinEmuAssist();
+    }
+    if (pane.stale) await rizinLoadEmuPane(true, 'patches');       // no lists in the answer, and no jump has read them
+    return d.restored === true;
 }
 
 // Export: the patched copy of the file with the patches set by hand (what a run wrote is not in it), built by the server;
@@ -25755,26 +25994,42 @@ async function rizinDetonatePatched(path, name) {
 // The lists the tab has learned (an answer of /patches, /breakpoints, POST patch or breakpoints): DISASSEMBLY's marks
 // and, where the EMULATION pane holds the list already, its rows (a request of the pane that is still out is older
 // than this answer, so it is dropped). Either list may be missing: the other one stays.
+// The offer of the restore button and what waits come with the patches of the routes that answer them (/patches, the
+// waiting variants of patch, restore): lists with a `restore` key carry them, and the newest answer wins them with the
+// rows. An answer that changes the patches or the breakpoints and carries no offer (a plain patch, a take-back, a
+// breakpoint) leaves the pane's offer out of date: it is dropped, so that no button says what is no longer so, and the
+// pane reads the lists again.
 function rizinSetLists(lists) {
     const sid = rizinState.session, marks = rizinState.marks, pane = rizinState.emuPane;
     if (!sid || !lists) return false;
     const safe = n => Number.isSafeInteger(n) && n >= 0;
+    const offered = 'restore' in lists;
+    let outdated = false;
     if (Array.isArray(lists.breakpoints)) {
         marks.stamp.breakpoints++;
         marks.breakpoints = lists.breakpoints.filter(bp => bp && safe(bp.addr)).map(bp => bp.addr);
-        if (pane.at === sid && Array.isArray(pane.breakpoints)) Object.assign(pane, { breakpoints: lists.breakpoints, seq: pane.seq + 1 });
+        if (pane.at === sid && Array.isArray(pane.breakpoints)) {
+            Object.assign(pane, { breakpoints: lists.breakpoints, seq: pane.seq + 1 });
+            outdated = outdated || !offered;
+        }
     }
     if (Array.isArray(lists.patches)) {
         marks.stamp.patches++;
         marks.patched = lists.patches.filter(p => p && p.mine === true && safe(p.addr) && Number.isSafeInteger(p.size) && p.size > 0)
             .map(p => [p.addr, p.size]);
-        if (pane.at === sid && Array.isArray(pane.patches)) Object.assign(pane, { patches: lists.patches, seq: pane.seq + 1 });
+        if (pane.at === sid && Array.isArray(pane.patches)) {
+            Object.assign(pane, { patches: lists.patches, seq: pane.seq + 1 });
+            if (offered) Object.assign(pane, { waiting: Array.isArray(lists.waiting) ? lists.waiting : pane.waiting, restore: lists.restore ?? null });
+            else outdated = true;
+        }
     }
+    if (outdated) pane.restore = null;
     rizinRenderEmuPane();
     if (rizinPageHolds(rizinState.disasm)) rizinRenderDisasm();
     // The C in sight shows the breakpoints too (decompilerAt is empty while the pane says something instead of
     // lines, which a list must not overwrite); hidden, it takes them once it is shown again
     if (rizinState.decompilerAt && rizinCodeOnScreen('decompiler')) rizinRenderDecompiler();
+    if (outdated) rizinLoadEmuPane(true, 'patches');
     return true;
 }
 
@@ -25794,7 +26049,9 @@ async function rizinLoadMarks(force) {
     }
     rizinState.retry.delete('marks');
     // A list that something newer set while these were on their way (an answer to a click, to a patch) stays
-    return rizinSetLists({ patches: stamp.patches === marks.stamp.patches ? (Array.isArray(patches.data && patches.data.patches) ? patches.data.patches : []) : undefined,
+    const fresh = stamp.patches === marks.stamp.patches, list = patches.data && typeof patches.data === 'object' ? patches.data : {};
+    return rizinSetLists({ patches: fresh ? (Array.isArray(list.patches) ? list.patches : []) : undefined,
+                           ...(fresh ? { waiting: list.waiting, restore: list.restore } : {}),
                            breakpoints: stamp.breakpoints === marks.stamp.breakpoints ? (Array.isArray(breakpoints.data) ? breakpoints.data : []) : undefined });
 }
 

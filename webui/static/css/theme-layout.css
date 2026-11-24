@@ -2417,6 +2417,12 @@
 [data-theme] .rizin-emu-run .rizin-emu-fate {
     color: var(--cp-orange);
 }
+[data-theme] .rizin-emu-waiting {
+    border-left-color: var(--cp-amber);
+}
+[data-theme] .rizin-emu-waiting .rizin-emu-fate {
+    color: var(--cp-amber);
+}
 [data-theme] .rizin-emu-note,
 [data-theme] .rizin-emu-export {
     color: var(--cp-text-muted);

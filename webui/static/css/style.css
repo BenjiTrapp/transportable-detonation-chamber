@@ -10568,6 +10568,29 @@ table[data-sortable] > thead > tr > th:focus-visible {
 .rizin-emu-run .rizin-emu-fate {
     color: var(--accent-orange);
 }
+/* What waits (held back over a run's bytes, not in the cache): a dotted edge, between the solid of the hand-made group
+   and the dashed of the run's, and a row of its own with the reason under it and two buttons */
+.rizin-emu-waiting {
+    border-left: 3px dotted var(--accent-yellow);
+}
+.rizin-emu-waiting .rizin-emu-fate {
+    color: var(--accent-yellow);
+}
+.rizin-emu-wait {
+    grid-template-columns: 19ch minmax(0, 1fr) minmax(0, 1.3fr) auto 3.2ch;
+}
+.rizin-emu-wait .rizin-emu-wait-why {
+    grid-column: 1 / -1;
+    overflow: visible;
+    white-space: normal;
+    text-overflow: clip;
+}
+/* The restore button, at the head of the column that holds the lists */
+.rizin-emu-restore {
+    display: flex;
+    gap: 8px;
+    margin: 4px 0 2px;
+}
 .rizin-emu-warn {
     color: var(--accent-yellow);
 }
