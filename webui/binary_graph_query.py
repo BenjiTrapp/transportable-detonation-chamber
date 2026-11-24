@@ -265,7 +265,7 @@ def imports_of(graph, module: str) -> Answer:
     info = graph.binaries.get(name)
     if info is None:
         return _empty(f"{name or 'That name'} is not in the binary graph of this system.")
-    caveat = (" Its import table was cut short when it was read, so the list may be incomplete."
+    caveat = (" It has a table (import, delay-load or export) that was cut short when it was read, so the list may be incomplete."
               if info.partial else "")
     parts = [_Part([_function_node(imported, function)],
                    [_edge(name, _function_id(imported, function), "imports", imported)], [])
@@ -801,7 +801,7 @@ def _members_isolated(graph, table):
     return (parts, len(names), f"{_plural(len(names), 'binary is', 'binaries are')} isolated: nothing imports "
                                f"{'it' if len(names) == 1 else 'them'}, directly or through an api set, and "
                                f"{'it imports' if len(names) == 1 else 'they import'} nothing else of System32."
-                               + _cut_note(graph, "a binary may be listed here only because what it imports was lost"),
+                               + _cut_note(graph, "a binary may be listed here only because an import that would link it was in a table that was cut short"),
             "isolated binaries", True, "No binary of the graph is isolated: each is imported by another, or imports another.")
 
 
@@ -1042,7 +1042,7 @@ def _record_doors(graph, info, names):
     An import by ordinal is named by the cache (_add_ordinal); one it cannot name may be a door, so it leaves the
     union incomplete."""
     if info.partial:
-        return f"the import table of {info.name} was cut short when it was read"
+        return f"a table (import, delay-load or export) of {info.name} was cut short when it was read"
     for module, functions in info.imports.items():
         for function in functions:
             if not function.startswith("#"):

@@ -27313,8 +27313,8 @@ function binaryGraphCombineOrigin(a, b) {
 // without adding to it. The origin of the edge is derived only if every edge it stands for is (binaryGraphCombineOrigin).
 // When the server cut the list, the last module's count is a lower bound and the modules after it are missing: the edge
 // says "at least", `functions` of the result says how many functions were cut and `last` which module is the lower bound.
-// When a table the answer read was cut short when the graph was built (`partial` of the answer: for an `imports` answer the
-// module's own import table, for an `importers` answer any table of the graph, which it reads whole), every count of it is
+// When a table the answer read was cut short when the graph was built (`partial` of the answer: for an `imports` answer any
+// table (import, delay-load or export) of the module itself, for an `importers` answer any table of the graph, which it reads whole), every count of it is
 // a lower bound and modules may be missing: `tableCut`.
 function binaryGraphExploreParts(request, answer) {
     const a = answer && typeof answer === 'object' ? answer : {};
@@ -27440,8 +27440,8 @@ function binaryGraphExploreRelease(st) {
 }
 
 // What is cut now, per opened node and level: the parts the server dropped of its own answer, the imported functions it
-// dropped from a list grouped by module (and the module whose count is a lower bound), the nodes whose own import table was
-// cut short when the graph was read, the nodes whose importers were read over a cut table, and the heads of the parts that
+// dropped from a list grouped by module (and the module whose count is a lower bound), the nodes with a table (import, delay-load or
+// export) that was cut short when the graph was read, the nodes whose importers were read over a cut table, and the heads of the parts that
 // did not fit on the canvas (or whose drawn head lost its edge) and are still not drawn. { hidden (neighbours known to be
 // missing), server, functions, tables, importers, dropped, any, parents, of, ofFunctions, ofTable, ofImporters, lastDrawn,
 // tableEdges }
@@ -27484,12 +27484,12 @@ function binaryGraphExploreStatus(st) {
                 + `${cut.lastDrawn ? ' and the count on that edge is at least what it says' : ''}`);
         }
         if (cut.tables) {
-            why.push(`${n(cut.tables, 'opened node has', 'opened nodes have')} an import table that was cut short when it was read, so modules may be missing`
+            why.push(`${n(cut.tables, 'opened node has', 'opened nodes have')} a table (import, delay-load or export) that was cut short when it was read, so modules may be missing`
                 + `${cut.tableEdges ? ' and the counts on its edges are at least what they say' : ''}`);
         }
         if (cut.importers) {
             // a fact about the graph, not about this node: the sentence points at the figure that says how big it is
-            why.push(`who imports ${n(cut.importers, 'opened node', 'opened nodes')} may be incomplete: some import tables of the graph were cut short when the graph was read, `
+            why.push(`who imports ${n(cut.importers, 'opened node', 'opened nodes')} may be incomplete: some tables (import, delay-load or export) of the graph were cut short when the graph was read, `
                 + 'and a binary whose table was cut may be one that imports it; the figures say how many');
         }
         if (cut.dropped) why.push(`${n(cut.dropped, 'did', 'did')} not fit on this canvas, which holds at most ${escapeHtml(String(BINARY_GRAPH_EXPLORE.cap))} nodes`);
@@ -27523,8 +27523,8 @@ function binaryGraphExploreInfo(st) {
     const cut = binaryGraphExploreCut(st), left = cut.of.get(node.id), lost = cut.ofFunctions.get(node.id);
     if (left) html += ` · ${escapeHtml(left.toLocaleString('en-US'))} of its neighbours are not shown`;
     if (lost) html += ` · ${escapeHtml(lost.toLocaleString('en-US'))} of its imported functions are not shown`;
-    if (cut.ofTable.has(node.id)) html += ' · its import table was cut short when it was read: modules may be missing';
-    if (cut.ofImporters.has(node.id)) html += ' · the list of its importers may be incomplete: some import tables were cut short when the graph was read (the figures say how many)';
+    if (cut.ofTable.has(node.id)) html += ' · it has a table (import, delay-load or export) that was cut short when it was read: modules may be missing';
+    if (cut.ofImporters.has(node.id)) html += ' · the list of its importers may be incomplete: some tables (import, delay-load or export) were cut short when the graph was read (the figures say how many)';
     return html;
 }
 
@@ -27890,7 +27890,7 @@ function binaryGraphDraw() {
         const pieces = [];
         if (cut.hidden) pieces.push(`${cut.hidden.toLocaleString('en-US')} not shown`);
         if (cut.functions) pieces.push(`${cut.functions.toLocaleString('en-US')} imported functions not shown`);
-        if (cut.tables) pieces.push(`${cut.tables.toLocaleString('en-US')} import ${cut.tables === 1 ? 'table' : 'tables'} cut short`);
+        if (cut.tables) pieces.push(`${cut.tables.toLocaleString('en-US')} ${cut.tables === 1 ? 'opened node has' : 'opened nodes have'} a table cut short`);
         if (cut.importers) pieces.push('importers may be incomplete (some tables cut short, the figures say how many)');
         ctx.fillStyle = themeColor('--severity-medium');
         ctx.fillText(`Not the whole neighbourhood: ${pieces.join(', ')} (the canvas holds ${BINARY_GRAPH_EXPLORE.cap} nodes)`, 12, 10);

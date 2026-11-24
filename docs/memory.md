@@ -361,6 +361,60 @@ asked for with `"syscalls": true`. The SWEEP button and "Sweep as baseline" do
 not ask for it: a syscall finding does not go into the host baseline until a
 clean VM has been shown to sweep clean with it.
 
+### The binary graph
+
+GRAPH beside MAP draws the **import graph of `C:\Windows\System32`** in the map's
+place: for every PE in that folder (about 4,000 binaries), which modules and which
+functions it imports, delay-loads included, what it exports, which exports are
+forwarders and where a forwarder ends, with api-set names resolved to the module
+that hosts them. It answers the question the baseline cannot: *by which door does
+a sample reach this syscall*, and who else uses the same door.
+
+The graph is made **here and offline**: `scripts/build-binary-graph.ps1` reads the
+files of this VM with `pefile` at provisioning, and the web UI builds it in the
+background when it is missing ([Configuration](configuration.md#the-binary-graph-cache),
+[Troubleshooting](troubleshooting.md#syscalls-graph-says-there-is-no-binary-graph)).
+It is the graph of this build and this architecture, and of no other, so on an
+ARM64 VM it is an ARM64 one. [WinGraph](https://wingraph.m0n1x90.dev/) shows a
+dependency graph of System32 too, but it has no public API, this VM has no
+internet, and a foreign dataset would not be the one of this system; the tab only
+links to it, and nothing is queried or fetched from it.
+
+It has three parts. **PATH** asks one question and draws the answer from left to
+right, one layer per hop: *path to syscall* (an import such as `kernel32.dll` and
+`WriteProcessMemory`, followed over forwarders and api sets to the export that
+defines it and from there to a syscall number of this build's baseline),
+*importers*, *imports*, *syscall callers*, *forwarders* and *shared dependencies*.
+**EXPLORE** starts at one binary and opens its neighbours node by node (EXPAND,
+FUNCTIONS, 1 to 3 hops at a time, 400 nodes at most on the canvas). **FIGURES**
+is the table of numbers of the whole stock (binaries, edges, resolved api sets,
+forwarders, isolated binaries, circular pairs, curated transitions, the most
+imported modules, skipped files, binaries with a cut table); a number opens the
+list behind it in the DETAIL panel and a row of that list starts an exploration.
+
+**What is read and what is written by hand.** Every edge is read from a binary
+except one kind. The last hop from a Win32 function to its Nt counterpart
+(`WriteProcessMemory` to `NtWriteVirtualMemory`) is not in any file: it comes from
+the table `webui/win32_to_nt.json`, kept by hand. That edge is drawn **dashed and
+marked `curated`**, it is at most one per path and always the last, and the
+legend says that it is the word of the table, not read from any binary. A path that ends in an Nt stub
+which `ntdll.dll` or `win32u.dll` exports has no such edge and is derived from end
+to end. The `Zw` name of an `ntdll` function reaches the syscall of its `Nt`
+name by a curated edge as well, a naming convention that no binary states. The
+interface never presents a curated edge as a derived one; the list of the table's
+own rows (the figure *curated transitions*) is the one other place where they
+appear.
+
+**Where the graph is incomplete it says so.** A binary whose import, delay-load or
+export table was cut short when it was read is counted as such (the figure
+*partial*), and an answer that read it is marked `partial`: a negative or a count
+over it is not certain, and a count is a lower bound. A name that no binary of
+System32 imports is *not imported by System32*, which is not the same as not
+imported by anything.
+
+The same graph is the denominator of the STUBS search for a stub in process
+memory (see above). A scan never starts building it.
+
 ## Before the first detonation (clean box)
 
 ```text

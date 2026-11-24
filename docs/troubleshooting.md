@@ -110,6 +110,35 @@ install-ntsleuth.ps1`, or the update button of [Tool updates](updates.md)).
 *Not distinguishable on this host* is not a fault: the x64 baseline was
 discarded on purpose, see [Live memory](memory.md#when-the-tab-says-it-cannot-measure).
 
+## SYSCALLS GRAPH says there is no binary graph
+
+GRAPH draws from `C:\tools\ntsleuth\baseline\binary-graph-<build>-<arch>.json`
+(how it is made: [Configuration](configuration.md#the-binary-graph-cache)). The GRAPH button is always
+on; where the graph is missing, the query and the figures answer with a
+sentence in place of a picture, and the sentence says which of these it is:
+
+| The tab says | What it means | What to do |
+|---|---|---|
+| *There is no binary graph for build … yet. It is being built in the background; that takes a few minutes.* | There is no file of this build and architecture, which includes the one a Windows update leaves behind under the old build number. The web UI started the build when you asked. | Wait a few minutes (it reads about 4,000 files) and press QUERY or RELOAD again. |
+| *The binary graph … cannot be used (other build / other architecture / unknown format / malformed: …).* | A file of the right name that holds another build or architecture, a format this web UI does not know, or something that is not a graph (a power loss can leave a zero-filled file). It is built again in the background. | Wait, and ask again. |
+| *The last build failed at …: <reason>. It is tried again from … on.* | The background build failed (for instance a timeout of 30 minutes, or a disk fault). A failed build is tried again after ten minutes. | Read the reason; ask again after the time it names. |
+| *Building it failed 3 attempts in a row … It is not built again by itself: rebuild it by hand with scripts\build-binary-graph.ps1 -Force* | The web UI gave up: a failure that three builds in a row did not cure is not cured by a fourth, and each one reads all of System32 at the cost of CPU. | Rebuild it by hand, as Administrator: `C:\tdc\scripts\build-binary-graph.ps1 -Force`. The tab takes the new graph without a restart. |
+| *Tool updates are running: no graph is built while they are.* | An update that swaps files in System32 or the web UI's Python under a build is the opposite of help. | Ask again when the update has ended. |
+| *The binary graph … cannot be opened right now; it is read again on the next request.* | Another program, usually a scanner, holds the file without sharing it. Nothing is rebuilt. | Ask again. |
+
+The script exits 0 even when it built nothing, so a provisioning that looks
+clean can still have no graph: its yellow `[!]` lines name the reason, such as
+*the web UI's Python is not there* (`install-webui.ps1` has not run) or *the
+build of this system cannot be read from the registry*. The cache is built by the
+web UI's own Python (`binary_graph.py`) and its command line is `--out <directory>
+--build <build> --arch <arch>`; `--check` says whether a cache loads.
+
+Two things that are not faults: an answer with **a table cut short**
+(`partial`) is a binary whose import, delay-load or export table the reader had
+to stop in, and the tab says every count it affects is a lower bound; and
+**files skipped** are PE files that could not be read, listed under the figure
+*skipped*.
+
 ## Local install fails
 
 ```bash
@@ -252,6 +281,7 @@ C:\ProgramData\chocolatey\lib\die\      Detect It Easy (DiE 3.21)
 C:\ProgramData\chocolatey\lib\ghidra\   Ghidra 12.1.2
 C:\tools\cutter\                        rizin 0.9.1 + rz-ghidra (Cutter's Windows package; only rizin runs)
 C:\tools\ntsleuth\                      NTSleuth (ntsleuth-arm64.exe on ARM64, ntsleuth-x64.exe) + baseline\ntsleuth-<build>-<view>.json
+                                        baseline\binary-graph-<build>-<arch>.json: the import graph of System32 (GRAPH view)
 C:\Windows\Temp\rizin_uploads\          Files uploaded in the RIZIN tab (newest 40)
 C:\DetonationChamberUI\rizin_projects\  RIZIN projects (renames and comments)
 C:\tdc\samples\                         Samples the FIREWALL tab fetched (<sha256[:2]>\<sha256>; never executed, Defender-excluded)

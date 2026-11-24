@@ -672,7 +672,7 @@ const importsOf = name => {
   }
   if (!parts.length) return none(name + ' imports nothing.', g.partial === true);
   return cutAnswer({ nodes: [modNode(name)], edges: [], roots: [name] }, parts, name + ' imports ' + parts.length + ' functions.'
-    + (g.partial ? ' Its import table was cut short when it was read, so the list may be incomplete.' : ''), 'imported functions', g.partial === true);
+    + (g.partial ? ' It has a table (import, delay-load or export) that was cut short when it was read, so the list may be incomplete.' : ''), 'imported functions', g.partial === true);
 };
 const importersOf = (target, fn) => {
   const t = GRAPH[target];
@@ -1371,7 +1371,7 @@ def test_an_edge_that_could_not_be_drawn_because_its_head_is_drawn_but_its_alias
 
 
 @needs_node
-def test_a_cut_import_table_keeps_its_caveat_once_modules_are_drawn():
+def test_a_cut_table_keeps_its_caveat_once_modules_are_drawn():
     r = _explore_flow(r"""
       (async () => {
         initSyscalls(); binaryGraphSetMode('explore');
@@ -1390,10 +1390,13 @@ def test_a_cut_import_table_keeps_its_caveat_once_modules_are_drawn():
     cut = r["cut"]
     assert sorted(cut["edges"]) == sorted([["kernel32.dll", 2, "at least 2 functions", True], ["user32.dll", 1, "at least 1 function", True]])
     status = _plain(cut["status"])
-    assert "import table" in status and "cut short when it was read" in status and "modules may be missing" in status, status
+    assert "1 opened node has a table (import, delay-load or export) that was cut short when it was read, so modules may be missing" in status, status
+    assert "import table" not in status, "BinaryInfo.partial is also set by an export or a delay-load table: the sentence must not call it an import table"
     assert "at least what they say" in status and "does not mean" in status
-    assert "import table was cut short" in cut["info"] and "modules may be missing" in cut["info"]
-    assert any("import table" in t and "cut short" in t for t in cut["texts"]) and "at least 2 functions" in cut["texts"]
+    assert "it has a table (import, delay-load or export) that was cut short when it was read: modules may be missing" in cut["info"]
+    assert "import table" not in cut["info"]
+    assert any("a table cut short" in t for t in cut["texts"]) and not any("import table" in t for t in cut["texts"])
+    assert "at least 2 functions" in cut["texts"]
     assert "cut short when it was read" in r["afterFunctions"], "the list of functions of a cut table says so too"
 
 
@@ -1486,10 +1489,13 @@ def test_importers_that_may_be_missing_because_a_table_was_cut_are_said_so():
       })();""")
     assert r["whole"]["status"] == "" and not any("cut short" in t for t in r["whole"]["texts"])
     status = _plain(r["status"])
-    assert "who imports" in status and "may be incomplete" in status and "some import tables of the graph were cut short when the graph was read" in status, status
+    assert "who imports" in status and "may be incomplete" in status, status
+    assert "some tables (import, delay-load or export) of the graph were cut short when the graph was read" in status, status
+    assert "import tables" not in status
     assert "the figures say how many" in status, "the sentence points at the count instead of standing alone"
     assert "does not mean" in status
-    assert "importers may be incomplete" in r["info"] and "some import tables" in r["info"] and "the figures say how many" in r["info"]
+    assert "importers may be incomplete" in r["info"] and "the figures say how many" in r["info"]
+    assert "some tables (import, delay-load or export) were cut short when the graph was read" in r["info"] and "import tables" not in r["info"]
     assert any("importers" in t and "cut short" in t and "figures" in t for t in r["texts"])
     assert r["ids"] == ["app.exe", "kernel32.dll", "kernelbase.dll", "ntdll.dll", "win32u.dll"], "the importers that are known are still drawn"
 

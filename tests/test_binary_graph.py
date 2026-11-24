@@ -3883,6 +3883,9 @@ def test_the_api_reference_and_the_help_both_name_partial_in_the_payload_of_the_
     for query in binary_graph_query.QUERIES:
         assert f"`{query}`" in clause, f"docs/api.md does not say when {query} is partial"
     assert "the same word as `partial` of a binary and of a chain" in clause
+    # the module's own table is an import table for `imports` and an export table for `forwarders`; the clause names neither as such
+    assert "own import table" not in clause, clause
+    assert "(import, delay-load or export)" in clause, "the clause does not say which tables the flag covers"
 
 
 # --- the figures of the whole stock (metrics, metric_members) -------------------------------------------------------------
@@ -4298,6 +4301,20 @@ def test_the_figure_of_cut_tables_says_a_table_of_any_of_three_kinds_not_an_impo
     assert needle in _members(_query_graph(_q("k.dll", partial=True)), "isolated").note, "also where the list itself is empty"
     assert "import, delay-load or export" in binary_graph_query.metrics.__doc__
     assert "whose import table was cut short" not in binary_graph_query.metrics.__doc__
+
+
+def test_the_notes_of_a_cut_table_never_call_it_an_import_table_when_it_may_have_been_an_export_one():
+    # the same flag as above: `imports_of` reads `info.partial`, which an export or a delay-load table sets as well, and
+    # `isolated` is the one list whose caveat names what was lost
+    needle = "a table (import, delay-load or export) that was cut short when it was read"
+    cut = binary_graph_query.imports_of(_query_graph(_q("k.dll", exports=("F",), partial=True),
+                                                     _q("x.exe", "exe", imports={"k.dll": ("F",)}, partial=True)), "x.exe")
+    assert cut.partial is True and needle in cut.note and "Its import table" not in cut.note, cut.note
+    empty = binary_graph_query.imports_of(_query_graph(_q("k.dll", partial=True)), "k.dll")
+    assert needle in empty.note and "Its import table" not in empty.note, empty.note
+    cut_isolated = _members(_query_graph(_q("k.dll", partial=True), _q("lone.exe", "exe")), "isolated")
+    assert "only because an import that would link it was in a table that was cut short" in cut_isolated.note, cut_isolated.note
+    assert "what it imports was lost" not in cut_isolated.note
 
 
 def test_a_binary_that_imports_only_an_api_set_whose_hosts_were_all_skipped_is_not_isolated():
