@@ -7,31 +7,39 @@
 # because that joins the arguments into one line of PowerShell and parses it.
 #
 # Verbs:
-#   Profiles            [{"Name","Enabled","DefaultOutboundAction","Configured"}] of the three profiles:
-#                       DefaultOutboundAction as in force (ActiveStore), Configured as set (PersistentStore). Always
-#                       through the cmdlets; see "Profiles stays on the cmdlets" below for why there is no fast way.
-#   Compare             reads TDC's rules both ways and holds them up against each other, field by field:
-#                       {"ok","rules","checked":{"displayNames","names","fields"},"differences":[{"what","fast","cmdlet"}]}.
-#                       Every TDC-FW-* rule with every field of List, as List and as Get read it fast; a rule only one
-#                       way finds is a difference. rules is how many TDC rules either way found: 0 means nothing was
-#                       compared, whatever ok says. Exit 0 when they agree, 1 when not (or when the cmdlets cannot be
-#                       read; then stderr says why). Writes nothing.
+#   Profiles            [{"Name","Enabled","DefaultOutboundAction","Configured","Via"[,"Fallback"]}] of the three
+#                       profiles: DefaultOutboundAction as in force (ActiveStore), Configured as set (PersistentStore).
+#                       Via is "fast" (CIM with the PolicyStore option, without the NetSecurity module) or "cmdlet", and
+#                       then Fallback says why; see "Profiles over CIM with the PolicyStore option" below.
+#   Compare             reads the profiles and TDC's rules both ways and holds them up against each other, field by
+#                       field: {"ok","rules","checked":{"profiles","displayNames","names","fields"},
+#                       "differences":[{"what","fast","cmdlet"}]}. Every profile's Enabled, DefaultOutboundAction and
+#                       Configured as Read-FastProfileStates and as the cmdlets read them; every TDC-FW-* rule with
+#                       every field of List, as List and as Get read it fast. A rule only one way finds is a difference.
+#                       rules is how many TDC rules either way found, and each kind of check is counted on its own: 0
+#                       means nothing of that kind was compared, whatever ok says. Exit 0 when they agree, 1 when not
+#                       (or when the cmdlets cannot be read; then stderr says why). Writes nothing.
 #   Enable              switch the three profiles on
-#   List                {"profiles": [...], "rules": [...], "Via"[, "Fallback"]}: the profiles as Profiles gives them,
-#                       and every rule named TDC-FW-* as {"Name","Enabled","Action","Direction","Profile","Program",
-#                       "RemoteAddress","RemotePort","Protocol"}. Via is the way the rules were read: "fast" (COM,
-#                       without the NetSecurity module) or "cmdlet", and then Fallback says why.
+#   List                {"profiles": [...], "rules": [...], "Via"[, "Fallback"]}: the profiles as the rows of Profiles
+#                       without their Via and Fallback, and every rule named TDC-FW-* as {"Name","Enabled","Action",
+#                       "Direction","Profile","Program","RemoteAddress","RemotePort","Protocol"}. Via is the way the
+#                       whole answer was read: "fast" only when both halves were (the profiles as Profiles reads them,
+#                       the rules over COM, neither with the NetSecurity module), else "cmdlet", and then Fallback
+#                       names every half that fell back with its reason: "profiles: <reason>", "rules: <reason>", or
+#                       both joined by "; ".
 #   Get -Name           the one rule as JSON, as List gives it plus "Via"[, "Fallback"], or no output at all when there is none
 #   Create -Name -Action [-Program] [-RemoteAddress a,b] [-RemotePort] [-Protocol]
 #                       an outbound rule. Exit 3: a profile is off (nothing is written). Exit 4: the rule is already there.
 #   Remove -Name        remove the rule (no error when it is not there)
 #   SetDefaultOutbound -DefaultOutboundAction [-Profiles Domain,Private]
-#                       in the PersistentStore, then the three profiles as Profiles gives them, read back
-#   AllowOut            {"profiles": [...], "rules": [{"Name","DisplayName","Group","Source"}]}: the profiles as
-#                       Profiles gives them, and every enabled outbound Allow rule in
-#                       force (ActiveStore) that is not TDC's. DefaultOutboundAction Block governs only traffic that no
-#                       rule matches, so each of these still lets traffic out. Source is PolicyStoreSourceType: only
-#                       Local rules (the PersistentStore) can be switched here; a GroupPolicy rule cannot.
+#                       in the PersistentStore, then the three profiles read back through the cmdlets, as the rows of
+#                       Profiles without their Via and Fallback
+#   AllowOut            {"profiles": [...], "rules": [{"Name","DisplayName","Group","Source"}]}: the profiles read
+#                       through the cmdlets, as the rows of Profiles without their Via and Fallback, and every enabled
+#                       outbound Allow rule in force (ActiveStore) that is not TDC's. DefaultOutboundAction Block
+#                       governs only traffic that no rule matches, so each of these still lets traffic out. Source is
+#                       PolicyStoreSourceType: only Local rules (the PersistentStore) can be switched here; a
+#                       GroupPolicy rule cannot.
 #   DisableAllowOut -Names <base64>, EnableAllowOut -Names <base64>
 #                       switch the named local outbound Allow rules off or on. -Names is base64 of a UTF-8 JSON list
 #                       of rule names, so no name is ever a wildcard or a parameter. Only outbound Allow rules of the
@@ -58,40 +66,61 @@
 # machine. A number that is not in its map, a spelling that is not known, an empty answer or any error is not guessed
 # at: the verb answers through the cmdlets instead and says so (Via "cmdlet", Fallback the reason). The verbs that
 # write read their rule back through the cmdlets as before.
-# Which store each way reads, as measured (see "Profiles stays on the cmdlets" for the experiment):
+# Which store each way reads, as measured (see "Profiles over CIM with the PolicyStore option" for the experiment):
 #   - COM reads the local store, the PersistentStore, and not what is in force: a group policy's value is not in
 #     what COM says.
 #   - Get-NetFirewallRule without -PolicyStore reads its default, the PersistentStore too. Create and Cut write there
 #     (New-NetFirewallRule's default store), so TDC's own rules live there.
 #   For TDC's rules both ways therefore read the same store, and that is why Compare agrees with them field by field.
-#   The one bounded residual: a rule named TDC-FW-* that a group policy sets is not in the PersistentStore, so the
-#   cmdlet read does not see it. Should COM's rule collection show it (for rules that is not measured), the fast read
-#   sees it and the cmdlet read does not, and Compare's check of the set of names is what shows it. Should COM not show
-#   it, neither way sees it, as List never did before COM. The cmdlet
+#   The one bounded residual: a rule named TDC-FW-* that a group policy sets is seen by neither way. Measured on the
+#   VM with one local group-policy outbound Allow rule standing: the cmdlets' ActiveStore 539 rules, the policy rule
+#   among them with source GroupPolicy; the cmdlets' PersistentStore 538, without it; COM 538, without it, both with
+#   and without the policy rule standing. So COM's rule collection does not show a group-policy rule, and neither
+#   does the cmdlet read: such a rule is not in List or Get either way, as it never was before COM. The cmdlet
 #   fallback of List and Get stays on the PersistentStore, as it always read: a fallback answers what it answered
 #   before, never another store.
 # COM's rule Name is what the cmdlets call DisplayName, not the Name a rule is looked up by: the two are one for TDC's
 # rules only because Create and Cut write DisplayName = Name, and Compare checks exactly that for every TDC rule.
 #
-# Profiles stays on the cmdlets, module load and all; do not move it to COM or CIM. Its in-force value is what
-# verified, the ISOLATED band and startup_state rest on, and no module-free source gives it:
-#   - COM (HNetCfg.FwPolicy2 DefaultOutboundAction) reads the local store, not what is in force. Measured on the VM,
-#     with the local GPO store written through Set-NetFirewallProfile -PolicyStore <computer name>:
+# Profiles over CIM with the PolicyStore option. Its in-force value is what verified, the ISOLATED band and
+# startup_state rest on, so the fast way may only ever answer what the cmdlets would: a configured value given out as
+# in force is the one failure this file exists to prevent. What does not reach the ActiveStore, measured on the VM:
+#   - COM (HNetCfg.FwPolicy2 DefaultOutboundAction) reads the local store, not what is in force. Measured with the
+#     local GPO store written through Set-NetFirewallProfile -PolicyStore <computer name>:
 #       local GPO (Domain outbound)  = Allow
 #       PersistentStore              = Block
 #       ActiveStore (in force)       = Allow   (the policy wins)
 #       COM                          = 0 = Block
-#     So where a group policy sets outbound Allow over the local Block that ISOLATED writes, a COM read would report
-#     Block, closed, while the egress is open. Compare found exactly this on its own before this path was removed. An
-#     earlier measurement (COM Allow where the PersistentStore said NotConfigured) only showed that COM is not the
-#     configured store; COM resolving NotConfigured of the local store to its default answers the same.
-#   - Raw CIM (MSFT_NetFirewallProfile) answers the PersistentStore, what is configured. Neither a namespace
-#     (root/standardcimv2/ActiveStore is "Ungueltiger Namespace") nor a query filter (PolicyStore='ActiveStore' is
-#     "Die Anfrage ist ungueltig") reaches the ActiveStore. The route the NetSecurity CDXML probably takes, -PolicyStore
-#     as a CIM operation option (CimOperationOptions.SetCustomOption), is unmeasured; measuring it is the one thing that
-#     could bring a fast in-force read back.
-# Configured alone could come from CIM, but the in-force half needs the cmdlets and so loads the module anyway: there is
-# no saving left in it, and half a fast path is only more surface for the same answer.
+#     So where a group policy sets outbound Allow over the local Block that ISOLATED writes, a COM read reports Block,
+#     closed, while the egress is open. Compare found exactly this, and the COM read of the profiles was reverted.
+#   - Raw CIM (MSFT_NetFirewallProfile) without an option answers the PersistentStore, what is configured. Neither a
+#     namespace (root/standardcimv2/ActiveStore is "Ungueltiger Namespace") nor a query filter
+#     (PolicyStore='ActiveStore' is "Die Anfrage ist ungueltig") reaches the ActiveStore.
+# What does: -PolicyStore as a CIM operation option, the mechanism of the NetSecurity module itself (its CDXML declares
+# <Option OptionName="PolicyStore">), set directly with CimOperationOptions.SetCustomOption. Measured on the VM, in the
+# policy state above:
+#       no option                    Domain = 4 = Block   538 rules   the PersistentStore
+#       option 'ActiveStore'         Domain = 2 = Allow   539 rules   the ActiveStore, what is in force
+#       option 'PersistentStore'     Domain = 4 = Block   538 rules   the PersistentStore
+#       cmdlets                      ActiveStore Allow, PersistentStore Block
+#   Both stores in a fresh process: 0.61 s against 1.20 s through the cmdlets (213 ms of it inside the process, the
+#   second store only +39 ms on the warm session), and the NetSecurity module is not loaded. The session is
+#   CimSession::Create('.'); Create($null) fails with "Der Parameter ist ungueltig".
+# The option cannot be forced: SetCustomOption with mustComply $true is refused for every call by the WS-Man WMI
+# plug-in ("unterstuetzt das angegebene OptionSet-Element nicht"), so it is set with $false. A provider that ignored it
+# would silently answer the PersistentStore, and TDC would give a configured value out as in force. The sentinel stands
+# in for mustComply: before any store is read, Read-FastProfileStates reads a store that cannot exist, a name no
+# computer and no path can have. Measured over ten reads, the provider always refuses it, in 46 ms typically and 160 ms
+# at most, with no DNS query. Should it answer, or fail in any other way than that refusal, the fast way throws instead
+# of answering. It is a proof per call, not a promise of the API, it narrows the hole of an ignored option rather than
+# closing it, and it proves something only when it comes before the first value that is used. What it proves and what
+# it does not is written at the sentinel.
+# Every value is translated through a map written out in Read-FastProfileStates and matched case-exactly. A value not in
+# its map, a profile missing or named twice, an empty answer, CIM not being there at all, or any other error is not
+# guessed at: Profiles answers through the cmdlets instead and says so (Via "cmdlet", Fallback the reason). Compare
+# holds the two ways up against each other; no test off Windows can confirm what the option reads on a machine.
+# The verbs that write (Create, Cut, SetDefaultOutbound) check and read back the profiles through the cmdlets, as they
+# always did, and so does AllowOut (see the comment above Get-ForeignAllowOut).
 
 param(
     [Parameter(Mandatory = $true)]
@@ -131,18 +160,139 @@ function Get-ShortReason {
     return $reason
 }
 
+# The profiles without the NetSecurity module, in the shape of the rows of Get-ProfileStates: in force (Enabled,
+# DefaultOutboundAction) from the ActiveStore, configured (Configured) from the PersistentStore, both over CIM with the
+# PolicyStore operation option (see "Profiles over CIM with the PolicyStore option" at the head of this file). Each
+# store fills a table of its own, and each table is filled in one line that names its store, so that no row can take a
+# value from the other store. Throws on anything it cannot vouch for, and emits nothing until all three profiles are
+# read from both stores.
+function Read-FastProfileStates {
+    # The values of MSFT_NetFirewallProfile, each one written out: measured on the VM against the cmdlets, not taken
+    # from documentation, and confirmed only by Compare. No arithmetic on them; a value that is not here throws.
+    # DefaultOutboundAction, as the cmdlets print it. The numbers were measured on this path (all three, 2 included);
+    # the names came back from the same class on the same VM through the way this script read it before, for a reason
+    # not known. Both forms are accepted, each written out, and matched case-exactly by $mapped.
+    $CimOutbound = @{ '0' = 'NotConfigured'; '2' = 'Allow'; '4' = 'Block'; 'NotConfigured' = 'NotConfigured'; 'Allow' = 'Allow'; 'Block' = 'Block' }
+    # Enabled is 0 and 1 on this path, measured with the Public profile's firewall switched off; not the 1 and 2 of
+    # the WMI convention. Nothing else is accepted, not even a spelling of true or false.
+    $CimEnabled = @{ '0' = $false; '1' = $true }
+    # One value through its map, or a throw. A PowerShell hashtable ignores case, so ContainsKey alone would let a
+    # `block` through that is not listed; the key must also be one of the map's own, compared case-exactly.
+    $mapped = {
+        param($Map, $Row, [string]$Field)
+        $Value = [string]$Row.$Field
+        if (-not ($Map.ContainsKey($Value) -and @($Map.Keys) -ccontains $Value)) { throw "CIM $($Row.Store) $Field of $($Row.Name) is not a known value: '$Value'" }
+        $Map[$Value]
+    }
+    # Create('.'), the local machine: Create($null) fails with "Der Parameter ist ungueltig".
+    $session = [Microsoft.Management.Infrastructure.CimSession]::Create('.')
+    try {
+        # The operation options that name one store. mustComply is $false because the WS-Man WMI plug-in refuses every
+        # call that sets it $true; the sentinel below is what stands in for it.
+        $optionsOf = {
+            param([string]$Store)
+            $options = New-Object Microsoft.Management.Infrastructure.Options.CimOperationOptions
+            $options.SetCustomOption('PolicyStore', $Store, $false)
+            $options
+        }
+        # The profiles of the store those options name, as CIM gives them: the enumeration alone.
+        $enumerate = {
+            param($Options)
+            @($session.EnumerateInstances('root/StandardCimv2', 'MSFT_NetFirewallProfile', $Options))
+        }
+        # One store's three profiles in the order of $AllProfiles, their values not yet mapped, or a throw.
+        $readStore = {
+            param([string]$Store)
+            $rows = @{}
+            foreach ($p in @(& $enumerate (& $optionsOf $Store))) {
+                $name = [string]$p.CimInstanceProperties['Name'].Value
+                if (-not ($AllProfiles -ccontains $name)) { throw "CIM $Store names a profile that is not known: '$name'" }
+                if ($rows.ContainsKey($name)) { throw "CIM $Store names the profile $name twice" }
+                $rows[$name] = [pscustomobject]@{ Store = $Store; Name = $name; Enabled = $p.CimInstanceProperties['Enabled'].Value; DefaultOutboundAction = $p.CimInstanceProperties['DefaultOutboundAction'].Value }
+            }
+            foreach ($name in $AllProfiles) {
+                if (-not $rows.ContainsKey($name)) { throw "CIM $Store does not name the profile $name" }
+            }
+            @(foreach ($name in $AllProfiles) { $rows[$name] })
+        }
+        # The sentinel, before any store is read: a store that cannot exist must be refused by the provider. If it
+        # answers at all, even with nothing, the option is being ignored and every read below would be the
+        # PersistentStore under another name. Moved behind a real read, it would prove nothing about that read.
+        # What shows that store names reach the provider and are judged there, as measured on the VM:
+        #   - a legal name makes it try to reach a machine of that name (-PolicyStore <computer name> addresses that
+        #     computer's GPO store): up to 5205 ms per read, and the name in the DNS trace;
+        #   - this name is refused with the Win32 path-syntax error ("Die Syntax fuer den Dateinamen, Verzeichnisnamen
+        #     oder die Datentraegerbezeichnung ist falsch"), which is the provider's judgement, not a client check;
+        #   - its base exception is a CimException with NativeErrorCode Failed, every time, which places the failure
+        #     inside CIM. Only that counts as the refusal; anything else (another code, an error that is not CIM's,
+        #     access denied, the type not being there) proves nothing and throws into the cmdlets. The check is on an
+        #     enum, not on the localised text.
+        # The options are built before the counted try, so that only the enumeration is counted: a client that refused
+        # the value while the option is set throws from here into the cmdlets, and is not taken for a refusal.
+        # That the error surfaces while enumerating proves nothing by itself: EnumerateInstances starts the operation
+        # only on the first MoveNext, so a client or transport refusal would surface the same way.
+        # A provider that ignored the option would never look at the name and would answer with the PersistentStore's
+        # three profiles, and that is what makes this throw.
+        # Residuals: Failed is a generic failure, so the code narrows the hole rather than closes it. A WS-Man transport
+        # error commonly arrives as a CimException with Failed too, and so would a transient provider failure on this,
+        # the session's first operation: either would still read as a refusal. And on a machine whose client refused
+        # such a value only when sending it, the sentinel would fail without having asked the provider. Compare in a
+        # policy state that contradicts the stores is the backstop for all of these, because that is where an option
+        # that is not honoured shows as a difference.
+        # The name must be no store, no computer name and no path, and it holds a | for that: no computer or path name
+        # can, so the provider refuses it on its syntax, in 46 ms typically and 160 ms at most, with no DNS query. A
+        # legal name is looked for on the network, from inside the chamber whose traffic TDC captures. It must never
+        # be empty either: an empty store name answers with all three profiles, exactly like no option at all.
+        # The | never reaches a command line: it is a string argument of SetCustomOption, and this script builds
+        # nothing from a value but the parameters of one call. It is not an injection to be "fixed".
+        # The name is written in this one line only, so that it changes in one edit.
+        $sentinel = & $optionsOf 'TDC|NoSuchStore'
+        $refused = $null
+        try { $null = & $enumerate $sentinel } catch { $refused = $_.Exception.GetBaseException() }
+        if (-not ($refused -is [Microsoft.Management.Infrastructure.CimException] -and $refused.NativeErrorCode -eq [Microsoft.Management.Infrastructure.NativeErrorCode]::Failed)) { throw "the sentinel store was not refused by the provider, so the PolicyStore option may be ignored: $(if ($null -eq $refused) { 'it answered' } else { "$($refused.GetType().Name) $($refused.NativeErrorCode)" })" }
+        $inForce = @{}
+        $configured = @{}
+        foreach ($p in @(& $readStore 'ActiveStore')) { $inForce[$p.Name] = @{ Enabled = (& $mapped $CimEnabled $p 'Enabled'); Outbound = (& $mapped $CimOutbound $p 'DefaultOutboundAction') } }
+        foreach ($p in @(& $readStore 'PersistentStore')) { $configured[$p.Name] = & $mapped $CimOutbound $p 'DefaultOutboundAction' }
+        $states = @(foreach ($name in $AllProfiles) {
+            [pscustomobject]@{
+                Name = $name
+                Enabled = $inForce[$name].Enabled
+                DefaultOutboundAction = $inForce[$name].Outbound
+                Configured = $configured[$name]
+            }
+        })
+        return $states
+    } finally {
+        $session.Dispose()
+    }
+}
+
 # Two stores, two questions; do not collapse them into one read.
 #   DefaultOutboundAction: the ActiveStore, what is IN FORCE. NotConfigured resolves there (to Allow, or to what a
 #     group policy sets). "Is ISOLATED in force?", Enabled and everything that is claimed read this.
 #   Configured: the PersistentStore, what this machine has CONFIGURED, NotConfigured included. It is the store
 #     SetDefaultOutbound writes, so it is what ISOLATED remembers and puts back, and what a write is checked against.
-# Every verb reads the profiles through here, and so through the cmdlets (see "Profiles stays on the cmdlets").
+# Every verb reads the profiles through here, as {Rows, Via, Fallback}. The fast way first (Read-FastProfileStates); on
+# any doubt the cmdlet read it always was, and Fallback says why. With -CmdletsOnly the cmdlets alone: the verbs that
+# write and AllowOut read through them as before, and Compare holds them up against the fast way, which only works if
+# this side can never be the fast reader itself; Fallback is null.
 function Get-ProfileStates {
+    param([switch]$CmdletsOnly)
+    $fallback = $null
+    if (-not $CmdletsOnly) {
+        try {
+            $rows = @(Read-FastProfileStates)
+            return [pscustomobject]@{ Rows = $rows; Via = 'fast'; Fallback = $null }
+        } catch {
+            $fallback = Get-ShortReason $_
+        }
+    }
     $configured = @{}
     foreach ($p in @(Get-NetFirewallProfile -PolicyStore PersistentStore)) {
         $configured[[string]$p.Name] = [string]$p.DefaultOutboundAction
     }
-    @(Get-NetFirewallProfile -PolicyStore ActiveStore | ForEach-Object {
+    $rows = @(Get-NetFirewallProfile -PolicyStore ActiveStore | ForEach-Object {
         [pscustomobject]@{
             Name = [string]$_.Name
             Enabled = ([string]$_.Enabled -eq 'True')
@@ -150,6 +300,7 @@ function Get-ProfileStates {
             Configured = $configured[[string]$_.Name]
         }
     })
+    return [pscustomobject]@{ Rows = $rows; Via = 'cmdlet'; Fallback = $fallback }
 }
 
 function Get-RuleView {
@@ -184,6 +335,10 @@ function Read-CmdletRuleViews {
 # Assert-OurName). The collection is enumerated, not queried, so every rule costs one read, its Name, and only TDC's
 # rules are read further: eight more reads each. Throws on anything it cannot vouch for, and emits nothing until every
 # rule is read.
+# COM's collection is the local store and does not show a group-policy rule. Measured on the VM with one local
+# group-policy outbound Allow rule standing: COM 538 rules both with and without it, the cmdlets' PersistentStore 538
+# without it, their ActiveStore 539 with it (source GroupPolicy). So this reader sees what the cmdlet fallback sees,
+# the PersistentStore, and never a rule only a policy sets.
 function Read-FastRuleViews {
     param([string]$RuleName)
     # The numbers of COM's rules, each one written out: derived from a measurement on the VM against the cmdlets, not
@@ -332,16 +487,18 @@ function Get-ProfileList {
     return $list
 }
 
-# AllowOut stays on the cmdlets, module load and all; do not move it to CIM or COM. It must read the ActiveStore, what
-# is in force, group policy included, and neither fast source can:
-#   - COM has no PolicyStoreSourceType, so a group-policy rule could not be told from a local one.
-#   - Raw CIM has no route to the ActiveStore. Measured on the VM: root/standardcimv2/ActiveStore is "Ungueltiger
-#     Namespace", and the PolicyStoreSource of all 538 rules raw CIM gives is PersistentStore. The counts agreed
-#     (cmdlet ActiveStore 135, cmdlet PersistentStore 135, CIM 135) only because that VM has no group-policy rules.
-#     On a host that has them, they are in the ActiveStore and not in the PersistentStore: read over CIM, they would
-#     vanish from allowed_out, and ISOLATED would say closed while they let traffic out. No guard can catch that,
-#     because seeing the difference takes a read of the ActiveStore.
-# It gains little besides: AllowOut runs only while ISOLATED is on and during a convergence, never in a tab's polls.
+# AllowOut stays on the cmdlets, module load and all, its profiles included; do not move it to CIM or COM. It must
+# read the ActiveStore, what is in force, group policy included. It could without the module, and that is not why it
+# stays:
+#   - COM cannot: it has no PolicyStoreSourceType, so a group-policy rule could not be told from a local one.
+#   - CIM can, with the PolicyStore operation option (see "Profiles over CIM with the PolicyStore option"). Measured
+#     on the VM in the policy state: with the option 'ActiveStore' it finds the same 136 enabled outbound Allow rules
+#     as the cmdlet, the policy's rule among them with PolicyStoreSourceType 2 (GroupPolicy). Raw CIM without the
+#     option does not (root/standardcimv2/ActiveStore is "Ungueltiger Namespace"; it answers the PersistentStore).
+# It stays because the gain does not pay for the risk. It would save about 0.4 s on a call that never appears in the
+# steady load (AllowOut runs only while ISOLATED is on and during a convergence, never in a tab's polls), and it is the
+# verb where a mistake reports closed while traffic still goes out: a rule missed here is a way out that ISOLATED does
+# not know of.
 # Not filtered by Get-NetFirewallRule's own -Direction/-Action/-Enabled: with those, "no rule matches" is an
 # error, and telling it apart from a real one would be a guess. A list that cannot be read must fail, never
 # read as "nothing is let out".
@@ -436,15 +593,43 @@ function Remove-IsolateRules {
 try {
     switch ($Op) {
         'Profiles' {
-            ConvertTo-Json -Compress -Depth 3 -InputObject (Get-ProfileStates)
+            $read = Get-ProfileStates
+            foreach ($row in $read.Rows) {
+                $row | Add-Member -NotePropertyName Via -NotePropertyValue $read.Via
+                if ($read.Via -ne 'fast') { $row | Add-Member -NotePropertyName Fallback -NotePropertyValue $read.Fallback }
+            }
+            ConvertTo-Json -Compress -Depth 3 -InputObject $read.Rows
         }
         'Compare' {
-            # TDC's rules both ways side by side; this reads and changes nothing. A fast way that cannot answer is a
-            # difference too: what it did not say has not been confirmed. The profiles are not compared: they have one
-            # way only (see "Profiles stays on the cmdlets"), and a comparison that cannot fail is worse than none.
-            # Each kind of check is counted on its own, so that a pass over no rule at all reads as one.
-            $checked = [ordered]@{ displayNames = 0; names = 0; fields = 0 }
+            # The profiles and TDC's rules both ways side by side; this reads and changes nothing. A fast way that
+            # cannot answer is a difference too: what it did not say has not been confirmed. Each kind of check is
+            # counted on its own, so that a pass over no profile or no rule at all reads as one.
+            $checked = [ordered]@{ profiles = 0; displayNames = 0; names = 0; fields = 0 }
             $differences = @()
+            # Every profile's in-force and configured values, read on their own both ways: the fast reader itself, not
+            # Get-ProfileStates, which answers one way only, against the cmdlets alone.
+            $cmdletProfiles = @{}
+            foreach ($row in @((Get-ProfileStates -CmdletsOnly).Rows)) { $cmdletProfiles[[string]$row.Name] = $row }
+            $fastProfiles = @{}
+            $profilesRead = $true
+            try {
+                foreach ($row in @(Read-FastProfileStates)) { $fastProfiles[[string]$row.Name] = $row }
+            } catch {
+                $profilesRead = $false
+                $differences += [pscustomobject]@{ what = 'profiles'; fast = "error: $(Get-ShortReason $_)"; cmdlet = 'read' }
+            }
+            if ($profilesRead) {
+                foreach ($profileName in @(@($AllProfiles) + @($cmdletProfiles.Keys) + @($fastProfiles.Keys) | Select-Object -Unique)) {
+                    foreach ($field in @('Enabled', 'DefaultOutboundAction', 'Configured')) {
+                        $checked.profiles += 1
+                        $a = $fastProfiles[$profileName].$field
+                        $b = $cmdletProfiles[$profileName].$field
+                        if (-not (Test-SameValue $a $b)) {
+                            $differences += [pscustomobject]@{ what = "profile $profileName $field"; fast = $a; cmdlet = $b }
+                        }
+                    }
+                }
+            }
             # Every rule either way finds, as the fast List reads it and as the fast Get reads it alone, against the
             # cmdlets. A rule only one way finds is a difference, so is a field that is not the same.
             $cmdletRules = @{}
@@ -467,8 +652,8 @@ try {
             $ruleNames = @($cmdletRules.Keys)
             try {
                 foreach ($view in @(Read-FastRuleViews)) { $fastWays.List[[string]$view.Name] = $view }
-                foreach ($name in @(@($fastWays.List.Keys) + @($cmdletRules.Keys) | Sort-Object -Unique)) {
-                    foreach ($view in @(Read-FastRuleViews -RuleName $name)) { $fastWays.Get[$name] = $view }
+                foreach ($ruleName in @(@($fastWays.List.Keys) + @($cmdletRules.Keys) | Sort-Object -Unique)) {
+                    foreach ($view in @(Read-FastRuleViews -RuleName $ruleName)) { $fastWays.Get[$ruleName] = $view }
                 }
             } catch {
                 $rulesRead = $false
@@ -480,13 +665,13 @@ try {
                 # the same rules only while TDC writes DisplayName = Name (see Read-FastRuleViews). A rule found by
                 # one side only is said, with the side that found it.
                 foreach ($way in $fastWays.Keys) {
-                    foreach ($name in $ruleNames) {
+                    foreach ($ruleName in $ruleNames) {
                         $checked.names += 1
-                        $inFast = $fastWays[$way].ContainsKey($name)
-                        $inCmdlet = $cmdletRules.ContainsKey($name)
+                        $inFast = $fastWays[$way].ContainsKey($ruleName)
+                        $inCmdlet = $cmdletRules.ContainsKey($ruleName)
                         if ($inFast -ne $inCmdlet) {
                             $differences += [pscustomobject]@{
-                                what = "$way rule names: $name found by one side only"
+                                what = "$way rule names: $ruleName found by one side only"
                                 fast = $(if ($inFast) { 'found' } else { 'not found' })
                                 cmdlet = $(if ($inCmdlet) { 'found' } else { 'not found' })
                             }
@@ -496,14 +681,14 @@ try {
                 # Then every field of every rule both sides found.
                 foreach ($way in $fastWays.Keys) {
                     $fastRules = $fastWays[$way]
-                    foreach ($name in $ruleNames) {
-                        if (-not ($fastRules.ContainsKey($name) -and $cmdletRules.ContainsKey($name))) { continue }
+                    foreach ($ruleName in $ruleNames) {
+                        if (-not ($fastRules.ContainsKey($ruleName) -and $cmdletRules.ContainsKey($ruleName))) { continue }
                         foreach ($field in @('Name', 'Enabled', 'Action', 'Direction', 'Profile', 'Program', 'RemoteAddress', 'RemotePort', 'Protocol')) {
                             $checked.fields += 1
-                            $a = $fastRules[$name].$field
-                            $b = $cmdletRules[$name].$field
+                            $a = $fastRules[$ruleName].$field
+                            $b = $cmdletRules[$ruleName].$field
                             if (-not (Test-SameValue $a $b)) {
-                                $differences += [pscustomobject]@{ what = "$way rule $name $field"; fast = $a; cmdlet = $b }
+                                $differences += [pscustomobject]@{ what = "$way rule $ruleName $field"; fast = $a; cmdlet = $b }
                             }
                         }
                     }
@@ -519,10 +704,17 @@ try {
             Set-NetFirewallProfile -Profile $AllProfiles -Enabled True
         }
         'List' {
+            # Not $profiles: this is script scope, where that name is the [string]$Profiles parameter (PowerShell
+            # names are case-insensitive), and assigning to it would coerce the read to a string.
+            $profileStates = Get-ProfileStates
             $read = Get-OurRuleViews
-            # The profiles always come through the cmdlets, so Via is the way of the rules alone.
-            $out = [ordered]@{ profiles = (Get-ProfileStates); rules = $read.Views; Via = $read.Via }
-            if ($read.Via -ne 'fast') { $out.Fallback = $read.Fallback }
+            # Via is fast only when both halves were. Fallback names every half that fell back, each with its own reason
+            # (already one line of at most 200 characters), joined by "; " so that both stay readable on one line.
+            $fallbacks = @()
+            if ($profileStates.Via -ne 'fast') { $fallbacks += "profiles: $($profileStates.Fallback)" }
+            if ($read.Via -ne 'fast') { $fallbacks += "rules: $($read.Fallback)" }
+            $out = [ordered]@{ profiles = $profileStates.Rows; rules = $read.Views; Via = 'fast' }
+            if ($fallbacks.Count -gt 0) { $out.Via = 'cmdlet'; $out.Fallback = $fallbacks -join '; ' }
             ConvertTo-Json -Compress -Depth 5 -InputObject ([pscustomobject]$out)
         }
         'Get' {
@@ -544,7 +736,7 @@ try {
         'Create' {
             Assert-OurName $Name
             if (-not $Action) { throw 'Create needs -Action' }
-            $off = @((Get-ProfileStates) | Where-Object { -not $_.Enabled } | ForEach-Object { $_.Name })
+            $off = @((Get-ProfileStates -CmdletsOnly).Rows | Where-Object { -not $_.Enabled } | ForEach-Object { $_.Name })
             if ($off.Count -gt 0) {
                 [Console]::Error.WriteLine($off -join ', ')
                 exit 3
@@ -567,7 +759,7 @@ try {
         'Cut' {
             $cut = 'TDC-FW-ISO-cut'
             Assert-OurName $cut
-            $off = @((Get-ProfileStates) | Where-Object { -not $_.Enabled } | ForEach-Object { $_.Name })
+            $off = @((Get-ProfileStates -CmdletsOnly).Rows | Where-Object { -not $_.Enabled } | ForEach-Object { $_.Name })
             if ($off.Count -gt 0) {
                 [Console]::Error.WriteLine($off -join ', ')
                 exit 3
@@ -602,10 +794,10 @@ try {
             if (-not $DefaultOutboundAction) { throw 'SetDefaultOutbound needs -DefaultOutboundAction' }
             # The PersistentStore (the default of Set-NetFirewallProfile, named so it is not mistaken for the ActiveStore)
             Set-NetFirewallProfile -PolicyStore PersistentStore -Profile (Get-ProfileList $Profiles) -DefaultOutboundAction $DefaultOutboundAction
-            ConvertTo-Json -Compress -Depth 3 -InputObject (Get-ProfileStates)
+            ConvertTo-Json -Compress -Depth 3 -InputObject (Get-ProfileStates -CmdletsOnly).Rows
         }
         'AllowOut' {
-            ConvertTo-Json -Compress -Depth 4 -InputObject ([pscustomobject]@{ profiles = (Get-ProfileStates); rules = @(Get-ForeignAllowOut) })
+            ConvertTo-Json -Compress -Depth 4 -InputObject ([pscustomobject]@{ profiles = (Get-ProfileStates -CmdletsOnly).Rows; rules = @(Get-ForeignAllowOut) })
         }
         'RemoveIsolate' {
             Remove-IsolateRules

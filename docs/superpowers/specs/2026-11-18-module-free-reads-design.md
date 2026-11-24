@@ -1,5 +1,29 @@
 # Modulfreie Lesevorgänge der Firewall
 
+> **Teilweise überholt durch
+> `docs/superpowers/specs/2026-11-19-in-force-reads-design.md`.** Dieses Dokument
+> bleibt als Stand des Wissens vom 18.11. stehen; vier Schlüsse daraus gelten
+> nicht mehr:
+>
+> - „`List` lädt das Modul für seine Profile weiter“ — **falsch**: `List` ist
+>   vollständig modulfrei.
+> - „`Profiles` liest deshalb wieder beide Stores über die Cmdlets, `Compare`
+>   vergleicht keine Profile mehr, und ein Pin-Test hält das fest“ — **falsch**:
+>   `Profiles` liest beide Stores über CIM mit der Operationsoption, `Compare`
+>   vergleicht wieder neun Profilfelder, und der Pin-Test ist **gelöscht**.
+> - „Nicht gemessen ist der Weg … Operationsoption“ — **gemessen**, und es ist
+>   der Weg, der ausgeliefert wird.
+> - `AllowOut` zurückgenommen, „weil rohes CIM den ActiveStore nicht lesen
+>   kann“ — die Option **kann** ihn lesen. `AllowOut` bleibt bei den Cmdlets aus
+>   einem anderen, schwächeren Grund: 0,4 s auf einem Aufruf, der in der
+>   Ruhelast nie vorkommt, und es ist der Verb, bei dem ein Fehler „geschlossen“
+>   meldet, während Verkehr rausgeht.
+>
+> Die betroffenen Abschnitte unten sind einzeln als überholt markiert. Das
+> Leistungsziel bleibt **unerreicht**: die Ruhelast liegt über drei saubere
+> Fenster gemessen bei 18,6 % gegen 19,5 % vorher. Gewonnen ist die Zeit je
+> Aufruf, nicht die Ruhelast.
+
 Erweiterung zu `docs/superpowers/specs/2026-11-16-firewall-tab-design.md` und
 `docs/superpowers/specs/2026-11-17-panic-cut-design.md`. Betrifft nur das
 **Lesen** des Firewall-Zustands, nicht das Schreiben.
@@ -195,6 +219,8 @@ das Folgende.
 
 ### Das Leistungsziel wurde nicht erreicht
 
+*Teilweise überholt durch `docs/superpowers/specs/2026-11-19-in-force-reads-design.md`: `List` und `Profiles` laden kein Modul mehr, und die Zeit je Lesevorgang hat sich halbiert. **Der Satz in der Überschrift gilt weiter**: die Ruhelast liegt bei 18,6 % gegen 19,5 % — die Ursache ist nur eine andere als damals vermutet, nämlich die Startgebühr von `powershell.exe` aus `python.exe` (1,40–1,65 s gegen 0,35 s), die kein Skript berührt. Die Zahlen unten stimmen für den Stand nach dem ersten Rückbau.*
+
 Ziel 1 oben (deutlich unter einer Sekunde je Lesen) gilt nur für `Get`. Das
 Ziel dieser Arbeit, einen ruhigeren Tab im Dauerbetrieb, wurde **verfehlt**:
 100 s eines beobachtenden Tabs, vorher 5 Aufrufe und 18 % eines
@@ -227,6 +253,8 @@ Fenster wurden nicht aufgeschrieben.
 
 ### Was umgestellt ist
 
+*Geschichte, überholt durch `docs/superpowers/specs/2026-11-19-in-force-reads-design.md`: `List` ist vollständig modulfrei, die Aussage „lädt das Modul für seine Profile weiter“ gilt nicht mehr.*
+
 Nur **`List` und `Get`** lesen TDCs eigene Regeln über COM
 (`HNetCfg.FwPolicy2.Rules`), mit der geschriebenen Zuordnung, dem Rückfall auf
 die Cmdlets und `Via`/`Fallback` im Aufruf-Log. Ohne Modul läuft damit nur
@@ -240,6 +268,8 @@ schnelle Weg sie, und `Compare`s Prüfung der Namensmenge meldet das.
 
 ### `AllowOut` zurückgenommen
 
+*Geschichte, überholt durch `docs/superpowers/specs/2026-11-19-in-force-reads-design.md`: die Rücknahme gilt weiter, ihr Grund nicht — die Operationsoption kann den ActiveStore lesen; sie bleibt bei den Cmdlets, weil sie 0,4 s auf einem Aufruf spart, der in der Ruhelast nicht vorkommt, und weil dort ein Fehler „geschlossen“ meldet, während Verkehr rausgeht.*
+
 `AllowOut` muss den ActiveStore lesen, Gruppenrichtlinie eingeschlossen. Rohes
 CIM gab auf der VM alle 538 Regeln aus dem PersistentStore; die Zählungen
 stimmten (135/135/135) nur, weil die VM keine Richtlinien-Regeln hat. Auf einem
@@ -249,6 +279,8 @@ Host mit solchen Regeln fehlten sie in `allowed_out`, und ISOLATED meldete
 ActiveStore`; ein Pin-Test hält das fest.
 
 ### `Profiles` zurückgenommen — mit dem Experiment
+
+*Geschichte, überholt durch `docs/superpowers/specs/2026-11-19-in-force-reads-design.md`: die Messung („COM liest den lokalen Store, nicht den gültigen“) stimmt weiter und ist der Grund für den Zustand D; die Folgerung nicht. `Profiles` liest beide Stores über CIM mit der Operationsoption, `Compare` vergleicht wieder neun Profilfelder, und der Pin-Test ist gelöscht.*
 
 Der schnelle Weg nahm den *in Kraft* befindlichen Wert von COM. Belegt war nur,
 dass COM **nicht** der konfigurierte Store ist (COM `Allow`, wo der
@@ -278,6 +310,8 @@ Pin-Test hält das fest. Die VM wurde danach zurückgesetzt.
 
 ### Wie weit „rohes CIM erreicht den ActiveStore nicht“ reicht
 
+*Geschichte, überholt durch `docs/superpowers/specs/2026-11-19-in-force-reads-design.md`: der hier „nicht gemessene“ Weg, `-PolicyStore` als CIM-Operationsoption, ist gemessen und wird ausgeliefert.*
+
 Versucht wurden zwei Wege: ein Namespace (`root/standardcimv2/ActiveStore`,
 „Ungültiger Namespace“) und ein Abfragefilter (`PolicyStore='ActiveStore'`,
 „Die Anfrage ist ungültig“). Nicht gemessen ist der Weg, den die
@@ -295,6 +329,8 @@ an `CALL_OBSERVER`; `app.py` schreibt sie in die Aufruf-Zeile. Kein Aufrufer,
 kein JSON-Vertrag und kein vorhandener Test der Python-Seite wurde geändert.
 
 ### `Compare` heute
+
+*Geschichte, überholt durch `docs/superpowers/specs/2026-11-19-in-force-reads-design.md`: `Compare` vergleicht wieder Profile (neun Profilfelder), nicht mehr nur Regeln.*
 
 Es vergleicht nur TDCs Regeln, wie `List` und wie `Get` sie schnell lesen,
 gegen die Cmdlets, dazu die Namensmenge und `DisplayName = Name`. Die Ausgabe
@@ -315,6 +351,8 @@ not confirmed“ steht (Richtung eingehend, Profilmasken `1` bis `6`, Aktion
 Allow an einer Regel, eine deaktivierte Regel).
 
 ### Entscheidung 1 oben
+
+*Geschichte, überholt durch `docs/superpowers/specs/2026-11-19-in-force-reads-design.md`: der Druck liest die Profile wieder schnell, über CIM mit der Operationsoption.*
 
 „Der Druck wird schneller, weil sein Profil-Lesen billiger wird“ gilt nicht
 mehr: der Druck liest die Profile wieder über die Cmdlets.

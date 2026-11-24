@@ -580,6 +580,43 @@ def test_a_listed_rule_blocks_only_when_it_stands_and_the_profiles_are_on():
     assert [x["blocking"] for x in rules_mod.rules(run)] == [False]
 
 
+@pytest.mark.parametrize("profiles, held", [(None, "null"), ([], "0 rows naming no profile"),
+                                            ("Domain", "a str"), ("two", "2 rows naming Domain, Private")])
+def test_a_list_whose_profiles_cannot_be_used_reads_no_block_and_says_why(profiles, held, caplog):
+    """Shipped once: List answered "profiles": null, every block read as not blocking, and nothing said why. That
+    way is still the safe one, but it is logged, with what the answer held and its own reason."""
+    run = FakeRun()
+    rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
+    if profiles == "two":
+        profiles = run.profile_rows()[:2]
+    run.op_List = lambda p: (0, json.dumps({"profiles": profiles, "rules": list(run.rules.values()), "Via": "cmdlet",
+                                            "Fallback": ""}), "")
+    with caplog.at_level("WARNING", logger=rules_mod.__name__):
+        assert [x["blocking"] for x in rules_mod.rules(run)] == [False]
+    said = [r.getMessage() for r in caplog.records if r.name == rules_mod.__name__]
+    assert said == ["List answered profiles that cannot be used (cannot read the Windows Firewall profiles; nothing "
+                    "can be enforced: %s; Via 'cmdlet', Fallback ''): every block rule reads as not blocking" % held]
+
+
+def test_a_list_and_an_allow_out_read_whose_profiles_are_good_say_nothing(caplog):
+    run = FakeRun()
+    rules_mod.block(run, image=IMAGE, ip="1.2.3.4", fetcher=PY)
+    with caplog.at_level("DEBUG", logger=rules_mod.__name__):
+        assert [x["blocking"] for x in rules_mod.rules(run)] == [True]
+        rules_mod.allowed_out(run)
+    assert [r for r in caplog.records if r.name == rules_mod.__name__] == []
+
+
+def test_an_allow_out_read_whose_profiles_cannot_be_used_says_so_too(caplog):
+    run = FakeRun()
+    run.op_AllowOut = lambda p: (0, json.dumps({"profiles": None, "rules": []}), "")
+    with caplog.at_level("WARNING", logger=rules_mod.__name__):
+        assert rules_mod.allowed_out(run) == []
+    assert [r.getMessage() for r in caplog.records if r.name == rules_mod.__name__] == [
+        "AllowOut answered profiles that cannot be used (cannot read the Windows Firewall profiles; nothing can be "
+        "enforced: null): nothing reads them today, so nothing changes"]
+
+
 def test_the_rule_list_says_whether_the_cut_rule_stands_in_the_catch_all_shape():
     """The poll's rule list is one of the reads ``verified`` rests on in the cut stages (app._fw_cut_stands)."""
     run = FakeRun()
@@ -2944,6 +2981,31 @@ def test_a_way_that_is_not_one_of_the_two_is_not_reported(monkeypatch, via):
     assert "via" not in seen[0] and "fallback" not in seen[0]
 
 
+def test_lists_two_reasons_reach_the_call_log_whole_and_on_one_line(monkeypatch):
+    """When both halves of List fall back, each reason may be as long as Get-ShortReason allows; the log keeps both,
+    and nothing from the machine in either reason can break the call line."""
+    script = _ps1()
+    short = re.search(r"Substring\(0, (\d+)\)", _functions(script)["Get-ShortReason"]).group(1)
+    listing = _op_case(script, "List")
+    parts = tuple(m.group(1) if m else None for m in (re.search(r'"([^"$]*)\$\(\$profileStates\.Fallback\)"', listing),
+                                                        re.search(r"-join '([^']*)'", listing),
+                                                        re.search(r'"([^"$]*)\$\(\$read\.Fallback\)"', listing)))
+    assert int(short) == rules_mod.MAX_FALLBACK_CHARS and parts == rules_mod.LIST_FALLBACK_PREFIXES, \
+        "MAX_LIST_FALLBACK_CHARS is two reasons cut by Get-ShortReason plus List's two prefixes and its separator: " \
+        "change MAX_FALLBACK_CHARS / LIST_FALLBACK_PREFIXES in firewall_rules.py to match the script"
+    assert rules_mod.MAX_LIST_FALLBACK_CHARS == 2 * int(short) + sum(map(len, parts))
+    seen = _observed(monkeypatch)
+    # a lone CR, a group separator and two Unicode line breaks survive Get-ShortReason's split on CR LF / LF
+    odd = "a\rb\x1cc\u2028d\x85e"
+    joined = "profiles: " + odd + "p" * (200 - len(odd)) + "; rules: " + odd + "r" * (200 - len(odd))
+    rules_mod.rules(_answering({"profiles": _rows(), "rules": [], "Via": "cmdlet", "Fallback": joined}))
+    assert seen[0]["op"] == "List" and seen[0]["via"] == "cmdlet" and seen[0]["fallback"] == joined
+    logged = repr(seen[0]["fallback"])                    # the call line quotes it with %r
+    assert not any(c in logged for c in "\n\r\x1c\u2028\x85"), logged
+    rules_mod.rules(_answering({"profiles": _rows(), "rules": [], "Via": "cmdlet", "Fallback": joined + "x" * 5000}))
+    assert seen[1]["fallback"] == joined                  # still bounded: past both whole reasons it is cut
+
+
 def test_a_long_reason_is_cut_and_a_failed_call_is_still_reported(monkeypatch):
     seen = _observed(monkeypatch)
     rules_mod._profiles(_answering(_rows(Via="cmdlet", Fallback="x" * 5000)))
@@ -3097,7 +3159,7 @@ def test_the_com_reader_says_what_its_name_is_and_what_breaks_without_the_invari
 def test_compare_checks_the_set_of_rule_names_on_its_own():
     """A rule only one side finds is its own, named difference, checked before and apart from the fields."""
     case = _op_case(_ps1(), "Compare")
-    names = case.index('what = "$way rule names: $name found by one side only"')
+    names = case.index('what = "$way rule names: $ruleName found by one side only"')
     fields = case.index("foreach ($field in @('Name'")
     assert names < fields and case.count("foreach ($way in $fastWays.Keys) {") == 2
     block = case[:fields][case[:fields].rindex("foreach ($way in $fastWays.Keys) {"):]
@@ -3182,27 +3244,32 @@ def test_only_get_takes_its_way_from_stderr(monkeypatch):
 
 
 
-# ---- AllowOut stays on the cmdlets: raw CIM cannot read the ActiveStore, COM has no store source ------------------
+# ---- AllowOut stays on the cmdlets: CIM could read the ActiveStore now, and the gain does not pay for the risk ------
 
 
-def test_allowout_stays_on_the_cmdlets_because_cim_cannot_read_the_activestore():
-    """Measured on the VM: root/standardcimv2/ActiveStore is an invalid namespace and raw CIM gives all 538 rules from
-    the PersistentStore. A group-policy rule lives in the ActiveStore only; read over CIM it would vanish from
-    allowed_out and ISOLATED would say closed while it lets traffic out. COM has no PolicyStoreSourceType at all.
-    So AllowOut reads Get-NetFirewallRule -PolicyStore ActiveStore, and nothing else, and has no second way to name."""
+def test_allowout_stays_on_the_cmdlets_because_the_gain_does_not_pay_for_the_risk():
+    """The old name said CIM cannot read the ActiveStore. Measured on 2026-11-19 that is false: the PolicyStore
+    operation option reads it and finds the same 136 enabled outbound Allow rules as the cmdlet, the policy rule with
+    PolicyStoreSourceType 2. AllowOut stays on the cmdlets because it would save 0.4 s on a call that never appears in
+    the steady load, and it is the verb where a mistake reports closed while traffic still goes out. So it reads
+    Get-NetFirewallRule -PolicyStore ActiveStore and its profiles through the cmdlets alone, and nothing of it goes over
+    COM or the option."""
     script = _ps1()
     case = _code_lines(_op_case(script, "AllowOut"))
     assert case == [
         "'AllowOut' {",
-        "ConvertTo-Json -Compress -Depth 4 -InputObject ([pscustomobject]@{ profiles = (Get-ProfileStates); "
+        "ConvertTo-Json -Compress -Depth 4 -InputObject ([pscustomobject]@{ profiles = (Get-ProfileStates -CmdletsOnly).Rows; "
         "rules = @(Get-ForeignAllowOut) })",
     ], case
     cmdlet = _code_lines(_functions(script)["Get-ForeignAllowOut"])
     assert "@(Get-NetFirewallRule -PolicyStore ActiveStore | Where-Object {" in cmdlet
-    assert not re.search(r"CimInstance|CimSession|EnumerateInstances|FwPolicy2|ComObject", "\n".join(cmdlet), re.I)
+    assert not re.search(r"CimInstance|CimSession|EnumerateInstances|SetCustomOption|FwPolicy2|ComObject",
+                         "\n".join(cmdlet), re.I)
     # no rule of the firewall is read over CIM anywhere in the script, and Compare has nothing of AllowOut to compare
-    assert not re.search(r"MSFT_NetFirewallRule|SetCustomOption", "\n".join(_code_lines(script)), re.I)
+    assert not re.search(r"MSFT_NetFirewallRule", "\n".join(_code_lines(script)), re.I)
     assert "Get-ForeignAllowOut" not in _op_case(script, "Compare")
+    # its profiles cannot reach the fast reader: -CmdletsOnly skips it (pinned with Compare's cmdlet side below)
+    assert "Read-FastProfileStates" not in _op_case(script, "AllowOut")
 
 
 def test_the_cmdlet_way_of_allow_out_is_what_it_was():
@@ -3230,62 +3297,34 @@ def test_only_a_rule_whose_source_is_local_counts_as_one_isolated_can_switch_off
     assert [(r["name"], r["local"]) for r in found] == [("Loc-Out", True), ("Num-Out", False), ("Pol-Out", False)]
 
 
-# ---- Profiles stays on the cmdlets: COM reads the local store, not what is in force -----------------------------
-
-
-def test_profiles_stays_on_the_cmdlets_because_com_reads_the_local_store_not_what_is_in_force():
-    """Measured on the VM, with the local GPO store written by Set-NetFirewallProfile -PolicyStore <computer name>:
-    local GPO Domain outbound Allow, PersistentStore Block, ActiveStore (in force) Allow, COM 0 = Block. COM reads the
-    local store, so where a policy sets Allow over the local Block that ISOLATED writes, a COM read would say closed
-    while the egress is open: the defect this feature exists to prevent. Raw CIM answers the PersistentStore only.
-    So every verb reads the profiles through Get-ProfileStates, and that reads both stores through the cmdlets and
-    nothing else, with no second way to name."""
-    script = _ps1()
-    assert _code_lines(_op_case(script, "Profiles")) == [
-        "'Profiles' {",
-        "ConvertTo-Json -Compress -Depth 3 -InputObject (Get-ProfileStates)",
-    ]
-    states = _code_lines(_functions(script)["Get-ProfileStates"])
-    assert "foreach ($p in @(Get-NetFirewallProfile -PolicyStore PersistentStore)) {" in states
-    assert "@(Get-NetFirewallProfile -PolicyStore ActiveStore | ForEach-Object {" in states
-    assert not [l for l in states if re.search(r"param\(|try\b|catch\b|Via|Fallback|ComObject|FwPolicy2", l, re.I)], states
-    # no verb has a second way to the profiles: nothing reads them over COM or CIM, and nothing asks for one
-    code = "\n".join(_code_lines(script))
-    assert not re.search(r"FirewallEnabled|DefaultOutboundAction\(|MSFT_NetFirewallProfile|CimInstance|CimSession|"
-                         r"Read-FastProfileStates|-Fast\b|\[switch\]", code, re.I)
-    for verb in ("Profiles", "List", "Create", "Cut", "SetDefaultOutbound", "AllowOut"):
-        assert "FwPolicy2" not in _op_case(script, verb), verb
-        assert "Get-ProfileStates" in _op_case(script, verb), verb
-    # Configured, the store ISOLATED remembers and puts back, is named in exactly one line: the cmdlet assignment
-    access = (r"\.configured\b", r"(?<![\w$])configured\s*=", r"['\"]configured['\"]", r"Add-Member\b.*(?<![\w$])configured\b")
-    assert [l for l in _code_lines(script) if any(re.search(a, l, re.I) for a in access)] == [
-        "Configured = $configured[[string]$_.Name]"]
-    # Compare has no profile section left: with one way there is nothing to compare
-    compare = "\n".join(_code_lines(_op_case(script, "Compare")))
-    assert not re.search(r"Get-ProfileStates|Get-NetFirewallProfile|DefaultOutboundAction|Configured|'profiles'", compare, re.I)
-
-
 def test_compare_counts_each_kind_of_rule_check_on_its_own_and_writes_nothing():
     """An ok over no rule at all must not read like an ok over fifty fields: how many rules either way found, and
-    each kind of check, are said apart."""
+    each kind of check (the profiles' fields, display names, the name sets, the rules' fields), are said apart."""
     script = _ps1()
     case = _op_case(script, "Compare")
     lines = _code_lines(case)
-    assert "$checked = [ordered]@{ displayNames = 0; names = 0; fields = 0 }" in lines
-    assert [l for l in lines if "+= 1" in l] == ["$checked.displayNames += 1", "$checked.names += 1", "$checked.fields += 1"]
+    assert "$checked = [ordered]@{ profiles = 0; displayNames = 0; names = 0; fields = 0 }" in lines
+    assert [l for l in lines if "+= 1" in l] == ["$checked.profiles += 1", "$checked.displayNames += 1",
+                                                 "$checked.names += 1", "$checked.fields += 1"]
     assert "ok = $ok; rules = $ruleNames.Count; checked = [pscustomobject]$checked; differences = $differences" in lines
     assert "exit 1" in case
     assert not re.search(r"\b(Set|New|Remove|Enable|Disable)-NetFirewall", _op_branch(script, "Compare"))
 
 
-def test_list_says_the_way_its_rules_were_read_and_get_the_way_of_its_rule():
+def test_list_says_the_way_both_its_halves_were_read_and_get_the_way_of_its_rule():
+    """List has two fast halves, its profiles and its rules: Via is fast only when both were, and Fallback names every
+    half that fell back with its own reason (each already one short line from Get-ShortReason), joined by "; "."""
     script = _ps1()
     listing = _code_lines(_op_case(script, "List"))
     assert listing == [
         "'List' {",
+        "$profileStates = Get-ProfileStates",
         "$read = Get-OurRuleViews",
-        "$out = [ordered]@{ profiles = (Get-ProfileStates); rules = $read.Views; Via = $read.Via }",
-        "if ($read.Via -ne 'fast') { $out.Fallback = $read.Fallback }",
+        "$fallbacks = @()",
+        "if ($profileStates.Via -ne 'fast') { $fallbacks += \"profiles: $($profileStates.Fallback)\" }",
+        "if ($read.Via -ne 'fast') { $fallbacks += \"rules: $($read.Fallback)\" }",
+        "$out = [ordered]@{ profiles = $profileStates.Rows; rules = $read.Views; Via = 'fast' }",
+        "if ($fallbacks.Count -gt 0) { $out.Via = 'cmdlet'; $out.Fallback = $fallbacks -join '; ' }",
         "ConvertTo-Json -Compress -Depth 5 -InputObject ([pscustomobject]$out)",
     ], listing
     get = _code_lines(_op_case(script, "Get"))
@@ -3295,6 +3334,167 @@ def test_list_says_the_way_its_rules_were_read_and_get_the_way_of_its_rule():
         assert line in get, line
 
 
+def _script_parameters(script):
+    block = re.search(r"^param\((.*?)^\)", script, re.S | re.M)
+    return re.findall(r"\$(\w+)\s*(?=[,=\n])", block.group(1) + "\n"), script[:block.end()].count("\n") + 1
+
+
+def _script_code_lines(script):
+    """(line number, code, inside a function) of every line after the param() block. Comment lines are left out, and
+    so are the lines of a here-string (between a line ending in @' or @" and the line starting '@ or "@), whose text is
+    no code and may hold a `}` at column 0. Code outside a function runs in the script's own scope, the scope its
+    parameters live in."""
+    _, last = _script_parameters(script)
+    lines, inside, found, declared, closer = [], False, 0, 0, None
+    for number, line in enumerate(script.splitlines(), 1):
+        if number <= last:
+            continue
+        if closer:
+            closer = None if line.startswith(closer) else closer
+            continue
+        here = re.search(r"@(['\"])$", line.rstrip())
+        closer = here and here.group(1) + "@"
+        declared += line.startswith("function ")
+        if re.match(r"function [\w-]+ \{", line):
+            assert not inside, ("_script_code_lines: line %d starts a function before the one above it was closed by a "
+                                "`}` at column 0; the line numbers it would give are wrong" % number)
+            inside, found = True, found + 1
+        elif inside and line == "}":
+            inside = False
+        elif line.strip() and not line.strip().startswith("#"):
+            lines.append((number, line.strip(), inside))
+    assert found == declared and not inside and not closer, (
+        "_script_code_lines read %d functions of the form `function Name {` ... `}` at column 0, but the script "
+        "declares %d (and %s): a function written another way (its brace on the next line, or a `}` at column 0 "
+        "inside it) is mis-parsed, and the line numbers it gives are wrong. Fix the parser before trusting it."
+        % (found, declared, "a here-string is never closed" if closer else
+           "one is never closed" if inside else "every one it read is closed"))
+    return lines
+
+
+def _script_level_lines(script):
+    """(line number, code) of every line that is not inside a function (see _script_code_lines)."""
+    return [(number, code) for number, code, inside in _script_code_lines(script) if not inside]
+
+
+_VARIABLE = r"\$\{?(?:(?:script|local|global|private):)?(\w+)\}?"
+_SCOPED_VARIABLE = r"\$\{?(?:script|global):(\w+)\}?"
+_STREAM_VARIABLE = r"(?<![\w-])-(?:(?:Out|Error|Warning|Information|Pipeline)Variable|ov|ev|wv|iv|pv)(?::|\s+)['\"]?\+?(\w+)"
+_WRITES = (re.compile(r"(?<![\w$`])" + _VARIABLE + r"\s*(?:[-+*/%]?=(?!=)|\+\+|--)", re.I),
+           re.compile(r"(?<![\w$`])(?:\+\+|--)" + _VARIABLE, re.I),
+           re.compile(r"\bforeach\s*\(\s*\$(\w+)\s+in\b", re.I),
+           re.compile(_STREAM_VARIABLE, re.I))
+_SCOPED_WRITES = (re.compile(r"(?<![\w$`])" + _SCOPED_VARIABLE + r"\s*(?:[-+*/%]?=(?!=)|\+\+|--)", re.I),
+                  re.compile(r"(?<![\w$`])(?:\+\+|--)" + _SCOPED_VARIABLE, re.I))
+_SET_VARIABLE = re.compile(r"\b(?:Set|New)-Variable\b([^|;}]*)", re.I)
+_SWAP = r"(?<![\w$`])((?:\$\w+\s*,\s*)+\$\w+)\s*=(?!=)"
+
+
+def _set_variable_writes(line, scoped):
+    """The names Set-Variable and New-Variable write on a line, by -Name wherever it stands or else by the first
+    argument; with ``scoped`` only those given -Scope Script, Global or a number above 0 (a scope above the caller's)."""
+    names = []
+    for args in _SET_VARIABLE.findall(line):
+        if scoped and not re.search(r"-Scope(?::|\s+)['\"]?(?:script|global|[1-9]\d*)\b", args, re.I):
+            continue
+        named = re.search(r"-Name(?::|\s+)['\"]?(\w+)", args, re.I) or re.match(r"\s+['\"]?(\w+)", args)
+        names += [named.group(1)] if named else []
+    return names
+
+
+def _variables_written(line):
+    """Every variable a script-level line writes: an assignment, ++ or -- either side, a foreach variable, a stream
+    variable (-OutVariable and its kind, or their aliases), Set-/New-Variable, and each name of a swap."""
+    names = [n for pattern in _WRITES for n in pattern.findall(line)] + _set_variable_writes(line, scoped=False)
+    return names + [n for swap in re.findall(_SWAP, line) for n in re.findall(r"\$(\w+)", swap)]
+
+
+def _variables_written_above(line):
+    """The variables a line inside a function writes outside it: only a scope-qualified write ($script:, $global:,
+    -Scope Script, Global or a number) leaves the function. An unqualified write there is a fresh local."""
+    return [n for pattern in _SCOPED_WRITES for n in pattern.findall(line)] + _set_variable_writes(line, scoped=True)
+
+
+@pytest.mark.parametrize("line, written", [
+    ("$Profiles = 1", ["Profiles"]), ("${Profiles} = 1", ["Profiles"]), ("$script:Profiles += 1", ["Profiles"]),
+    ("$x++", ["x"]), ("++$x", ["x"]), ("--${x}", ["x"]), ("foreach ($x in $y) {", ["x"]),
+    ("Get-X -OutVariable x", ["x"]), ("Get-X -OutVariable:x", ["x"]), ("Get-X -ov +x", ["x"]), ("Get-X -ev:'x'", ["x"]),
+    ("Set-Variable x 1", ["x"]), ("Set-Variable -Name x -Value 1", ["x"]), ("Set-Variable -Value 1 -Name x", ["x"]),
+    ("$a, $b = $b, $a", ["a", "b"]), ("if ($c) { $Profiles, $x = $x, $Profiles }", ["Profiles", "x"]),
+    ("if ($a -eq $b) { Get-X }", []), ("$h = @{ a = 1 }", ["h"]), ("Get-X -Overwrite:$true -Evidence $e", []),
+])
+def test_the_script_level_scanner_sees_every_form_of_a_write(line, written):
+    assert set(_variables_written(line)) == set(written)
+
+
+@pytest.mark.parametrize("line, written", [
+    ("$script:Profiles = @{}", ["Profiles"]), ("${global:Name} = 1", ["Name"]), ("++$script:Name", ["Name"]),
+    ("Set-Variable -Scope Script -Name Profiles -Value @{}", ["Profiles"]),
+    ("New-Variable -Scope Global -Name Name -Value 1 -Force", ["Name"]), ("Set-Variable Name 1 -Scope 1", ["Name"]),
+    ("$Profiles = 1", []), ("$local:Profiles = 1", []), ("Set-Variable -Name Profiles -Value 1", []),
+    ("Set-Variable -Scope 0 -Name Profiles -Value 1", []), ("Set-Variable -Scope Local -Name Profiles -Value 1", []),
+])
+def test_the_function_scanner_sees_only_the_writes_that_leave_the_function(line, written):
+    assert set(_variables_written_above(line)) == set(written)
+
+
+def test_no_script_level_assignment_writes_into_a_parameter():
+    """Shipped once: List did `$profiles = Get-ProfileStates`, and every List answered profiles null, Via cmdlet and
+    an empty reason. PowerShell variable names are case-insensitive, and the switch runs in the script's own scope,
+    where the parameters live: so $profiles IS the [string]$Profiles parameter, the assignment rebinds it, [string]
+    coerces the read to its ToString(), and .Rows, .Via and .Fallback are then $null. Inside a function a plain
+    assignment to the same name is a fresh local, so it is exempt there; a scope-qualified one ($script:Profiles,
+    Set-Variable -Scope Script) is not, and is guarded there too. The parameters and the code are both read out of
+    the script, so a parameter added tomorrow is guarded too. (No other test could see this: the others read the
+    script as text and the module's tests answer from canned JSON, so none of them ever runs PowerShell.)"""
+    script = _ps1()
+    params, _ = _script_parameters(script)
+    lines = _script_code_lines(script)
+    assert "Op" in params and len(params) > 1, params
+    assert ("switch ($Op) {", False) in [(code, inside) for _, code, inside in lines], "the switch is script-level"
+    written = {name.lower() for _, code, inside in lines if not inside for name in _variables_written(code)}
+    assert {"read", "fallbacks", "out"} <= written, written      # the scanner sees the switch's own assignments
+    collisions = ["line %d: writes into the parameter $%s %s   ->   %s"
+                  % (number, param, "from inside a function" if inside else "at script level", code)
+                  for number, code, inside in lines
+                  for name in (_variables_written_above(code) if inside else _variables_written(code))
+                  for param in params if name.lower() == param.lower()]
+    assert not collisions, (
+        "\n".join(collisions) + "\nA write to a parameter's name, in any case, in the parameters' scope (at script "
+        "level: the switch and the code around it, outside any function; or from a function with $script:, $global: "
+        "or -Scope) is not a new local: PowerShell names are case-insensitive, so it rebinds the typed parameter and "
+        "[string] turns the value into its ToString(). Pick a name no parameter has.")
+
+
+def test_a_here_string_is_no_code_and_its_brace_at_column_0_closes_nothing():
+    script = "param(\n    [string]$Op\n)\nfunction A {\n    $t = @'\n}\n$Op = 1\n'@\n    $u = 1\n}\n$v = 2\n"
+    assert _script_code_lines(script) == [(5, "$t = @'", True), (9, "$u = 1", True), (11, "$v = 2", False)]
+    with pytest.raises(AssertionError, match="a here-string is never closed"):
+        _script_code_lines("param(\n    [string]$Op\n)\n$t = @\"\nfunction B {\n")
+
+
+@pytest.mark.parametrize("line", ["$script:Profiles = @{ Rows = @() }",
+                                  "Set-Variable -Scope Script -Name Profiles -Value @{ Rows = @() }",
+                                  "New-Variable -Scope Global -Name Name -Value 1 -Force",
+                                  "${Profiles} = 1"])
+def test_the_guard_goes_red_on_a_write_into_a_parameter_from_a_function_or_in_brace_form(line, monkeypatch):
+    """The guard on a copy of the script with one line added: inside a function, or at script level for the brace
+    form. It must fail and name the line and the parameter."""
+    script = _ps1()
+    lines = script.split("\n")
+    if line.startswith("${"):
+        at = next(i for i, l in enumerate(lines) if l.strip() == "switch ($Op) {")
+    else:
+        at = next(i for i, l in enumerate(lines) if re.match(r"function [\w-]+ \{", l))
+    lines.insert(at + 1, "    " + line)
+    monkeypatch.setattr(sys.modules[__name__], "_ps1", lambda: "\n".join(lines))
+    with pytest.raises(AssertionError) as failed:
+        test_no_script_level_assignment_writes_into_a_parameter()
+    param = re.search(r"-Name (\w+)|\$\{?(?:script:)?(\w+)", line)
+    assert "line %d: writes into the parameter $%s " % (at + 2, param.group(1) or param.group(2)) in str(failed.value)
+    print(str(failed.value).split("\n")[0])
+
+
 def test_a_reason_is_one_short_line_in_the_rule_reads_and_in_compare_alike():
     script = _ps1()
     reason = _functions(script)["Get-ShortReason"]
@@ -3302,3 +3502,250 @@ def test_a_reason_is_one_short_line_in_the_rule_reads_and_in_compare_alike():
     assert "$fallback = Get-ShortReason $_" in _functions(script)["Get-OurRuleViews"]
     assert 'fast = "error: $(Get-ShortReason $_)"' in _op_case(script, "Compare")
     assert "$_.Exception.Message" not in _op_case(script, "Compare")
+
+
+# ---- Profiles in force without the module: CIM with the PolicyStore option, proved per call by a sentinel ---------
+
+
+def _function_body(script, name):
+    """The body of one function of the script: the lines between `function <name> {` and its closing brace."""
+    head = re.search(r"^function %s \{\n" % re.escape(name), script, re.M)
+    assert head, "the script has no function %s" % name
+    return script[head.end():script.index("\n}\n", head.end())]
+
+
+def test_profiles_reads_cim_with_the_option_and_never_com():
+    """COM reads the local store, which is why the previous attempt was
+    reverted; the profile read must not go back to it."""
+    fast = _function_body(_ps1(), "Read-FastProfileStates")
+    assert "SetCustomOption" in fast and "MSFT_NetFirewallProfile" in fast
+    assert "FwPolicy2" not in fast, "the profiles must not be read over COM"
+    assert "Create('.')" in fast, "Create($null) fails with 'Der Parameter ist ungueltig'"
+    # Kept from the pin this replaces, and still the reason it was written: measured on the VM, local GPO Domain
+    # outbound Allow, PersistentStore Block, ActiveStore (in force) Allow, COM 0 = Block. COM reads the local store, so
+    # where a policy sets Allow over the local Block that ISOLATED writes, a COM read says closed while the egress is
+    # open. No way to the profiles, fast or cmdlet, in any verb, goes over COM.
+    script = _ps1()
+    com = r"FwPolicy2|ComObject|FirewallEnabled|DefaultOutboundAction\("
+    assert not re.search(com, "\n".join(_code_lines(_op_branch(script, "Profiles"))), re.I)
+    for name in ("Get-ProfileStates", "Read-FastProfileStates"):
+        assert not re.search(com, _function_body(script, name), re.I), name
+    for verb in ("Profiles", "List", "Create", "Cut", "SetDefaultOutbound", "AllowOut", "Compare"):
+        assert "Get-ProfileStates" in _op_case(script, verb), verb
+        assert not re.search(r"FirewallEnabled|DefaultOutboundAction\(", _op_case(script, verb), re.I), verb
+    assert not re.search(r"FirewallEnabled|DefaultOutboundAction\(", "\n".join(_code_lines(script)), re.I)
+
+
+def test_the_profile_maps_are_exactly_what_was_measured():
+    """DefaultOutboundAction 0 NotConfigured, 2 Allow, 4 Block, and the three names as themselves (both forms were
+    seen from the same class on the same VM); Enabled 0 false, 1 true. Nothing else, nothing computed."""
+    fast = _function_body(_ps1(), "Read-FastProfileStates")
+    outbound = re.search(r"\$CimOutbound = @\{([^}]*)\}", fast).group(1)
+    assert dict(re.findall(r"'(\w+)' = '(\w+)'", outbound)) == {
+        "0": "NotConfigured", "2": "Allow", "4": "Block",
+        "NotConfigured": "NotConfigured", "Allow": "Allow", "Block": "Block"}
+    assert len(re.findall(r"=", outbound)) == 6, outbound
+    enabled = re.search(r"\$CimEnabled = @\{([^}]*)\}", fast).group(1)
+    assert dict(re.findall(r"'(\w+)' = (\$\w+)", enabled)) == {"0": "$false", "1": "$true"}
+    assert len(re.findall(r"=", enabled)) == 2, enabled
+    assert not re.search(r"-band|-bor|-bxor|-shl|-shr|\[enum\]|-as \[|\[bool\]", fast, re.I)
+
+
+def test_a_profile_value_is_matched_case_exactly_or_refused():
+    """A PowerShell hashtable ignores case, so ContainsKey alone would let `block` through unlisted."""
+    fast = _function_body(_ps1(), "Read-FastProfileStates")
+    checks = [l.strip() for l in fast.splitlines() if "ContainsKey($Value)" in l]
+    assert len(checks) == 1 and checks[0].startswith(
+        "if (-not ($Map.ContainsKey($Value) -and @($Map.Keys) -ccontains $Value)) { throw "), checks
+    assert "$Value" in checks[0][checks[0].index("throw "):], "the throw names the value it refused"
+    # every profile value goes through that one check
+    for line in _code_lines(fast):
+        if re.search(r"\$Cim(Outbound|Enabled)\b", line) and "= @{" not in line:
+            assert "& $mapped $Cim" in line, line
+    # a profile name is matched exactly, and every profile must be there once
+    assert "if (-not ($AllProfiles -ccontains $name)) { throw " in fast
+    assert re.search(r"if \(\$rows\.ContainsKey\(\$name\)\) \{ throw ", fast)
+    assert re.search(r"if \(-not \$rows\.ContainsKey\(\$name\)\) \{ throw ", fast)
+
+
+def test_no_store_is_read_before_the_sentinel_and_each_table_holds_its_own_store():
+    fast = _function_body(_ps1(), "Read-FastProfileStates")
+    lines = _code_lines(fast)
+    reads = [(i, l) for i, l in enumerate(lines) if re.search(r"& \$(optionsOf|readStore) '", l)]
+    assert [re.search(r"& \$(?:optionsOf|readStore) '([^']+)'", l).group(1) for _, l in reads] == [
+        "TDC|NoSuchStore", "ActiveStore", "PersistentStore"], reads
+    sentinel = reads[0][0]
+    assert "foreach ($p in @(& $enumerate (& $optionsOf $Store))) {" in lines
+    assert all(sentinel < i for i, l in enumerate(lines) if re.search(r"ActiveStore|PersistentStore", l)), \
+        "no store may be named before the sentinel is read"
+    in_force = [l for l in lines if re.search(r"\$inForce\s*\[.*\]\s*=", l, re.I)]
+    configured = [l for l in lines if re.search(r"\$configured\s*\[.*\]\s*=", l, re.I)]
+    assert len(in_force) == 1 and "& $readStore 'ActiveStore'" in in_force[0], in_force
+    assert len(configured) == 1 and "& $readStore 'PersistentStore'" in configured[0], configured
+    assert "PersistentStore" not in in_force[0] and "Enabled" not in configured[0]
+    rows = [l for l in lines if re.search(r"^(Enabled|DefaultOutboundAction|Configured) = ", l)]
+    assert rows == ["Enabled = $inForce[$name].Enabled", "DefaultOutboundAction = $inForce[$name].Outbound",
+                    "Configured = $configured[$name]"], rows
+
+
+def test_the_sentinels_verdict_is_three_consecutive_exact_lines():
+    """The safety of the whole design sits in these lines, and a one-token edit to any of them would silently disable
+    it: starting from a value that passes, a catch that counts any error, a condition that can never be true. The
+    sentinel is read raw through $enumerate, so any answer, even an empty one, is an answer. Only a CimException with
+    NativeErrorCode Failed, the refusal measured on the VM, counts as proof; anything else throws into the cmdlets."""
+    lines = _code_lines(_function_body(_ps1(), "Read-FastProfileStates"))
+    start = lines.index("$refused = $null")
+    # the options are built before the counted try: only the enumeration may count as the provider's refusal
+    assert re.fullmatch(r"\$sentinel = & \$optionsOf '[^']+'", lines[start - 1]), lines[start - 1]
+    assert lines[start + 1] == "try { $null = & $enumerate $sentinel } catch { $refused = $_.Exception.GetBaseException() }"
+    assert re.fullmatch(r'if \(-not \(\$refused -is \[Microsoft\.Management\.Infrastructure\.CimException\] -and '
+                        r'\$refused\.NativeErrorCode -eq \[Microsoft\.Management\.Infrastructure\.NativeErrorCode\]::Failed\)\) '
+                        r'\{ throw "[^\n]*sentinel[^\n]*" \}', lines[start + 2]), lines[start + 2]
+    assert len([l for l in lines if re.search(r"\$refused\b", l)]) == 3, "$refused is used in those three lines only"
+    assert len([l for l in lines if re.search(r"\$sentinel\b", l)]) == 2, "the sentinel's options serve its read only"
+
+
+def test_the_cim_session_is_the_local_one_and_is_closed():
+    fast = _function_body(_ps1(), "Read-FastProfileStates")
+    lines = _code_lines(fast)
+    assert "$session = [Microsoft.Management.Infrastructure.CimSession]::Create('.')" in lines
+    assert "$options.SetCustomOption('PolicyStore', $Store, $false)" in lines
+    assert "@($session.EnumerateInstances('root/StandardCimv2', 'MSFT_NetFirewallProfile', $Options))" in lines
+    assert "} finally {" in lines and "$session.Dispose()" in lines
+    assert not re.search(r"Import-Module|Get-NetFirewall|Get-CimInstance|ComObject", fast, re.I)
+
+
+def test_configured_is_touched_in_these_lines_of_the_script_and_nowhere_else():
+    """Shipped twice: an in-force value restored as the configured one leaves the host configured differently from
+    how it was found. Configured, the store ISOLATED remembers and puts back, is named in exactly these code lines of
+    the whole script: each reader's own table, filled from the PersistentStore and put into its rows, and the name of
+    the field Compare compares. A new Configured in any verb, or anything else filling the table, is a failure here."""
+    script = _ps1()
+    access = (r"\.configured\b", r"(?<![\w$])configured\s*=", r"['\"]configured['\"]",
+              r"Add-Member\b.*(?<![\w$])configured\b", r"\$configured\b", r"-NotePropertyName\s+['\"]?configured")
+    found = [l for l in _code_lines(script) if any(re.search(a, l, re.I) for a in access)]
+    fast = ["$configured = @{}",
+            "foreach ($p in @(& $readStore 'PersistentStore')) { $configured[$p.Name] = & $mapped $CimOutbound $p 'DefaultOutboundAction' }",
+            "Configured = $configured[$name]"]
+    cmdlet = ["$configured = @{}",
+              "$configured[[string]$p.Name] = [string]$p.DefaultOutboundAction",
+              "Configured = $configured[[string]$_.Name]"]
+    compare = ["foreach ($field in @('Enabled', 'DefaultOutboundAction', 'Configured')) {"]
+    assert found == fast + cmdlet + compare, found
+    # and each sits where it belongs: the fast lines in the fast reader, the cmdlet lines behind the PersistentStore
+    # cmdlet read of Get-ProfileStates, the field name in Compare
+    fast_body = _code_lines(_function_body(script, "Read-FastProfileStates"))
+    states = _code_lines(_function_body(script, "Get-ProfileStates"))
+    assert all(l in fast_body for l in fast) and all(l in states for l in cmdlet)
+    assert states.index(cmdlet[1]) == states.index("foreach ($p in @(Get-NetFirewallProfile -PolicyStore PersistentStore)) {") + 1
+    assert compare[0] in _code_lines(_op_case(script, "Compare"))
+
+
+def test_profiles_tries_the_fast_way_first_and_falls_back_to_the_cmdlets_unchanged():
+    script = _ps1()
+    states = _function_body(script, "Get-ProfileStates")
+    assert re.search(r"if \(-not \$CmdletsOnly\) \{\s*try \{\s*\$rows = @\(Read-FastProfileStates\)\s*"
+                     r"return \[pscustomobject\]@\{ Rows = \$rows; Via = 'fast'; Fallback = \$null \}\s*"
+                     r"\} catch \{\s*\$fallback = Get-ShortReason \$_\s*\}\s*\}", states), states
+    # the cmdlet read as it always was, now behind the fast one
+    cmdlet = states[states.index("    $configured = @{}"):]
+    assert cmdlet.index("Get-NetFirewallProfile -PolicyStore PersistentStore") < cmdlet.index(
+        "Get-NetFirewallProfile -PolicyStore ActiveStore")
+    assert "Configured = $configured[[string]$_.Name]" in cmdlet
+    assert "return [pscustomobject]@{ Rows = $rows; Via = 'cmdlet'; Fallback = $fallback }" in _code_lines(cmdlet)
+
+
+def test_the_profiles_rows_name_the_way_they_were_read():
+    lines = _code_lines(_op_case(_ps1(), "Profiles"))
+    assert lines == [
+        "'Profiles' {",
+        "$read = Get-ProfileStates",
+        "foreach ($row in $read.Rows) {",
+        "$row | Add-Member -NotePropertyName Via -NotePropertyValue $read.Via",
+        "if ($read.Via -ne 'fast') { $row | Add-Member -NotePropertyName Fallback -NotePropertyValue $read.Fallback }",
+        "}",
+        "ConvertTo-Json -Compress -Depth 3 -InputObject $read.Rows",
+    ], lines
+
+
+def test_every_other_caller_takes_the_rows_and_the_writing_verbs_keep_the_cmdlets():
+    """The verbs that write check and read back the profiles as they always did, through the cmdlets. And no caller
+    puts the {Rows, Via, Fallback} wrapper itself into an answer, which would change the JSON's shape: a read used
+    in place is used for its .Rows, a read held in a variable only for its .Rows, .Via and .Fallback, and every
+    profiles of an answer is .Rows."""
+    script = _ps1()
+    for verb in ("List", "AllowOut", "Create", "Cut", "SetDefaultOutbound"):
+        case = _op_case(script, verb)
+        inline = re.findall(r"\(Get-ProfileStates[^)]*\)(\.Rows)?", case)
+        held = re.findall(r"(\$\w+) = Get-ProfileStates\b", case)
+        assert inline or held, verb
+        assert all(inline), verb
+        for var in held:
+            uses = re.findall(r"%s(?!\w)(\.\w+)?" % re.escape(var), case)[1:]
+            assert ".Rows" in uses and set(uses) <= {".Rows", ".Via", ".Fallback"}, (verb, var, uses)
+        for value in re.findall(r"(?<![$\w])profiles = ([^;}]+)", case):
+            assert value.strip().endswith(".Rows"), (verb, value)
+    for verb in ("Create", "Cut", "SetDefaultOutbound", "AllowOut"):
+        assert "(Get-ProfileStates -CmdletsOnly).Rows" in _op_case(script, verb), verb
+    assert "$profileStates = Get-ProfileStates" in _code_lines(_op_case(script, "List"))
+    for verb in ("Enable", "Remove", "DisableAllowOut", "EnableAllowOut", "RemoveIsolate"):
+        assert "ProfileStates" not in _op_case(script, verb), verb
+
+
+def test_compare_holds_each_profile_up_both_ways_read_on_their_own():
+    script = _ps1()
+    case = _op_case(script, "Compare")
+    lines = _code_lines(case)
+    assert "$checked = [ordered]@{ profiles = 0; displayNames = 0; names = 0; fields = 0 }" in lines
+    assert "foreach ($row in @((Get-ProfileStates -CmdletsOnly).Rows)) { $cmdletProfiles[[string]$row.Name] = $row }" in lines
+    assert "foreach ($row in @(Read-FastProfileStates)) { $fastProfiles[[string]$row.Name] = $row }" in lines
+    assert "foreach ($field in @('Enabled', 'DefaultOutboundAction', 'Configured')) {" in lines
+    assert "$checked.profiles += 1" in lines
+    assert "if (-not (Test-SameValue $a $b)) {" in lines
+    assert 'what = \'profiles\'; fast = "error: $(Get-ShortReason $_)"' in case
+    # the profiles are compared before the rules, and a profile pass that fails stops at its own difference
+    assert case.index("$checked.profiles += 1") < case.index("$cmdletRules = @{}")
+
+
+def test_compares_cmdlet_side_can_never_be_the_fast_reader():
+    """A comparison whose two sides can reach the same reader proves nothing. Compare's cmdlet side is
+    Get-ProfileStates -CmdletsOnly, and with that switch the fast reader is not reached at all: it is called in the one
+    block the switch skips, and nowhere after it."""
+    script = _ps1()
+    states = _function_body(script, "Get-ProfileStates")
+    lines = _code_lines(states)
+    assert lines[0] == "param([switch]$CmdletsOnly)"
+    guard = lines.index("if (-not $CmdletsOnly) {")
+    close = lines.index("}", lines.index("$fallback = Get-ShortReason $_"))
+    calls = [i for i, l in enumerate(lines) if "Read-FastProfileStates" in l]
+    assert calls and all(guard < i < close for i in calls), (guard, close, calls)
+    assert lines[close + 1] == "}", "the try/catch must be the whole of the skipped block"
+    assert not re.search(r"Read-Fast|\$CmdletsOnly", "\n".join(lines[close + 1:])), "nothing after the block may go fast"
+    case = _op_case(script, "Compare")
+    cmdlet_side = [l for l in _code_lines(case) if "$cmdletProfiles[[string]" in l]
+    assert cmdlet_side == ["foreach ($row in @((Get-ProfileStates -CmdletsOnly).Rows)) { $cmdletProfiles[[string]$row.Name] = $row }"]
+    fast_side = [l for l in _code_lines(case) if "$fastProfiles[[string]" in l]
+    assert fast_side == ["foreach ($row in @(Read-FastProfileStates)) { $fastProfiles[[string]$row.Name] = $row }"]
+
+
+def test_the_sentinel_is_named_in_one_place():
+    """One code line names it, so that a change of name is one edit and cannot leave a second, older name behind."""
+    lines = _code_lines(_ps1())
+    named = [l for l in lines if "NoSuchStore" in l]
+    assert len(named) == 1 and named[0].startswith("$sentinel = & $optionsOf '"), named
+
+
+def test_the_sentinel_name_cannot_be_a_computer_or_a_path():
+    """Measured on the VM: an unknown store is taken for a computer name (-PolicyStore <computer name> addresses its
+    GPO store). TDC-NoSuchStore cost up to 5.2 s per read and put an AAAA query for it on the wire inside the captured
+    chamber; not-a-store.invalid queried DNS too. A | can be in no computer name and no path, so the provider refuses
+    the name on its syntax: 46 ms typically, no DNS. A plain name must not come back."""
+    lines = _code_lines(_function_body(_ps1(), "Read-FastProfileStates"))
+    sentinel = [l for l in lines if l.startswith("$sentinel = & $optionsOf '")]
+    assert len(sentinel) == 1, sentinel
+    name = re.search(r"& \$optionsOf '([^']*)'", sentinel[0]).group(1)
+    assert "|" in name, "the sentinel %r could be a computer or a path name, and is then looked for on the network" % name
+    assert name not in ("ActiveStore", "PersistentStore", "RSOP", "SystemDefaults", "StaticServiceStore",
+                        "ConfigurableServiceStore", "localhost", ".")
+    # measured: an empty store name answers with all three profiles, exactly like no option at all
+    assert name.strip(), "an empty sentinel answers like no option and proves nothing"
