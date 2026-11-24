@@ -45,6 +45,7 @@ Environment:
   FAKE_RIZIN_XOR_KEY  "<key>": the byte a decryption store really XORs with (``pdj`` still says 0x41): a run that
                     writes **other bytes** than the one that was recorded, which is what a replay that does not hold
                     looks like
+  FAKE_RIZIN_ARA0_IGNORED  set: ``ara0`` does nothing (a rizin that did not take the reset of the register arenas)
   FAKE_RIZIN_ASSIST  set: the calls into the imports the API assistant answers for (see ASSIST_OPS),
                     with their flags and import entries. They are behind a variable of their own
                     because the flag and import lists of the default model are counted in tests
@@ -1307,6 +1308,8 @@ def answer(cmd):
         return stepped
     if word == "ara0":
         # every register to zero, the PC and the stack pointer with them (measured), and what ar set before aei is gone
+        if os.environ.get("FAKE_RIZIN_ARA0_IGNORED"):
+            return ""
         esil["pre"].clear()
         if esil["regs"] is not None:
             esil["regs"] = dict.fromkeys(REG_NAMES, 0)

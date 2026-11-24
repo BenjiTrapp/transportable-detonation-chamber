@@ -894,7 +894,9 @@ def test_a_restarted_rizin_gets_the_patches_back_and_does_not_erase_them(session
     assert "\npatches=100080:41\n" in saved.read_text()
     stacked.analyze_full()
     _wait_state(stacked, "stopped")
-    assert stacked.patches() == {"patches": [], "waiting": []}  # the emulation's memory is gone with its rizin
+    answer = stacked.patches()  # the emulation's memory is gone with its rizin
+    assert (answer["patches"], answer["waiting"]) == ([], [])
+    assert answer["restore"]["actions"] == 0 and "restarted" in answer["restore"]["reason"]
     assert "could not be applied" in stacked.analysis["note"]
     stacked.comment(0x1400014B7, "after the restart")
     timers.fire()
@@ -3531,7 +3533,7 @@ def test_a_patch_is_refused_when_io_cache_did_not_take(rz, monkeypatch):
     response = rz.post(f"/api/rizin/{sid}/patch", {"addr": "0x140001440", "bytes": "90"})
     assert response.status_code == 400 and "io.cache" in response.get_json()["refused"]
     assert not any(c.startswith("wx") for c in _commands_since(rz, mark))
-    assert rz.get(f"/api/rizin/{sid}/patches").get_json() == {"patches": [], "waiting": []}
+    assert rz.get(f"/api/rizin/{sid}/patches").get_json() == {"patches": [], "waiting": [], "restore": {"actions": 0, "reason": None, "digests": 0}}
 
 
 def test_the_patch_buttons_write_the_bytes_of_the_instruction(rz):
@@ -4691,7 +4693,7 @@ def test_a_patch_over_a_runs_bytes_is_held_back_when_the_file_is_opened_again(rz
     rz.wait_done(sid)
     assert not any(c.startswith("wx 90") for c in _commands_since(rz, mark)), "it was not even sent"
     answer = rz.read(f"/api/rizin/{sid}/patches")
-    assert set(answer) == {"patches", "waiting"}
+    assert set(answer) == {"patches", "waiting", "restore"}
     assert answer["patches"] == [], "not in the cache, so it is not exported either"
     assert [(w["addr"], w["after"]) for w in answer["waiting"]] == [(0x140001441, "90")]
     assert set(answer["waiting"][0]) == {"addr", "after", "reason"}
@@ -5407,7 +5409,7 @@ def test_real_rizin_patches_through_the_cache(tdc, tmp_path, monkeypatch):
         original = api.read(f"/api/rizin/{sid}/hex?addr={main}&len=2")["bytes"]
 
         # one row per write operation, with the bytes that were there before it
-        assert api.read(f"/api/rizin/{sid}/patches") == {"patches": [], "waiting": []}
+        assert api.read(f"/api/rizin/{sid}/patches") == {"patches": [], "waiting": [], "restore": {"actions": 0, "reason": None, "digests": 0}}
         answer = api.send(f"/api/rizin/{sid}/patch", {"addr": main, "bytes": "9090"})
         assert answer["patches"] == [{"addr": main, "size": 2, "before": bytes(original).hex(),
                                       "after": "9090", "mine": True, "over_run": False}]
@@ -9251,7 +9253,7 @@ def test_restoring_replays_the_timeline_and_applies_the_waiting_patches(rz, monk
     session._waiting += [(0x140002005, "cc", True), (UNCOVERED, "90", True)]
     assert _offer(rz, sid) == {"actions": 3, "reason": None, "digests": 1}, "a record in the project is offered"
     saved, spied = session._restore_saved, []
-    monkeypatch.setattr(session, "_schedule_save", lambda: spied.append(1))
+    session._schedule_save = lambda: spied.append(1)
     session._assist_tick = 0x500000  # where the counters stand now is not where the timeline began
     _console(rz, sid, "ar rax=0x5")  # a register somebody set by hand: the replay begins from rizin's own state
     assert session._restore_pending
@@ -9274,11 +9276,20 @@ def test_restoring_replays_the_timeline_and_applies_the_waiting_patches(rz, monk
     assert rz.read(f"/api/rizin/{sid}/patches") == answer["patches"], "what the route answers is what GET says"
     assert session._assist_tick == rizin_emulation.TICK_START, "the counters began where the timeline did"
 
-    # the replay is nobody's action: it recorded nothing, asked for no save, and left the record as it was
-    assert session._restore is None and session._replaying is False
-    assert session._restore_saved is saved and spied == []
-    rz.close(sid)
-    assert _restore_value(rz.project()) == line, "and the project's line is the one that was saved"
+    # the replay is nobody's action: it recorded nothing of its own and left the project's record as it was. The
+    # replayed timeline is the session's from here on -- a copy, with the one patch written after the proof as an action,
+    # which asks for a save as a patch of the user's does (once; the replay's own actions asked for none)
+    assert session._replaying is False and session._restore_saved is saved
+    assert saved["actions"] == _the_saved_record(rz)["actions"] and len(saved["actions"]) == 3, "the project's record is not grown"
+    assert session._restore == {"counters": saved["counters"], "breakpoints": [], "tainted": None,
+                                "actions": saved["actions"] + [{"kind": "patch", "addr": 0x140002005, "data": "cc"}]}
+    assert session._restore["actions"] is not saved["actions"] and spied == [1]
+    del session._schedule_save  # the real scheduling again, and a save that is asked for
+    _mark_dirty(rz, sid)
+    assert session.flush() is True
+    record = _the_saved_record(rz)
+    assert record["actions"][:3] == saved["actions"] and record["actions"][3]["data"] == "cc", "the longer recipe is saved"
+    assert record["digests"] == saved["digests"], "of the same bytes"
 
 
 def test_restoring_refuses_when_the_cache_is_not_the_one_from_opening(rz):
@@ -9353,6 +9364,14 @@ def test_restoring_refuses_when_the_breakpoints_are_not_the_ones_the_timeline_ra
     rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x140001490"})
     assert _offer(rz, sid)["reason"] is None
     assert rz.ok(_restore(rz, sid))["restored"] is True
+    # the replayed timeline ran under that set, and says so: the same set again is no change, another one is
+    assert session._restore["breakpoints"] == [0x140001490]
+    rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x140001490"})
+    _run(rz, sid, "step")
+    assert session._restore["tainted"] is None and session._restore_reason() is None
+    rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})
+    _run(rz, sid, "step")
+    assert "breakpoint" in session._restore["tainted"]
 
 
 def _the_state_of_the_open(rz, sid, session, patches, tick=None):
@@ -9558,29 +9577,80 @@ def test_the_replay_sets_the_value_the_skip_applied_and_the_counters_the_timelin
     assert answer["restored"] is True, answer["reason"]
     assert _register(rz, sid, "rax") == 0x1234, "the applied value"
     assert (session._assist_tick, session._assist_handle, session._assist_pseudo) == (ticks, 0, 0)
+    assert session._restore["counters"] == {"tick": rizin_emulation.TICK_START, "handle": 0, "pseudo": 0}, \
+        "the timeline's own begin, not where the replay left them: a derivation from them starts there"
     assert answer["state"]["pc"] == hex(DECRYPT_END)
 
 
 def test_a_timeline_of_the_session_is_replaced_by_the_replay_not_added_to(rz):
     # started and stopped by hand before the restore: the cache is still the open's, so it is let through, and the
     # live timeline (a start) describes a cache that was replaced -- it must not be saved with the digests of the
-    # replayed run, nor grow by the replay's actions
+    # replayed run, nor grow by the replay's actions: it is the record that is the timeline afterwards, and nothing else
     path, line = _decrypted_and_saved(rz)
     sid, session = _reopened(rz, path)
     rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
     rz.send(f"/api/rizin/{sid}/emulation/stop")
-    assert session._restore is not None
+    assert len(session._restore["actions"]) == 1
+    spied = []
+    session._schedule_save = lambda: spied.append(1)
     answer = rz.ok(_restore(rz, sid))
-    assert answer["restored"] is True
-    assert session._restore is None, "and no timeline of this session describes the cache now"
+    assert answer["restored"] is True and answer["applied"] == []
+    assert [a["kind"] for a in session._restore["actions"]] == ["start", "run", "patch"], "not a start of the hand's, nor six"
+    assert spied == [], "the replay asked for no save, and nothing was written after the proof"
+    del session._schedule_save
     _mark_dirty(rz, sid)
     session.flush()
     assert _restore_value(rz.project()) == line, "the project keeps the record it had"
 
 
+def test_the_replayed_timeline_is_a_copy_that_grows_and_the_project_keeps_the_longer_recipe(rz):
+    # the review's addition: the replay proved the cache is what the record describes, so what is done next is an
+    # action after the last one, in its place. Not begun again (the run's own rows are not "foreign": it is not
+    # tainted, and its counters are the record's), a copy (the project's record does not grow in place), and the
+    # next open restores all of it
+    import rizin_emulation
+
+    path, line = _decrypted_and_saved(rz)
+    sid, session = _reopened(rz, path)
+    session._assist_tick = 0x500000  # begun again, the timeline would take the counters as they stand
+    assert rz.ok(_restore(rz, sid))["restored"] is True
+    saved, live = session._restore_saved, session._restore
+    assert live is not saved and live["actions"] is not saved["actions"] and live["actions"] == saved["actions"]
+    assert live["tainted"] is None and live["counters"] == saved["counters"]
+    assert live["counters"]["tick"] == rizin_emulation.TICK_START
+    assert _offer(rz, sid) == {"actions": 3, "reason": None, "digests": 1}
+    _run(rz, sid, "step")
+    _patch(rz, sid, addr="0x140001600", bytes="9090")
+    assert len(live["actions"]) == 5 and len(saved["actions"]) == 3, "the copy grew, the project's did not"
+    assert session._opened == [] and _restore(rz, sid).status_code == 400, "a second press is refused: the cache is the run's"
+    assert session.flush() is True
+    record = _the_saved_record(rz)
+    assert [a["kind"] for a in record["actions"]] == ["start", "run", "patch", "run", "patch"]
+    rz.close(sid)
+
+    sid, session = _reopened(rz, path)
+    assert [(r["addr"], r["after"]) for r in _patches(rz, sid)] == [(0x140001600, "9090")]
+    answer = rz.ok(_restore(rz, sid))
+    assert answer["restored"] is True, answer["reason"]
+    assert [(r["addr"], r["after"]) for r in answer["patches"]["patches"] if r["mine"]] == [
+        (0x140001600, "9090"), (0x140002003, "90")]
+    assert len(session._restore["actions"]) == 5
+
+
+def test_a_replayed_record_that_is_at_the_cap_spoils_at_the_first_action_that_follows(rz, monkeypatch):
+    import rizin_emulation
+
+    path, line = _decrypted_and_saved(rz)
+    sid, session = _reopened(rz, path)
+    assert rz.ok(_restore(rz, sid))["restored"] is True
+    monkeypatch.setattr(rizin_emulation, "RESTORE_MAX_ACTIONS", 3)
+    _run(rz, sid, "step")
+    assert len(session._restore["actions"]) == 3 and "dropped" in session._restore["tainted"]
+
+
 def test_the_replay_does_not_throw_the_record_away_the_way_a_take_back_does(rz, monkeypatch):
     # Task 3: unpatch() discards the timeline. The replay's wc-* is not an unpatch: nothing about the record changes,
-    # not its text, not the reason it is gone (there is none), and the offer afterwards is the cache's reason
+    # not its text, not the reason it is gone (there is none), and a second press is refused for the cache's reason
     import rizin_sessions
 
     path, line = _decrypted_and_saved(rz)
@@ -9589,12 +9659,10 @@ def test_the_replay_does_not_throw_the_record_away_the_way_a_take_back_does(rz, 
     discarded = []
     monkeypatch.setattr(session, "_restore_discard", lambda *args, **kwargs: discarded.append(1))
     assert rz.ok(_restore(rz, sid))["restored"] is True
-    assert discarded == [] and session._restore_gone is None
+    assert discarded == [] and session._restore_gone is None and session._restore_saved is not None
     rz.send(f"/api/rizin/{sid}/emulation/stop")
-    offer = _offer(rz, sid)
-    assert offer["actions"] == 3 and "write cache holds more or other" in offer["reason"], "a second press is refused"
-    assert _restore(rz, sid).status_code == 400
-    assert rizin_sessions._RESTORE_CACHE in offer["reason"]
+    response = _restore(rz, sid)
+    assert response.status_code == 400 and response.get_json()["refused"] == rizin_sessions._RESTORE_CACHE
 
 
 def test_apply_now_is_refused_until_a_runs_bytes_cover_the_address(rz):
@@ -9654,7 +9722,8 @@ def test_dropping_a_waiting_patch_takes_it_out_of_the_project(rz):
     assert rz.delete(url, {"addr": "0x140002003", "waiting": 1}).status_code == 400
     mark = len(rz.commands())
     answer = rz.remove(url, {"addr": "0x140002003", "waiting": True})
-    assert answer == {"patches": [], "waiting": []} and session._waiting == []
+    assert answer["patches"] == [] and answer["waiting"] == [] and session._waiting == []
+    assert answer["restore"]["actions"] == 0 and "taken out of the project" in answer["restore"]["reason"]
     assert not [c for c in rz.commands()[mark:] if c.startswith(("wc-", "wx"))], "the cache is not touched"
     assert session._restore_saved is None
     offer = _offer(rz, sid)
@@ -9801,7 +9870,8 @@ def test_real_rizin_a_replayed_timeline_gives_the_same_bytes(tmp_path):
         assert session.json("pxj 64 @ 0x1000") == first, "the same bytes, patch included"
         assert answer["state"]["pc"] == hex(stop) and answer["applied"] == []
         assert sorted(r["addr"] for r in answer["patches"]["patches"] if r["mine"]) == [0x1002, 0x2000]
-        assert answer["patches"]["waiting"] == [] and session._restore is None
+        assert answer["patches"]["waiting"] == [] and session._restore["tainted"] is None
+        assert len(session._restore["actions"]) == 3
     finally:
         mgr.shutdown()
 
@@ -9814,7 +9884,9 @@ def test_real_rizin_a_replayed_timeline_gives_the_same_bytes(tmp_path):
         assert [(r["addr"], r["after"]) for r in rows] == [(0x2000, "9090")], "the cache is the open's: wcj says so"
         assert session.json("pxj 64 @ 0x1000")[0] == 0x06 and session.json("pxj 2 @ 0x2000") == [0x90, 0x90]
         assert not [m for m in session.json("omlj") if m["name"].startswith("mem.")], "the emulation's maps are gone"
-        assert session.text("ar rcx").split("=")[-1].strip() in ("0x0000000000000000", "0x0")
+        # the registers are the reset's again: the decryptor's loop leaves rsi at 0x1040 (and rcx at 0, which would
+        # say nothing), and aei keeps what a run left -- so only a reset that the undo really sent reads 0 here
+        assert int(session.text("ar rsi").split("=")[-1].strip(), 16) == 0
         assert [(w["addr"], w["after"]) for w in answer["patches"]["waiting"]] == [(0x1002, "9090")]
     finally:
         mgr.shutdown()
@@ -9890,3 +9962,256 @@ def test_restoring_says_so_when_rizin_will_not_say_what_the_cache_or_the_breakpo
     response = _restore(rz, sid)
     assert response.status_code == 400 and response.get_json()["refused"] == rizin_sessions._RESTORE_CACHE_UNREAD
     assert _the_replay(rz, mark) == []
+
+
+# --- Fix round 1 for the replay --------------------------------------------------------------------------------
+
+def test_taking_back_a_patch_the_timeline_makes_drops_the_saved_timeline(rz):
+    # Measured by the review: the patch is a timeline action over no run's bytes (the open applies it), the user takes
+    # it back in a reopened session -- where there is no live timeline for unpatch to discard -- and the next replay
+    # wrote it again and said "restored". The SHA-256 cannot tell: the patch lies outside the hashed ranges.
+    path, line = _decrypted_and_saved(rz, over=[(0x140002003, "90"), (0x140001600, "9090")])
+    sid, session = _reopened(rz, path)
+    assert [(r["addr"], r["after"]) for r in _patches(rz, sid)] == [(0x140001600, "9090")]
+    rz.remove(f"/api/rizin/{sid}/patch", {"addr": "0x140001600"})
+    assert session._restore_saved is None, "what replays the patch is not kept"
+    assert "taken back" in session._restore_gone and "again" in session._restore_gone
+    assert _offer(rz, sid)["actions"] == 0 and "taken back" in _offer(rz, sid)["reason"]
+    assert session.flush() is True
+    assert "\nrestore=" not in _project_text(rz.project())
+    rz.close(sid)
+    sid, session = _reopened(rz, path)
+    assert session._restore_saved is None
+    response = _restore(rz, sid)
+    assert response.status_code == 400 and "no timeline" in response.get_json()["refused"]
+    assert [(r["addr"], r["after"]) for r in _patches(rz, sid)] == [], "and nothing put the patch back"
+
+
+def test_taking_the_whole_cache_back_drops_a_saved_timeline_that_makes_a_patch(rz):
+    path, line = _decrypted_and_saved(rz, over=[(0x140002003, "90"), (0x140001600, "9090")])
+    sid, session = _reopened(rz, path)
+    rz.remove(f"/api/rizin/{sid}/patch", {})
+    assert session._restore_saved is None
+
+
+def test_taking_back_a_patch_the_timeline_does_not_make_keeps_the_saved_timeline(rz):
+    # a patch made before the first start is no action: nothing replays it, so nothing is lost with it
+    path, line = _decrypted_and_saved(rz, before=[(UNCOVERED, "9090")])
+    sid, session = _reopened(rz, path)
+    saved = session._restore_saved
+    rz.remove(f"/api/rizin/{sid}/patch", {"addr": f"{UNCOVERED:#x}"})
+    assert session._restore_saved is saved and session._restore_gone is None
+    # and a take-back where no row of the session's own goes (a run's bytes) is not a patch of the timeline either
+    session._pipe.cmd("wx aa @ 0x140002010")
+    rz.remove(f"/api/rizin/{sid}/patch", {"addr": "0x140002010"})
+    assert session._restore_saved is saved
+
+
+def test_the_patches_of_the_open_are_written_in_the_order_they_were_made_in(rz):
+    # Task 5's third step: two patches that overlap, neither of them an action of the timeline, so nothing but the
+    # order of the open's list decides what the cache holds -- the later write wins over the byte they share
+    path, line = _decrypted_and_saved(rz, before=[(UNCOVERED, "9090"), (UNCOVERED + 1, "cc")], over=[(0x140002003, "90")])
+    sid, session = _reopened(rz, path)
+    mark = len(rz.commands())
+    assert rz.ok(_restore(rz, sid))["restored"] is True
+    replay = _the_replay(rz, mark)
+    assert replay[:4] == ["wc-*", "ara0", "wx 9090 @ 0x140001500", "wx cc @ 0x140001501"], replay
+    assert _the_bytes(session, UNCOVERED, 2) == [0x90, 0xCC]
+
+
+def test_the_gate_compares_the_bytes_of_the_cache_and_not_only_where_they_are(rz):
+    # a write of the console of the same address and size as the open's patch, with other bytes
+    path, line = _decrypted_and_saved(rz, before=[(UNCOVERED, "9090")])
+    sid, session = _reopened(rz, path)
+    session._pipe.cmd(f"wc- {UNCOVERED:#x} {UNCOVERED + 1:#x}")
+    session._pipe.cmd(f"wx abab @ {UNCOVERED:#x}")
+    response = _restore(rz, sid)
+    assert response.status_code == 400 and "write cache holds more or other" in response.get_json()["refused"]
+
+
+def test_get_patches_carries_the_offer_and_reads_the_cache_once(rz):
+    # The button's reader (spec 3): the offer rides the answer of GET /patches, which is asked for by the user and takes the
+    # gate like a run. One wcj for all of it -- the list, the proof of a live timeline, the gate of a saved one.
+    def reads(sid):
+        mark = len(rz.commands())
+        answer = rz.read(f"/api/rizin/{sid}/patches")
+        return answer, rz.commands()[mark:].count("wcj"), rz.commands()[mark:].count("dblj")
+
+    sid = rz.session()
+    answer, wcj, dblj = reads(sid)
+    assert answer == {"patches": [], "waiting": [], "restore": {"actions": 0, "reason": None, "digests": 0}}
+    assert (wcj, dblj) == (1, 0), "no timeline: nothing to ask the breakpoints for"
+
+    path, line = _decrypted_and_saved(rz, name="saved.exe")
+    sid, session = _reopened(rz, path)
+    answer, wcj, dblj = reads(sid)
+    assert answer["restore"] == {"actions": 3, "reason": None, "digests": 1} and (wcj, dblj) == (1, 1)
+    assert answer["restore"] == _offer(rz, sid)
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": f"{DECRYPT_AT:#x}"})
+    _run(rz, sid, "until", addr=f"{DECRYPT_END:#x}")
+    answer, wcj, dblj = reads(sid)
+    assert answer["restore"] == _offer(rz, sid) and answer["restore"]["actions"] == 2 and wcj == 1, "a live timeline"
+    rz.send(f"/api/rizin/{sid}/emulation/stop")
+    answer, wcj, dblj = reads(sid)
+    assert "write cache holds more or other" not in (answer["restore"]["reason"] or ""), "the live timeline answers"
+
+
+def test_a_reset_of_the_registers_that_rizin_did_not_take_is_said_and_not_taken_for_other_bytes(rz, monkeypatch):
+    # ara0 answers nothing either way: it is read back (the PC is 0 after it). Here rizin ignores it and the PC is where
+    # an earlier run left it -- the replay says so, and the undo, which has no digest to find it out, says it too
+    path, line = _decrypted_and_saved(rz)
+    monkeypatch.setenv("FAKE_RIZIN_ARA0_IGNORED", "1")
+    sid, session = _reopened(rz, path)
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    rz.send(f"/api/rizin/{sid}/emulation/stop")
+    mark = len(rz.commands())
+    answer = rz.ok(_restore(rz, sid))
+    assert answer["restored"] is False and "did not reset the registers (the PC reads 0x140001440)" in answer["reason"], answer
+    assert "other bytes" not in answer["reason"] and "nothing was applied" in answer["reason"]
+    assert answer["reason"].endswith("-- and rizin did not reset the registers either: they are what the replay left")
+    assert not [c for c in rz.commands()[mark:] if c.startswith(("aei", "aepc", "wx"))], "it never got to the first action"
+    assert _patches(rz, sid) == [] and session._emulation is None
+
+
+def test_a_replay_that_runs_out_of_time_stops_between_actions_and_undoes_itself(rz, monkeypatch):
+    # spec 6: the cap on the actions is the lever against a restore that takes minutes; 500 runs of esil.timeout is not
+    # one, so the replay has a budget of its own, checked before each action. Exactly the budget is still in time.
+    import rizin_sessions
+
+    path, line = _decrypted_and_saved(rz, before=[(UNCOVERED, "9090")])
+    sid, session = _reopened(rz, path)
+    budget = rizin_sessions.RESTORE_BUDGET
+    ticks = iter([0, 0, budget / 2, budget + 1])  # the deadline, then before action 1, 2 and 3
+    monkeypatch.setattr(rizin_sessions, "_replay_clock", lambda: next(ticks))
+    answer = rz.ok(_restore(rz, sid))
+    assert answer["restored"] is False
+    assert "before action 3 of 3 (patch at 0x140002003)" in answer["reason"] and f"{budget:g} seconds" in answer["reason"]
+    _the_state_of_the_open(rz, sid, session, [(UNCOVERED, "9090")])
+    ticks = iter([0, 0, budget / 2, budget])
+    answer = rz.ok(_restore(rz, sid))
+    assert answer["restored"] is True, answer["reason"]
+
+
+def test_a_replay_whose_list_of_the_cache_cannot_be_made_is_still_a_restored_one(rz, monkeypatch):
+    # the list after the replay is for the pane: a failure of it must not turn a replay that held into a 500
+    path, line = _decrypted_and_saved(rz)
+    sid, session = _reopened(rz, path)
+    monkeypatch.setattr(session, "_patches_answer", lambda pipe, rows=None: (_ for _ in ()).throw(ValueError("wcj")))
+    answer = rz.ok(_restore(rz, sid))
+    assert answer["restored"] is True and answer["patches"] is None and answer["reason"] is None
+    assert _the_bytes(session)[3] == 0x90
+
+
+def test_a_replay_that_rizin_dies_in_ends_the_session_and_leaves_no_flag_behind(rz, monkeypatch):
+    # RizinDied passes by the replay's own failure paths (there is no rizin to undo it in): _call ends the session as it
+    # does for any command, and what the replay set on the session is not left set
+    import rizin_sessions
+
+    path, line = _decrypted_and_saved(rz, before=[(UNCOVERED, "9090")])  # its write clears what a restart lost, as any does
+    sid, session = _reopened(rz, path)
+    session._lost = [(0x140001700, "aa", False)]
+
+    def dies(pipe, kind, command, addr):
+        raise rizin_sessions.RizinDied("rizin is gone")
+
+    monkeypatch.setattr(session, "_emulation_ran", dies)
+    response = _restore(rz, sid)
+    assert response.status_code == 404 and response.get_json()["error"] == "session ended"
+    assert session.closed and session._replaying is False and session._lost == [(0x140001700, "aa", False)]
+    assert rz.get(f"/api/rizin/{sid}/patches").status_code == 404
+
+
+def test_what_each_route_reads_of_the_cache(rz):
+    # R-T3h: ``wcj`` is 84 ms and 4 MB of JSON per MB cached, so every answer reads it as often as it must and no more.
+    # The list, the offer and the gate share one read; a write adds the read its own check needs (_patch_write), and
+    # the answer after it is the cache as it is then. The counts are: gate 1 + the patch of the open 1 + the patch
+    # action 1 + the proof 1 + the answer 1 for a replay; read 1 + the write 1 + the answer 1 for apply-now.
+    path, line = _decrypted_and_saved(rz, before=[(UNCOVERED, "9090")])
+    sid, session = _reopened(rz, path)
+    session._waiting.append((0x140002005, "cc", True))
+
+    def reads(do):
+        mark = len(rz.commands())
+        do()
+        commands = rz.commands()[mark:]
+        return commands.count("wcj"), commands.count("dblj")
+
+    assert reads(lambda: rz.read(f"/api/rizin/{sid}/patches")) == (1, 1), "one read; the breakpoints for the project's timeline"
+    assert reads(lambda: rz.post(f"/api/rizin/{sid}/patch", {"addr": "0x140002003", "waiting": True})) == (1, 0), "refused"
+    assert reads(lambda: rz.remove(f"/api/rizin/{sid}/patch", {"addr": "0x140002005", "waiting": True})) == (1, 1), \
+        "nothing was written, so the read of the gate is the answer's"
+    assert reads(lambda: rz.ok(_restore(rz, sid))) == (5, 1)
+    rz.send(f"/api/rizin/{sid}/emulation/stop")
+    session._waiting.append((0x140002005, "cc", True))
+    assert reads(lambda: rz.send(f"/api/rizin/{sid}/patch", {"addr": "0x140002005", "waiting": True})) == (3, 0)
+
+
+def test_taking_back_a_write_that_is_not_a_patch_of_the_session_keeps_the_saved_timeline(rz):
+    # the rule is about the session's own patches: a run's row that happens to have the bytes of a patch action goes,
+    # and the timeline is not what put it there
+    path, line = _decrypted_and_saved(rz)
+    sid, session = _reopened(rz, path)
+    saved = session._restore_saved
+    session._pipe.cmd("e io.cache=true")
+    session._pipe.cmd("wx 90 @ 0x140002003")  # a foreign row with the address and bytes of the timeline's patch
+    assert [r["mine"] for r in _patches(rz, sid)] == [False]
+    rz.remove(f"/api/rizin/{sid}/patch", {"addr": "0x140002003"})
+    assert session._restore_saved is saved and session._restore_gone is None
+
+
+def test_the_offer_of_a_project_with_patches_in_the_order_they_were_made_in_is_not_refused_for_the_order(rz):
+    # the open's patches are written in the order the first session made them, which is not the order of their
+    # addresses; the gate compares the cache in write order, and both the answer of GET /patches and the route do
+    path, line = _decrypted_and_saved(rz, before=[(UNCOVERED + 1, "cc"), (UNCOVERED, "9090")])
+    sid, session = _reopened(rz, path)
+    assert session._opened == [(UNCOVERED + 1, 1, "cc"), (UNCOVERED, 2, "9090")]
+    assert rz.read(f"/api/rizin/{sid}/patches")["restore"] == {"actions": 3, "reason": None, "digests": 1}
+    assert _offer(rz, sid) == {"actions": 3, "reason": None, "digests": 1}
+    assert rz.ok(_restore(rz, sid))["restored"] is True
+    assert _the_bytes(session, UNCOVERED, 2) == [0x90, 0x90], "the later write, the one over the byte they share"
+
+
+def test_an_offer_that_cannot_make_the_proof_says_so_and_still_answers(rz, monkeypatch):
+    import rizin_sessions
+
+    sid = rz.session()
+    session = rz.mgr.get(sid)
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    _wrote(rz, sid)
+    monkeypatch.setattr(session, "_restore_digests", lambda pipe, rows=None: (_ for _ in ()).throw(ValueError("short")))
+    answer = rz.read(f"/api/rizin/{sid}/patches")
+    assert answer["restore"] == {"actions": 1, "reason": rizin_sessions._RESTORE_CACHE_UNREAD, "digests": 0}
+
+
+def test_a_replay_that_fails_after_it_became_the_timeline_is_not_the_timeline_any_more(rz, monkeypatch):
+    # the step that follows the proof (reading the state) fails: the cache is the open's again, and the record that was
+    # adopted for it is gone with the replay -- a timeline that outlived it would be recording over the wrong cache
+    path, line = _decrypted_and_saved(rz, before=[(UNCOVERED, "9090")])
+    sid, session = _reopened(rz, path)
+    real = session._emulation_read
+
+    def fails_once_the_record_is_the_sessions(pipe):
+        if session._restore is not None:
+            raise ValueError("state")
+        return real(pipe)
+
+    monkeypatch.setattr(session, "_emulation_read", fails_once_the_record_is_the_sessions)
+    answer = rz.ok(_restore(rz, sid))
+    assert answer["restored"] is False and "could not go on (state)" in answer["reason"]
+    _the_state_of_the_open(rz, sid, session, [(UNCOVERED, "9090")])
+    assert session._restore is None
+
+
+def test_taking_back_a_patch_at_the_address_of_one_the_timeline_makes_but_with_other_bytes_keeps_it(rz):
+    # the timeline replays bytes, not an address: another patch of the session's own at the same place is not the one
+    # it would write again
+    path, line = _decrypted_and_saved(rz)
+    sid, session = _reopened(rz, path)
+    saved = session._restore_saved
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": f"{DECRYPT_AT:#x}"})
+    _run(rz, sid, "until", addr=f"{DECRYPT_END:#x}")
+    _patch(rz, sid, addr="0x140002003", bytes="cc")
+    answer = rz.remove(f"/api/rizin/{sid}/patch", {"addr": "0x140002003"})
+    assert [(r["addr"], r["after"]) for r in answer["patches"] if r["mine"]] == []
+    assert session._restore_saved is saved and session._restore_gone is not None, "the live timeline went, the project's did not"
+    assert "taken back" not in session._restore_gone
