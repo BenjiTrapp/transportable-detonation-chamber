@@ -233,7 +233,7 @@ def test_the_detail_of_a_curated_edge_says_the_mapping_comes_from_a_table():
 
 @needs_node
 def test_the_detail_and_legend_of_the_zw_edge_say_a_naming_convention_not_a_row_of_the_table():
-    # syscall-callers and path-to-syscall draw ntdll!ZwClose -> NtClose curated: no row of the table says it, a rename does
+    # syscall-callers and path-to-syscall draw ntdll!ZwClose -> NtClose curated: a rename, which the table calls zw-alias
     r = _graph_flow(r"""
       (async () => {
         initSyscalls(); syscallSetView('graph');
@@ -252,9 +252,15 @@ def test_the_detail_and_legend_of_the_zw_edge_say_a_naming_convention_not_a_row_
     text = " ".join(re.sub(r"<[^>]+>", " ", r["detail"]).split()).lower()
     assert "curated" in text and "not derived" in text and "not read from any binary" in text
     assert "naming convention" in text and "zwclose" in text and "ntclose" in text
-    assert "comes from the hand-curated win32 to nt table" not in text, "no row of the table maps a Zw name"
+    # the edge is the naming convention's word (the table names it zw-alias, and its one row of that source,
+    # ZwUnmapViewOfSection, is the same convention), not a Win32 row's "the function ends in this syscall"
+    assert "comes from the hand-curated win32 to nt table" not in text, "the panel names the convention, not a Win32 row"
     legend = {e["attrs"]["data-legend"]: e for e in _Elements(r["legend"]).elements if "data-legend" in e["attrs"]}
     assert "Zw" in legend["edge-curated"]["attrs"]["title"] and "naming convention" in legend["edge-curated"]["attrs"]["title"]
+    # the visible label too, not only its title: on an answer whose one curated edge is a Zw rename, a label that says
+    # only "from the hand-curated Win32 to Nt table" names the wrong source (re-review of the final wave)
+    label = " ".join(legend["edge-curated"]["text"].split())
+    assert "naming convention" in label and "not read from any binary" in label, label
 
 
 # --- What the view says besides the drawing ------------------------------------------------------------------------

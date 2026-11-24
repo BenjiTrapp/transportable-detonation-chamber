@@ -27025,7 +27025,7 @@ function binaryGraphLegend(mode, edges) {
         'An import, a forwarder or an api-set resolution that the import and export tables of the binaries themselves say.'));
     if (!explore || drawn.has('curated')) {
         parts.push(item('edge-curated', line('curated', binaryGraphEdgeLook({ origin: 'curated' })),
-            'curated: from the hand-curated Win32 to Nt table, not read from any binary',
+            'curated: the hand-curated Win32 to Nt table or the Zw naming convention, not read from any binary',
             'The step from a Win32 function to its Nt syscall is the word of a hand-curated table, and the step from a Zw name of ntdll to its Nt syscall a naming convention. No binary of this system was read to draw either.'));
     }
     if (!explore || drawn.has('unknown')) {
@@ -27240,7 +27240,9 @@ function binaryGraphDetailHtml(item) {
     if (origin === 'curated') {
         rows.push(['Origin', 'curated, not derived']);
         const from = escapeHtml(name(item.source) || e.source), to = escapeHtml(name(item.target) || e.target);
-        // a Zw name of ntdll is its Nt name by convention: no row of the table says it, and the panel must not either
+        // a Zw name of ntdll is its Nt name by convention, which the table calls zw-alias (its own row of that source,
+        // ZwUnmapViewOfSection, says no more). The edge is that convention's word, so the panel names the convention and
+        // not "the table's word that the function ends in this syscall", which reads as a Win32 row someone looked up
         note = e.label === 'curated: zw-alias'
             ? '<p class="binary-graph-curated-note"><strong>Curated, not derived.</strong> This step is not read from any binary: that '
                 + `${from} is ${to} is a naming convention, a Zw name of ntdll being its Nt name, which the curated table calls zw-alias. `
