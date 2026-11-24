@@ -1007,7 +1007,7 @@ def _named_addresses(addrs):
 
 def _sanitize_project(src, dst, level, mode, done, patches, ranges=(), restore=None, restore_lost=False):
     """Copy a project written by ``Ps`` so that rizin 0.9.1 can load it again; (how many patches did not fit,
-    whether ``restore`` did).
+    whether ``restore`` did, whether it would have with the whole budget to itself).
 
     Loading a variable that came from DWARF looks up its DWARF entry, which
     the newly opened file does not have, and rizin then crashes on ``aflj``.
@@ -1036,10 +1036,15 @@ def _sanitize_project(src, dst, level, mode, done, patches, ranges=(), restore=N
     """
     namespace = None
     line_of_patches, left_out = _patches_line(patches)
-    line_of_restore, fitted = "", True
+    line_of_restore, fitted, alone = "", True, True
     room = PROJECT_PATCH_CHARS - len(line_of_patches)
     if restore is not None:
-        line_of_restore, fitted = rizin_emulation.restore_line(restore, room)
+        # one build, against the whole budget: that it fits there is "alone", and that it is also no longer than
+        # what the patches left is "fitted" -- the blame of the note needs both
+        line_of_restore, alone = rizin_emulation.restore_line(restore, PROJECT_PATCH_CHARS)
+        fitted = alone and len(line_of_restore) <= room
+        if not fitted:
+            line_of_restore = ""
     if not line_of_restore and (restore is not None or restore_lost) and room >= len(_RESTORE_DROPPED_MARK):
         line_of_restore = _RESTORE_DROPPED_MARK
     with open(src, encoding="utf-8", errors="surrogateescape", newline="\n") as fin, \
@@ -1057,7 +1062,7 @@ def _sanitize_project(src, dst, level, mode, done, patches, ranges=(), restore=N
                    f"patches={line_of_patches}\n")
         if line_of_restore:
             fout.write(f"restore={line_of_restore}\n")
-    return left_out, fitted
+    return left_out, fitted, alone
 
 
 # The flag spaces rizin's own analysis and search fill: a function's flag and the string search's hits.
@@ -1524,7 +1529,8 @@ class RizinSession:
         # the originating session's cache is not "nothing but the applied patches" (spec 6) for it to run in.
         # ``_restore_lost``: the project held the marker of a dropped record when it was opened. It matters until a
         # record is saved (then ``_restore_saved`` is set and a save writes that or, if it does not fit, the marker
-        # again), so it is read at the open and never changed.
+        # again), so it is read at the open and never changed. The note the open made of it is retracted by
+        # _note_restore when a record fits.
         self._restore_saved = None
         self._restore_lost = False
         self._restore_dropped_note = None
@@ -3594,7 +3600,7 @@ class RizinSession:
         try:
             if not os.path.isfile(tmp):
                 raise OSError(f"rizin did not write {tmp}")
-            left_out, fitted = _sanitize_project(tmp, part, level, mode, done, patches, ranges, restore, lost)
+            left_out, fitted, alone = _sanitize_project(tmp, part, level, mode, done, patches, ranges, restore, lost)
             with self._replace_lock:
                 if seq > self._saved_seq:
                     os.replace(part, self._project)
@@ -3602,8 +3608,7 @@ class RizinSession:
             if left_out:
                 self._note_dropped_patches(left_out)
             if restore is not None:
-                # alone: whether it would have fitted with the whole budget to itself, which says whom to blame
-                self._note_restore(fitted, fitted or rizin_emulation.restore_line(restore, PROJECT_PATCH_CHARS)[1])
+                self._note_restore(fitted, alone)
         finally:
             for leftover in (tmp, part):
                 try:
@@ -3636,6 +3641,11 @@ class RizinSession:
         with self._lock:
             if self._closed:
                 return
+            if fitted:
+                # what the open said of the project it found ("the way is gone") is not true of one that holds the
+                # record again, and it would send the user to decrypt what the pane is about to offer
+                self._kept_notes = [n for n in self._kept_notes if n != _RESTORE_LOST_AT_OPEN]
+                self._notes = [n for n in self._notes if n != _RESTORE_LOST_AT_OPEN]
             said = self._restore_dropped_note
             note = None if fitted else (_RESTORE_DROPPED if fits_alone else _RESTORE_TOO_LONG_ALONE).format(
                 chars=PROJECT_PATCH_CHARS)

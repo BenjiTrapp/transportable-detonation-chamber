@@ -4609,9 +4609,8 @@ def test_what_a_run_wrote_does_not_come_back(rz):
     # a run alone asks for a save since the timeline is kept (R-T4a): a project, with the way to the bytes (a hash of
     # them) and not the bytes -- no patch, and nothing of the run's row
     saved = rz.project().read_text(encoding="utf-8", errors="surrogateescape")
-    tail = saved.split("\n/tdc\n")[-1]
     assert "\npatches=\n" in saved and "\nrestore=1;" in saved
-    assert ran[0]["after"] not in tail, "its bytes are not in the project, only their hash"
+    assert ran[0]["after"] not in saved, "its bytes are not in the project, only their hash"
     assert f"patches={ran[0]['addr']:x}" not in saved
     rz.project().unlink()
 
@@ -5204,7 +5203,7 @@ def test_the_mark_goes_through_the_project_and_comes_back(tmp_path):
     src, dst = tmp_path / "in.rzdb", tmp_path / "out.rzdb"
     src.write_text("/\nversion=25\n")
     patches = [(0x140001000, "9090", False), (0x140002000, "41", True), (0x140003000, "42", False)]
-    assert rizin_sessions._sanitize_project(str(src), str(dst), "aaa", "one", ["aaa"], patches) == (0, True)
+    assert rizin_sessions._sanitize_project(str(src), str(dst), "aaa", "one", ["aaa"], patches) == (0, True, True)
     assert "\npatches=140001000:9090,140002000:41:r,140003000:42\n" in dst.read_text()
     assert rizin_sessions._read_project_meta(str(dst))["patches"] == patches
     # the slice that cuts the line takes the entry it cuts, with its mark: "1:90:" is no entry either
@@ -5357,7 +5356,7 @@ def test_the_tdc_namespace_stays_inside_the_tail_that_is_read_back(tmp_path):
     src, dst = tmp_path / "in.rzdb", tmp_path / "out.rzdb"
     src.write_text("/\nversion=25\n")
     big = [(0x140001000 + i * 0x2000, "90" * rizin_emulation.MAX_PATCH_BYTES, False) for i in range(10)]
-    left_out, fitted = rizin_sessions._sanitize_project(str(src), str(dst), "aaa", "one", ["aaa"], big)
+    left_out, fitted, _ = rizin_sessions._sanitize_project(str(src), str(dst), "aaa", "one", ["aaa"], big)
     assert fitted, "there was no record to fit"
     meta = rizin_sessions._read_project_meta(str(dst))
     # an entry costs 9 + 1 + 2 * MAX_PATCH_BYTES characters, and a comma between two of them
@@ -8998,6 +8997,14 @@ def test_a_record_that_had_to_be_dropped_leaves_a_marker_and_the_open_says_so(rz
     _mark_dirty(rz, sid)
     session.flush()
     assert _restore_value(rz.project()).startswith("1;") and _marker() not in _project_text(rz.project())
+    # the note said "the way is gone" about the project as it was: it is not true of the project that holds the record
+    # again, and a user told to decrypt again would redo what the pane is about to offer
+    assert "could not be kept" not in (rz.status(sid)["analysis"]["note"] or ""), rz.status(sid)["analysis"]["note"]
+    assert session._restore_dropped_note is None
+    # and a re-plan (Full analysis) does not bring it back out of the notes that outlive one
+    session.analyze_full()
+    _wait_state(session, "done", "stopped")
+    assert "could not be kept" not in (rz.status(sid)["analysis"]["note"] or "")
 
 
 def test_the_marker_is_written_only_where_the_patches_leave_room_for_it(rz, monkeypatch):
@@ -9052,7 +9059,6 @@ def test_a_running_emulation_asks_for_a_save_like_every_other_change(sessions, s
     _wait_state(session, "done")
     project = tmp_path / "projects" / (opened["file"]["sha256"] + ".rzdb")
     timers.fire()
-    mark = len(timers.made)
     session.emulation_start(0x140001440)
     assert session._dirty and timers.pending, "a start asks for a save"
     timers.fire()
@@ -9125,3 +9131,42 @@ def test_a_restart_keeps_the_record_the_session_holds_over_an_older_line_of_the_
     session.comment(0x1400014B7, "after the restart")
     timers.fire()
     assert rizin_emulation.read_restore(_restore_value(project)) == mine
+
+
+def test_a_run_that_ended_at_the_time_limit_does_not_ask_for_a_save(sessions, sample, fake, tmp_path, monkeypatch):
+    # tainted by this very action (not before it, as a hand-set register is): a save would write nothing new and cost a
+    # Ps and a read of the cache, in the one case where rizin was blocked for the whole time limit already
+    monkeypatch.setenv("FAKE_RIZIN_ESIL_RUNAWAY", "1")
+    timers = Timers()
+    mgr = sessions(timer=timers, big_file=1)
+    session = mgr.get(mgr.open(sample("runaway.exe", b"MZ runaway"), "tab")["session"])
+    _wait_state(session, "done")
+    session.emulation_start(0x140001440)
+    timers.fire()
+    assert not session._dirty and session._restore["tainted"] is None
+    made = len(timers.made)
+    assert session.emulation_run("cont")["stopped"] == "timeout"
+    assert session._restore["tainted"] and "time limit" in session._restore["tainted"]
+    assert len(session._restore["actions"]) == 2, "the run is on the timeline all the same"
+    assert not session._dirty and len(timers.made) == made, "and asked for no save"
+
+
+def test_the_blame_for_a_dropped_timeline_follows_the_cause_within_one_session(rz, monkeypatch):
+    # first the patches took the room, then the timeline is over the budget on its own: the note says the second, and
+    # says it once
+    import rizin_sessions
+
+    path, sid, line = _saved_with_a_record(rz)
+    session = rz.mgr.get(sid)
+    patches = "140001441:90:r"
+    monkeypatch.setattr(rizin_sessions, "PROJECT_PATCH_CHARS", len(patches) + len(line) - 1)
+    _mark_dirty(rz, sid)
+    session.flush()
+    note = rz.status(sid)["analysis"]["note"]
+    assert "with the patches" in note and "on its own" not in note, note
+    monkeypatch.setattr(rizin_sessions, "PROJECT_PATCH_CHARS", len(line) - 1)
+    _mark_dirty(rz, sid)
+    session.flush()
+    note = rz.status(sid)["analysis"]["note"]
+    assert "on its own" in note and "with the patches" not in note, note
+    assert note.count("did not fit") == 1
