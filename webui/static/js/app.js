@@ -28076,7 +28076,7 @@ const BINARY_GRAPH_METRICS = {
     curated_transitions: { name: 'Curated transitions', means: 'Rows of the Win32 to Nt table: its word, not read from any binary.', jump: 'syscall' },
     most_imported: { name: 'Most imported', means: 'The modules most binaries import.', jump: 'binary' },
     skipped: { name: 'Skipped files', means: 'Files of System32 that could not be read and are not in the graph.', jump: '' },
-    partial: { name: 'Tables cut short', means: 'Binaries whose import table was cut short when it was read.', jump: 'binary' },
+    partial: { name: 'Binaries with a cut table', means: 'Binaries with a table (import, delay-load or export) that was cut short when it was read.', jump: 'binary' },
 };
 // how many neighbours a row of a list names before it says how many more there are
 const BINARY_GRAPH_MEMBER_LINKS = 6;
@@ -28089,11 +28089,14 @@ function binaryGraphMetricRows(figures) {
         const meta = BINARY_GRAPH_METRICS[key], raw = figures[key];
         let value = null, means = meta.means;
         if (key === 'most_imported') {
+            // an empty top is a zero (nothing is imported); only a list that is not there is not known
             const top = Array.isArray(raw) && raw.length && raw[0] && typeof raw[0] === 'object' ? raw[0] : null;
             const degree = top ? Number(top.in_degree) : NaN;
             if (top && typeof top.name === 'string' && Number.isFinite(degree) && degree >= 0) {
                 value = degree;
                 means += ` The first is ${top.name}, imported by ${degree.toLocaleString('en-US')} ${degree === 1 ? 'binary' : 'binaries'}.`;
+            } else if (Array.isArray(raw) && !raw.length) {
+                value = 0;
             }
         } else if (typeof raw === 'number' && Number.isFinite(raw) && raw >= 0) {
             value = raw;
@@ -28119,8 +28122,8 @@ function binaryGraphMetricsStatus() {
     let html = '';
     const cut = typeof f.partial === 'number' && f.partial > 0 ? f.partial : 0;
     if (cut) {
-        html += `<strong class="binary-graph-cut">${escapeHtml(cut.toLocaleString('en-US'))} import ${cut === 1 ? 'table was' : 'tables were'} cut short when the graph was read: `
-            + 'the counts that read import tables are lower bounds, and the number of isolated binaries is an upper one.</strong> ';
+        html += `<strong class="binary-graph-cut">${escapeHtml(cut.toLocaleString('en-US'))} ${cut === 1 ? 'binary has' : 'binaries have'} a table (import, delay-load or export) that was cut short when the graph was read: `
+            + 'the counts that read tables are lower bounds, and the number of isolated binaries is an upper one.</strong> ';
     }
     const stamp = [f.build ? `build ${f.build}` : '', f.arch || ''].filter(Boolean).join(' · ');
     if (stamp) html += `<span class="syscall-muted">${escapeHtml(stamp)}</span>`;
@@ -28203,7 +28206,11 @@ async function binaryGraphMetricOpen(key) {
 function binaryGraphMetricJump(key, node, edges) {
     const meta = binaryGraphOwn(BINARY_GRAPH_METRICS, key);
     if (!meta || !node || typeof node.id !== 'string') return null;
-    if (meta.jump === 'binary') return { mode: 'explore', name: node.id, hint: 'Start an exploration from it' };
+    if (meta.jump === 'binary') {
+        // START opens the module of a function (module!function): the name given is the one it would show
+        const bang = node.id.indexOf('!');
+        return { mode: 'explore', name: bang > 0 ? node.id.slice(0, bang) : node.id, hint: 'Start an exploration from it' };
+    }
     if (meta.jump === 'syscall') {
         const edge = edges.find(e => e && e.source === node.id && typeof e.target === 'string' && e.target.startsWith(BINARY_GRAPH_SYSCALL));
         return edge ? { mode: 'syscall', name: edge.target.slice(BINARY_GRAPH_SYSCALL.length), hint: 'Show the binaries that reach the syscall it leads to' } : null;

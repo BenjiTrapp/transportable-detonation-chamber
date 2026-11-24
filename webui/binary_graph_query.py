@@ -643,11 +643,12 @@ MOST_IMPORTED = 20
 
 def _reach(graph, module, every, skipped):
     """The files an import of `module` reaches: the module itself where the graph holds it, or a file it had to skip
-    (it is System32's, though unread); for an api set its hosts the graph holds, all of them where `every`, otherwise
-    the first only, the default the map gives at module level."""
+    (it is System32's, though unread); for an api set its hosts that are one or the other, all of them where `every`,
+    otherwise the first only, the default the map gives at module level. A host that was skipped counts like a skipped
+    module: an absence is not claimed over a file nobody could read."""
     if _is_api_set(graph, module):
         hosts = [host.lower() for host in binary_graph.api_set_hosts(graph.api_sets, module) or ()]
-        return [host for host in (hosts if every else hosts[:1]) if host in graph.binaries]
+        return [host for host in (hosts if every else hosts[:1]) if host in graph.binaries or host in skipped]
     return [module] if module in graph.binaries or module in skipped else []
 
 
@@ -678,10 +679,10 @@ def _isolated(graph):
     return sorted(name for name, mine in links.items() if not mine and name not in imported)
 
 
-def _circular_pairs(graph):
+def _circular_pairs(graph, links=None):
     """Two binaries that import each other, each pair once as (a, b) with a < b: a pair, not its two directed edges,
-    and no binary with itself."""
-    links = _links(graph, every=False)
+    and no binary with itself. `links` is `_links(graph, every=False)` where the caller has it already."""
+    links = _links(graph, every=False) if links is None else links
     return sorted((a, b) for a, mine in links.items() for b in mine if a < b and a in links.get(b, {}))
 
 
@@ -721,8 +722,8 @@ def metrics(graph, table) -> dict:
     `circular_pairs` pairs of binaries that import each other (an api set counts as its first host, as the shared
     dependencies read it: a claim of presence must not either); `curated_transitions` the rows of the Win32 to Nt
     table, not the Nt names they lead to; `most_imported` the modules with the highest in-degree; `skipped` the files
-    that could not be read; and `partial` the binaries whose import table was cut short when it was read, which makes
-    every count that reads import tables a lower bound and `isolated` an upper one."""
+    that could not be read; and `partial` the binaries with a table (import, delay-load or export) cut short when it was read, which
+    makes every count that reads tables a lower bound and `isolated` an upper one."""
     return {
         "binaries": len(graph.binaries),
         "edges": _edge_count(graph),
@@ -739,7 +740,8 @@ def metrics(graph, table) -> dict:
 
 def _cut_note(graph, effect):
     count = sum(1 for info in graph.binaries.values() if info.partial)
-    return f" {_plural(count, 'import table was', 'import tables were')} cut short when the graph was read, so {effect}." if count else ""
+    return (f" {_plural(count, 'binary has', 'binaries have')} a table (import, delay-load or export) that was cut short "
+            f"when the graph was read, so {effect}.") if count else ""
 
 
 # Each list is `(parts, total, note, what, reads_tables, nothing)`: its parts as an iterator, built only as far as the cap
@@ -805,7 +807,7 @@ def _members_isolated(graph, table):
 
 def _members_circular(graph, table):
     links = _links(graph, every=False)
-    pairs = _circular_pairs(graph)
+    pairs = _circular_pairs(graph, links)
     parts = (_Part([_module_node(graph, a), _module_node(graph, b)],
                    [_edge(a, b, "imports", links[a][b]), _edge(b, a, "imports", links[b][a])], [a, b])
              for a, b in pairs)
@@ -846,9 +848,9 @@ def _members_skipped(graph, table):
 def _members_partial(graph, table):
     names = _partial_names(graph)
     parts = (_Part([_module_node(graph, name)], [], [name]) for name in names)
-    return (parts, len(names), f"{_plural(len(names), 'binary has', 'binaries have')} an import table that was cut short when it was "
-                               f"read: what it imports may be more than the graph holds.", "binaries", False,
-            "No import table was cut short when the graph was read.")
+    return (parts, len(names), f"{_plural(len(names), 'binary has', 'binaries have')} a table (import, delay-load or export) that was cut "
+                               f"short when it was read: what it imports or exports may be more than the graph holds.", "binaries", False,
+            "No table (import, delay-load or export) was cut short when the graph was read.")
 
 
 _MEMBERS = {"binaries": _members_binaries, "edges": _members_edges, "api_sets_resolved": _members_api_sets,

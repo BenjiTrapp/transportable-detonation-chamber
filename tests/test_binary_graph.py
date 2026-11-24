@@ -4122,6 +4122,17 @@ def test_both_pages_name_the_figures_route_every_figure_and_the_curated_zw_edge(
     # a metric the table cannot give is null, never 0, and both pages say so for the route
     assert "`null`" in docs["/api/binary-graph/metrics"] and "null" in helps["/api/binary-graph/metrics"]
     assert "the only curated edge of any answer" not in query
+    # the one exception to "derived everywhere else" is said by both pages, at the claim and not only further on
+    exception = "`metric=curated_transitions`", "<code>metric=curated_transitions</code>"
+    assert exception[0] in query and exception[1] in help_query, "a page does not name the one answer besides a path that carries curated edges"
+    assert query.index(exception[0]) < query.index("`derived`"), "docs/api.md says every edge is derived before it names the exception"
+    assert help_query.index(exception[1]) < help_query.index("Every other edge"), "the help says every other edge is derived before it names the exception"
+    for page in (query, help_query):
+        assert "each the table's word" in page
+    # what the `partial` figure counts is a binary with a table of any of three kinds cut, and both pages say so
+    for page in (docs["/api/binary-graph/metrics"], helps["/api/binary-graph/metrics"]):
+        assert "import, delay-load or export" in page, page
+        assert "whose import table was cut short" not in page and "import tables cut short" not in page
 
 
 # --- Ruling 60: a list far above the cap is not built whole ---------------------------------------------------------------
@@ -4270,3 +4281,42 @@ def test_the_exception_is_said_where_the_rule_is_and_names_the_query_and_the_rea
     assert "every row of the table is a curated mapping" in module
     function = binary_graph_query.metric_members.__doc__
     assert "curated_transitions" in function and "path_to_syscall" in function and "No other list may carry one" in function
+
+
+# --- Ruling 61 and four minors of the review -------------------------------------------------------------------------------
+
+def test_the_figure_of_cut_tables_says_a_table_of_any_of_three_kinds_not_an_import_table():
+    # BinaryInfo.partial is set when the import, the delay-load or the export directory was cut: a binary whose only cut was its
+    # exports is not one with a cut import table
+    graph = _figures_system(lone_exe=True)
+    needle = "a table (import, delay-load or export)"
+    note = _members(graph, "partial").note
+    assert needle in note and "an import table that was cut" not in note
+    for name in ("edges", "forwarders", "isolated", "circular_pairs", "api_sets_resolved", "most_imported"):
+        got = _members(graph, name)
+        assert needle in got.note and "import table was cut" not in got.note and "import tables were cut" not in got.note, name
+    assert needle in _members(_query_graph(_q("k.dll", partial=True)), "isolated").note, "also where the list itself is empty"
+    assert "import, delay-load or export" in binary_graph_query.metrics.__doc__
+    assert "whose import table was cut short" not in binary_graph_query.metrics.__doc__
+
+
+def test_a_binary_that_imports_only_an_api_set_whose_hosts_were_all_skipped_is_not_isolated():
+    graph = _query_graph(_q("a.exe", "exe", imports={"api-ms-win-gone-l1-1-0.dll": ("F",)}),
+                         _q("b.exe", "exe", imports={"api-ms-win-ghost-l1-1-0.dll": ("F",)}),
+                         api_sets={"api-ms-win-gone-l1-1-0": ("lost.dll", "lost2.dll")})
+    graph = dataclasses.replace(graph, skipped=(("lost.dll", "not a PE file"), ("LOST2.dll", "truncated")))
+    got = _members(graph, "isolated")
+    # a.exe imports an api set whose hosts are System32's files that could not be read: that is an import of System32 it cannot see
+    assert [n.id for n in got.nodes] == ["b.exe"], "b.exe imports an api set the map has no host for: nothing of System32"
+    assert binary_graph_query.metrics(graph, win32_to_nt.load_table())["isolated"] == 1
+
+
+def test_a_list_of_pairs_and_a_list_of_the_isolated_read_the_imports_once(monkeypatch):
+    graph = _figures_system()
+    calls = []
+    real = binary_graph_query._links
+    monkeypatch.setattr(binary_graph_query, "_links", lambda *a, **k: calls.append(1) or real(*a, **k))
+    for name in ("circular_pairs", "isolated"):
+        del calls[:]
+        assert _members(graph, name).total
+        assert len(calls) == 1, f"{name} read every import {len(calls)} times"

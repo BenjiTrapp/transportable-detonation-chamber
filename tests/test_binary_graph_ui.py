@@ -566,7 +566,7 @@ def test_the_curated_edge_and_the_match_do_not_look_like_a_deviation():
 
 def test_the_assets_moved_on():
     html = _read(INDEX_HTML)
-    for asset, minimum in (("style.css", 90), ("theme-cyberpunk.css", 38), ("app.js", 149)):
+    for asset, minimum in (("style.css", 90), ("theme-cyberpunk.css", 38), ("app.js", 150)):
         version = int(re.search(rf"{re.escape(asset)}\?v=(\d+)", html).group(1))
         assert version >= minimum, f"{asset} was changed and kept its ?v="
 
@@ -1646,7 +1646,7 @@ def test_the_metrics_table_is_sortable_and_has_a_unique_sort_id():
     assert r["requested"] == ["/api/binary-graph/metrics"], "showing the GRAPH surface reads the figures once"
     names = [row["cells"][0]["text"] for row in rows]
     assert names == ["Binaries", "Import edges", "Api sets resolved", "Forwarded exports", "Isolated binaries", "Circular pairs",
-                     "Curated transitions", "Most imported", "Skipped files", "Tables cut short"]
+                     "Curated transitions", "Most imported", "Skipped files", "Binaries with a cut table"]
     # a number sorts as a number: the cell carries its value, whatever the text shows
     assert [row["cells"][1]["attrs"].get("data-sort-value") for row in rows] == ["8", "19", "3", "1", "3", "1", "2", "4000", "1", "0"]
     assert all("data-sort-skip" not in row["attrs"] for row in rows)
@@ -1711,7 +1711,7 @@ def test_a_metric_of_zero_is_a_row_without_a_link_rather_than_an_empty_list():
         out({ rows, zero, none, unreadable, unknown, asked: metricRequests(), detail: detail(), metric: binaryGraphState.metric });
       })();""")
     rows = {row["cells"][0]["text"]: row for row in _rows(r["rows"])}
-    for name in ("Forwarded exports", "Skipped files", "Tables cut short"):
+    for name in ("Forwarded exports", "Skipped files", "Binaries with a cut table"):
         assert rows[name]["buttons"] == [] and rows[name]["cells"][1]["text"].strip() == "0", name
         assert "onclick" not in str(rows[name]["cells"][1]["attrs"]), name
     # a figure the server could not give is not a zero: it says so, and it has no list either
@@ -1830,7 +1830,8 @@ def test_a_list_the_server_cut_says_how_much_it_shows_and_a_caveat_of_the_figure
         out({ warned, cutList, calm: { html: status.innerHTML, hidden: status.hidden } });
       })();""")
     warned = _plain(r["warned"]["html"])
-    assert "2 import tables were cut short" in warned and "isolated" in warned and "lower bound" in warned
+    assert "2 binaries have a table (import, delay-load or export) that was cut short" in warned and "isolated" in warned and "lower bound" in warned
+    assert "import tables" not in warned, "the flag is set by an export table too"
     assert r["warned"]["hidden"] is False and "warn" in r["warned"]["cls"]
     assert "Not the whole list" in r["cutList"] and "1 of 5,000" in _plain(r["cutList"])
     assert "cut short" not in _plain(r["calm"]["html"]) and "build 26220.5770" in _plain(r["calm"]["html"])
@@ -1908,4 +1909,36 @@ def test_the_warning_of_the_explore_view_points_at_a_figure_that_is_in_the_table
     js = _read(APP_JS)
     assert js.count("the figures say how many") == 3
     meta = _const_source("BINARY_GRAPH_METRICS")
-    assert re.search(r"partial: \{ name: 'Tables cut short', means: '[^']*cut short[^']*', jump: 'binary' \}", meta)
+    assert re.search(r"partial: \{ name: 'Binaries with a cut table', means: '[^']*import, delay-load or export[^']*cut short[^']*', jump: 'binary' \}", meta)
+
+
+@needs_node
+def test_a_top_list_that_is_empty_is_a_zero_and_only_a_missing_one_is_not_there():
+    r = _figures_flow(r"""
+      (async () => {
+        figures = { ...figures, most_imported: [] };
+        await shown();
+        const empty = table();
+        figures = { ...figures }; delete figures.most_imported;
+        await binaryGraphMetricsLoad(true);
+        out({ empty, missing: table() });
+      })();""")
+    cell = lambda html: next(row for row in _rows(html) if row["cells"][0]["text"] == "Most imported")
+    zero, unknown = cell(r["empty"]), cell(r["missing"])
+    assert zero["cells"][1]["text"].strip() == "0" and zero["cells"][1]["attrs"].get("data-sort-value") == "0" and zero["buttons"] == []
+    assert unknown["cells"][1]["text"].strip() == "n/a" and unknown["buttons"] == []
+
+
+@needs_node
+def test_a_row_of_a_function_starts_the_exploration_from_the_module_and_puts_the_module_in_the_field():
+    r = _figures_flow(r"""
+      (async () => {
+        await shown();
+        await binaryGraphMetricOpen('forwarders');
+        const started = await binaryGraphMetricGo('kernel32.dll!HeapAlloc');
+        out({ started, input: els['binary-explore-start'].value, explored: binaryGraphExplore.nodes.map(n => n.id),
+              asked: requests.map(q => q.url).filter(u => u.startsWith('/api/binary-graph/node')) });
+      })();""")
+    assert r["started"] is True and r["explored"] == ["kernel32.dll"]
+    assert r["input"] == "kernel32.dll", "the field shows the name START would show, not module!function"
+    assert r["asked"] == ["/api/binary-graph/node?name=kernel32.dll"]
