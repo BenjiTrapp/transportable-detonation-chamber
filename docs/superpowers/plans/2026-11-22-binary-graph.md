@@ -1011,8 +1011,8 @@ Der Cache: wo er liegt, wie er neu entsteht (`scripts/build-binary-graph.ps1`), 
 
 - [ ] **Step 4: Lauf lassen**
 
-Run: `webui/.venv/bin/python -m pytest tests/test_docs.py tests/test_readme.py tests/test_help.py -v`
-Erwartet: PASS — die Tests über API-Tabelle, Hilfe-Modal und Dateibaum.
+Run: `webui/.venv/bin/python -m pytest tests/test_docs.py tests/test_theme.py -v`
+Erwartet: PASS — die Tests über API-Tabelle, Hilfe-Modal, README-Tab-Tabelle und Dateibaum liegen in `tests/test_docs.py`; die Farb- und Asset-Tests in `tests/test_theme.py`.
 
 - [ ] **Step 5: Screenshot**
 
