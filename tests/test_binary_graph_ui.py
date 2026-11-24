@@ -11,6 +11,7 @@ Regressions covered:
     syscall that does not carry its tone
   * the map and the graph choosing different syscalls
   * a module name from an import table, or the note or error that echoes what the user typed, taken as markup
+  * the path view (or EXPLORE) shrunk below its content, so its canvas and legend are painted over the figures
 
 EXPLORE, the same graph opened one node at a time on a canvas of its own (tests at the end of this file):
   * the exploration drawing more than the binary that was asked for, an expansion that replaced what was drawn, a depth
@@ -25,7 +26,8 @@ from html.parser import HTMLParser
 
 from test_frontend import needs_node
 from test_syscalls_ui import FLOW_CONSTS, FLOW_DOM, FLOW_FUNCTIONS, _const, _flow, _run_node
-from test_theme import APP_JS, INDEX_HTML, _const_source, _cyberpunk_palette, _hex_rgb, _read, _root_values, _tab_markup
+from test_theme import (APP_JS, INDEX_HTML, STYLE_CSS, _const_source, _cyberpunk_palette, _hex_rgb, _read, _root_values, _rules,
+                        _tab_markup)
 
 
 class _Elements(HTMLParser):
@@ -652,9 +654,32 @@ def test_the_curated_edge_and_the_match_do_not_look_like_a_deviation():
 
 def test_the_assets_moved_on():
     html = _read(INDEX_HTML)
-    for asset, minimum in (("style.css", 90), ("theme-cyberpunk.css", 38), ("app.js", 150)):
+    for asset, minimum in (("style.css", 91), ("theme-cyberpunk.css", 38), ("app.js", 150)):
         version = int(re.search(rf"{re.escape(asset)}\?v=(\d+)", html).group(1))
         assert version >= minimum, f"{asset} was changed and kept its ?v="
+
+
+def _declarations(body):
+    return {name.strip(): value.strip() for name, _, value in
+            (d.partition(":") for d in body.split(";") if ":" in d)}
+
+
+def test_the_path_view_and_its_legend_are_never_painted_over_the_figures():
+    """Measured in Chrome on the VM (1920x960 and 1280x900, both themes): with min-height 0 the path view shrank to
+    158px while its bar (85), canvas (120) and legend (65) needed 270, and as it set no overflow, the canvas and the
+    legend were painted over the FIGURES table, header and first row unreadable. That legend is the only place that
+    tells a derived edge from a curated one. EXPLORE has the same rule and the same shape. A layout engine is needed to
+    see it (this suite has none), so the rules that prevent it are held here: neither view shrinks below its content,
+    the figures give way first (down to a floor), and the panel scrolls rather than paint outside itself. Do not
+    "clean up" min-height: min-content back to 0."""
+    rules = _rules(STYLE_CSS)
+    for view in (".binary-graph-pathview", ".binary-explore"):
+        assert _declarations(rules[view]).get("min-height") == "min-content", view
+    figures = _declarations(rules[".binary-graph-metrics"])
+    assert figures["flex"] == "0 1 auto" and figures["min-height"] == "96px" and figures["max-height"] == "260px"
+    assert _declarations(rules[".binary-graph-panel"]).get("overflow-y") == "auto"
+    for kept_out in (".binary-graph-pathview", ".binary-explore", ".binary-graph-legend"):
+        assert "hidden" not in _declarations(rules[kept_out]).get("overflow", ""), kept_out
 
 
 # === EXPLORE: the graph opened one node at a time ======================================================================

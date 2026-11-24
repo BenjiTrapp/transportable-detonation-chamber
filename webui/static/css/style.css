@@ -12527,13 +12527,15 @@ button.logs-trunc:hover { color: var(--accent-orange); text-decoration: underlin
     flex: 2 1 0;
 }
 /* The GRAPH surface: the query bar, the line an answer leaves, the layered paths (scrolling in themselves, never
-   squeezed: a path keeps the size it is readable at) and the legend */
+   squeezed: a path keeps the size it is readable at) and the legend. When the views and the figures together do not
+   fit, the panel scrolls instead of painting them over each other or over the panels below it. */
 .binary-graph-panel {
     flex: 1 1 0;
     display: flex;
     flex-direction: column;
     min-width: 0;
     min-height: 0;
+    overflow-y: auto;
     background: var(--bg-card);
     border: 1px solid var(--border-primary);
     border-radius: 4px;
@@ -12616,13 +12618,16 @@ button.logs-trunc:hover { color: var(--accent-orange); text-decoration: underlin
     align-items: center;
     padding: 8px 12px 0;
 }
+/* Never shorter than their content: at min-height 0 the path view shrank to 158px while its bar, canvas and legend
+   needed 270, and the legend (the only place that tells a derived edge from a curated one) was painted over the
+   figures. The figures give way first. */
 .binary-graph-pathview,
 .binary-explore {
     flex: 1 1 0;
     display: flex;
     flex-direction: column;
     min-width: 0;
-    min-height: 0;
+    min-height: min-content;
 }
 .binary-graph-pathview[hidden],
 .binary-explore[hidden] {
@@ -12669,9 +12674,10 @@ button.logs-trunc:hover { color: var(--accent-orange); text-decoration: underlin
 }
 /* The figures of the whole stock under the canvases, and the list of one in the detail panel */
 .binary-graph-metrics {
-    flex: 0 0 auto;
+    flex: 0 1 auto;
     display: flex;
     flex-direction: column;
+    min-height: 96px;
     max-height: 260px;
     border-top: 1px solid var(--border-primary);
 }
