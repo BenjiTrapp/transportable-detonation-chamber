@@ -453,6 +453,21 @@ forwarders, isolated binaries, circular pairs, curated transitions, the most
 imported modules, skipped files, binaries with a cut table); a number opens the
 list behind it in the DETAIL panel and a row of that list starts an exploration.
 
+**The graph gets the room.** Measured on the chamber at 1920×1080, the canvas got
+240 px — its floor — while the panels of the last scan took 320 px of the same
+column and the figures table 260, so GRAPH folds those panels away and **⇱** folds
+the figures' rows as well: 240 px becomes 647. EXPLORE, which works on the canvas,
+starts with those rows folded — at 1280×900 that is 254 px of canvas against 438 —
+and PATH, whose answer is a short path, keeps the figures beside it. Folded is
+never silent. The scan
+panels keep a bar that names them with their counts, because a stub run in the
+graph view writes its proof there, and ⇱ leaves the figures' own line standing,
+the one that says how many binaries had a table cut short. A fold or unfold by
+hand is kept from then on. The canvas zooms with the wheel, `+` and `−`, FIT
+brings every node into view, LAYOUT lays them out again, and a drag moves a node
+or the view; the line under the canvas says what the controls around the chosen
+node do.
+
 **What is read and what is written by hand.** Every edge is read from a binary
 except the curated kind. The last hop from a Win32 function to its Nt counterpart
 (`WriteProcessMemory` to `NtWriteVirtualMemory`) is not in any file: it comes from

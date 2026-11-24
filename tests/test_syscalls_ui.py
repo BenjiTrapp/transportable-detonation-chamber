@@ -461,6 +461,7 @@ FLOW_FUNCTIONS = [
     "binaryGraphExploreFresh", "binaryGraphExploreAddEdge", "binaryGraphExploreMerge", "binaryGraphExploreRelease", "binaryGraphExploreCut", "binaryGraphExploreDegree", "binaryGraphExploreStatus", "binaryGraphExploreInfo",
     "binaryGraphExploreLayout", "binaryGraphExploreAsk", "binaryGraphExploreStart", "binaryGraphExploreSubmit",
     "binaryGraphExpand", "binaryGraphRelayout", "binaryGraphSetDepth", "binaryGraphSetMode", "binaryGraphExploreRender", "binaryGraphDraw",
+    "binaryGraphToggleMax", "binaryGraphApplyMax", "binaryGraphExploreNextStep", "binaryGraphCanvasResized",
     "binaryGraphToWorld", "binaryGraphNodeAt", "binaryGraphFit", "binaryGraphZoom", "binaryGraphOnCanvasDown", "binaryGraphOnCanvasMove",
     "binaryGraphOnCanvasUp", "binaryGraphOnCanvasLeave", "binaryGraphOnCanvasWheel", "binaryGraphOnCanvasClick",
     "binaryGraphOnCanvasDblClick", "initBinaryGraphExplore",

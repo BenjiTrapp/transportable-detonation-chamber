@@ -26762,6 +26762,7 @@ function syscallSetView(name) {
         renderSyscallMap();
     } else {
         renderBinaryGraph();
+        binaryGraphApplyMax();
         binaryGraphMetricsLoad();
     }
     renderSyscallDetailPanel();
@@ -26847,7 +26848,7 @@ function binaryGraphOrigin(edge) {
 // `module` is what the start field holds, whichever parameter the query sends it as; `function` the second field's
 // figures: the table of the whole stock (null until it was read), figuresNote why it could not be; metric: the list of a figure the detail panel shows
 const binaryGraphState = { answer: null, query: 'path-to-syscall', module: '', function: '', depth: 1, loading: false, selected: null, note: '', nodes: [], edges: [],
-    figures: null, figuresNote: '', figuresLoading: false, metric: null };
+    figures: null, figuresNote: '', figuresLoading: false, metric: null, maxed: false, maxedByHand: false };
 // numbers the queries, of which only the last answer counts
 const binaryGraphRequests = { seq: 0, metric: 0 };
 
@@ -27607,6 +27608,16 @@ function binaryGraphExploreDegree(node) {
 }
 
 // The line under the canvas: the chosen node, or how much is drawn. Everything from a binary is escaped.
+// What the controls around a chosen node do. START chooses the binary it draws at once, so without this the line
+// that guides a reader ("Choose a node, then EXPAND…") never appears: it only shows while nothing is chosen. A
+// function or an api set has no functions to open, and naming a button that is disabled for it would mislead.
+function binaryGraphExploreNextStep(node) {
+    const opens = node && (node.kind === 'dll' || node.kind === 'exe');
+    return opens
+        ? 'EXPAND opens the modules around it, FUNCTIONS the functions it imports; DEPTH sets how many hops one click opens.'
+        : 'EXPAND opens the modules around it; DEPTH sets how many hops one click opens.';
+}
+
 function binaryGraphExploreInfo(st) {
     const node = st.selected ? st.nodes.find(n => n.id === st.selected) : null;
     if (!node) {
@@ -27621,7 +27632,7 @@ function binaryGraphExploreInfo(st) {
     if (lost) html += ` · ${escapeHtml(lost.toLocaleString('en-US'))} of its imported functions are not shown`;
     if (cut.ofTable.has(node.id)) html += ' · it has a table (import, delay-load or export) that was cut short when it was read: modules may be missing';
     if (cut.ofImporters.has(node.id)) html += ' · the list of its importers may be incomplete: some tables (import, delay-load or export) were cut short when the graph was read (the figures say how many)';
-    return html;
+    return `${html} · ${escapeHtml(binaryGraphExploreNextStep(node))}`;
 }
 
 // New neighbours of `parentId` are laid out around it with the process graph's force layout (applyForceLayout, used as
@@ -27845,6 +27856,33 @@ function binaryGraphSetDepth(n) {
 }
 
 // PATH / EXPLORE: the view that is on. The path's query bar and canvas and the explorer's are separate elements.
+// ⇱ gives the graph the height of the figures table, the way the RIZIN tab's ⇱ gives one half the width. It folds
+// the rows and nothing above them: the caveat that a binary's table was cut short when the graph was read sits in
+// the figures' own status line, and every path and explore answer points the reader at that line. A folded pointer
+// would dangle, so the bar, RELOAD and that line stay.
+function binaryGraphApplyMax() {
+    const surface = document.getElementById('syscall-surface-graph');
+    if (!surface) return false;
+    const maxed = !!binaryGraphState.maxed;
+    surface.classList.toggle('binary-graph-maxed', maxed);
+    const button = document.getElementById('binary-graph-max');
+    if (button) {
+        button.setAttribute('aria-pressed', String(maxed));
+        button.title = maxed ? 'Give the figures their rows back' : 'Give the graph the height of the figures table';
+        button.setAttribute('aria-label', button.title);
+    }
+    // the stage's own ResizeObserver resizes the canvas when it grows, so nothing is redrawn from here
+    return true;
+}
+
+// A fold or unfold by hand wins over the view's default from then on, the same rule the scan panels follow: a view
+// that keeps reclosing what the reader opened is worse than one that never folded.
+function binaryGraphToggleMax() {
+    binaryGraphState.maxed = !binaryGraphState.maxed;
+    binaryGraphState.maxedByHand = true;
+    return binaryGraphApplyMax();
+}
+
 function binaryGraphSetMode(mode) {
     if (mode !== 'path' && mode !== 'explore') return false;
     binaryGraphExplore.mode = mode;
@@ -27855,6 +27893,10 @@ function binaryGraphSetMode(mode) {
         const button = document.getElementById(`binary-graph-mode-${name}`);
         if (button) button.setAttribute('aria-pressed', String(name === mode));
     }
+    // EXPLORE works on the canvas and wants the height; PATH draws a short answer and its reader wants the figures
+    // beside it. At 1280x900 that is the difference between 254px of canvas and 438.
+    if (!binaryGraphState.maxedByHand) binaryGraphState.maxed = mode === 'explore';
+    binaryGraphApplyMax();
     if (mode === 'explore') {
         initBinaryGraphExplore();
         binaryGraphExploreRender();
@@ -27879,9 +27921,20 @@ function binaryGraphExploreRender() {
     const legend = el('binary-explore-legend');
     if (legend) legend.innerHTML = binaryGraphLegend('explore', st.edges);
     const expand = el('binary-explore-expand');
-    if (expand) expand.disabled = st.loading || !st.selected;
+    if (expand) {
+        expand.disabled = st.loading || !st.selected;
+        // a disabled button says what to do first, the way SCAN says "Choose a process first"
+        expand.title = !expand.disabled ? 'Open the neighbours of the chosen node'
+            : st.loading ? 'Wait for what is being opened' : 'Choose a node first: click one on the canvas';
+    }
     const functions = el('binary-explore-functions'), chosen = st.selected ? st.nodes.find(n => n.id === st.selected) : null;
-    if (functions) functions.disabled = st.loading || !chosen || (chosen.kind !== 'dll' && chosen.kind !== 'exe');
+    if (functions) {
+        functions.disabled = st.loading || !chosen || (chosen.kind !== 'dll' && chosen.kind !== 'exe');
+        functions.title = !functions.disabled ? 'Draw the functions the chosen module imports, one node each'
+            : st.loading ? 'Wait for what is being opened'
+            : !chosen ? 'Choose a module first: click one on the canvas'
+            : 'Only a module imports functions: this node is not one';
+    }
     for (const n of BINARY_GRAPH_EXPLORE.depths) {
         const button = el(`binary-explore-depth-${n}`);
         if (button) button.setAttribute('aria-pressed', String(binaryGraphState.depth === n));
@@ -28051,6 +28104,22 @@ function binaryGraphZoom(factor, sx, sy) {
     return true;
 }
 
+// The stage changed size: the camera holds a screen offset, so without moving it the drawing stays anchored to the
+// old corner and slides out of view - after ⇱ gave the figures their rows back, the node sat half outside with its
+// label cut off. Moving the camera by half the change keeps the world point that was in the middle in the middle,
+// at the same zoom. A first size (no canvas yet) moves nothing: there was no middle to keep.
+function binaryGraphCanvasResized(canvas, w, h) {
+    if (!canvas || !(w > 0) || !(h > 0)) return false;
+    const c = binaryGraphExplore.camera;
+    if (canvas.width > 0 && canvas.height > 0) {
+        c.x += (w - canvas.width) / 2;
+        c.y += (h - canvas.height) / 2;
+    }
+    canvas.width = w;
+    canvas.height = h;
+    return true;
+}
+
 function binaryGraphOnCanvasDown(ev) {
     const st = binaryGraphExplore, w = binaryGraphToWorld(ev.offsetX, ev.offsetY), node = binaryGraphNodeAt(w.x, w.y);
     st.moved = false;
@@ -28138,8 +28207,7 @@ function initBinaryGraphExplore() {
     const resize = () => {
         const w = stage.clientWidth, h = stage.clientHeight;
         if (!w || !h || (canvas.width === w && canvas.height === h)) return;
-        canvas.width = w;
-        canvas.height = h;
+        binaryGraphCanvasResized(canvas, w, h);
         binaryGraphDraw();
     };
     resize();

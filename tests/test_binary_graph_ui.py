@@ -92,7 +92,7 @@ def _draw(script):
 
 # The page of the flow tests (FLOW_DOM of test_syscalls_ui) and the elements of the GRAPH surface
 GRAPH_DOM = PATH + r"""
-for (const id of ['syscall-surface-graph', 'binary-graph-query', 'binary-graph-module', 'binary-graph-function', 'binary-graph-run',
+for (const id of ['syscall-surface-graph', 'binary-graph-max', 'binary-graph-query', 'binary-graph-module', 'binary-graph-function', 'binary-graph-run',
                   'binary-graph-status', 'binary-graph-canvas', 'binary-graph-legend']) els[id] = Object.assign(new Node('div'), { id });
 els['syscall-surface-graph'].hidden = true;
 els['binary-graph-query'].value = 'path-to-syscall';
@@ -189,6 +189,39 @@ def test_the_graph_view_folds_the_scan_panels_and_the_bar_says_what_is_behind_th
         assert word in r["graph"]["note"], word
     assert r["byHand"]["folded"] is False, "a click opens them in the graph view"
     assert r["afterSwitch"]["folded"] is False, "and the view's default no longer overrides that choice"
+
+
+@needs_node
+def test_the_graph_can_take_the_figures_table_height_and_still_says_what_was_cut():
+    """The height the canvas is short of is the figures table's: 199px of the 260 the section takes. ⇱ folds that
+    table away, the way the RIZIN tab's ⇱ gives one half the width.
+
+    It folds the table and nothing above it. The caveat that some binary's import, delay-load or export table was
+    cut short when the graph was read lives in the figures' own status line, and the explore and path answers point
+    at it ("the figures say how many"). Fold that line away and the pointer dangles, so the bar, the RELOAD button
+    and the caveat all stay; only the rows go."""
+    r = _graph_flow(r"""
+      initSyscalls(); syscallSetView('graph');
+      const look = () => ({ maxed: els['syscall-surface-graph'].className.includes('binary-graph-maxed'),
+                            pressed: els['binary-graph-max'].attrs['aria-pressed'],
+                            title: els['binary-graph-max'].title });
+      const before = look();
+      binaryGraphToggleMax();
+      const maxed = look();
+      binaryGraphToggleMax();
+      out({ before, maxed, back: look() });""")
+    assert r["before"]["maxed"] is False and r["before"]["pressed"] == "false"
+    assert r["maxed"]["maxed"] is True and r["maxed"]["pressed"] == "true"
+    assert r["back"]["maxed"] is False, "a second click gives the figures back"
+    assert r["maxed"]["title"] != r["before"]["title"], "the button says which way it goes"
+    rules = _rules(STYLE_CSS)
+    folded = ".binary-graph-maxed .binary-graph-metrics-wrap"
+    assert _declarations(rules[folded]).get("display") == "none", "⇱ folds the rows away"
+    for kept in (".binary-graph-metrics", ".binary-graph-metrics .binary-graph-bar"):
+        assert "none" not in _declarations(rules.get(kept, "")).get("display", ""), kept
+    css = _read(STYLE_CSS)
+    assert ".binary-graph-maxed #binary-graph-metrics-status" not in css, \
+        "the caveat the answers point at may not be folded away"
 
 
 # --- The layers and the curated hop --------------------------------------------------------------------------------
@@ -2129,3 +2162,100 @@ def test_a_row_of_a_function_starts_the_exploration_from_the_module_and_puts_the
     assert r["started"] is True and r["explored"] == ["kernel32.dll"]
     assert r["input"] == "kernel32.dll", "the field shows the name START would show, not module!function"
     assert r["asked"] == ["/api/binary-graph/node?name=kernel32.dll"]
+
+
+@needs_node
+def test_a_chosen_node_still_says_what_the_controls_around_it_do():
+    """Seen in Chrome on the VM: START draws the binary and chooses it at once, so the line that told a reader what
+    to do next ("Choose a node, then EXPAND opens its neighbours") never appears - it only shows while nothing is
+    chosen. What a reader sees after START is a node and a row of facts, with a canvas of 647px and no next step.
+
+    So the chosen-node line ends in what the controls do, and it follows the node: EXPAND and FUNCTIONS for a
+    binary, EXPAND alone for a function or an api set, where FUNCTIONS has nothing to open and is disabled. A
+    disabled button also says what to do first, the way SCAN says "Choose a process first"."""
+    r = _explore_flow(r"""
+      (async () => {
+        initSyscalls(); binaryGraphSetMode('explore');
+        GRAPH['ntdll.dll'] = { in_degree: 9, imports: { 'kernel32.dll': ['CloseHandle'] } };
+        await binaryGraphExploreStart('ntdll.dll');
+        const chosen = { info: els['binary-explore-info'].innerHTML,
+                         expand: [els['binary-explore-expand'].disabled, els['binary-explore-expand'].title],
+                         functions: [els['binary-explore-functions'].disabled, els['binary-explore-functions'].title] };
+        await binaryGraphOpenFunctions('ntdll.dll');
+        const fnNode = st.nodes.find(n => n.kind === 'function');
+        binaryGraphOnCanvasClick(screenOf(fnNode.id));
+        const fn = { info: els['binary-explore-info'].innerHTML,
+                     functions: [els['binary-explore-functions'].disabled, els['binary-explore-functions'].title] };
+        st.selected = '';
+        binaryGraphExploreRender();
+        out({ chosen, fn, none: { info: els['binary-explore-info'].innerHTML,
+                                  expand: [els['binary-explore-expand'].disabled, els['binary-explore-expand'].title] } });
+      })();""")
+    binary = _plain(r["chosen"]["info"])
+    assert "ntdll.dll" in binary and "EXPAND" in binary and "FUNCTIONS" in binary, binary
+    assert "DEPTH" in binary, "and what DEPTH changes about one click"
+    function = _plain(r["fn"]["info"])
+    assert "EXPAND" in function, function
+    assert "FUNCTIONS" not in function, "a function has no functions to open: naming the button would mislead"
+    assert r["fn"]["functions"][0] is True and r["fn"]["functions"][1], "a disabled button says why it is off"
+    assert r["none"]["expand"][0] is True and "node" in r["none"]["expand"][1].lower(), \
+        "without a chosen node EXPAND says to choose one"
+    assert "Choose a node" in _plain(r["none"]["info"]), "the line without a choice keeps its own first step"
+
+
+@needs_node
+def test_explore_starts_with_the_figures_folded_and_path_does_not():
+    """Measured on the VM at 1280x900: folding the scan panels gave the explore canvas 254px of the 900, because at
+    that height there is little to hand over - the figures table keeps its 260 (ruling 78). ⇱ takes it to 438. So
+    the view that works on the canvas starts with the rows folded, and PATH, whose answer is a short path and whose
+    reader wants the figures beside it, does not. Same rule as the scan panels: a fold or unfold by hand wins over
+    the view's default from then on, so switching PATH and EXPLORE does not fight the reader."""
+    r = _graph_flow(r"""
+      initSyscalls(); syscallSetView('graph');
+      const look = () => ({ maxed: els['syscall-surface-graph'].className.includes('binary-graph-maxed'),
+                            pressed: els['binary-graph-max'].attrs['aria-pressed'] });
+      binaryGraphSetMode('explore');
+      const explore = look();
+      binaryGraphSetMode('path');
+      const path = look();
+      binaryGraphSetMode('explore');
+      binaryGraphToggleMax();
+      const byHand = look();
+      binaryGraphSetMode('path'); binaryGraphSetMode('explore');
+      out({ explore, path, byHand, afterSwitch: look() });""")
+    assert r["explore"] == {"maxed": True, "pressed": "true"}, "EXPLORE starts with the rows folded"
+    assert r["path"] == {"maxed": False, "pressed": "false"}, "PATH keeps the figures beside its answer"
+    assert r["byHand"]["maxed"] is False, "⇱ gives them back"
+    assert r["afterSwitch"]["maxed"] is False, "and the view's default no longer overrides that choice"
+
+
+@needs_node
+def test_a_stage_that_changed_size_keeps_what_was_in_the_middle_in_the_middle():
+    """Seen in Chrome on the VM, and caused by the folds above: the camera holds a screen offset, so a stage that
+    changed size left the drawing anchored to the old corner. After ⇱ gave the figures their rows back, kernel32.dll
+    sat half outside the canvas with its label cut off. The stage used to be a fixed 240px and never resized, which
+    is why this never showed before; now ⇱, the fold and the view switch all resize it.
+
+    So a resize moves the camera by half the change: the world point that was in the middle stays there, at the same
+    zoom. A first size (no canvas yet) moves nothing."""
+    r = _explore_flow(r"""
+      st.camera = { x: 300, y: 200, zoom: 2 };
+      const canvas = els['binary-explore-canvas'];
+      canvas.width = 600; canvas.height = 400;
+      const middleBefore = binaryGraphToWorld(300, 200);
+      binaryGraphCanvasResized(canvas, 600, 647);
+      const grown = { camera: { ...st.camera }, size: [canvas.width, canvas.height],
+                      middle: binaryGraphToWorld(300, 323.5) };
+      binaryGraphCanvasResized(canvas, 600, 254);
+      const shrunk = { camera: { ...st.camera }, middle: binaryGraphToWorld(300, 127) };
+      const fresh = Object.assign(new Node('canvas'), { width: 0, height: 0 });
+      st.camera = { x: 7, y: 9, zoom: 1 };
+      binaryGraphCanvasResized(fresh, 500, 300);
+      out({ middleBefore, grown, shrunk, firstSize: { camera: { ...st.camera }, size: [fresh.width, fresh.height] } });""")
+    assert r["grown"]["size"] == [600, 647], "the canvas takes the stage's size"
+    assert r["grown"]["camera"]["zoom"] == 2, "a resize is not a zoom"
+    for state in ("grown", "shrunk"):
+        for axis in ("x", "y"):
+            assert abs(r[state]["middle"][axis] - r["middleBefore"][axis]) < 0.51, (state, axis, r[state]["middle"])
+    assert r["firstSize"]["camera"] == {"x": 7, "y": 9, "zoom": 1}, "a first size moves nothing"
+    assert r["firstSize"]["size"] == [500, 300]
