@@ -8708,7 +8708,8 @@ def _syscall_search_file(content, baseline):
     or the Nt name pointing anywhere but at the stub would buy off the proof for one line."""
     info, why = _pe_sample_record(content)
     imports = _record_import_names(info) if info is not None else None
-    doors_note = "" if info is not None else f"the file is no PE whose import table can be read ({why})"
+    # the reader's reason says what happened: no PE at all, or which of its directories pefile refused
+    doors_note = "" if info is not None else f"the file cannot be read as a PE: {why}"
     named = set()
     if info is not None:
         if any(f.startswith("#") for functions in info.imports.values() for f in functions):

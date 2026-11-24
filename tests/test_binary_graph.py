@@ -733,6 +733,49 @@ def test_a_parse_that_warned_and_still_produced_entries_is_kept_and_marked_parti
     assert binary_graph.extract_binary(str(tmp_path / "short.dll")).partial is False
 
 
+def test_pefiles_packed_executable_heuristic_is_no_cut_table_ruling_65(tmp_path):
+    # pefile notes "entries typical of packed executables" for LoadLibrary* and GetProcAddress* among fewer than 20
+    # imports: an observation about content, the shape of every small loader, not a table it could not read
+    loader = make_pe(imports=(("kernel32.dll", ("LoadLibraryA", "GetProcAddress")),))
+    info = binary_graph.extract_bytes(loader, "loader.exe")
+    assert info.partial is False and info.imports == {"kernel32.dll": ("LoadLibraryA", "GetProcAddress")}
+    (tmp_path / "loader.dll").write_bytes(loader)
+    assert binary_graph.extract_binary(str(tmp_path / "loader.dll")).partial is False
+    # a heuristic note beside a real cut is still a cut: 130 nameless exports stop pefile's export parse
+    both = make_pe(imports=(("kernel32.dll", ("LoadLibraryA", "GetProcAddress")),), exports=("A",),
+                   nameless=tuple((n, None) for n in range(2, 132)))
+    assert binary_graph.extract_bytes(both, "both.exe").partial is True
+
+
+def test_a_system32_with_small_loaders_in_it_is_not_a_graph_of_cut_tables_ruling_65(tmp_path):
+    # before Ruling 65 every small binary importing LoadLibrary* and GetProcAddress* was partial, so on a real System32
+    # _any_partial was true for every graph-wide answer: the PATH and explore caveats a standing warning (Ruling 58)
+    (tmp_path / "helper.dll").write_bytes(make_pe(imports=(("kernel32.dll", ("LoadLibraryW", "GetProcAddress")),), dll=True))
+    (tmp_path / "shim.dll").write_bytes(make_pe(delay=(("kernel32.dll", ("LoadLibraryExW", "GetProcAddress")),), dll=True))
+    (tmp_path / "plain.exe").write_bytes(make_pe(imports=(("helper.dll", ("F",)),)))
+    binaries, skipped = binary_graph.extract_tree(str(tmp_path))
+    assert skipped == [] and [b.partial for b in binaries] == [False, False, False]
+    graph = _query_graph(*binaries)
+    assert binary_graph_query._any_partial(graph) is False
+    assert binary_graph_query.importers_of(graph, "helper.dll").partial is False
+
+
+def test_a_warning_the_exclusions_do_not_name_still_counts_as_a_cut(monkeypatch):
+    # the safe default: a warning not on the list, a reworded heuristic included, reads as a table cut short
+    import pefile
+    real = pefile.PE.parse_data_directories
+
+    def warn(self, *args, **kwargs):
+        out = real(self, *args, **kwargs)
+        if getattr(self, "DIRECTORY_ENTRY_IMPORT", None):
+            self._PE__warnings.append("Imported symbols look like those of a packed executable.")
+        return out
+
+    monkeypatch.setattr(pefile.PE, "parse_data_directories", warn)
+    loader = make_pe(imports=(("kernel32.dll", ("GetLastError",)),))
+    assert binary_graph.extract_bytes(loader, "loader.exe").partial is True
+
+
 def test_without_pefile_every_file_is_skipped_and_nothing_escapes(tmp_path, monkeypatch):
     import sys
     (tmp_path / "a.dll").write_bytes(make_pe())
@@ -3352,10 +3395,13 @@ _KERNELBASE_NT = ("NtAllocateVirtualMemory", "NtProtectVirtualMemory", "NtWriteV
 
 
 def _doors_graph(*extra, arch="x64"):
-    """A System32 as it can exist: kernelbase exports the Win32 doors and imports the Nt functions it implements them
-    with (_KERNELBASE_NT), so a stub of any of those reads as imported in every process that loads it. No binary
-    imports a door to NtQueueApcThread: the stand-in for a covered syscall no loaded module imports, the narrow case
-    in which process mode can prove at all (on a real system there may be no such syscall)."""
+    """kernelbase exports the Win32 doors and imports the Nt functions it implements them with (_KERNELBASE_NT), so a
+    stub of any of those reads as imported in every process that loads it, as on a real system.
+
+    One part is not as on a real system, on purpose: kernelbase exports QueueUserAPC without importing
+    NtQueueApcThread, and no binary imports a door to it. That is what makes NtQueueApcThread the stand-in for a
+    covered syscall no loaded module imports, the narrow case in which process mode can prove at all; the real
+    kernelbase may well import it, and then a real system has no such syscall."""
     return _query_graph(
         _q("ntdll.dll", exports=["NtWriteVirtualMemory", "ZwWriteVirtualMemory", "NtClose", "ZwClose",
                                  "NtQueueApcThread", *_KERNELBASE_NT]),
@@ -3449,10 +3495,12 @@ def test_only_in_the_narrow_case_of_a_covered_syscall_no_loaded_module_imports_d
 
 
 def test_the_doors_of_every_loaded_module_count_as_the_documented_path(apc_baseline):
-    # dbghelp, not the sample, imports WriteProcessMemory: the process holds a door, whoever's it is
+    # dbghelp, not the sample, imports QueueUserAPC: the process holds a door, whoever's it is. The door is dbghelp's
+    # alone: without it no module of _doors_graph leads to NtQueueApcThread
     dbghelp = _q("dbghelp.dll", imports={"kernel32.dll": ("QueueUserAPC",)})
+    assert "NtQueueApcThread" not in _doors(_doors_graph(dbghelp), _loaded(_IMAGE, *_SYSTEM_MODULES))
     doors = _doors(_doors_graph(dbghelp), _loaded(_IMAGE, *_SYSTEM_MODULES, _SYS32 + "dbghelp.dll"))
-    assert "NtWriteVirtualMemory" in doors
+    assert "NtQueueApcThread" in doors
     assert _process_hit(apc_baseline, doors)["import_present"] is True
     # and the image's own imports count as well, read from its file
     doors = _doors(_doors_graph(), _loaded(_IMAGE, *_SYSTEM_MODULES), image=_image("QueueUserAPC"))
@@ -3647,7 +3695,7 @@ def _changing(target, later):
 
 
 def test_a_cached_module_loaded_during_the_search_brings_its_doors_into_the_union(client, target, doors_host):
-    # dbghelp arrived while the search ran: its import of WriteProcessMemory was in the address space all the same
+    # dbghelp arrived while the search ran: its import of QueueUserAPC was in the address space all the same
     _changing(target, lambda first: first + _loaded(_SYS32 + "dbghelp.dll"))
     body = client.post("/api/syscalls/stubs", json={"pid": 4812}).get_json()
     assert [h["import_present"] for h in body["hits"]] == [True]
@@ -3781,6 +3829,20 @@ def test_a_sample_whose_import_directory_cannot_be_read_is_no_proven_bypass_in_a
     assert body["evidence"]["findings"][0]["needs_corroboration"] is True
 
 
+def test_the_note_says_which_directory_could_not_be_read(client, target, sample_dir):
+    # an export directory pefile refused is not an import table that cannot be read: the note says what happened
+    import struct
+    data = bytearray(make_pe(imports=(("kernel32.dll", ("GetLastError",)),), exports=("A",)) + _X64_STUB_0x3A)
+    struct.pack_into("<I", data, 0x40 + 4 + 20 + 112, 0x7FFF0000)
+    (sample_dir / "exports.exe").write_bytes(bytes(data))
+    hit, body = _file_hit(client, sample_dir / "exports.exe")
+    assert hit["import_present"] is None
+    assert "export directory" in body["doors_note"] and "import table" not in body["doors_note"], body["doors_note"]
+    (sample_dir / "plain.bin").write_bytes(_X64_STUB_0x3A)
+    hit, body = _file_hit(client, sample_dir / "plain.bin")
+    assert "not a PE" in body["doors_note"] or "no PE" in body["doors_note"], body["doors_note"]
+
+
 def test_a_sample_whose_tables_were_cut_short_claims_no_absence_in_a_file(client, target, sample_dir):
     # a partial record kept what pefile read before it stopped: what it lost may be the door, or the stub's export
     path = sample_dir / "cut.exe"
@@ -3806,6 +3868,16 @@ def test_the_detonation_stage_reads_an_unreadable_import_directory_as_unknown_in
     result = tdc._run_syscall_stage(4812, str(path), [])
     assert [h["import_present"] for h in result["stubs"]["file"]["hits"]] == [None]
     assert result["stubs"]["file"]["doors_complete"] is False
+
+
+def test_a_loader_importing_loadlibrary_and_getprocaddress_keeps_its_proof_in_a_file_ruling_65(client, target,
+                                                                                               sample_dir):
+    # the reviewer's reproduction: the shape the file-mode proof exists for read as "cut short" and lost its False
+    path = sample_dir / "loader.exe"
+    path.write_bytes(make_pe(imports=(("kernel32.dll", ("LoadLibraryA", "GetProcAddress")),)) + _X64_STUB_0x3A)
+    hit, body = _file_hit(client, path)
+    assert (hit["syscall"], hit["import_present"]) == ("NtWriteVirtualMemory", False)
+    assert body["doors_complete"] is True and body["doors_note"] == ""
 
 
 # --- Ruling 37: an empty or thinned module list is not a complete one ---------------------------------------------

@@ -123,24 +123,42 @@ DIRECTORIES = (("IMAGE_DIRECTORY_ENTRY_IMPORT", "DIRECTORY_ENTRY_IMPORT", "unrea
                ("IMAGE_DIRECTORY_ENTRY_EXPORT", "DIRECTORY_ENTRY_EXPORT", "unreadable export directory"))
 
 
+# Warnings pefile gives about what a directory holds, not about failing to read it (Ruling 65). Matched by substring and
+# left out of the partial decision; every other warning, a reworded one included, still counts as a cut, so an upgrade
+# of pefile can only make the record say "cut short" too often, never too seldom.
+HEURISTIC_WARNINGS = (
+    # parse_import_directory: LoadLibrary* and GetProcAddress* among fewer than 20 imported symbols. A guess that the
+    # image is packed, made from a table pefile read whole: the shape of every small loader, the very samples the
+    # file-mode proof is for
+    "Imported symbols contain entries typical of packed executables",
+)
+
+
+def _read_failures(warnings):
+    return [w for w in warnings if not any(known in str(w) for known in HEURISTIC_WARNINGS)]
+
+
 def _parse_directories(pefile, pe):
     """Parse the import, delay-load and export directories one at a time; True when one of them is partial.
 
-    Per directory, only whether its own parse warned counts, never what the warning says. A declared directory that
+    Per directory, only whether its own parse warned counts, never what the warning says, save the notes about content
+    in HEURISTIC_WARNINGS, which report nothing unread. A declared directory that
     warned and yielded no entry is refused (ExtractError); one that warned and yielded entries is kept as partial,
     since pefile stops early (at 120 repeated nameless exports, say) and keeps what it read. An empty table without
     a warning is read as empty; a fault elsewhere in the file (a section cut short, say) is pefile's to tolerate."""
     # pefile refuses a truncated directory by warning, not by raising. Should an upgrade stop warning, a truncated PE
     # would read as one that imports nothing: test_a_pe_truncated_after_its_headers_is_skipped_and_does_not_raise,
     # test_a_directory_pefile_cannot_read_skips_only_when_it_is_one_the_record_needs and
-    # test_a_parse_that_warned_and_still_produced_entries_is_kept_and_marked_partial are the tripwire for that
+    # test_a_parse_that_warned_and_still_produced_entries_is_kept_and_marked_partial are the tripwire for that.
+    # Only warnings of a read count: HEURISTIC_WARNINGS lists the notes about content that do not, and
+    # test_pefiles_packed_executable_heuristic_is_no_cut_table_ruling_65 is the tripwire for a reworded one
     declared = pe.OPTIONAL_HEADER.DATA_DIRECTORY
     partial = False
     for index_name, attribute, reason in DIRECTORIES:
         index = pefile.DIRECTORY_ENTRY[index_name]
         before = len(pe.get_warnings())
         pe.parse_data_directories(directories=[index])
-        if len(pe.get_warnings()) == before:
+        if not _read_failures(pe.get_warnings()[before:]):
             continue
         if getattr(pe, attribute, None):
             partial = True
