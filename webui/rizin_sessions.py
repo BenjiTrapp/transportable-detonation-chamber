@@ -186,13 +186,26 @@ _PATCHES_HELD = ("Held back, not applied: {count} saved {patch} over bytes an em
 _PATCHES_DROPPED = ("{count} {patch} did not fit into the project ({chars} characters at most) and will "
                     "not come back when the file is opened again.")
 # What the session says about the timeline of the emulation in the project: that a save could not keep it (it is
-# not written in part: a timeline that ends where the budget did would replay to somewhere nobody named), and
-# that the one the project held was not used.
+# not written in part: a timeline that ends where the budget did would replay to somewhere nobody named) -- either
+# because the patches, which have the budget first, left too little, or because it is longer than the budget on its
+# own --, that the one the project held was not used, and, at the open that follows a save that dropped it, that it
+# was. A dropped patch is seen to be gone by the user who put it there; a dropped timeline is not, so the project
+# keeps a marker (_RESTORE_DROPPED_MARK) in the place of its line, and the open says it (spec 1 and 4).
 _RESTORE_DROPPED = ("The timeline of the emulation did not fit into the project (it shares {chars} characters "
                     "with the patches, and they come first) and was not saved: the way to the decrypted bytes "
                     "will not be there when the file is opened again.")
+_RESTORE_TOO_LONG_ALONE = ("The timeline of the emulation did not fit into the project: on its own it is longer than "
+                           "the {chars} characters a project keeps of it and the patches, so it was not saved and the "
+                           "way to the decrypted bytes will not be there when the file is opened again.")
 _RESTORE_REFUSED = ("The project's saved timeline of the emulation was not used: it is not exactly what this "
                     "version writes (edited, cut short, or from another version).")
+_RESTORE_LOST_AT_OPEN = ("The project's timeline of the emulation could not be kept when the file was last saved (it "
+                         "was too long for the room the project has): the way to the decrypted bytes is gone, and "
+                         "decrypting again is the only way back.")
+# What the project holds in the place of ``restore=``'s record when a save had to drop it. Not the shape of a record
+# (they begin "1;"), so read_restore would refuse it, and _read_restore_line knows it for what it is. It is written
+# only where the patches leave room for its own length: they have priority.
+_RESTORE_DROPPED_MARK = "dropped"
 # Why the timeline of an emulation session (RizinSession._restore) cannot be offered, or is gone. Said by the
 # pane as they stand: a record that is tainted is never offered, whatever else is true of it.
 _RESTORE_HAND_REGISTER = "a register was set by hand, which the timeline does not record"
@@ -992,7 +1005,7 @@ def _named_addresses(addrs):
     return shown + (", ..." if len(addrs) > _NOTE_ADDRESSES else "")
 
 
-def _sanitize_project(src, dst, level, mode, done, patches, ranges=(), restore=None):
+def _sanitize_project(src, dst, level, mode, done, patches, ranges=(), restore=None, restore_lost=False):
     """Copy a project written by ``Ps`` so that rizin 0.9.1 can load it again; (how many patches did not fit,
     whether ``restore`` did).
 
@@ -1016,12 +1029,19 @@ def _sanitize_project(src, dst, level, mode, done, patches, ranges=(), restore=N
     the convenience (spec, section "Entscheidungen"). With no record there is no line at all, which is what
     a project from before the record is, and what _read_project_meta reads as none. A ``restore`` that is
     not a record the writer makes raises ValueError (_restore_record_for_save sees to it that it is one).
+
+    A record that does not fit leaves ``_RESTORE_DROPPED_MARK`` in the line's place, so that the next open can say
+    it was lost; ``restore_lost`` says the project already holds one (a save with no record of its own must not
+    forget it). The marker is written only if the patches leave room for its own length: they come first.
     """
     namespace = None
     line_of_patches, left_out = _patches_line(patches)
     line_of_restore, fitted = "", True
+    room = PROJECT_PATCH_CHARS - len(line_of_patches)
     if restore is not None:
-        line_of_restore, fitted = rizin_emulation.restore_line(restore, PROJECT_PATCH_CHARS - len(line_of_patches))
+        line_of_restore, fitted = rizin_emulation.restore_line(restore, room)
+    if not line_of_restore and (restore is not None or restore_lost) and room >= len(_RESTORE_DROPPED_MARK):
+        line_of_restore = _RESTORE_DROPPED_MARK
     with open(src, encoding="utf-8", errors="surrogateescape", newline="\n") as fin, \
             open(dst, "w", encoding="utf-8", errors="surrogateescape", newline="\n") as fout:
         for line in fin:
@@ -1122,7 +1142,8 @@ def _read_project_meta(path):
             fh.seek(max(0, fh.tell() - 65536))
             tail = fh.read().decode("utf-8", "replace")
     except OSError:
-        return {"level": None, "mode": None, "done": [], "patches": [], "restore": None, "restore_refused": False}
+        return {"level": None, "mode": None, "done": [], "patches": [], "restore": None, "restore_refused": False,
+                "restore_dropped": False}
     meta = {}
     at = tail.rfind("\n/tdc\n")
     if at != -1:
@@ -1131,12 +1152,12 @@ def _read_project_meta(path):
                 break
             key, _, value = line.partition("=")
             meta[key] = value
-    record, refused = _read_restore_line(meta.get("restore", ""))
+    record, refused, dropped = _read_restore_line(meta.get("restore", ""))
     return {"level": meta.get("level") if meta.get("level") in ("aa", "aaa") else None,
             "mode": meta.get("mode") if meta.get("mode") in ("one", "steps") else None,
             "done": [s for s in meta.get("done", "").split(",") if s in _ALL_STEPS],
             "patches": _read_patches(meta.get("patches", "")),
-            "restore": record, "restore_refused": refused}
+            "restore": record, "restore_refused": refused, "restore_dropped": dropped}
 
 
 # One patch of the /tdc namespace: the address in hex (up to 2^64-1) and the bytes it wrote, as the
@@ -1153,8 +1174,9 @@ _TDC_PATCH_RE = re.compile(r"([0-9a-f]{1,16}):((?:[0-9a-f]{2})+)(:r)?")
 
 
 def _read_restore_line(text):
-    """The ``restore=`` line as (record, refused): the record, or None, and whether a line was there that is
-    not one. No line (or an empty one) is no record and not a refusal.
+    """The ``restore=`` line as (record, refused, dropped): the record, or None; whether a line was there that is
+    not one; and whether it is the marker a save left for a record it had to drop. No line (or an empty one) is
+    no record and neither of the others.
 
     The line is hostile input (the project is a file a user can edit), so it passes the same cap as the
     patches line before anything parses it -- a save never writes more than PROJECT_PATCH_CHARS of it, so a
@@ -1162,9 +1184,11 @@ def _read_restore_line(text):
     ``restore_line`` writes. It builds every action of the line before it checks the count, so the cap is
     the only brake on what a long line costs."""
     if not text:
-        return None, False
+        return None, False, False
+    if text == _RESTORE_DROPPED_MARK:
+        return None, False, True
     record = None if len(text) > PROJECT_PATCH_CHARS else rizin_emulation.read_restore(text)
-    return record, record is None
+    return record, record is None, False
 
 
 def _read_patches(text):
@@ -1486,12 +1510,23 @@ class RizinSession:
         # (_RESTORE_BEFORE_START), and whether the breakpoints stand other than the timeline began with.
         self._restore_pending = None
         self._restore_bp_moved = False
-        # The record the project holds, or will at the next save: the one it was opened with, and every clean
-        # one a save has asked since. It is what a save writes when the timeline has nothing newer to say
-        # (_restore_record_for_save), so a rizin that restarted, an unpatch or a session that never emulated
-        # leave the project's line alone. With its digests, as the project holds it. Not the live timeline:
-        # that is ``_restore``, and the digests of it are made when a save reads the cache.
+        # The record the project is to hold: the one it was opened with, and every clean one a save has asked
+        # since. It is what a save writes when the timeline has nothing newer to say (_restore_record_for_save),
+        # so a rizin that restarted, an unpatch or a session that never emulated leave the project's line
+        # alone. With its digests, as the project holds it. Not the live timeline: that is ``_restore``, and the
+        # digests of it are made when a save reads the cache.
+        #
+        # It is set when the save is **asked**, not when it is written, and so it can say something the project
+        # does not hold for as long as a line did not fit (_finish_save then leaves the marker, and the next save
+        # asks again, when the budget may allow it). That was chosen over setting it in _finish_save, which
+        # would lose the retry for a session whose record was dropped and whose timeline is then gone, and it is
+        # harmless to the replay: that runs on a reopened file, whose project holds a line or does not, and
+        # the originating session's cache is not "nothing but the applied patches" (spec 6) for it to run in.
+        # ``_restore_lost``: the project held the marker of a dropped record when it was opened. It matters until a
+        # record is saved (then ``_restore_saved`` is set and a save writes that or, if it does not fit, the marker
+        # again), so it is read at the open and never changed.
         self._restore_saved = None
+        self._restore_lost = False
         self._restore_dropped_note = None
         # Notes that outlive a re-plan: what the session starts with (a project that could not be
         # loaded, patches that could not be applied) and the standing warning that patches did not fit
@@ -1512,10 +1547,11 @@ class RizinSession:
         self._done = list(contained)
         self.level = level or self.level
         self._mode = mode or self._mode
-        self._restore_saved, restore_refused = saved_restore
+        self._restore_saved, restore_refused, self._restore_lost = saved_restore
         # in the order of what costs the user most: a project that could not be loaded, patches that were not
-        # applied or are held back, a timeline that was not used
-        for text in (note, patch_note, _RESTORE_REFUSED if restore_refused else None):
+        # applied or are held back, a timeline that was not used or was lost
+        for text in (note, patch_note, _RESTORE_REFUSED if restore_refused else None,
+                     _RESTORE_LOST_AT_OPEN if self._restore_lost else None):
             if text:
                 self._kept_notes.append(text)
         self._notes += self._kept_notes
@@ -1817,6 +1853,11 @@ class RizinSession:
             record["actions"].append(action)
         if timed_out:
             self._restore_taint(_RESTORE_TIMEOUT)
+        if record["tainted"] is None:
+            # The record is a change of the project like a patch is: a session that only ran the emulation and
+            # closed would otherwise write none. Debounced as every other (SAVE_DELAY), so single-stepping asks
+            # once. A timeline that cannot be offered has nothing new for a save to say.
+            self._schedule_save()
 
     def _restore_taint(self, reason):
         """Say that the timeline cannot be offered (gate held); the first reason stays. With no timeline
@@ -1875,11 +1916,17 @@ class RizinSession:
             return self._restore_gone
         return record["tainted"] or (_RESTORE_HAND_BREAKPOINT if self._restore_bp_moved else None)
 
-    def _restore_digests(self, pipe):
+    def _restore_digests(self, pipe, rows=None):
         """What the record would prove right now (gate held): the SHA-256 of what the run left in each range,
         read from the cache while it is alive (rizin_emulation.run_digests, over the rows in the order they
-        were written). The save writes these, and an empty answer is the cache having nothing of a run."""
-        rows = self._patch_list(pipe, ordered=True)
+        were written). The save writes these, and an empty answer is the cache having nothing of a run.
+
+        ``rows`` are the cache's rows **in write order** (``_patch_list(pipe, ordered=True)``) where the caller
+        has read them already: the save does, and a second ``wcj`` of megabytes would be for nothing. Rows by
+        address are not what this wants and run_digests cannot tell (spec 5): the one place that hands them over
+        is _saved_cache, and tests/test_rizin.py pins what the save writes."""
+        if rows is None:
+            rows = self._patch_list(pipe, ordered=True)
         return rizin_emulation.run_digests(rows, rizin_emulation.run_only_ranges(rows))
 
     def restore_offer(self, wait=2.0):
@@ -3144,10 +3191,11 @@ class RizinSession:
 
     def _boot(self):
         """Start rizin and load the project; returns (pipe, steps in the project, level, mode, note, patches,
-        restore), restore being (the project's timeline or None, whether the project had a line that is none)."""
+        restore), restore being (the project's timeline or None, whether the project had a line that is none, whether
+        it held the marker of a record a save had to drop)."""
         pipe = self._start_rizin()
         if not os.path.isfile(self._project):
-            return pipe, [], None, None, None, [], (None, False)
+            return pipe, [], None, None, None, [], (None, False, False)
         meta = _read_project_meta(self._project)
         try:
             arch = pipe.cmd("e asm.arch").strip()
@@ -3160,13 +3208,13 @@ class RizinSession:
             loaded = False
         if loaded:
             return (pipe, meta["done"], meta["level"], meta["mode"], None, meta["patches"],
-                    (meta["restore"], meta["restore_refused"]))
+                    (meta["restore"], meta["restore_refused"], meta["restore_dropped"]))
         pipe.close()
         try:
             os.replace(self._project, self._project + ".broken")
         except OSError:
             pass
-        return self._start_rizin(), [], None, None, _PROJECT_FAILED, [], (None, False)
+        return self._start_rizin(), [], None, None, _PROJECT_FAILED, [], (None, False, False)
 
     def _replay_patches(self, patches):
         """Write the project's hand-made patches back into the cache (gate not held yet: the session is
@@ -3455,8 +3503,8 @@ class RizinSession:
 
     def _project_snapshot(self, pipe):
         """``Ps`` to a temporary file (gate held); _finish_save then makes it the project."""
-        patches, ranges = self._saved_cache(pipe)
-        restore = self._restore_record_for_save(pipe)
+        patches, ranges, rows = self._saved_cache(pipe)
+        restore = self._restore_record_for_save(pipe, rows)
         self._save_seq += 1
         os.makedirs(self._projects_dir, exist_ok=True)
         tmp = f"{self._project}.{self._save_seq}.tmp"
@@ -3469,7 +3517,7 @@ class RizinSession:
                 pass
             raise
         with self._lock:
-            return self._save_seq, tmp, self.level, self._mode, list(self._done), patches, ranges, restore
+            return self._save_seq, tmp, self.level, self._mode, list(self._done), patches, ranges, restore, self._restore_lost
 
     def _saved_cache(self, pipe):
         """What the write cache says about the project (gate held): the patches to write into it, and
@@ -3494,7 +3542,7 @@ class RizinSession:
         gives no ranges, so a save after a lost cache leaves the project as it was rather than stripping
         it by guesswork.
         """
-        rows = self._patch_list(pipe)
+        rows = self._patch_list(pipe, ordered=True)  # one read for the whole save: the digests need this order
         kept = self._own_patches()
         waiting = self._waiting_left(kept)
         # one entry for one address and bytes, whichever mark: a patch that waits and one a restart lost are the
@@ -3505,9 +3553,9 @@ class RizinSession:
             if (patch[0], patch[1]) not in known:
                 known.add((patch[0], patch[1]))
                 more.append(patch)
-        return kept + more, rizin_emulation.run_only_ranges(rows)
+        return kept + more, rizin_emulation.run_only_ranges(rows), rows
 
-    def _restore_record_for_save(self, pipe):
+    def _restore_record_for_save(self, pipe, rows):
         """The timeline the project is to hold after this save, with its digests (gate held), or None for no
         record at all.
 
@@ -3521,7 +3569,8 @@ class RizinSession:
         the saved record is written again, as ``_saved_cache`` keeps ``_lost`` and ``_waiting`` over a cache
         that died.
 
-        The digests are made from the rows in the order they were written (_restore_digests): by address,
+        ``rows`` are the cache as _saved_cache read it, **in the order the writes were made in**. The digests are
+        made from them in that order (_restore_digests): by address,
         two overlapping writes would swap, and the digest would be a plausible SHA-256 of bytes the run never
         left. A timeline the digests cannot be made for (a row of the cache that does not hold as many bytes
         as it says: ValueError) or that has none leaves the saved record as it is, and so does one that is
@@ -3529,7 +3578,7 @@ class RizinSession:
         record = self._restore
         if record is not None and not self._restore_reason():
             try:
-                digests = self._restore_digests(pipe)
+                digests = self._restore_digests(pipe, rows)
                 live = {"counters": dict(record["counters"]), "breakpoints": list(record["breakpoints"]),
                         "actions": [dict(action) for action in record["actions"]], "digests": digests}
                 if digests:
@@ -3540,12 +3589,12 @@ class RizinSession:
         return self._restore_saved
 
     def _finish_save(self, snapshot):
-        seq, tmp, level, mode, done, patches, ranges, restore = snapshot
+        seq, tmp, level, mode, done, patches, ranges, restore, lost = snapshot
         part = f"{self._project}.{seq}.part"
         try:
             if not os.path.isfile(tmp):
                 raise OSError(f"rizin did not write {tmp}")
-            left_out, fitted = _sanitize_project(tmp, part, level, mode, done, patches, ranges, restore)
+            left_out, fitted = _sanitize_project(tmp, part, level, mode, done, patches, ranges, restore, lost)
             with self._replace_lock:
                 if seq > self._saved_seq:
                     os.replace(part, self._project)
@@ -3553,7 +3602,8 @@ class RizinSession:
             if left_out:
                 self._note_dropped_patches(left_out)
             if restore is not None:
-                self._note_restore(fitted)
+                # alone: whether it would have fitted with the whole budget to itself, which says whom to blame
+                self._note_restore(fitted, fitted or rizin_emulation.restore_line(restore, PROJECT_PATCH_CHARS)[1])
         finally:
             for leftover in (tmp, part):
                 try:
@@ -3578,23 +3628,25 @@ class RizinSession:
             self._kept_notes.append(note)
             self._notes.append(note)
 
-    def _note_restore(self, fitted):
+    def _note_restore(self, fitted, fits_alone=True):
         """Say, once, that the timeline did not fit into the project (``fitted`` false), and take the note back
         when a later save has room for it again: the note is kept past a re-plan like the patches' one, and a
-        warning that outlived its truth would be the other way to mislead."""
+        warning that outlived its truth would be the other way to mislead. ``fits_alone`` says whom it is to
+        blame: the patches, which have the budget first, or the timeline's own length."""
         with self._lock:
             if self._closed:
                 return
             said = self._restore_dropped_note
-            if fitted:
-                if said is not None:
-                    self._restore_dropped_note = None
-                    self._kept_notes = [n for n in self._kept_notes if n != said]
-                    self._notes = [n for n in self._notes if n != said]
-                return
-            if said is not None:
+            note = None if fitted else (_RESTORE_DROPPED if fits_alone else _RESTORE_TOO_LONG_ALONE).format(
+                chars=PROJECT_PATCH_CHARS)
+            if note == said:
                 return  # every save that follows would say it again
-            note = self._restore_dropped_note = _RESTORE_DROPPED.format(chars=PROJECT_PATCH_CHARS)
+            if said is not None:
+                self._kept_notes = [n for n in self._kept_notes if n != said]
+                self._notes = [n for n in self._notes if n != said]
+            self._restore_dropped_note = note
+            if note is None:
+                return
             self._kept_notes.append(note)
             self._notes.append(note)
         print(f"[rizin] {self.sha256[:12]}: {note}")
