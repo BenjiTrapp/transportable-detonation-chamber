@@ -449,6 +449,7 @@ FLOW_FUNCTIONS = [
     "syscallCopyText", "syscallTargetProcess", "syscallStubsModel", "renderSyscallStubs", "renderSyscallStubsPanel", "runSyscallStubs",
     "syscallRequestDraft", "syscallDraftStubRule",
     "syscallHookKey", "syscallHookPairs", "syscallHookDifference", "syscallHookDrift", "syscallWin32uMissing", "syscallSyncModuleFilter",
+    "syscallToggleLower", "syscallApplyLower", "syscallLowerNote",
     # the GRAPH surface (tests/test_binary_graph_ui.py): the map's choice and filter reach it
     "binaryGraphLayout", "binaryGraphEdgeLook", "binaryGraphNodeLook", "binaryGraphTones", "binaryGraphMatches", "binaryGraphCut",
     "binaryGraphSvg", "binaryGraphLegend", "binaryGraphStatus", "binaryGraphModel", "renderBinaryGraph", "binaryGraphOnQuery",
@@ -518,7 +519,8 @@ const ids = ['syscalls-subtitle', 'syscall-view-map', 'syscall-view-graph', 'sys
              'syscall-scan-result', 'syscall-legend', 'syscall-map', 'syscall-tip', 'syscall-catalog-head', 'syscall-rows',
              'syscall-work', 'syscall-pane-map', 'syscall-pane-detail', 'syscall-detail-body', 'syscall-draft',
              'syscall-deviations', 'syscall-deviations-head', 'syscall-hooks', 'syscall-hooks-head',
-             'syscall-stubs', 'syscall-stubs-body', 'syscall-stubs-head', 'syscall-stubs-run', 'syscall-lower'];
+             'syscall-stubs', 'syscall-stubs-body', 'syscall-stubs-head', 'syscall-stubs-run', 'syscall-lower',
+             'syscall-lower-fold', 'syscall-lower-note', 'syscall-lower-body'];
 const els = Object.fromEntries(ids.map(id => [id, Object.assign(new Node('div'), { id })]));
 els['syscall-map'].parentElement = Object.assign(new Node('div'), { boxWidth: 800 });
 els['syscall-tip'].hidden = true;

@@ -154,6 +154,43 @@ def test_the_graph_view_shows_its_surface_and_the_pane_toggle_names_it():
     assert r["back"] == {"map": False, "graph": True, "pressed": ["true", "false"], "pane": "MAP"}
 
 
+@needs_node
+def test_the_graph_view_folds_the_scan_panels_and_the_bar_says_what_is_behind_them():
+    """Measured in Chrome on the VM at 1920x1080: of the window's height the explore canvas got 240px, its CSS floor,
+    while DEVIATIONS, DIRECT SYSCALL STUBS and KNOWN HOOKS took 320px of the same column - every one of them about a
+    process scanned on the map, none about the import graph. GRAPH folds them, which is where the canvas gets its
+    height from.
+
+    Folded may not mean silent. A stub run while GRAPH is showing writes the proof of this whole feature into that
+    row, so the bar names the three panels and carries their counts, and one click opens them. And a fold or unfold
+    by hand wins over the view's default from then on: a view that keeps reclosing what the reader opened is worse
+    than one that never folded."""
+    r = _graph_flow(r"""
+      initSyscalls();
+      els['syscall-deviations-head'].textContent = '3 deviations';
+      els['syscall-stubs-head'].textContent = '2 hits';
+      els['syscall-hooks-head'].textContent = '0 known';
+      els['syscall-stubs'].hidden = false;
+      const look = () => ({ folded: els['syscall-lower'].className.includes('syscall-lower-folded'),
+                            expanded: els['syscall-lower-fold'].attrs['aria-expanded'],
+                            note: els['syscall-lower-note'].textContent });
+      syscallSetView('graph');
+      const graph = look();
+      syscallSetView('map');
+      const map = look();
+      syscallSetView('graph');
+      syscallToggleLower();
+      const byHand = look();
+      syscallSetView('map'); syscallSetView('graph');
+      out({ graph, map, byHand, afterSwitch: look() });""")
+    assert r["graph"]["folded"] is True and r["graph"]["expanded"] == "false", "GRAPH folds the scan panels"
+    assert r["map"]["folded"] is False and r["map"]["expanded"] == "true", "MAP shows them"
+    for word in ("DEVIATIONS", "DIRECT SYSCALL STUBS", "KNOWN HOOKS", "3 deviations", "2 hits"):
+        assert word in r["graph"]["note"], word
+    assert r["byHand"]["folded"] is False, "a click opens them in the graph view"
+    assert r["afterSwitch"]["folded"] is False, "and the view's default no longer overrides that choice"
+
+
 # --- The layers and the curated hop --------------------------------------------------------------------------------
 
 @needs_node
@@ -655,7 +692,7 @@ def test_the_curated_edge_and_the_match_do_not_look_like_a_deviation():
 
 def test_the_assets_moved_on():
     html = _read(INDEX_HTML)
-    for asset, minimum in (("style.css", 92), ("theme-cyberpunk.css", 38), ("app.js", 150)):
+    for asset, minimum in (("style.css", 93), ("theme-cyberpunk.css", 38), ("app.js", 160)):
         version = int(re.search(rf"{re.escape(asset)}\?v=(\d+)", html).group(1))
         assert version >= minimum, f"{asset} was changed and kept its ?v="
 

@@ -25692,6 +25692,8 @@ const syscallState = {
     stubs: { searched: false, running: false, pid: 0, name: '', sources: {} },
     pane: 'map',
     view: 'map',
+    // The scan panels under the surface: folded by the graph view, until the reader folds or opens them by hand
+    lowerFolded: false, lowerByHand: false,
     targets: {}, target: '',
     timer: null,
 };
@@ -26041,6 +26043,50 @@ function syscallRenderAll() {
     renderSyscallDraft();
     renderSyscallHooks();
     renderSyscallStubsPanel();
+    syscallApplyLower();
+}
+
+// The bar over the scan panels, which names what is behind them when they are folded. A panel that is not there at
+// all (the stub search has not run) is left out: the bar may only promise what the row holds.
+function syscallLowerNote() {
+    const el = id => document.getElementById(id);
+    const parts = [];
+    const add = (title, head) => {
+        const count = (el(head)?.textContent || '').trim();
+        parts.push(count ? `${title} (${count})` : title);
+    };
+    add('DEVIATIONS', 'syscall-deviations-head');
+    if (!el('syscall-stubs')?.hidden) add('DIRECT SYSCALL STUBS', 'syscall-stubs-head');
+    add('KNOWN HOOKS', 'syscall-hooks-head');
+    return parts.join(' · ');
+}
+
+// DEVIATIONS, DIRECT SYSCALL STUBS and KNOWN HOOKS are all about a process scanned on the map, and on the VM they
+// took 320px of the column the graph canvas sits in, which never grew past its 240px floor. GRAPH therefore folds
+// them away, and that is where the canvas gets its height. Folded is not silent: the bar keeps naming the panels
+// with their counts, because a stub run in the graph view writes the proof of the whole feature into that row.
+function syscallApplyLower() {
+    const row = document.getElementById('syscall-lower');
+    if (!row) return false;
+    const folded = !!syscallState.lowerFolded;
+    row.classList.toggle('syscall-lower-folded', folded);
+    const button = document.getElementById('syscall-lower-fold');
+    if (button) {
+        button.setAttribute('aria-expanded', String(!folded));
+        button.title = folded ? 'Show the panels of the last scan' : 'Fold the panels of the last scan away';
+        button.setAttribute('aria-label', button.title);
+    }
+    const note = document.getElementById('syscall-lower-note');
+    if (note) note.textContent = syscallLowerNote();
+    return true;
+}
+
+// A fold or unfold by hand wins over the view's default from then on: a view that keeps reclosing what the reader
+// opened is worse than one that never folded.
+function syscallToggleLower() {
+    syscallState.lowerFolded = !syscallState.lowerFolded;
+    syscallState.lowerByHand = true;
+    return syscallApplyLower();
 }
 
 // The modules the filter offers: those the loaded baseline has entries for, so no choice can only dim every cell.
@@ -26709,6 +26755,8 @@ function syscallSetView(name) {
         const surface = document.getElementById(`syscall-surface-${other}`);
         if (surface) surface.hidden = other !== name;
     }
+    if (!syscallState.lowerByHand) syscallState.lowerFolded = name === 'graph';
+    syscallApplyLower();
     renderSyscallToolbar();
     if (name === 'map') {
         renderSyscallMap();

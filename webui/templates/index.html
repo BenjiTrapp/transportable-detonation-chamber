@@ -19,7 +19,7 @@
             document.documentElement.dataset.theme = 'cyberpunk';
         }
     </script>
-    <link rel="stylesheet" href="/static/css/style.css?v=92">
+    <link rel="stylesheet" href="/static/css/style.css?v=93">
     <link rel="stylesheet" href="/static/css/theme-layout.css?v=5">
     <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=38">
 </head>
@@ -1384,6 +1384,11 @@
                         <div class="syscall-draft" id="syscall-draft" hidden></div>
                     </section>
                     <div class="syscall-lower" id="syscall-lower">
+                        <div class="syscall-lower-bar">
+                            <button type="button" class="syscall-lower-fold" id="syscall-lower-fold" aria-expanded="true" aria-controls="syscall-lower-body" title="Fold the panels of the last scan away" aria-label="Fold the panels of the last scan away" onclick="syscallToggleLower()">▾</button>
+                            <span class="syscall-lower-note" id="syscall-lower-note"></span>
+                        </div>
+                        <div class="syscall-lower-body" id="syscall-lower-body">
                         <div class="syscall-lower-left">
                             <section class="syscall-panel syscall-deviations" aria-label="Deviations">
                                 <div class="syscall-panel-head">
@@ -1407,6 +1412,7 @@
                             </div>
                             <div class="syscall-panel-body" id="syscall-hooks"></div>
                         </section>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -1952,6 +1958,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
         <div id="decision-toasts" class="decision-stack" role="region" aria-label="Firewall decisions"></div>
     </div>
 
-    <script src="/static/js/app.js?v=159"></script>
+    <script src="/static/js/app.js?v=160"></script>
 </body>
 </html>
