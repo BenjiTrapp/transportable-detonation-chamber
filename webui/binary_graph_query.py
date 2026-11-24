@@ -9,7 +9,12 @@ as the importer or forwarder wrote it ("api-ms-win-core-heap-l1-1-0.dll!HeapAllo
 A colon cannot be part of a Windows file name, so a syscall id never collides with a module's.
 
 An edge's `origin` is its claim: "derived" is read from the binaries, "curated" is the Win32 to Nt table's word. The one
-curated edge of a path to a syscall is its last, and no other edge of any answer is.
+curated edge of a path to a syscall is its last. The only other curated edges of any answer are the rows of the table
+itself, which `metric_members("curated_transitions")` lists, each marked as the table's: a Win32 function of that list
+has no module, so its id is its bare name.
+
+The figures of the whole stock (`metrics`) are numbers, not a graph; `metric_members` answers what lies behind one as an
+Answer like the others, a list of nodes that the view shows as rows, not as a picture.
 """
 
 from __future__ import annotations
@@ -354,6 +359,8 @@ def _stop_reason(graph, resolution, module, function):
     return "it ends for a reason this view does not know"
 
 
+# what the curated table calls the rename of a Zw name to its Nt name (win32_to_nt.SOURCES)
+_ZW_ALIAS = "zw-alias"
 _CUT_SHORT_NEGATIVE = (" A table on this chain was cut short when it was read, so this end is not certain: what is "
                        "missing here may lie in the part that was not read, and it is not proof that the chain really "
                        "ends here.")
@@ -372,7 +379,9 @@ def path_to_syscall(graph, table, baseline, module: str, function: str) -> Answe
     "reaches_syscall" with origin "curated", the word of the Win32 to Nt `table`, goes from there to the syscall; no
     node of ntdll stands between, as no kind of edge honestly joins it. Where the chain ends in the stub itself (an
     Nt name that ntdll or win32u exports and the baseline holds), the same edge is "derived" and the path has no
-    curated edge at all. A path has at most one curated edge, and it is the last.
+    curated edge at all, unless the stub is reached by its Zw name: ntdll exports `ZwClose` and `NtClose`, and that the
+    one is the other is a naming convention, not something a binary says, so the edge from a Zw name is curated too,
+    labelled "curated: zw-alias" as the table calls it. A path has at most one curated edge, and it is the last.
 
     What `module` means depends on what the graph holds of it, in this order:
       1. The importer: the graph holds `module`, its import table holds `function`, and it does not itself export or
@@ -443,11 +452,17 @@ def path_to_syscall(graph, table, baseline, module: str, function: str) -> Answe
     if stub is not None and stub.module.lower() == end_module:
         syscall = Node(f"syscall:{nt_name}", f"{nt_name} ({stub.module}, 0x{stub.number:x})", "syscall", 0, "")
         part.nodes.append(syscall)
+        number = f"the baseline of this build gives {nt_name} the number {stub.number:#x} ({stub.number})."
+        if nt_name != end_function:
+            # ntdll exports both names, but that one is the other is a naming convention, not something a binary says
+            part.edges.append(Edge(end, syscall.id, "reaches_syscall", "curated", f"curated: {_ZW_ALIAS}"))
+            return ended(f"{function} is defined at {end}, after {hops}, and that export is the Zw name of the stub of "
+                         f"{nt_name}. The last step is not read from any binary: that the Zw name is the Nt name is a "
+                         f"naming convention, which the curated Win32 to Nt table calls {_ZW_ALIAS}. Given that, "
+                         f"{number}", _CUT_SHORT_POSITIVE)
         part.edges.append(_edge(end, syscall.id, "reaches_syscall"))
-        alias = f" ({end_function} is the Zw name of {nt_name})" if nt_name != end_function else ""
         return ended(f"{function} is defined at {end}, after {hops}, and that export is the stub of a syscall "
-                     f"itself{alias}: no curated step is needed, and the baseline of this build gives {nt_name} the "
-                     f"number {stub.number:#x} ({stub.number}).", _CUT_SHORT_POSITIVE)
+                     f"itself: no curated step is needed, and {number}", _CUT_SHORT_POSITIVE)
     rows, via = (), ""
     for candidate in dict.fromkeys((function, end_function)) if table is not None else ():
         rows = table.entries_for(candidate)
@@ -606,6 +621,221 @@ def node_detail(graph, name: str) -> dict:
     return detail
 
 
+# --- the figures of the whole stock ---------------------------------------------------------------------------------
+
+# the figures in the order of the table that shows them, and how many of the most imported modules are listed
+METRICS = ("binaries", "edges", "api_sets_resolved", "forwarders", "isolated", "circular_pairs",
+           "curated_transitions", "most_imported", "skipped", "partial")
+MOST_IMPORTED = 20
+
+
+def _reach(graph, module, every, skipped):
+    """The files an import of `module` reaches: the module itself where the graph holds it, or a file it had to skip
+    (it is System32's, though unread); for an api set its hosts the graph holds, all of them where `every`, otherwise
+    the first only, the default the map gives at module level."""
+    if _is_api_set(graph, module):
+        hosts = [host.lower() for host in binary_graph.api_set_hosts(graph.api_sets, module) or ()]
+        return [host for host in (hosts if every else hosts[:1]) if host in graph.binaries]
+    return [module] if module in graph.binaries or module in skipped else []
+
+
+def _links(graph, every):
+    """binary -> {the other file it imports: the api set it goes through, or "" for a direct import}. A file that
+    imports itself is linked to nothing by it. `every` reads an api set as all its hosts, which only makes a claim of
+    absence weaker; without it as its first, which only makes a claim of presence weaker."""
+    skipped = {name.lower() for name, _ in graph.skipped}
+    reached = {}
+    links = {}
+    for name, info in graph.binaries.items():
+        mine = {}
+        for module in info.imports:
+            if module not in reached:
+                reached[module] = _reach(graph, module, every, skipped)
+            for target in reached[module]:
+                if target != name:
+                    mine.setdefault(target, "" if target == module else module)
+        links[name] = mine
+    return links
+
+
+def _isolated(graph):
+    """The binaries nothing imports, directly or through any host of an api set, and that import no other file of
+    System32: both halves, or every leaf .exe would be isolated."""
+    links = _links(graph, every=True)
+    imported = {target for mine in links.values() for target in mine}
+    return sorted(name for name, mine in links.items() if not mine and name not in imported)
+
+
+def _circular_pairs(graph):
+    """Two binaries that import each other, each pair once as (a, b) with a < b: a pair, not its two directed edges,
+    and no binary with itself."""
+    links = _links(graph, every=False)
+    return sorted((a, b) for a, mine in links.items() for b in mine if a < b and a in links.get(b, {}))
+
+
+def _resolved_api_sets(graph):
+    """The api sets some binary imports and the map has a host for, the most imported first."""
+    names = [name for name in graph.in_degree
+             if _is_api_set(graph, name) and binary_graph.api_set_hosts(graph.api_sets, name)]
+    return sorted(names, key=lambda name: (-graph.in_degree[name], name))
+
+
+def _most_imported(graph):
+    """The modules most binaries import, by the name the importers wrote (an api set counts as itself)."""
+    return sorted(graph.in_degree.items(), key=lambda item: (-item[1], item[0]))[:MOST_IMPORTED]
+
+
+def metrics(graph, table) -> dict:
+    """The figures of the whole stock, as numbers; the lists behind them are `metric_members`. Each is made from the
+    records in one pass, none from a query, and a figure that cannot be had is None, never 0: `curated_transitions`
+    without a `table`.
+
+    `edges` are the imports of every binary, one for each module it imports as the file names it (delay-loads
+    included); `forwarders` the forwarded exports, not the binaries that hold them; `api_sets_resolved` the api sets
+    some binary imports and the map has a host for; `isolated` the binaries nothing imports and that import nothing
+    else of System32 (an api set counts as every host it has: a claim of absence must not overreach);
+    `circular_pairs` pairs of binaries that import each other (an api set counts as its first host, as the shared
+    dependencies read it: a claim of presence must not either); `curated_transitions` the rows of the Win32 to Nt
+    table, not the Nt names they lead to; `most_imported` the modules with the highest in-degree; `skipped` the files
+    that could not be read; and `partial` the binaries whose import table was cut short when it was read, which makes
+    every count that reads import tables a lower bound and `isolated` an upper one."""
+    return {
+        "binaries": len(graph.binaries),
+        "edges": sum(len(info.imports) for info in graph.binaries.values()),
+        "api_sets_resolved": len(_resolved_api_sets(graph)),
+        "forwarders": sum(len(info.forwarders) for info in graph.binaries.values()),
+        "isolated": len(_isolated(graph)),
+        "circular_pairs": len(_circular_pairs(graph)),
+        "curated_transitions": None if table is None else len(table.entries),
+        "most_imported": [{"name": name, "in_degree": degree} for name, degree in _most_imported(graph)],
+        "skipped": len(graph.skipped),
+        "partial": sum(1 for info in graph.binaries.values() if info.partial),
+    }
+
+
+def _cut_note(graph, effect):
+    count = sum(1 for info in graph.binaries.values() if info.partial)
+    return f" {_plural(count, 'import table was', 'import tables were')} cut short when the graph was read, so {effect}." if count else ""
+
+
+def _members_binaries(graph, table):
+    parts = [_Part([_module_node(graph, name)], [], [name]) for name in sorted(graph.binaries)]
+    dlls = sum(1 for info in graph.binaries.values() if info.kind == "dll")
+    return (parts, f"The graph holds {_plural(len(parts), 'binary', 'binaries')}, {_plural(dlls, 'DLL', 'DLLs')} and "
+                   f"{_plural(len(parts) - dlls, 'EXE', 'EXEs')}, listed by name.", "binaries", False,
+            "The graph holds no binary.")
+
+
+def _members_edges(graph, table):
+    known = {}
+
+    def node(name):
+        if name not in known:
+            known[name] = _module_node(graph, name)
+        return known[name]
+
+    # a part per edge, and every edge of System32 is some tens of thousands: a module's node is made once
+    parts = [_Part([node(name), node(module)], [_edge(name, module, "imports")], [name])
+             for name in sorted(graph.binaries) for module in graph.binaries[name].imports]
+    return (parts, f"{_plural(len(parts), 'import', 'imports')}: a binary and a module it imports, counted by the name "
+                   f"the importer wrote, so an api set counts as itself, and delay-loaded imports count."
+                   + _cut_note(graph, "this count may be too low"), "imports", True, "No binary of the graph imports anything.")
+
+
+def _members_api_sets(graph, table):
+    parts = [_Part([_module_node(graph, name)], [], [name]) for name in _resolved_api_sets(graph)]
+    return (parts, f"{_plural(len(parts), 'api set', 'api sets')} that binaries import and the api-set map of this "
+                   f"system has a host for, the most imported first." + _cut_note(graph, "this count may be too low"),
+            "api sets", True, "No binary of the graph imports an api set that the map of this system has a host for.")
+
+
+def _members_forwarders(graph, table):
+    holders = sorted((name for name, info in graph.binaries.items() if info.forwarders),
+                     key=lambda name: (-len(graph.binaries[name].forwarders), name))
+    parts = [_Part([_function_node(name, export)], [], [_function_id(name, export)])
+             for name in holders for export in graph.binaries[name].forwarders]
+    return (parts, f"{_plural(len(parts), 'forwarded export', 'forwarded exports')} in "
+                   f"{_plural(len(holders), 'binary', 'binaries')}: an export that names a function of another module "
+                   f"instead of holding its code. The binary that forwards the most comes first."
+                   + _cut_note(graph, "this count may be too low"), "forwarded exports", True,
+            "No binary of the graph forwards an export.")
+
+
+def _members_isolated(graph, table):
+    parts = [_Part([_module_node(graph, name)], [], [name]) for name in _isolated(graph)]
+    return (parts, f"{_plural(len(parts), 'binary is', 'binaries are')} isolated: nothing imports "
+                   f"{'it' if len(parts) == 1 else 'them'}, directly or through an api set, and "
+                   f"{'it imports' if len(parts) == 1 else 'they import'} nothing else of System32."
+                   + _cut_note(graph, "a binary may be listed here only because what it imports was lost"),
+            "isolated binaries", True, "No binary of the graph is isolated: each is imported by another, or imports another.")
+
+
+def _members_circular(graph, table):
+    links = _links(graph, every=False)
+    parts = [_Part([_module_node(graph, a), _module_node(graph, b)],
+                   [_edge(a, b, "imports", links[a][b]), _edge(b, a, "imports", links[b][a])], [a, b])
+             for a, b in _circular_pairs(graph)]
+    return (parts, f"{_plural(len(parts), 'pair', 'pairs')} of binaries that import each other, each pair listed once; "
+                   f"an api set counts as its first host, and the edge names it." + _cut_note(graph, "this count may be too low"),
+            "pairs", True, "No two binaries of the graph import each other.")
+
+
+def _members_curated(graph, table):
+    if table is None:
+        return ([], "", "", False, "The curated Win32 to Nt table could not be read on this system, so its transitions "
+                                   "cannot be listed.")
+    parts = [_Part([Node(entry.win32, entry.win32, "function", 0, category_of(entry.win32)), _syscall_node(entry.nt)],
+                   [Edge(entry.win32, f"syscall:{entry.nt}", "reaches_syscall", "curated", f"curated: {entry.source}")],
+                   [entry.win32]) for entry in table.entries]
+    names = len({entry.win32 for entry in table.entries})
+    return (parts, f"{_plural(len(parts), 'row', 'rows')} of the curated Win32 to Nt table, for {_plural(names, 'Win32 function', 'Win32 functions')}: "
+                   f"each is the table's word, not read from any binary.", "rows", False, "The curated Win32 to Nt table has no rows.")
+
+
+def _members_most_imported(graph, table):
+    parts = [_Part([_module_node(graph, name)], [], [name]) for name, _ in _most_imported(graph)]
+    return (parts, f"The {_plural(len(parts), 'module', 'modules')} that most binaries import, by the name the importers "
+                   f"wrote, so an api set counts as itself." + _cut_note(graph, "an in-degree may be too low"),
+            "modules", True, "No binary of the graph imports anything.")
+
+
+def _members_skipped(graph, table):
+    parts = [_Part([Node(name, f"{name}: {reason}", "exe" if name.lower().endswith(".exe") else "dll", 0, "")], [], [name])
+             for name, reason in graph.skipped]
+    return (parts, f"{_plural(len(parts), 'file', 'files')} of System32 could not be read and {'is' if len(parts) == 1 else 'are'} "
+                   f"not in the graph, each with the reason.", "files", False, "Every file of System32 was read.")
+
+
+def _members_partial(graph, table):
+    parts = [_Part([_module_node(graph, name)], [], [name]) for name in sorted(graph.binaries) if graph.binaries[name].partial]
+    return (parts, f"{_plural(len(parts), 'binary has', 'binaries have')} an import table that was cut short when it was "
+                   f"read: what it imports may be more than the graph holds.", "binaries", False,
+            "No import table was cut short when the graph was read.")
+
+
+_MEMBERS = {"binaries": _members_binaries, "edges": _members_edges, "api_sets_resolved": _members_api_sets,
+            "forwarders": _members_forwarders, "isolated": _members_isolated, "circular_pairs": _members_circular,
+            "curated_transitions": _members_curated, "most_imported": _members_most_imported,
+            "skipped": _members_skipped, "partial": _members_partial}
+
+
+def metric_members(graph, table, name: str) -> Answer:
+    """The list behind the figure `name` of `metrics`, as an Answer: its nodes are the rows, in the order that keeps what
+    says most when it is cut at MAX_NODES, and its `total` is how many there are. `edges` lists the imports, each with
+    both of its ends; `circular_pairs` both binaries of a pair, joined by the two edges; `forwarders` the forwarded
+    exports; `curated_transitions` the table's rows, each a curated edge. A figure of zero, one that cannot be had and a
+    name that is none of METRICS give an empty answer with a note."""
+    if not isinstance(name, str) or name not in _MEMBERS:
+        shown = name[:40] if isinstance(name, str) and name.strip() else "That name"
+        return _empty(f"{shown} is not a figure of the graph: the figures are {', '.join(METRICS)}.")
+    parts, note, what, reads_tables, nothing = _MEMBERS[name](graph, table)
+    partial = reads_tables and _any_partial(graph)
+    if not parts:
+        return _empty(nothing + (_cut_note(graph, "what is missing here may lie in the part that was not read") if partial else ""),
+                      partial)
+    return _answer(_Part([], [], []), parts, note, what, partial)
+
+
 # --- what the route calls -------------------------------------------------------------------------------------------
 
 @dataclass(frozen=True)
@@ -616,6 +846,14 @@ class Context:
     graph: binary_graph.Graph
     table: win32_to_nt.Table | None = None
     baseline: syscall_baseline.Baseline | None = None
+
+
+class BadParameter(ValueError):
+    """A parameter is not one of the values it can have; `name` is the parameter."""
+
+    def __init__(self, name, allowed):
+        super().__init__(f"the parameter {name} must be one of {', '.join(allowed)}")
+        self.name = name
 
 
 class MissingParameter(ValueError):
@@ -635,13 +873,20 @@ NEEDS = {
     "forwarders": ("module",),
     "shared": ("module", "other"),
     "path-to-syscall": ("module", "function"),
+    "metric": ("metric",),
 }
+
+# parameter -> the values it can have, where they are a closed set: refused before any graph is fetched too
+VOCABULARY = {"metric": METRICS}
 
 
 def check_parameters(name: str, params: dict) -> None:
-    """Raise MissingParameter for the first parameter query `name` needs and `params` does not give."""
+    """Raise MissingParameter for the first parameter query `name` needs and `params` does not give, and BadParameter for
+    one that is not among the values it can have."""
     for needed in NEEDS[name]:
-        _need(params, needed)
+        value = _need(params, needed)
+        if needed in VOCABULARY and value not in VOCABULARY[needed]:
+            raise BadParameter(needed, VOCABULARY[needed])
 
 
 def _need(params, name):
@@ -675,6 +920,10 @@ def _path(ctx, params):
     return path_to_syscall(ctx.graph, ctx.table, ctx.baseline, _need(params, "module"), _need(params, "function"))
 
 
+def _metric(ctx, params):
+    return metric_members(ctx.graph, ctx.table, _need(params, "metric"))
+
+
 # query name -> adapter `(Context, params) -> Answer`; `params` is the request's strings (module, function, syscall,
 # other, metric), and an adapter raises MissingParameter for one it needs and was not given
 QUERIES = {
@@ -684,6 +933,7 @@ QUERIES = {
     "forwarders": _forwarders,
     "shared": _shared,
     "path-to-syscall": _path,
+    "metric": _metric,
 }
 
 

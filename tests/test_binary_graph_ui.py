@@ -25,7 +25,7 @@ from html.parser import HTMLParser
 
 from test_frontend import needs_node
 from test_syscalls_ui import FLOW_CONSTS, FLOW_DOM, FLOW_FUNCTIONS, _const, _flow, _run_node
-from test_theme import INDEX_HTML, _const_source, _cyberpunk_palette, _hex_rgb, _read, _root_values, _tab_markup
+from test_theme import APP_JS, INDEX_HTML, _const_source, _cyberpunk_palette, _hex_rgb, _read, _root_values, _tab_markup
 
 
 class _Elements(HTMLParser):
@@ -566,7 +566,7 @@ def test_the_curated_edge_and_the_match_do_not_look_like_a_deviation():
 
 def test_the_assets_moved_on():
     html = _read(INDEX_HTML)
-    for asset, minimum in (("style.css", 89), ("theme-cyberpunk.css", 38), ("app.js", 148)):
+    for asset, minimum in (("style.css", 90), ("theme-cyberpunk.css", 38), ("app.js", 149)):
         version = int(re.search(rf"{re.escape(asset)}\?v=(\d+)", html).group(1))
         assert version >= minimum, f"{asset} was changed and kept its ?v="
 
@@ -1540,3 +1540,372 @@ def test_the_edge_between_two_drawn_nodes_of_a_dropped_path_is_drawn_and_its_hea
     assert r["count"] == 400 and not r["h"] and not r["imports"]
     assert r["resolves"], "the api set and r.dll are both drawn: that edge is real and costs nothing"
     assert "1 did not fit" in r["status"], "h.exe, who imports through it, is still not shown, and said so"
+
+
+# === FIGURES: the stock as a sortable table, each number opening its list ==========================================
+
+FIGURE_IDS = ["binary-graph-metrics-body", "binary-graph-metrics-status", "binary-graph-query", "binary-graph-module",
+              "binary-graph-function", "binary-graph-run", "syscall-surface-graph"]
+
+# The page of the figures on top of the explore page: what /api/binary-graph/metrics answers (`figures`, changed by a
+# test) and the lists behind a figure as /api/binary-graph/query?q=metric answers them. `later` holds an answer back.
+FIGURES_DOM = r"""
+for (const id of __FIGURE_IDS__) els[id] = Object.assign(new Node('div'), { id });
+els['binary-graph-query'].value = 'path-to-syscall';
+const HOSTILE = '<img src=x onerror=alert(1)>.dll';
+const QUOTE = "x'),alert(1),('.dll";
+const base = { ...STAMP, truncated: false, partial: false };
+let figures = { binaries: 8, edges: 19, api_sets_resolved: 3, forwarders: 1, isolated: 3, circular_pairs: 1, curated_transitions: 2,
+  most_imported: [{ name: 'ntdll.dll', in_degree: 4000 }, { name: 'kernel32.dll', in_degree: 3900 }], skipped: 1, partial: 0,
+  ...STAMP, cache: 'binary-graph-26220.5770-arm64.json' };
+const bin = (id, kind = 'dll', in_degree = 0) => ({ id, label: id, kind, in_degree, category: '' });
+const MEMBERS = {
+  isolated: { ...base, nodes: [bin('lone.exe', 'exe'), bin(HOSTILE), bin(QUOTE)], edges: [], roots: ['lone.exe', HOSTILE, QUOTE], total: 3,
+              note: '3 binaries are isolated: nothing imports them, directly or through an api set, and they import nothing else of System32.' },
+  circular_pairs: { ...base, nodes: [bin('cyc1.dll', 'dll', 1), bin('cyc2.dll', 'dll', 1)], roots: ['cyc1.dll', 'cyc2.dll'], total: 1,
+    edges: [{ source: 'cyc1.dll', target: 'cyc2.dll', kind: 'imports', origin: 'derived', label: '' },
+            { source: 'cyc2.dll', target: 'cyc1.dll', kind: 'imports', origin: 'derived', label: 'api-ms-win-x-l1-1-0.dll' }],
+    note: '1 pair of binaries that import each other, each pair listed once.' },
+  forwarders: { ...base, nodes: [{ id: 'kernel32.dll!HeapAlloc', label: 'HeapAlloc', kind: 'function', in_degree: 0, category: '' }],
+    edges: [], roots: ['kernel32.dll!HeapAlloc'], total: 1, note: '1 forwarded export in 1 binary.' },
+  curated_transitions: { ...base, total: 2, roots: ['VirtualAllocEx', 'Mystery'],
+    nodes: [{ id: 'VirtualAllocEx', label: 'VirtualAllocEx', kind: 'function', in_degree: 0, category: 'memory' },
+            { id: 'syscall:NtAllocateVirtualMemory', label: 'NtAllocateVirtualMemory', kind: 'syscall', in_degree: 0, category: '' },
+            { id: 'Mystery', label: 'Mystery', kind: 'function', in_degree: 0, category: '' }, { id: 'syscall:NtMystery', label: 'NtMystery', kind: 'syscall', in_degree: 0, category: '' }],
+    edges: [{ source: 'VirtualAllocEx', target: 'syscall:NtAllocateVirtualMemory', kind: 'reaches_syscall', origin: 'curated', label: 'curated: documented' },
+            { source: 'Mystery', target: 'syscall:NtMystery', kind: 'reaches_syscall', label: '' }],
+    note: '2 rows of the curated Win32 to Nt table, for 2 Win32 functions: each is the table\'s word, not read from any binary.' },
+  skipped: { ...base, nodes: [bin('bad.dll')], edges: [], roots: ['bad.dll'], total: 1, note: '1 file of System32 could not be read.' },
+  edges: { ...base, nodes: [bin('a.exe', 'exe')], edges: [], roots: ['a.exe'], total: 5000, truncated: true,
+           note: '5000 imports. Only the first 1 of 5000 imports are drawn: an answer is cut at 400 nodes.' },
+};
+const none2 = { ...base, nodes: [], edges: [], roots: [], total: 0, note: 'Nothing here.' };
+let later = null;
+routes['/api/binary-graph/metrics'] = () => ({ body: figures });
+const exploreQuery = routes['/api/binary-graph/query'];
+routes['/api/binary-graph/query'] = (url, options) => {
+  const q = new URL(url, 'http://x').searchParams;
+  if (q.get('q') === 'syscall-callers') return { body: { ...base, nodes: [{ id: 'syscall:' + q.get('syscall'), label: q.get('syscall'), kind: 'syscall', in_degree: 0, category: '' }],
+                                                        edges: [], roots: ['syscall:' + q.get('syscall')], total: 1, note: 'No binary reaches it.' } };
+  if (q.get('q') !== 'metric') return exploreQuery(url, options);
+  return { body: MEMBERS[q.get('metric')] || none2 };
+};
+GRAPH['lone.exe'] = { in_degree: 0, imports: {} };
+GRAPH['cyc1.dll'] = { in_degree: 1, imports: { 'cyc2.dll': ['F'] } };
+const metricRequests = () => requests.filter(q => q.url.includes('q=metric')).map(q => new URL(q.url, 'http://x').searchParams.get('metric'));
+const detail = () => els['syscall-detail-body'].innerHTML;
+const table = () => els['binary-graph-metrics-body'].innerHTML;
+const shown = async () => { initSyscalls(); syscallSetView('graph'); await settle(); await settle(); };
+""".replace("__FIGURE_IDS__", "[" + ", ".join(f"'{i}'" for i in FIGURE_IDS) + "]")
+
+
+def _figures_flow(script):
+    return _explore_flow(FIGURES_DOM + script)
+
+
+def _rows(html):
+    """The rows of the figures table: name, the value cell's attributes and text, and the button in it, if there is one."""
+    rows, current = [], None
+    for element in _Elements(html).elements:
+        if element["tag"] == "tr":
+            current = {"attrs": element["attrs"], "cells": [], "buttons": []}
+            rows.append(current)
+        elif element["tag"] == "td" and current is not None:
+            current["cells"].append(element)
+        elif element["tag"] == "button" and current is not None:
+            current["buttons"].append(element)
+    return rows
+
+
+def test_the_figures_table_is_in_the_graph_surface_below_the_canvases_and_explains_itself():
+    tab = _tab_markup("syscalls")
+    graph = tab[tab.index('id="syscall-surface-graph"'):tab.index('id="syscall-detail"')]
+    table = re.search(r"<table[^>]*>", graph).group(0)
+    assert 'data-sort-id="binary-graph-metrics"' in table and re.search(r"\sdata-sortable(?=[\s>])", table)
+    assert graph.index('id="binary-graph-canvas"') < graph.index('id="binary-explore"') < graph.index("<table")
+    assert 'id="binary-graph-metrics-body"' in graph and 'id="binary-graph-metrics-status"' in graph
+    heads = [e["text"].strip() for e in _Elements(graph[graph.index("<table"):graph.index("</table>")]).elements if e["tag"] == "th"]
+    assert heads == ["FIGURE", "VALUE", "MEANING"]
+    section = graph[graph.index('aria-label="Figures of the whole stock"'):graph.index("</table>")]
+    info = re.findall(r'data-info="([^"]+)"', section)
+    assert info, "the figures explain themselves"
+    for text in info:
+        assert len(text) <= 300 and text[-1] in ".!?" and not any(bad in text for bad in ("<", "&", "${")), text
+
+
+@needs_node
+def test_the_metrics_table_is_sortable_and_has_a_unique_sort_id():
+    # unique across the page and the script: the sort order is kept per id
+    assert (_read(INDEX_HTML) + _read(APP_JS)).count('data-sort-id="binary-graph-metrics"') == 1
+    r = _figures_flow(r"""
+      (async () => {
+        await shown();
+        out({ table: table(), status: els['binary-graph-metrics-status'].innerHTML, requested: requests.map(q => q.url).filter(u => u.includes('/metrics')) });
+      })();""")
+    rows = _rows(r["table"])
+    assert r["requested"] == ["/api/binary-graph/metrics"], "showing the GRAPH surface reads the figures once"
+    names = [row["cells"][0]["text"] for row in rows]
+    assert names == ["Binaries", "Import edges", "Api sets resolved", "Forwarded exports", "Isolated binaries", "Circular pairs",
+                     "Curated transitions", "Most imported", "Skipped files", "Tables cut short"]
+    # a number sorts as a number: the cell carries its value, whatever the text shows
+    assert [row["cells"][1]["attrs"].get("data-sort-value") for row in rows] == ["8", "19", "3", "1", "3", "1", "2", "4000", "1", "0"]
+    assert all("data-sort-skip" not in row["attrs"] for row in rows)
+    assert "ntdll.dll" in rows[7]["cells"][2]["text"] and "4,000" in rows[7]["cells"][2]["text"]
+
+
+@needs_node
+def test_a_figure_the_server_could_not_be_asked_for_is_a_row_that_holds_no_data_and_is_asked_again():
+    r = _figures_flow(r"""
+      (async () => {
+        routes['/api/binary-graph/metrics'] = { status: 404, body: { error: 'There is no binary graph for build 26220.5770 (arm64) yet. <b>x</b>', cache: null } };
+        await shown();
+        const failed = { table: table(), status: els['binary-graph-metrics-status'].innerHTML };
+        routes['/api/binary-graph/metrics'] = () => ({ body: figures });
+        syscallSetView('map'); syscallSetView('graph'); await settle(); await settle();
+        out({ failed, table: table(), asked: requests.filter(q => q.url === '/api/binary-graph/metrics').length });
+      })();""")
+    rows = _rows(r["failed"]["table"])
+    assert len(rows) == 1 and "data-sort-skip" in rows[0]["attrs"] and rows[0]["cells"][0]["attrs"].get("colspan") == "3"
+    assert "no binary graph" in r["failed"]["table"] and "<b>" not in r["failed"]["table"] and "&lt;b&gt;" in r["failed"]["table"]
+    assert "no binary graph" in r["failed"]["status"]
+    assert len(_rows(r["table"])) == 10 and r["asked"] == 2, "the next time the surface is shown, the figures are read again"
+
+
+@needs_node
+def test_clicking_a_metric_opens_its_list_in_the_shared_detail_panel():
+    r = _figures_flow(r"""
+      (async () => {
+        await shown();
+        const before = { selected: binaryGraphState.selected, syscall: syscallState.selected, nodes: binaryGraphState.nodes.length };
+        const opened = binaryGraphMetricOpen('isolated');
+        const pending = detail();
+        await opened;
+        out({ table: table(), pending, detail: detail(), before, after: { selected: binaryGraphState.selected, syscall: syscallState.selected,
+              nodes: binaryGraphState.nodes.length, panel: syscallState.detail.name }, asked: metricRequests() });
+      })();""")
+    assert r["asked"] == ["isolated"]
+    assert "Asking" in r["pending"]
+    detail = r["detail"]
+    assert "Isolated binaries" in detail and "3 binaries are isolated" in detail and "lone.exe" in detail
+    # a name from a PE is text, never markup or script
+    assert "<img" not in detail and "&lt;img" in detail
+    assert r["before"]["selected"] is None and r["after"]["selected"] is None and r["after"]["syscall"] == r["before"]["syscall"]
+    assert r["after"]["nodes"] == 0 and r["after"]["panel"] == "", "the list is the detail panel's, not a drawing of the graph"
+    # the number that opens it is a button that names the figure, in the table
+    buttons = [b for row in _rows(r["table"]) for b in row["buttons"]]
+    opening = {re.search(r"binaryGraphMetricOpen\([\"'](\w+)[\"']\)", b["attrs"]["onclick"]).group(1) for b in buttons}
+    assert opening == {"binaries", "edges", "api_sets_resolved", "forwarders", "isolated", "circular_pairs", "curated_transitions", "most_imported", "skipped"}
+
+
+@needs_node
+def test_a_metric_of_zero_is_a_row_without_a_link_rather_than_an_empty_list():
+    r = _figures_flow(r"""
+      (async () => {
+        figures = { ...figures, forwarders: 0, skipped: 0, curated_transitions: null };
+        await shown();
+        const rows = table();
+        const zero = await binaryGraphMetricOpen('skipped');
+        const none = await binaryGraphMetricOpen('forwarders');
+        const unreadable = await binaryGraphMetricOpen('curated_transitions');
+        const unknown = await binaryGraphMetricOpen('everything');
+        out({ rows, zero, none, unreadable, unknown, asked: metricRequests(), detail: detail(), metric: binaryGraphState.metric });
+      })();""")
+    rows = {row["cells"][0]["text"]: row for row in _rows(r["rows"])}
+    for name in ("Forwarded exports", "Skipped files", "Tables cut short"):
+        assert rows[name]["buttons"] == [] and rows[name]["cells"][1]["text"].strip() == "0", name
+        assert "onclick" not in str(rows[name]["cells"][1]["attrs"]), name
+    # a figure the server could not give is not a zero: it says so, and it has no list either
+    assert rows["Curated transitions"]["buttons"] == [] and rows["Curated transitions"]["cells"][1]["text"].strip() == "n/a"
+    assert rows["Binaries"]["buttons"] and rows["Isolated binaries"]["buttons"]
+    assert (r["zero"], r["none"], r["unreadable"], r["unknown"]) == (False, False, False, False)
+    assert r["asked"] == [], "no list is asked for a figure that has none"
+    assert r["metric"] is None and "Choose a syscall" in r["detail"], "the panel is as it was: no list, and no empty one"
+
+
+@needs_node
+def test_a_row_of_that_list_starts_an_exploration_from_that_binary():
+    r = _figures_flow(r"""
+      (async () => {
+        await shown();
+        await binaryGraphMetricOpen('isolated');
+        const markup = detail();
+        const from = requests.length;
+        const started = await binaryGraphMetricGo('lone.exe');
+        out({ markup, started, mode: binaryGraphExplore.mode, explored: binaryGraphExplore.nodes.map(n => n.id), selected: binaryGraphExplore.selected,
+              nodeAsked: requests.slice(from).map(q => q.url).filter(u => u.startsWith('/api/binary-graph/node')),
+              exploreHidden: els['binary-explore'].hidden, pathHidden: els['binary-graph-path'].hidden,
+              input: els['binary-explore-start'].value, stillOpen: binaryGraphState.metric && binaryGraphState.metric.key });
+      })();""")
+    assert r["started"] is True and r["mode"] == "explore"
+    assert r["explored"] == ["lone.exe"] and r["selected"] == "lone.exe", "drawn alone, as START draws it"
+    assert r["nodeAsked"] == ["/api/binary-graph/node?name=lone.exe"]
+    assert r["exploreHidden"] is False and r["pathHidden"] is True and r["input"] == "lone.exe"
+    assert r["stillOpen"] == "isolated", "the list stays, to walk down it"
+    # every row of the list is a button that carries the id of its node, as a string the page can read back
+    calls = [b["attrs"]["onclick"] for b in _Elements(r["markup"]).elements if b["tag"] == "button" and "binaryGraphMetricGo" in b["attrs"].get("onclick", "")]
+    assert len(calls) == 3
+    assert calls[0] == 'binaryGraphMetricGo("lone.exe")'    # the browser has read the attribute: a JSON string, not a quote of ours
+
+
+@needs_node
+def test_a_name_in_a_row_reaches_the_handler_as_that_name_and_nothing_else():
+    r = _figures_flow(r"""
+      (async () => {
+        await shown();
+        await binaryGraphMetricOpen('isolated');
+        const given = [];
+        const handlers = [...detail().matchAll(/onclick="(binaryGraphMetricGo\([^"]*\))"/g)].map(m => m[1]);
+        const unescape = s => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
+        for (const h of handlers) new Function('binaryGraphMetricGo', unescape(h))(id => given.push(id));
+        out({ given, hostile: HOSTILE, quote: QUOTE, handlers });
+      })();""")
+    assert r["given"] == ["lone.exe", r["hostile"], r["quote"]], r["handlers"]
+
+
+@needs_node
+def test_a_list_of_pairs_names_the_other_binary_and_the_api_set_it_goes_through():
+    r = _figures_flow(r"""
+      (async () => {
+        await shown();
+        await binaryGraphMetricOpen('circular_pairs');
+        out({ detail: detail() });
+      })();""")
+    text = _plain(r["detail"])
+    assert "cyc1.dll" in text and "cyc2.dll" in text
+    assert "api-ms-win-x-l1-1-0.dll" in text, "a pair made through an api set says which"
+    assert "curated" not in text, "what is read from the binaries is not called the table's word"
+
+
+@needs_node
+def test_a_curated_row_says_it_is_the_tables_word_and_an_edge_without_an_origin_is_not_called_anything():
+    r = _figures_flow(r"""
+      (async () => {
+        await shown();
+        await binaryGraphMetricOpen('curated_transitions');
+        const markup = detail();
+        const from = requests.length;
+        const started = await binaryGraphMetricGo('VirtualAllocEx');
+        out({ markup, started, mode: binaryGraphExplore.mode, query: els['binary-graph-query'].value, module: els['binary-graph-module'].value,
+              asked: requests.slice(from).map(q => Object.fromEntries(new URL(q.url, 'http://x').searchParams)), pathHidden: els['binary-graph-path'].hidden });
+      })();""")
+    text = _plain(r["markup"])
+    assert "VirtualAllocEx" in text and "NtAllocateVirtualMemory" in text and "curated: documented" in text
+    row_of = lambda name: next(p for p in r["markup"].split("<li") if name in p)
+    assert "origin unknown" not in row_of("VirtualAllocEx") and "curated: documented" in row_of("VirtualAllocEx")
+    assert "origin unknown" in row_of("Mystery") and "curated" not in row_of("Mystery"), "a missing origin is neither derived nor curated"
+    # the way into the graph from a Win32 name goes to the callers of the syscall it leads to
+    assert r["started"] is True and r["mode"] == "path" and r["pathHidden"] is False
+    assert (r["query"], r["module"]) == ("syscall-callers", "NtAllocateVirtualMemory")
+    assert {"q": "syscall-callers", "syscall": "NtAllocateVirtualMemory"} in r["asked"]
+
+
+@needs_node
+def test_a_row_that_leads_nowhere_in_the_graph_is_not_a_link():
+    r = _figures_flow(r"""
+      (async () => {
+        await shown();
+        await binaryGraphMetricOpen('skipped');
+        const markup = detail();
+        const from = requests.length;
+        const started = await binaryGraphMetricGo('bad.dll');
+        const unknown = await binaryGraphMetricGo('nothere.dll');
+        out({ markup, started, unknown, asked: requests.length - from, mode: binaryGraphExplore.mode });
+      })();""")
+    assert "bad.dll" in r["markup"] and "binaryGraphMetricGo" not in r["markup"]
+    assert (r["started"], r["unknown"], r["asked"], r["mode"]) == (False, False, 0, "path")
+
+
+@needs_node
+def test_a_list_the_server_cut_says_how_much_it_shows_and_a_caveat_of_the_figures_is_said_once():
+    r = _figures_flow(r"""
+      (async () => {
+        figures = { ...figures, partial: 2 };
+        await shown();
+        const status = els['binary-graph-metrics-status'];
+        const warned = { html: status.innerHTML, hidden: status.hidden, cls: status.className };
+        await binaryGraphMetricOpen('edges');
+        const cutList = detail();
+        figures = { ...figures, partial: 0 };
+        await binaryGraphMetricsLoad(true);
+        out({ warned, cutList, calm: { html: status.innerHTML, hidden: status.hidden } });
+      })();""")
+    warned = _plain(r["warned"]["html"])
+    assert "2 import tables were cut short" in warned and "isolated" in warned and "lower bound" in warned
+    assert r["warned"]["hidden"] is False and "warn" in r["warned"]["cls"]
+    assert "Not the whole list" in r["cutList"] and "1 of 5,000" in _plain(r["cutList"])
+    assert "cut short" not in _plain(r["calm"]["html"]) and "build 26220.5770" in _plain(r["calm"]["html"])
+
+
+@needs_node
+def test_choosing_a_node_or_a_syscall_lets_go_of_the_list_and_a_late_list_does_not_come_back():
+    r = _figures_flow(r"""
+      (async () => {
+        await shown();
+        await binaryGraphMetricOpen('isolated');
+        binaryGraphState.nodes = [bin('x.dll')];
+        binaryGraphSelect('x.dll');
+        const node = { detail: detail(), metric: binaryGraphState.metric };
+        // a list asked for and not yet there, a node chosen meanwhile
+        const real = globalThis.fetch;
+        let release;
+        globalThis.fetch = (url, o) => url.includes('metric=forwarders') ? new Promise(res => { release = () => res(real(url, o)); }) : real(url, o);
+        const slow = binaryGraphMetricOpen('forwarders');
+        binaryGraphSelect('x.dll');
+        release(); await slow;
+        const late = { detail: detail(), metric: binaryGraphState.metric };
+        await binaryGraphMetricOpen('isolated');
+        binaryGraphFollowMap('NtClose');
+        out({ node, late, mapped: binaryGraphState.metric });
+      })();""")
+    assert r["node"]["metric"] is None and "isolated" not in r["node"]["detail"].lower() and "x.dll" in r["node"]["detail"]
+    assert r["late"]["metric"] is None and "HeapAlloc" not in r["late"]["detail"], "an answer that arrives after a choice is not shown"
+    assert r["mapped"] is None, "the map choosing a syscall lets go of it too"
+
+
+@needs_node
+def test_the_list_can_be_closed_and_a_newer_list_replaces_an_older_one():
+    r = _figures_flow(r"""
+      (async () => {
+        await shown();
+        await binaryGraphMetricOpen('isolated');
+        const real = globalThis.fetch;
+        let release;
+        globalThis.fetch = (url, o) => url.includes('metric=forwarders') ? new Promise(res => { release = () => res(real(url, o)); }) : real(url, o);
+        const slow = binaryGraphMetricOpen('forwarders');
+        await binaryGraphMetricOpen('circular_pairs');
+        release(); await slow;
+        const shown1 = { key: binaryGraphState.metric.key, detail: detail() };
+        binaryGraphMetricClose();
+        out({ shown1, closed: binaryGraphState.metric, after: detail() });
+      })();""")
+    assert r["shown1"]["key"] == "circular_pairs" and "HeapAlloc" not in r["shown1"]["detail"]
+    assert r["closed"] is None and "cyc1.dll" not in r["after"]
+
+
+@needs_node
+def test_on_a_narrow_screen_opening_a_list_shows_the_detail_pane_and_walking_into_the_graph_shows_the_graph():
+    r = _figures_flow(r"""
+      (async () => {
+        globalThis.matchMedia = () => ({ matches: true });
+        await shown();
+        await binaryGraphMetricOpen('isolated');
+        const opened = syscallState.pane;
+        await binaryGraphMetricGo('lone.exe');
+        out({ opened, after: syscallState.pane });
+      })();""")
+    assert (r["opened"], r["after"]) == ("detail", "map")
+
+
+def test_the_surface_reads_its_figures_when_it_is_shown_and_the_list_is_asked_as_the_query_metric():
+    block = _read(APP_JS)
+    assert "'/api/binary-graph/metrics'" in block and "q: 'metric'" in block
+    assert "binaryGraphMetricsLoad()" in block[block.index("function syscallSetView"):block.index("function syscallResized")], "the surface reads its figures when it is shown"
+
+
+def test_the_warning_of_the_explore_view_points_at_a_figure_that_is_in_the_table():
+    """The explore view says "the figures say how many" of the tables that were cut short; the figure it points at is the
+    row of that name, the `partial` count, and a list of the binaries it counts."""
+    js = _read(APP_JS)
+    assert js.count("the figures say how many") == 3
+    meta = _const_source("BINARY_GRAPH_METRICS")
+    assert re.search(r"partial: \{ name: 'Tables cut short', means: '[^']*cut short[^']*', jump: 'binary' \}", meta)

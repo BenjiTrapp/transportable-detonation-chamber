@@ -26222,7 +26222,8 @@ function renderSyscallDetailPanel() {
     const detail = syscallState.detail;
     const graphItem = binaryGraphDetailItem();
     let html;
-    if (graphItem) html = binaryGraphDetailHtml(graphItem);
+    if (binaryGraphMetricShown()) html = binaryGraphMetricHtml(binaryGraphState.metric);
+    else if (graphItem) html = binaryGraphDetailHtml(graphItem);
     else if (!syscallState.selected || !detail.name) html = renderSyscallDetail(null);
     else if (detail.loading) html = `<p class="syscall-empty">Loading ${escapeHtml(detail.name)}…</p>`;
     else if (detail.error) html = `<p class="syscall-empty syscall-empty-error">${escapeHtml(detail.error)}</p>`;
@@ -26685,8 +26686,12 @@ function syscallSetView(name) {
         if (surface) surface.hidden = other !== name;
     }
     renderSyscallToolbar();
-    if (name === 'map') renderSyscallMap();
-    else renderBinaryGraph();
+    if (name === 'map') {
+        renderSyscallMap();
+    } else {
+        renderBinaryGraph();
+        binaryGraphMetricsLoad();
+    }
     renderSyscallDetailPanel();
     return true;
 }
@@ -26768,9 +26773,11 @@ function binaryGraphOrigin(edge) {
 }
 
 // `module` is what the start field holds, whichever parameter the query sends it as; `function` the second field's
-const binaryGraphState = { answer: null, query: 'path-to-syscall', module: '', function: '', depth: 1, loading: false, selected: null, note: '', nodes: [], edges: [] };
+// figures: the table of the whole stock (null until it was read), figuresNote why it could not be; metric: the list of a figure the detail panel shows
+const binaryGraphState = { answer: null, query: 'path-to-syscall', module: '', function: '', depth: 1, loading: false, selected: null, note: '', nodes: [], edges: [],
+    figures: null, figuresNote: '', figuresLoading: false, metric: null };
 // numbers the queries, of which only the last answer counts
-const binaryGraphRequests = { seq: 0 };
+const binaryGraphRequests = { seq: 0, metric: 0 };
 
 // The layers: a node one layer right of the deepest node that has an edge into it, so a path runs left to right in
 // the order of its hops. In a layer, the nodes keep the answer's order, then move toward the middle of those that
@@ -27157,6 +27164,7 @@ function binaryGraphSelect(id) {
         syscallSelect(item.node.id.slice(BINARY_GRAPH_SYSCALL.length));
         return true;
     }
+    binaryGraphMetricForget();
     binaryGraphState.selected = String(id);
     renderBinaryGraph();
     renderSyscallDetailPanel();
@@ -27169,8 +27177,10 @@ function binaryGraphSelect(id) {
 // The map chose a syscall (or let go of one): the graph marks its node, if it draws one
 function binaryGraphFollowMap(name) {
     const st = binaryGraphState;
-    if (name) st.selected = BINARY_GRAPH_SYSCALL + name;
-    else if (st.selected && st.selected.startsWith(BINARY_GRAPH_SYSCALL)) st.selected = null;
+    if (name) {
+        st.selected = BINARY_GRAPH_SYSCALL + name;
+        binaryGraphMetricForget();
+    } else if (st.selected && st.selected.startsWith(BINARY_GRAPH_SYSCALL)) st.selected = null;
     renderBinaryGraph();
 }
 
@@ -28046,4 +28056,245 @@ function initBinaryGraphExplore() {
     canvas.addEventListener('wheel', binaryGraphOnCanvasWheel, { passive: false });
     canvas.addEventListener('click', binaryGraphOnCanvasClick);
     canvas.addEventListener('dblclick', binaryGraphOnCanvasDblClick);
+}
+
+// --- GRAPH, FIGURES: the whole stock as a table, each number opening its list --------------------------------------------
+// Figures over the whole of System32 do not belong in a cloud of nodes, where they would be unreadable: they are a table
+// under the canvases, one row per figure (/api/binary-graph/metrics). A number opens the list behind it in the shared
+// detail panel (/api/binary-graph/query?q=metric), and a row of that list starts an exploration from that binary. A figure
+// of zero is a row without a link, because an empty list is a dead end the reader had to click to find; a figure the server
+// could not give says n/a, which is not 0.
+// figure -> its name in the table, what it counts, and where a row of its list leads: 'binary' (EXPLORE from it), 'syscall'
+// (who reaches the syscall the row leads to), '' (nowhere: a file that is not in the graph has no neighbours to open)
+const BINARY_GRAPH_METRICS = {
+    binaries: { name: 'Binaries', means: 'The DLLs and EXEs of System32 that the graph read.', jump: 'binary' },
+    edges: { name: 'Import edges', means: 'A binary and a module it imports, by the name the importer wrote: an api set counts as itself.', jump: 'binary' },
+    api_sets_resolved: { name: 'Api sets resolved', means: 'Api sets that binaries import and the map of this system has a host for.', jump: 'binary' },
+    forwarders: { name: 'Forwarded exports', means: 'Exports that name a function of another module instead of holding its code.', jump: 'binary' },
+    isolated: { name: 'Isolated binaries', means: 'Nothing imports them, and they import nothing else of System32.', jump: 'binary' },
+    circular_pairs: { name: 'Circular pairs', means: 'Two binaries that import each other, counted as one pair.', jump: 'binary' },
+    curated_transitions: { name: 'Curated transitions', means: 'Rows of the Win32 to Nt table: its word, not read from any binary.', jump: 'syscall' },
+    most_imported: { name: 'Most imported', means: 'The modules most binaries import.', jump: 'binary' },
+    skipped: { name: 'Skipped files', means: 'Files of System32 that could not be read and are not in the graph.', jump: '' },
+    partial: { name: 'Tables cut short', means: 'Binaries whose import table was cut short when it was read.', jump: 'binary' },
+};
+// how many neighbours a row of a list names before it says how many more there are
+const BINARY_GRAPH_MEMBER_LINKS = 6;
+
+// The figures as rows, in the order of the table: { key, name, means, value (a number, or null where the server gave none),
+// open (there is a list to open: a figure above zero) }
+function binaryGraphMetricRows(figures) {
+    if (!figures || typeof figures !== 'object') return [];
+    return Object.keys(BINARY_GRAPH_METRICS).map(key => {
+        const meta = BINARY_GRAPH_METRICS[key], raw = figures[key];
+        let value = null, means = meta.means;
+        if (key === 'most_imported') {
+            const top = Array.isArray(raw) && raw.length && raw[0] && typeof raw[0] === 'object' ? raw[0] : null;
+            const degree = top ? Number(top.in_degree) : NaN;
+            if (top && typeof top.name === 'string' && Number.isFinite(degree) && degree >= 0) {
+                value = degree;
+                means += ` The first is ${top.name}, imported by ${degree.toLocaleString('en-US')} ${degree === 1 ? 'binary' : 'binaries'}.`;
+            }
+        } else if (typeof raw === 'number' && Number.isFinite(raw) && raw >= 0) {
+            value = raw;
+        }
+        return { key, name: meta.name, means, value, open: value !== null && value > 0 };
+    });
+}
+
+function binaryGraphMetricRowHtml(row) {
+    const shown = row.value === null ? 'n/a' : row.value.toLocaleString('en-US');
+    const cell = row.open
+        ? `<button type="button" class="binary-graph-figure" title="List what it counts" onclick="binaryGraphMetricOpen(${jsArg(row.key)})">${escapeHtml(shown)}</button>`
+        : escapeHtml(shown);
+    const sort = row.value === null ? '' : ` data-sort-value="${row.value}"`;
+    return `<tr><td>${escapeHtml(row.name)}</td><td class="view-table-num"${sort}>${cell}</td><td class="binary-graph-means">${escapeHtml(row.means)}</td></tr>`;
+}
+
+// The line above the table: what is being read or why it could not be, and otherwise the caveat of the figures and the stamp
+// of the graph they are of. { tone, html } with html '' when there is nothing to say.
+function binaryGraphMetricsStatus() {
+    const st = binaryGraphState, f = st.figures;
+    if (!f) return { tone: st.figuresNote ? 'warn' : 'info', html: st.figuresLoading ? 'Reading the figures…' : escapeHtml(st.figuresNote) };
+    let html = '';
+    const cut = typeof f.partial === 'number' && f.partial > 0 ? f.partial : 0;
+    if (cut) {
+        html += `<strong class="binary-graph-cut">${escapeHtml(cut.toLocaleString('en-US'))} import ${cut === 1 ? 'table was' : 'tables were'} cut short when the graph was read: `
+            + 'the counts that read import tables are lower bounds, and the number of isolated binaries is an upper one.</strong> ';
+    }
+    const stamp = [f.build ? `build ${f.build}` : '', f.arch || ''].filter(Boolean).join(' · ');
+    if (stamp) html += `<span class="syscall-muted">${escapeHtml(stamp)}</span>`;
+    return { tone: cut ? 'warn' : 'info', html };
+}
+
+function renderBinaryGraphMetrics() {
+    const st = binaryGraphState, el = id => document.getElementById(id);
+    const status = el('binary-graph-metrics-status');
+    if (status) {
+        const s = binaryGraphMetricsStatus();
+        status.innerHTML = s.html;
+        status.className = `binary-graph-status binary-graph-status-${cssToken(s.tone)}`;
+        status.hidden = !s.html;
+    }
+    const body = el('binary-graph-metrics-body');
+    if (!body) return false;
+    const rows = binaryGraphMetricRows(st.figures);
+    body.innerHTML = rows.length ? rows.map(row => binaryGraphMetricRowHtml(row)).join('')
+        : `<tr data-sort-skip><td colspan="3" class="view-table-empty">${escapeHtml(st.figuresLoading ? 'Reading the figures…' : st.figuresNote || 'The figures have not been read yet.')}</td></tr>`;
+    return true;
+}
+
+// The figures, read when the surface is shown and still not had (a graph that was not there yet is asked for again the next
+// time), or on RELOAD
+async function binaryGraphMetricsLoad(force) {
+    const st = binaryGraphState;
+    if (st.figuresLoading || (st.figures && !force)) return false;
+    st.figuresLoading = true;
+    renderBinaryGraphMetrics();
+    const r = await syscallApi('/api/binary-graph/metrics');
+    st.figuresLoading = false;
+    st.figures = r.ok ? r.data : null;
+    st.figuresNote = r.ok ? '' : syscallErrorText(r);
+    renderBinaryGraphMetrics();
+    return r.ok;
+}
+
+// What the panel shows: the list of a figure, while the graph is the surface and nothing else was chosen since
+function binaryGraphMetricShown() {
+    return syscallState.view === 'graph' && !!binaryGraphState.metric;
+}
+
+// A choice of something else lets go of the list, and an answer still on its way is not shown when it comes
+function binaryGraphMetricForget() {
+    binaryGraphRequests.metric++;
+    if (!binaryGraphState.metric) return false;
+    binaryGraphState.metric = null;
+    return true;
+}
+
+function binaryGraphMetricClose() {
+    binaryGraphMetricForget();
+    renderSyscallDetailPanel();
+    return true;
+}
+
+// A number was clicked: the list behind it, in the shared detail panel. A figure of zero, one that is not there and a name
+// that is no figure have no list, and none is asked for.
+async function binaryGraphMetricOpen(key) {
+    const st = binaryGraphState;
+    const row = binaryGraphOwn(BINARY_GRAPH_METRICS, key) ? binaryGraphMetricRows(st.figures).find(r => r.key === key) : null;
+    if (!row || !row.open) return false;
+    const seq = ++binaryGraphRequests.metric;
+    st.metric = { key, loading: true, answer: null, error: '' };
+    renderSyscallDetailPanel();
+    const body = document.getElementById('syscall-detail-body');
+    if (body) body.scrollTop = 0;
+    if (typeof window.matchMedia === 'function' && window.matchMedia(SYSCALL_NARROW).matches) syscallSetPane('detail');
+    const r = await syscallApi(`/api/binary-graph/query?${new URLSearchParams({ q: 'metric', metric: key })}`);
+    if (seq !== binaryGraphRequests.metric) return false;
+    st.metric = r.ok ? { key, loading: false, answer: r.data, error: '' } : { key, loading: false, answer: null, error: syscallErrorText(r) };
+    renderSyscallDetailPanel();
+    return r.ok;
+}
+
+// Where a row of the list leads in the graph, or null: { mode: 'explore', name } starts an exploration from the binary,
+// { mode: 'syscall', name } asks who reaches the syscall the row leads to (a Win32 function of the table is no module,
+// there is nothing to explore from), each with the hint of its button
+function binaryGraphMetricJump(key, node, edges) {
+    const meta = binaryGraphOwn(BINARY_GRAPH_METRICS, key);
+    if (!meta || !node || typeof node.id !== 'string') return null;
+    if (meta.jump === 'binary') return { mode: 'explore', name: node.id, hint: 'Start an exploration from it' };
+    if (meta.jump === 'syscall') {
+        const edge = edges.find(e => e && e.source === node.id && typeof e.target === 'string' && e.target.startsWith(BINARY_GRAPH_SYSCALL));
+        return edge ? { mode: 'syscall', name: edge.target.slice(BINARY_GRAPH_SYSCALL.length), hint: 'Show the binaries that reach the syscall it leads to' } : null;
+    }
+    return null;
+}
+
+// The neighbours of a row, as the answer's edges give them: the other end of each edge with its direction, and what the edge
+// claims. An edge the table drew says so, an edge that names no origin says that, and one read from the binaries names only the
+// api set it goes through: a claim is stated where it is not the default, and never lent.
+function binaryGraphMetricLinks(id, byId, edges) {
+    const others = new Map();
+    for (const e of edges) {
+        if (!e || typeof e.source !== 'string' || typeof e.target !== 'string') continue;
+        const out = e.source === id, into = e.target === id;
+        if (!out && !into) continue;
+        const other = out ? e.target : e.source;
+        const entry = others.get(other) || { out: false, into: false, tags: [] };
+        entry.out = entry.out || out;
+        entry.into = entry.into || into;
+        const origin = binaryGraphOrigin(e), label = typeof e.label === 'string' ? e.label : '';
+        let tag = '';
+        if (origin === 'curated') tag = /^curated\b/i.test(label) ? label : `curated${label ? `: ${label}` : ''}`;
+        else if (origin === 'unknown') tag = 'origin unknown';
+        else if (label) tag = `via ${label}`;
+        if (tag && !entry.tags.includes(tag)) entry.tags.push(tag);
+        others.set(other, entry);
+    }
+    const shown = [...others].slice(0, BINARY_GRAPH_MEMBER_LINKS).map(([other, entry]) => {
+        const node = byId.get(other), name = node && node.kind === 'syscall' ? node.label || other : other;
+        const arrow = entry.out && entry.into ? '⇄' : entry.out ? '→' : '←';
+        return `<span class="binary-graph-link">${arrow} ${escapeHtml(name)}${entry.tags.length ? ` <span class="binary-graph-link-tag">(${escapeHtml(entry.tags.join(', '))})</span>` : ''}</span>`;
+    });
+    const more = others.size - shown.length;
+    if (more > 0) shown.push(`<span class="syscall-muted">and ${escapeHtml(more.toLocaleString('en-US'))} more</span>`);
+    return shown.join(' ');
+}
+
+// The list behind a figure, as the detail panel shows it: one row per root of the answer, a button where the row leads into the graph
+function binaryGraphMetricHtml(metric) {
+    const meta = binaryGraphOwn(BINARY_GRAPH_METRICS, metric.key) || { name: String(metric.key || ''), jump: '' };
+    const head = `<div class="syscall-detail-name"><span class="syscall-detail-sc">${escapeHtml(meta.name)}</span>`
+        + '<button type="button" class="btn btn-sm binary-graph-close" onclick="binaryGraphMetricClose()">CLOSE</button></div>';
+    if (metric.loading) return head + '<p class="syscall-empty">Asking the binary graph…</p>';
+    if (!metric.answer) return head + `<p class="syscall-empty syscall-empty-error">${escapeHtml(metric.error)}</p>`;
+    const a = metric.answer;
+    const nodes = Array.isArray(a.nodes) ? a.nodes.filter(n => n && typeof n.id === 'string') : [];
+    const edges = Array.isArray(a.edges) ? a.edges : [];
+    const byId = new Map(nodes.map(n => [n.id, n]));
+    const roots = (Array.isArray(a.roots) ? a.roots : []).filter(id => byId.has(id));
+    let html = head;
+    if (a.truncated) {
+        html += `<p class="binary-graph-cut">Not the whole list: ${escapeHtml(roots.length.toLocaleString('en-US'))} of ${escapeHtml((Number(a.total) || 0).toLocaleString('en-US'))} are shown, `
+            + 'whole parts of it, and what is not shown is not absent.</p>';
+    }
+    if (typeof a.note === 'string' && a.note) html += `<p class="syscall-detail-note">${escapeHtml(a.note)}</p>`;
+    html += '<ul class="binary-graph-members">' + roots.map(id => {
+        const node = byId.get(id), jump = binaryGraphMetricJump(metric.key, node, edges);
+        const text = node.kind === 'function' ? node.id : String(node.label || node.id);
+        const name = jump
+            ? `<button type="button" class="binary-graph-member-name" title="${escapeHtml(jump.hint)}" onclick="binaryGraphMetricGo(${jsArg(node.id)})">${escapeHtml(text)}</button>`
+            : `<span class="binary-graph-member-name">${escapeHtml(text)}</span>`;
+        const kind = (binaryGraphOwn(BINARY_GRAPH_KINDS, node.kind) || { name: '' }).name;
+        const degree = meta.jump === 'binary' && node.kind !== 'function' ? ` · imported by ${(Number(node.in_degree) || 0).toLocaleString('en-US')}` : '';
+        const links = binaryGraphMetricLinks(node.id, byId, edges);
+        return `<li class="binary-graph-member">${name} <span class="syscall-muted">${escapeHtml(kind)}${escapeHtml(degree)}</span>${links ? `<div class="binary-graph-links">${links}</div>` : ''}</li>`;
+    }).join('') + '</ul>';
+    return html;
+}
+
+// A row of the list was clicked: into the graph. A row that leads nowhere, or is not in the list, does nothing. The list stays,
+// to be walked down; on a narrow screen the graph comes back to the front.
+function binaryGraphMetricGo(id) {
+    const m = binaryGraphState.metric, a = m && m.answer;
+    if (!a || !Array.isArray(a.nodes)) return false;
+    const edges = Array.isArray(a.edges) ? a.edges : [];
+    const jump = binaryGraphMetricJump(m.key, a.nodes.find(n => n && n.id === id), edges);
+    if (!jump) return false;
+    const el = name => document.getElementById(name);
+    if (typeof window.matchMedia === 'function' && window.matchMedia(SYSCALL_NARROW).matches) syscallSetPane('map');
+    if (jump.mode === 'explore') {
+        binaryGraphSetMode('explore');
+        const input = el('binary-explore-start');
+        if (input) input.value = jump.name;
+        return binaryGraphExploreStart(jump.name);
+    }
+    binaryGraphSetMode('path');
+    const select = el('binary-graph-query'), first = el('binary-graph-module'), second = el('binary-graph-function');
+    if (select) select.value = 'syscall-callers';
+    if (first) first.value = jump.name;
+    if (second) second.value = '';
+    binaryGraphOnQuery();
+    return binaryGraphRun();
 }

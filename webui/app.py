@@ -9226,17 +9226,23 @@ def _binary_graph_stamp(graph):
 
 
 def _binary_graph_context(graph, query):
-    """What query `query` reads besides its parameters. Only the path to a syscall reads the curated Win32 to Nt table
-    and the syscall baseline, each None where it cannot be had (the answer then says so); no baseline is extracted for
-    a question about the graph."""
-    if query != "path-to-syscall":
+    """What query `query` reads besides its parameters. The path to a syscall reads the curated Win32 to Nt table and
+    the syscall baseline, each None where it cannot be had (the answer then says so); the list behind a figure reads the
+    table only. No baseline is extracted for a question about the graph."""
+    if query not in ("path-to-syscall", "metric"):
         return binary_graph_query.Context(graph)
+    table = _curated_table()
+    baseline = _syscall_baseline_for(graph.arch, extract=False)[0] if query == "path-to-syscall" else None
+    return binary_graph_query.Context(graph, table, baseline)
+
+
+def _curated_table():
+    """The curated Win32 to Nt table, or None where it cannot be read: what reads it says so, it never reads it as empty."""
     try:
-        table = win32_to_nt.load_table()
+        return win32_to_nt.load_table()
     except win32_to_nt.TableError as exc:
-        print(f"[binary graph] the Win32 to Nt table is unusable, no path can reach a syscall: {exc}")
-        table = None
-    return binary_graph_query.Context(graph, table, _syscall_baseline_for(graph.arch, extract=False)[0])
+        print(f"[binary graph] the Win32 to Nt table is unusable, no path can reach a syscall and no row of it is listed: {exc}")
+        return None
 
 
 @app.route("/api/binary-graph/query")
@@ -9249,7 +9255,7 @@ def api_binary_graph_query():
     params = {name: _binary_graph_param(name) for name in ("module", "function", "syscall", "other", "metric")}
     try:
         binary_graph_query.check_parameters(request.args.get("q"), params)
-    except binary_graph_query.MissingParameter as exc:
+    except (binary_graph_query.MissingParameter, binary_graph_query.BadParameter) as exc:
         return jsonify({"error": str(exc)}), 400
     graph, refusal = _binary_graph_for()
     if graph is None:
@@ -9259,6 +9265,16 @@ def api_binary_graph_query():
     except binary_graph_query.MissingParameter as exc:
         return jsonify({"error": str(exc)}), 400
     return jsonify({**binary_graph_query.answer_json(answer), **_binary_graph_stamp(graph)})
+
+
+@app.route("/api/binary-graph/metrics")
+def api_binary_graph_metrics():
+    """The figures of the whole stock (binary_graph_query.metrics), with the stamp of the graph; the list behind each is
+    the query `metric`. `curated_transitions` is null where the Win32 to Nt table cannot be read."""
+    graph, refusal = _binary_graph_for()
+    if graph is None:
+        return jsonify(refusal), 404
+    return jsonify({**binary_graph_query.metrics(graph, _curated_table()), **_binary_graph_stamp(graph)})
 
 
 @app.route("/api/binary-graph/node")

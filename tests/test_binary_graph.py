@@ -2559,7 +2559,7 @@ def test_a_path_has_at_most_one_curated_edge_and_only_ever_the_last_and_the_sysc
                              ("evil.exe", "WriteProcessMemory"), ("ntdll.dll", "NtWriteVirtualMemory"),
                              ("direct.exe", "NtWriteVirtualMemory"), ("win32u.dll", "NtUserGetForegroundWindow"),
                              ("kernel32.dll", "CreateRemoteThread"), ("kernel32.dll", "Gone"),
-                             ("user32.dll", "MessageBoxW")):
+                             ("ntdll.dll", "ZwWriteVirtualMemory"), ("user32.dll", "MessageBoxW")):
         edges = _descend(graph, module, function, descent_baseline).edges
         marked = [index for index, edge in enumerate(edges) if edge.origin == "curated"]
         assert marked in ([], [len(edges) - 1]), (module, function, edges)
@@ -2724,13 +2724,27 @@ def test_a_binary_that_exports_a_syscall_name_without_being_the_stub_draws_no_de
     assert [(edge.kind, edge.origin) for edge in stub.edges] == [("reaches_syscall", "derived")]
 
 
-def test_a_zw_name_of_ntdll_reaches_the_syscall_of_its_nt_name_by_data_too(descent_baseline):
+def test_a_zw_name_of_ntdll_reaches_the_syscall_of_its_nt_name_by_a_curated_edge_not_a_derived_one(descent_baseline):
+    # ntdll exports ZwWriteVirtualMemory and NtWriteVirtualMemory, but that the one is the other is a naming
+    # convention, which the curated table calls zw-alias: no binary says it, so the edge cannot be "derived"
     graph = _descent_system()
     got = _descend(graph, "ntdll.dll", "ZwWriteVirtualMemory", descent_baseline)
     assert [(edge.source, edge.target, edge.kind, edge.origin) for edge in got.edges] == [
-        ("ntdll.dll!ZwWriteVirtualMemory", "syscall:NtWriteVirtualMemory", "reaches_syscall", "derived")]
+        ("ntdll.dll!ZwWriteVirtualMemory", "syscall:NtWriteVirtualMemory", "reaches_syscall", "curated")]
+    assert got.edges[0].label == "curated: zw-alias"
     assert _node(got, "syscall:NtWriteVirtualMemory").label == "NtWriteVirtualMemory (ntdll.dll, 0x3a)"
-    assert "Zw" in got.note and "no curated step is needed" in got.note
+    assert "Zw" in got.note and "naming convention" in got.note and "zw-alias" in got.note
+    assert "not read from any binary" in got.note and "no curated step is needed" not in got.note
+    # the Nt name of the same stub is still read from the binaries: the baseline gives its module, ntdll exports it
+    nt = _descend(graph, "ntdll.dll", "NtWriteVirtualMemory", descent_baseline)
+    assert [(edge.kind, edge.origin) for edge in nt.edges] == [("reaches_syscall", "derived")]
+    assert "no curated step is needed" in nt.note
+    # a sample that imports the Zw name directly gets the same last edge, and nothing before it that is curated
+    sample = binary_graph_query.path_to_syscall(
+        _query_graph(*graph.binaries.values(), _q("zw.exe", "exe", imports={"ntdll.dll": ("ZwWriteVirtualMemory",)}),
+                     api_sets=dict(graph.api_sets)),
+        win32_to_nt.load_table(), descent_baseline, "zw.exe", "ZwWriteVirtualMemory")
+    assert [(edge.kind, edge.origin) for edge in sample.edges] == [("imports", "derived"), ("reaches_syscall", "curated")]
     # a Zw name whose Nt name the baseline does not hold is no syscall by data
     lacking = _query_graph(_q("ntdll.dll", exports=["ZwCreateThreadEx"]))
     assert not any(node.kind == "syscall" for node in _descend(lacking, "ntdll.dll", "ZwCreateThreadEx",
@@ -2853,7 +2867,7 @@ def test_an_import_by_ordinal_descends_from_the_name_the_ordinal_stands_for(desc
 
 _PARAMS = {"importers": "module=kernel32.dll&function=CloseHandle", "imports": "module=b.exe",
            "syscall-callers": "syscall=NtClose", "forwarders": "module=kernel32.dll", "shared": "module=d.exe&other=e.exe",
-           "path-to-syscall": "module=kernelbase.dll&function=NtClose"}
+           "path-to-syscall": "module=kernelbase.dll&function=NtClose", "metric": "metric=edges"}
 
 
 @pytest.fixture
@@ -2963,6 +2977,54 @@ def test_the_node_route_answers_a_binary_and_four_oh_fours_an_unknown_name(clien
     assert r.status_code == 404 and "nowhere.dll" in r.get_json()["error"]
     assert r.get_json()["cache"] is not None            # the graph is there; it is the name it does not know
     assert client.get("/api/binary-graph/node").status_code == 400
+
+
+def test_the_metrics_route_answers_the_figures_of_the_stock_with_the_stamp_of_the_graph(client, graph_host, monkeypatch):
+    r = client.get("/api/binary-graph/metrics")
+    assert r.status_code == 200, r.get_json()
+    body = r.get_json()
+    graph = _system()
+    assert set(binary_graph_query.METRICS) | {"build", "arch", "created", "cache"} == set(body)
+    assert body["binaries"] == len(graph.binaries) == 8 and body["edges"] == sum(graph.in_degree.values())
+    assert body["curated_transitions"] == len(win32_to_nt.load_table().entries)
+    assert body["most_imported"][0] == {"name": "api-ms-win-core-memory-l1-1-0.dll", "in_degree": 2}, "ties go by name"
+    assert max(graph.in_degree.values()) == 2
+    assert (body["build"], body["arch"], body["created"]) == ("26220.5770", "arm64", "2026-11-23T10:00:00Z")
+    assert body["cache"] == binary_graph.cache_name("26220.5770", "arm64")
+    # the table that cannot be read is no zero: the figure is null, and the rest still stands
+    def unreadable(*a, **k):
+        raise win32_to_nt.TableError("gone")
+    monkeypatch.setattr(win32_to_nt, "load_table", unreadable)
+    body = client.get("/api/binary-graph/metrics").get_json()
+    assert body["curated_transitions"] is None and body["binaries"] == 8
+
+
+def test_the_metrics_route_says_so_when_there_is_no_graph_and_builds_it_like_the_query_route(client, tdc, graph_host):
+    path, builds, _ = graph_host
+    os.remove(path)
+    r = client.get("/api/binary-graph/metrics")
+    _join(tdc)
+    assert r.status_code == 404 and r.get_json()["cache"] is None and "26220.5770" in r.get_json()["error"]
+    assert builds == [("26220.5770", "arm64")]
+
+
+def test_the_metric_query_lists_what_is_behind_a_figure_and_refuses_an_unknown_one_before_any_graph(client, tdc, graph_host):
+    body = client.get("/api/binary-graph/query?q=metric&metric=edges").get_json()
+    assert body["total"] == sum(_system().in_degree.values())
+    assert {n["id"] for n in body["nodes"]} >= {"a.exe", "kernel32.dll"} and body["roots"]
+    curated = client.get("/api/binary-graph/query?q=metric&metric=curated_transitions").get_json()
+    assert curated["total"] == len(win32_to_nt.load_table().entries) and curated["nodes"]
+    assert {edge["origin"] for edge in curated["edges"]} == {"curated"}, "the table's rows say whose word they are"
+    zero = client.get("/api/binary-graph/query?q=metric&metric=skipped").get_json()
+    assert zero["nodes"] == [] and zero["note"] and zero["total"] == 0
+    path, builds, _ = graph_host
+    os.remove(path)
+    for url in ("/api/binary-graph/query?q=metric&metric=everything", "/api/binary-graph/query?q=metric"):
+        r = client.get(url)
+        assert r.status_code == 400 and "metric" in r.get_json()["error"], url
+    assert "binaries" in client.get("/api/binary-graph/query?q=metric&metric=everything").get_json()["error"]
+    _join(tdc)
+    assert builds == [] and tdc._binary_graph_build_state["thread"] is None
 
 
 def test_the_graph_is_loaded_once_and_held_across_requests(client, tdc, graph_host, monkeypatch):
@@ -3182,7 +3244,7 @@ def test_a_query_without_a_parameter_it_needs_is_refused_before_any_graph_is_fet
 
 def test_the_parameters_each_query_needs_are_the_ones_its_adapter_reads():
     ctx = binary_graph_query.Context(_system())
-    given = {"module": "d.exe", "function": "CloseHandle", "syscall": "NtClose", "other": "e.exe", "metric": ""}
+    given = {"module": "d.exe", "function": "CloseHandle", "syscall": "NtClose", "other": "e.exe", "metric": "binaries"}
     for name, run in binary_graph_query.QUERIES.items():
         needs = binary_graph_query.NEEDS[name]
         binary_graph_query.check_parameters(name, {key: given[key] for key in needs})
@@ -3821,3 +3883,242 @@ def test_the_api_reference_and_the_help_both_name_partial_in_the_payload_of_the_
     for query in binary_graph_query.QUERIES:
         assert f"`{query}`" in clause, f"docs/api.md does not say when {query} is partial"
     assert "the same word as `partial` of a binary and of a chain" in clause
+
+
+# --- the figures of the whole stock (metrics, metric_members) -------------------------------------------------------------
+
+def _figures_system(**partial):
+    """A System32 of 21 binaries made to have every figure a known number. By hand:
+    * 20 import edges (a binary and a module it imports, as the file names the module), 3 forwarded exports
+    * 4 api sets imported and resolved by the map; one imported that the map has no host for (api-ms-win-ghost)
+    * isolated (nothing imports it, it imports nothing of System32): lone.exe, vendor.exe (imports a DLL that is not
+      System32's and an api set without a host) and selfie.dll (imports only itself); not skipper.exe, which imports a
+      file the graph had to skip, nor ucrtbase.dll, which only an api set reaches, nor hostlast.dll and hostspare.dll,
+      which only a later host of an api set reaches
+    * circular pairs: cyc1 and cyc2 by direct imports, viaset1 and viaset2 through an api set; not the ring tri1, tri2
+      and tri3, not selfie.dll, and not two1 and hostlast, which import each other only through the second host of an
+      api set that the map lists after hostfirst"""
+    def info(name, imports=None, forwarders=None):
+        return _q(name, "exe" if name.endswith(".exe") else "dll", imports=imports or {}, forwarders=forwarders or {},
+                  partial=partial.get(name.replace(".", "_"), False))
+    graph = _query_graph(
+        info("ntdll.dll"),
+        info("kernelbase.dll", {"ntdll.dll": ("NtClose",)}, {"HeapAlloc": "NTDLL.RtlAllocateHeap"}),
+        info("kernel32.dll", {"api-ms-win-core-memory-l1-1-0.dll": ("VirtualAlloc",), "ntdll.dll": ("NtClose",)},
+             {"HeapAlloc": "KERNELBASE.HeapAlloc", "CloseHandle": "KERNELBASE.CloseHandle"}),
+        info("ucrtbase.dll", {"ntdll.dll": ("NtClose",)}),
+        info("a.exe", {"kernel32.dll": ("CloseHandle",), "api-ms-win-crt-stdio-l1-1-0.dll": ("printf",)}),
+        info("leaf.exe", {"kernel32.dll": ("CloseHandle",)}),
+        info("lone.exe"),
+        info("vendor.exe", {"vendor.dll": ("Go",), "api-ms-win-ghost-l1-1-0.dll": ("Boo",)}),
+        info("cyc1.dll", {"cyc2.dll": ("F",)}), info("cyc2.dll", {"cyc1.dll": ("G",)}),
+        info("selfie.dll", {"selfie.dll": ("H",)}),
+        info("tri1.dll", {"tri2.dll": ("A",)}), info("tri2.dll", {"tri3.dll": ("B",)}), info("tri3.dll", {"tri1.dll": ("C",)}),
+        info("viaset1.dll", {"api-ms-win-pair-l1-1-0.dll": ("P",)}), info("viaset2.dll", {"viaset1.dll": ("Q",)}),
+        info("two1.dll", {"api-ms-win-two-l1-1-0.dll": ("T",)}), info("hostfirst.dll"), info("hostspare.dll"),
+        info("hostlast.dll", {"two1.dll": ("U",)}),
+        info("skipper.exe", {"bad.dll": ("Z",)}),
+        api_sets={"api-ms-win-core-memory-l1-1-0": ("kernelbase.dll",), "api-ms-win-crt-stdio-l1-1-0": ("ucrtbase.dll",),
+                  "api-ms-win-pair-l1-1-0": ("viaset2.dll",), "api-ms-win-two-l1-1-0": ("hostfirst.dll", "hostlast.dll", "hostspare.dll")})
+    return dataclasses.replace(graph, skipped=(("bad.dll", "not a PE file"),))
+
+
+def _members(graph, name, table=None):
+    return binary_graph_query.metric_members(graph, table if table is not None else win32_to_nt.load_table(), name)
+
+
+def test_the_metrics_count_binaries_edges_forwarders_and_resolved_api_sets():
+    graph = _figures_system()
+    figures = binary_graph_query.metrics(graph, win32_to_nt.load_table())
+    assert figures["binaries"] == 21 == len(graph.binaries)
+    assert figures["edges"] == 20 == sum(graph.in_degree.values()), "one edge per binary and module it imports"
+    assert figures["forwarders"] == 3, "forwarded exports, not the binaries that forward them"
+    assert figures["api_sets_resolved"] == 4, "the api sets the binaries import and the map has a host for; ghost is not one"
+    assert figures["skipped"] == 1 and figures["partial"] == 0
+    assert set(figures) == {"binaries", "edges", "api_sets_resolved", "forwarders", "isolated", "circular_pairs",
+                            "curated_transitions", "most_imported", "skipped", "partial"}
+    assert list(figures) == list(binary_graph_query.METRICS), "the table of the page follows this order"
+    json.dumps(figures)
+    # most imported: the in-degree as the importers wrote the name, the most first, ties by name, never more than the cap
+    top = figures["most_imported"]
+    assert top[:2] == [{"name": "ntdll.dll", "in_degree": 3}, {"name": "kernel32.dll", "in_degree": 2}]
+    assert [(-m["in_degree"], m["name"]) for m in top] == sorted((-m["in_degree"], m["name"]) for m in top)
+    assert len(top) <= binary_graph_query.MOST_IMPORTED
+    assert all(set(m) == {"name", "in_degree"} for m in top)
+    # a graph the figures were computed from twice gives the same figures: nothing is kept between calls
+    assert binary_graph_query.metrics(graph, win32_to_nt.load_table()) == figures
+
+
+def test_an_isolated_binary_is_one_nothing_imports_and_that_imports_nothing_of_system32():
+    graph = _figures_system()
+    got = _members(graph, "isolated")
+    assert [node.id for node in got.nodes] == ["lone.exe", "selfie.dll", "vendor.exe"]
+    assert binary_graph_query.metrics(graph, win32_to_nt.load_table())["isolated"] == 3
+    # leaf.exe imports System32 but nothing imports it, hostfirst.dll imports nothing but an api set reaches it, and
+    # ucrtbase.dll is reached through an api set only: none of them is isolated
+    assert not {"leaf.exe", "hostfirst.dll", "ucrtbase.dll", "hostlast.dll", "skipper.exe"} & {n.id for n in got.nodes}
+    # hostspare.dll is the last host of an api set that two1.dll imports: it imports nothing and no binary names it, yet any
+    # host may be the one the loader picks, so a claim that it is isolated would overreach
+    assert "hostspare.dll" not in {n.id for n in got.nodes}
+    # a binary that imports a file the graph had to skip does import System32: it is not isolated
+    without = dataclasses.replace(graph, skipped=())
+    assert "skipper.exe" in {n.id for n in _members(without, "isolated").nodes}, "an import of a file nobody knows is no import of System32"
+    assert binary_graph_query.metrics(without, win32_to_nt.load_table())["isolated"] == 4
+    # a leaf .exe is not isolated just because nothing imports it
+    assert binary_graph_query.metrics(_query_graph(_q("k.dll"), _q("leaf.exe", "exe", imports={"k.dll": ("F",)})),
+                                      win32_to_nt.load_table())["isolated"] == 0
+
+
+def test_a_circular_pair_is_two_binaries_that_import_each_other():
+    graph = _figures_system()
+    figures = binary_graph_query.metrics(graph, win32_to_nt.load_table())
+    assert figures["circular_pairs"] == 2, "pairs, not the four directed edges"
+    got = _members(graph, "circular_pairs")
+    assert [node.id for node in got.nodes] == ["cyc1.dll", "cyc2.dll", "viaset1.dll", "viaset2.dll"]
+    assert got.total == 2 and got.roots == ("cyc1.dll", "cyc2.dll", "viaset1.dll", "viaset2.dll")
+    assert _edges(got) == {("cyc1.dll", "cyc2.dll", "imports"), ("cyc2.dll", "cyc1.dll", "imports"),
+                           ("viaset1.dll", "viaset2.dll", "imports"), ("viaset2.dll", "viaset1.dll", "imports")}
+    assert {edge.origin for edge in got.edges} == {"derived"}, "read from the binaries, never claimed more"
+    assert {edge.label for edge in got.edges if edge.source == "viaset1.dll"} == {"api-ms-win-pair-l1-1-0.dll"}, "the api set it goes through"
+    # a ring of three and a binary that imports itself are no pair; nor is one direction only
+    ring = _query_graph(_q("x.dll", imports={"y.dll": ("F",)}), _q("y.dll", imports={"z.dll": ("F",)}),
+                        _q("z.dll", imports={"x.dll": ("F",)}), _q("s.dll", imports={"s.dll": ("F",)}))
+    assert binary_graph_query.metrics(ring, win32_to_nt.load_table())["circular_pairs"] == 0
+    # a pair made only through the second host of an api set is not claimed: an api set counts as its first host
+    assert "two1.dll" not in {n.id for n in got.nodes} and "hostlast.dll" not in {n.id for n in got.nodes}
+
+
+def test_the_curated_transitions_count_the_entries_of_the_win32_to_nt_table():
+    table = win32_to_nt.load_table()
+    figures = binary_graph_query.metrics(_figures_system(), table)
+    assert figures["curated_transitions"] == len(table.entries) > len(table.covered), "rows, not the Nt names they lead to"
+    # a Win32 name with two rows, and an Nt name with two doors, count by their rows
+    row = {"source": "documented", "note": "x"}
+    small = win32_to_nt.parse_table({"version": 1, "entries": [
+        dict(row, win32="Door", nt="NtWriteVirtualMemory"), dict(row, win32="Door", nt="NtProtectVirtualMemory"),
+        dict(row, win32="Other", nt="NtWriteVirtualMemory")]})
+    assert binary_graph_query.metrics(_figures_system(), small)["curated_transitions"] == 3
+    got = _members(_figures_system(), "curated_transitions", small)
+    assert got.total == 3 and [(e.source, e.target) for e in got.edges] == [
+        ("Door", "syscall:NtWriteVirtualMemory"), ("Door", "syscall:NtProtectVirtualMemory"), ("Other", "syscall:NtWriteVirtualMemory")]
+    # each row is the table's word and says so: the one place besides the last edge of a path where an edge is curated
+    assert {(e.kind, e.origin, e.label) for e in got.edges} == {("reaches_syscall", "curated", "curated: documented")}
+    assert got.roots == ("Door", "Other")
+    # a table that could not be read is no zero
+    assert binary_graph_query.metrics(_figures_system(), None)["curated_transitions"] is None
+    gone = binary_graph_query.metric_members(_figures_system(), None, "curated_transitions")
+    assert gone.nodes == () and "could not be read" in gone.note
+
+
+def test_the_members_behind_a_metric_are_the_binaries_it_counted():
+    graph = _figures_system()
+    table = win32_to_nt.load_table()
+    figures = binary_graph_query.metrics(graph, table)
+    assert {n.id for n in _members(graph, "binaries").nodes} == set(graph.binaries) and _members(graph, "binaries").total == 21
+    forwards = _members(graph, "forwarders")
+    assert {n.id for n in forwards.nodes} == {"kernel32.dll!HeapAlloc", "kernel32.dll!CloseHandle", "kernelbase.dll!HeapAlloc"}
+    assert forwards.total == figures["forwarders"] == 3
+    # the module with the most forwarded exports comes first, so a cut keeps the ones that say the most
+    assert [n.id.split("!")[0] for n in forwards.nodes] == ["kernel32.dll", "kernel32.dll", "kernelbase.dll"]
+    assert {n.kind for n in forwards.nodes} == {"function"}
+    edges = _members(graph, "edges")
+    assert edges.total == figures["edges"] == 20 and len([e for e in edges.edges if e.source == "a.exe"]) == 2
+    assert {e.kind for e in edges.edges} == {"imports"} and {e.origin for e in edges.edges} == {"derived"}
+    assert ("a.exe", "api-ms-win-crt-stdio-l1-1-0.dll", "imports") in _edges(edges)
+    api = _members(graph, "api_sets_resolved")
+    assert {n.id for n in api.nodes} == {"api-ms-win-core-memory-l1-1-0.dll", "api-ms-win-crt-stdio-l1-1-0.dll",
+                                         "api-ms-win-pair-l1-1-0.dll", "api-ms-win-two-l1-1-0.dll"}
+    assert {n.kind for n in api.nodes} == {"api-set"} and api.total == figures["api_sets_resolved"] == 4
+    top = _members(graph, "most_imported")
+    assert [n.id for n in top.nodes][:2] == ["ntdll.dll", "kernel32.dll"] and top.total == len(figures["most_imported"])
+    assert _node(top, "ntdll.dll").in_degree == 3
+    skipped = _members(graph, "skipped")
+    assert [n.id for n in skipped.nodes] == ["bad.dll"] and "not a PE file" in skipped.nodes[0].label
+    assert skipped.total == 1
+    # every list is a whole answer: roots among nodes, every edge between nodes, a note in prose, nothing cut at this size
+    figures = binary_graph_query.metrics(_figures_system(lone_exe=True), table)
+    for name in binary_graph_query.METRICS:
+        got = _members(_figures_system(lone_exe=True), name)
+        _whole(got)
+        assert got.nodes and got.roots and _is_sentence(got.note) and got.truncated is False, name
+        counted = len(figures[name]) if isinstance(figures[name], list) else figures[name]
+        assert got.total == counted, name
+
+
+def test_a_metric_of_zero_has_no_members_and_an_empty_answer_says_why():
+    clean = _query_graph(_q("k.dll", exports=["F"]), _q("a.exe", "exe", imports={"k.dll": ("F",)}))
+    table = win32_to_nt.load_table()
+    figures = binary_graph_query.metrics(clean, table)
+    zero = [name for name, value in figures.items() if value == 0 or value == []]
+    assert {"forwarders", "isolated", "circular_pairs", "api_sets_resolved", "skipped", "partial"} <= set(zero)
+    for name in zero:
+        got = _members(clean, name)
+        assert (got.nodes, got.edges, got.roots, got.total, got.truncated) == ((), (), (), 0, False), name
+        assert _is_sentence(got.note), (name, got.note)
+    assert "curated_transitions" in figures and figures["curated_transitions"] > 0, "a figure the table gives is not zero here"
+
+
+def test_a_cut_table_makes_a_count_a_bound_and_the_list_says_so():
+    graph = _figures_system(lone_exe=True, a_exe=True)
+    figures = binary_graph_query.metrics(graph, win32_to_nt.load_table())
+    assert figures["partial"] == 2
+    assert [n.id for n in _members(graph, "partial").nodes] == ["a.exe", "lone.exe"]
+    for name in ("edges", "forwarders", "isolated", "circular_pairs", "api_sets_resolved"):
+        got = _members(graph, name)
+        assert got.partial is True and "cut short" in got.note, name
+    assert _members(_figures_system(), "isolated").partial is False
+    assert "cut short" not in _members(_figures_system(), "isolated").note
+    # the figures that read no table at all are not caveated
+    assert _members(graph, "binaries").partial is False and _members(graph, "skipped").partial is False
+
+
+def test_an_unknown_metric_name_is_refused():
+    graph = _figures_system()
+    got = _members(graph, "everything")
+    assert (got.nodes, got.edges, got.roots, got.total) == ((), (), (), 0)
+    assert _is_sentence(got.note) and "everything" in got.note
+    for name in binary_graph_query.METRICS:
+        assert name in got.note, "the note names the figures there are"
+    for bad in ("", "  ", None, "Binaries", "__class__", "binaries ", "<img>"):
+        answer = binary_graph_query.metric_members(graph, win32_to_nt.load_table(), bad)
+        assert answer.nodes == () and _is_sentence(answer.note)
+    # the route's check refuses it before any graph is fetched
+    with pytest.raises(binary_graph_query.BadParameter):
+        binary_graph_query.check_parameters("metric", {"metric": "everything"})
+    with pytest.raises(binary_graph_query.MissingParameter):
+        binary_graph_query.check_parameters("metric", {"metric": ""})
+    binary_graph_query.check_parameters("metric", {"metric": "isolated"})
+
+
+def test_a_list_over_max_nodes_is_cut_whole_and_says_so():
+    wide = _query_graph(*[_q(f"b{i:04d}.exe", "exe", imports={}) for i in range(binary_graph_query.MAX_NODES + 50)])
+    got = _members(wide, "binaries")
+    assert got.truncated is True and len(got.nodes) == binary_graph_query.MAX_NODES and got.total == binary_graph_query.MAX_NODES + 50
+    assert [n.id for n in got.nodes][:2] == ["b0000.exe", "b0001.exe"] and "Only the first" in got.note
+    assert binary_graph_query.metrics(wide, win32_to_nt.load_table())["binaries"] == binary_graph_query.MAX_NODES + 50
+
+
+def _api_rows():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    reference = open(os.path.join(root, "docs", "api.md"), encoding="utf-8").read()
+    help_page = open(os.path.join(root, "webui", "templates", "index.html"), encoding="utf-8").read()
+    docs = {line.split("`")[1]: line for line in reference.splitlines() if line.startswith("| GET | `/api/binary-graph/")}
+    helps = {re.search(r"<code>(/api/binary-graph/[a-z]+)</code>", line).group(1): line for line in help_page.splitlines()
+             if re.search(r'<td class="api-get">GET</td><td><code>/api/binary-graph/', line)}
+    return docs, helps
+
+
+def test_both_pages_name_the_figures_route_every_figure_and_the_curated_zw_edge():
+    docs, helps = _api_rows()
+    assert set(docs) == set(helps) == {"/api/binary-graph/query", "/api/binary-graph/node", "/api/binary-graph/metrics"}
+    query, help_query = docs["/api/binary-graph/query"], helps["/api/binary-graph/query"]
+    for figure in binary_graph_query.METRICS:
+        assert f"`{figure}`" in query and f"<code>{figure}</code>" in help_query, f"a page does not name the figure {figure} of q=metric"
+        assert f"`{figure}`" in docs["/api/binary-graph/metrics"], f"docs/api.md does not name the figure {figure} of the metrics route"
+    # a Zw name's edge is the table's word, and neither page may go on saying that a direct import is derived throughout
+    assert "`curated: zw-alias`" in query and "naming convention" in query
+    assert "Zw" in help_query and "naming convention" in help_query and "curated" in help_query
+    assert "by data" not in query
+    # a metric the table cannot give is null, never 0, and both pages say so for the route
+    assert "`null`" in docs["/api/binary-graph/metrics"] and "null" in helps["/api/binary-graph/metrics"]
+    assert "the only curated edge of any answer" not in query
