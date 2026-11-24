@@ -26046,18 +26046,25 @@ function syscallRenderAll() {
     syscallApplyLower();
 }
 
-// The bar over the scan panels, which names what is behind them when they are folded. A panel that is not there at
-// all (the stub search has not run) is left out: the bar may only promise what the row holds.
+// The bar over the scan panels, which is all the reader has of them while the graph view keeps them folded. A panel
+// that is not there at all (the stub search has not run) is left out: the bar may only promise what the row holds.
+// A count alone would hide a search that read only one of its two ways in, or one the server marked partial, and an
+// empty hooks count looks exactly like "nothing to report" when the list could not be read at all.
 function syscallLowerNote() {
     const el = id => document.getElementById(id);
     const parts = [];
-    const add = (title, head) => {
-        const count = (el(head)?.textContent || '').trim();
-        parts.push(count ? `${title} (${count})` : title);
+    const add = (title, head, trouble) => {
+        const said = [(el(head)?.textContent || '').trim(), trouble].filter(Boolean).join(', ');
+        parts.push(said ? `${title} (${said})` : title);
     };
     add('DEVIATIONS', 'syscall-deviations-head');
-    if (!el('syscall-stubs')?.hidden) add('DIRECT SYSCALL STUBS', 'syscall-stubs-head');
-    add('KNOWN HOOKS', 'syscall-hooks-head');
+    const stubs = syscallState.stubs;
+    if (!el('syscall-stubs')?.hidden) {
+        const model = stubs.searched && !stubs.running ? syscallStubsModel() : null;
+        add('DIRECT SYSCALL STUBS', 'syscall-stubs-head', model && model.partial ? 'not complete' : '');
+    }
+    const hooks = syscallState.hooks;
+    add('KNOWN HOOKS', 'syscall-hooks-head', hooks.error || hooks.problem ? 'could not be read' : '');
     return parts.join(' · ');
 }
 
@@ -26509,13 +26516,17 @@ function renderSyscallStubsPanel() {
     const lower = document.getElementById('syscall-lower');
     if (lower && lower.classList) lower.classList.toggle('with-stubs', st.searched);
     if (panel) panel.hidden = !st.searched;
-    if (!st.searched) return;
-    const model = syscallStubsModel();
-    if (head) head.textContent = st.running ? `Searching PID ${st.pid}…` : `PID ${st.pid} · ${model.hits.length} hit${model.hits.length === 1 ? '' : 's'}`;
-    if (!body) return;
-    const top = body.scrollTop;
-    body.innerHTML = st.running ? `<p class="syscall-empty">Searching PID ${escapeHtml(st.pid)}…</p>` : renderSyscallStubs(model);
-    body.scrollTop = top;
+    if (st.searched) {
+        const model = syscallStubsModel();
+        if (head) head.textContent = st.running ? `Searching PID ${st.pid}…` : `PID ${st.pid} · ${model.hits.length} hit${model.hits.length === 1 ? '' : 's'}`;
+        if (body) {
+            const top = body.scrollTop;
+            body.innerHTML = st.running ? `<p class="syscall-empty">Searching PID ${escapeHtml(st.pid)}…</p>` : renderSyscallStubs(model);
+            body.scrollTop = top;
+        }
+    }
+    // in the graph view this row is folded and the bar over it is the only trace of this panel
+    syscallApplyLower();
 }
 
 async function runSyscallStubs() {
@@ -26623,6 +26634,7 @@ function renderSyscallHooks() {
     const top = host.scrollTop;
     host.innerHTML = renderHookAllowlist(syscallHooksModel());
     host.scrollTop = top;
+    syscallApplyLower();
 }
 
 async function syscallLoadHooks() {
@@ -27611,11 +27623,11 @@ function binaryGraphExploreDegree(node) {
 // What the controls around a chosen node do. START chooses the binary it draws at once, so without this the line
 // that guides a reader ("Choose a node, then EXPAND…") never appears: it only shows while nothing is chosen. A
 // function or an api set has no functions to open, and naming a button that is disabled for it would mislead.
+// DEPTH belongs to EXPAND alone: FUNCTIONS is one hop whatever DEPTH says (binaryGraphOpenFunctions).
 function binaryGraphExploreNextStep(node) {
     const opens = node && (node.kind === 'dll' || node.kind === 'exe');
-    return opens
-        ? 'EXPAND opens the modules around it, FUNCTIONS the functions it imports; DEPTH sets how many hops one click opens.'
-        : 'EXPAND opens the modules around it; DEPTH sets how many hops one click opens.';
+    return 'EXPAND opens the modules around it, as many hops as DEPTH says'
+        + (opens ? '; FUNCTIONS draws the functions it imports, always one hop.' : '.');
 }
 
 function binaryGraphExploreInfo(st) {
@@ -28289,9 +28301,16 @@ function binaryGraphMetricsStatus() {
         html += `<strong class="binary-graph-cut">${escapeHtml(cut.toLocaleString('en-US'))} ${cut === 1 ? 'binary has' : 'binaries have'} a table (import, delay-load or export) that was cut short when the graph was read: `
             + 'the counts that read tables are lower bounds, and the number of isolated binaries is an upper one.</strong> ';
     }
+    // `skipped` is of the same class as `partial` and belongs beside it: the figures table, its only other home, is
+    // what EXPLORE folds away, and a file the build could not read at all is a hole no count of the table shows
+    const lost = typeof f.skipped === 'number' && f.skipped > 0 ? f.skipped : 0;
+    if (lost) {
+        html += `<strong class="binary-graph-cut">${escapeHtml(lost.toLocaleString('en-US'))} ${lost === 1 ? 'file of System32 could not be read' : 'files of System32 could not be read'} at all when the graph was built: `
+            + 'they are in no count and in no answer.</strong> ';
+    }
     const stamp = [f.build ? `build ${f.build}` : '', f.arch || ''].filter(Boolean).join(' · ');
     if (stamp) html += `<span class="syscall-muted">${escapeHtml(stamp)}</span>`;
-    return { tone: cut ? 'warn' : 'info', html };
+    return { tone: cut || lost ? 'warn' : 'info', html };
 }
 
 function renderBinaryGraphMetrics() {

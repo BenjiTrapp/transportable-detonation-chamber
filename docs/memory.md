@@ -458,11 +458,17 @@ list behind it in the DETAIL panel and a row of that list starts an exploration.
 column and the figures table 260, so GRAPH folds those panels away and **⇱** folds
 the figures' rows as well: 240 px becomes 647. EXPLORE, which works on the canvas,
 starts with those rows folded — at 1280×900 that is 254 px of canvas against 438 —
-and PATH, whose answer is a short path, keeps the figures beside it. Folded is
-never silent. The scan
-panels keep a bar that names them with their counts, because a stub run in the
-graph view writes its proof there, and ⇱ leaves the figures' own line standing,
-the one that says how many binaries had a table cut short. A fold or unfold by
+and PATH, whose answer is a short path, keeps the figures beside it.
+
+What a fold may not do is swallow something the reader should learn. The scan
+panels keep a bar that names them, carries each one's count as it is written, and
+says when a stub search was not complete or the hook list could not be read at
+all — a stub run in the graph view writes the proof of this whole feature into
+that row. ⇱ leaves the figures' own line standing, the one that says how many
+binaries had a table cut short and how many files could not be read at all; only
+the rows go. A scan's own result line sits outside both views and is never
+folded. What a fold does hide is the detail behind a count, and the bar is a
+pointer to it, not a replacement. A fold or unfold by
 hand is kept from then on. The canvas zooms with the wheel, `+` and `−`, FIT
 brings every node into view, LAYOUT lays them out again, and a drag moves a node
 or the view; the line under the canvas says what the controls around the chosen

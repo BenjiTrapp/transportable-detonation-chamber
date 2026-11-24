@@ -12714,9 +12714,7 @@ button.logs-trunc:hover { color: var(--accent-orange); text-decoration: underlin
     color: var(--text-secondary);
     overflow-wrap: anywhere;
 }
-/* The figures of the whole stock under the canvases, and the list of one in the detail panel. They never shrink below
-   their content (up to 260px, past which their body scrolls): shrunk, they left a 30px window with no whole row. */
-/* ⇱ folds the figures' rows away and gives their height to the graph; the bar, RELOAD and the cut-table caveat stay */
+/* ⇱ folds the figures' rows away and gives their height to the graph; the bar, RELOAD and the caveats stay */
 .binary-graph-max {
     margin-left: auto;
     flex: 0 0 auto;
@@ -12724,6 +12722,8 @@ button.logs-trunc:hover { color: var(--accent-orange); text-decoration: underlin
 .binary-graph-maxed .binary-graph-metrics-wrap {
     display: none;
 }
+/* The figures of the whole stock under the canvases, and the list of one in the detail panel. They never shrink below
+   their content (up to 260px, past which their body scrolls): shrunk, they left a 30px window with no whole row. */
 .binary-graph-metrics {
     flex: 0 0 auto;
     display: flex;

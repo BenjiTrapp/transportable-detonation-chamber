@@ -725,7 +725,7 @@ def test_the_curated_edge_and_the_match_do_not_look_like_a_deviation():
 
 def test_the_assets_moved_on():
     html = _read(INDEX_HTML)
-    for asset, minimum in (("style.css", 93), ("theme-cyberpunk.css", 38), ("app.js", 160)):
+    for asset, minimum in (("style.css", 94), ("theme-cyberpunk.css", 38), ("app.js", 161)):
         version = int(re.search(rf"{re.escape(asset)}\?v=(\d+)", html).group(1))
         assert version >= minimum, f"{asset} was changed and kept its ?v="
 
@@ -2194,6 +2194,9 @@ def test_a_chosen_node_still_says_what_the_controls_around_it_do():
     binary = _plain(r["chosen"]["info"])
     assert "ntdll.dll" in binary and "EXPAND" in binary and "FUNCTIONS" in binary, binary
     assert "DEPTH" in binary, "and what DEPTH changes about one click"
+    # found in review: DEPTH belongs to EXPAND alone, FUNCTIONS is one hop whatever DEPTH says
+    assert re.search(r"EXPAND[^;]*DEPTH", binary), "DEPTH is named on EXPAND's side of the sentence"
+    assert "always one hop" in binary, "and FUNCTIONS says it does not follow DEPTH"
     function = _plain(r["fn"]["info"])
     assert "EXPAND" in function, function
     assert "FUNCTIONS" not in function, "a function has no functions to open: naming the button would mislead"
@@ -2237,7 +2240,9 @@ def test_a_stage_that_changed_size_keeps_what_was_in_the_middle_in_the_middle():
     is why this never showed before; now ⇱, the fold and the view switch all resize it.
 
     So a resize moves the camera by half the change: the world point that was in the middle stays there, at the same
-    zoom. A first size (no canvas yet) moves nothing."""
+    zoom. The no-canvas-yet case below is a guard, not something the page does: the canvas carries width and height
+    in the markup, so its first real resize does move the camera, which is harmless because START resets the camera
+    and fits."""
     r = _explore_flow(r"""
       st.camera = { x: 300, y: 200, zoom: 2 };
       const canvas = els['binary-explore-canvas'];
@@ -2259,3 +2264,28 @@ def test_a_stage_that_changed_size_keeps_what_was_in_the_middle_in_the_middle():
             assert abs(r[state]["middle"][axis] - r["middleBefore"][axis]) < 0.51, (state, axis, r[state]["middle"])
     assert r["firstSize"]["camera"] == {"x": 7, "y": 9, "zoom": 1}, "a first size moves nothing"
     assert r["firstSize"]["size"] == [500, 300]
+
+
+@needs_node
+def test_a_file_the_graph_could_not_read_at_all_is_said_beside_the_cut_tables():
+    """Found in review. `skipped` counts the System32 files the build could not read at all, and it existed only as
+    a row of the figures table - which EXPLORE now starts with folded, so that completeness fact left the screen.
+    It is of the same class as `partial` and belongs where `partial` already is: the figures' own status line, which
+    no fold touches. Zero says nothing, as everywhere else here."""
+    r = _figures_flow(r"""
+      (async () => {
+        figures = { ...figures, partial: 0, skipped: 0 };
+        await shown();
+        const none = els['binary-graph-metrics-status'].innerHTML;
+        figures = { ...figures, skipped: 5 };
+        await binaryGraphMetricsLoad(true);
+        const some = els['binary-graph-metrics-status'].innerHTML;
+        figures = { ...figures, partial: 7, skipped: 5 };
+        await binaryGraphMetricsLoad(true);
+        out({ none, some, both: els['binary-graph-metrics-status'].innerHTML });
+      })();""")
+    assert "skipped" not in r["none"].lower() and "could not be read" not in r["none"], r["none"]
+    assert "5" in r["some"] and "could not be read" in r["some"], r["some"]
+    assert "7" in r["both"] and "5" in r["both"], r["both"]
+    assert r["both"].index("cut short") < r["both"].index("could not be read"), \
+        "the cut tables first, then the files that were not read at all"

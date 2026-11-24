@@ -2715,3 +2715,43 @@ def test_the_detail_names_the_relay_a_hook_went_through():
         relay: [{address: 140703380275200, owner: "private", pattern: "JMP [rip]<b>"}]}));""")
     assert "Relay" in html and "0x7FF80F000000" in html and "JMP [rip]&lt;b&gt;" in html
     assert "<b>" not in html
+
+
+@needs_node
+def test_the_fold_bar_follows_a_stub_run_and_says_when_a_count_is_not_the_whole_story():
+    """Found in review. The graph view folds DEVIATIONS, DIRECT SYSCALL STUBS and KNOWN HOOKS away and the bar is
+    all the reader has of them, but the bar was written only from syscallSetView and syscallRenderAll - and a stub
+    run ends in renderSyscallStubsPanel, a hooks load in renderSyscallHooks, neither of which touched it. So a stub
+    run in the graph view finished, wrote the proof of this whole feature into a folded row, and the bar still said
+    "DEVIATIONS · KNOWN HOOKS": the one case the fold was justified by.
+
+    A count alone is not the whole story either. A search that could read only one of its two ways in, or one the
+    server marked partial, would show as a plain "2 hits". The bar says so, and so does a hooks list that could not
+    be read, where an empty head otherwise looks exactly like "nothing to report"."""
+    r = _panels(STUBS_FLOW + r"""
+      (async () => {
+        await searchable();
+        syscallSetView('graph');
+        const folded = () => els['syscall-lower'].className.includes('syscall-lower-folded');
+        const bar = () => els['syscall-lower-note'].textContent;
+        const before = { folded: folded(), bar: bar() };
+        await runSyscallStubs();
+        const after = bar();
+        // a search that could read only one of its two ways in
+        syscallState.stubs.sources.file = { skipped: 'no image path is known for this process' };
+        renderSyscallStubsPanel();
+        const incomplete = bar();
+        syscallState.stubs.running = true;
+        renderSyscallStubsPanel();
+        const running = bar();
+        syscallState.stubs.running = false;
+        syscallState.hooks = { ...syscallState.hooks, loaded: false, error: 'the hook baseline could not be read' };
+        renderSyscallHooks();
+        out({ before, after, incomplete, running, hooks: bar() });
+      })();""")
+    assert r["before"]["folded"] is True and "DIRECT SYSCALL STUBS" not in r["before"]["bar"]
+    assert "DIRECT SYSCALL STUBS" in r["after"] and "hit" in r["after"], r["after"]
+    assert "4242" in r["after"], "and which process it was"
+    assert r["incomplete"] != r["after"] and "complete" in r["incomplete"].lower(), r["incomplete"]
+    assert "earch" in r["running"], r["running"]
+    assert "KNOWN HOOKS" in r["hooks"] and "read" in r["hooks"].lower(), r["hooks"]
