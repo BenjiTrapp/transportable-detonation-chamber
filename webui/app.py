@@ -8705,8 +8705,9 @@ def _syscall_search_file(content, baseline):
     from here. One it cannot name may be a door: the hits keep their True, and no stub becomes a proof.
 
     A stub that is the body of an export under its own Nt or Zw name is the documented path itself, a copy of ntdll,
-    and is imported (True). Nothing else in the export table counts: the author of a sample writes it, so a door name
-    or the Nt name pointing anywhere but at the stub would buy off the proof for one line.
+    and is imported (True): one that starts at the export's address or less than one stub's read length after it.
+    Nothing else in the export table counts: the author of a sample writes it, so a door name or the Nt name pointing
+    anywhere but at the stub would buy off the proof for one line.
 
     A view the file's machine does not match claims no absence and reads no export: the export table describes the
     native view only (an ARM64X ntdll names its ARM64 stubs, not its x64 ones)."""
@@ -8739,11 +8740,18 @@ def _syscall_search_file(content, baseline):
         keywords["covered"] = frozenset()
     hits = syscall_scan.find_stubs_in_bytes(content, baseline, imports, **keywords)
     exported = _pe_export_offsets(content) if imports is not None and not foreign else {}
+    # Ruling 71: the stub is the body of the export, so inside it, not only at its first byte (arm64 ntdll has a
+    # second SVC 16 bytes into NtUnmapViewOfSection). The bound is one stub's read length of the view: with none, any
+    # stub after an export would match it, and the rescue would buy off every proof behind a single Nt export
+    span = syscall_baseline.READ_LEN.get(baseline.view, 0)
     for hit in hits:
-        name = hit.get("syscall")
+        name, at = hit.get("syscall"), hit.get("offset")
         if hit.get("import_present") is True or not isinstance(name, str) or not name.startswith("Nt"):
             continue
-        if any(exported.get(alias) == hit.get("offset") for alias in (name, "Zw" + name[2:])):
+        if not isinstance(at, int):
+            continue
+        starts = (exported.get(alias) for alias in (name, "Zw" + name[2:]))
+        if any(isinstance(start, int) and 0 <= at - start < span for start in starts):
             hit["import_present"] = True
     return hits, imports, doors_note
 

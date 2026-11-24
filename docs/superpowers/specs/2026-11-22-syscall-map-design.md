@@ -614,6 +614,12 @@ mitgebrachten Stub daher nie sähe.
   die Nummer in seiner Tabelle, es gibt keinen Cache, oder der Cache hat eine andere
   Sicht als die Datei —, ist die Tür unbekannt: im Prozessmodus ist die Vereinigung
   unvollständig, und auch im Dateimodus wird dann kein Fehlen behauptet.
+- **Ein Stub, der Rumpf eines Exports unter seinem eigenen Nt- oder Zw-Namen ist**
+  (eine Kopie von ntdll), gilt im Dateimodus als importiert (`True`): er beginnt an
+  der Adresse des Exports oder weniger als eine Stub-Leselänge dahinter (`READ_LEN`,
+  20 Byte auf ARM64, 32 auf x64), denn die ARM64-ntdll trägt einen zweiten `SVC`
+  sechzehn Byte tief in `NtUnmapViewOfSection`. Die Grenze hält die Regel eng: ohne
+  sie passte jeder Stub hinter einem Export dieses Namens.
 - **Grenze: Eine Sicht, die nicht zur Maschine der Datei passt, trägt kein Fehlen.**
   Verglichen wird die gesuchte Sicht mit `FileHeader.Machine` der Datei. Die
   Exporttabelle, die pefile liest, beschreibt die native Sicht der Datei; ein Stub,

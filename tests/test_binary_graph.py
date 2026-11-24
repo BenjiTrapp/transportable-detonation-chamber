@@ -392,6 +392,24 @@ def test_a_mismatched_view_keeps_the_true_of_the_raw_import_table(client, tdc, t
     assert hit["import_present"] is True
 
 
+def test_a_stub_inside_its_export_within_one_stub_length_holds_its_door(client, tdc, target, sample_dir):
+    # Ruling 71, from the VM: arm64 ntdll found NtUnmapViewOfSection at 0x8d0 (its export) and again at 0x8e0,
+    # sixteen bytes into the same function; the second read as a bypass. Inside the body counts, within READ_LEN
+    assert syscall_baseline.READ_LEN["arm64"] == 20
+    inside = make_pe(exports=("NtWriteVirtualMemory",), machine=0xAA64, code=_ARM64_NOP * 4 + _ARM64_STUB_0x3A)
+    [hit] = _file_stubs(client, sample_dir, inside, "arm64")["hits"]
+    assert (hit["offset"], hit["import_present"]) == (0x3D0, True)
+    # the bound is tight: one stub length past the export is no longer its body
+    past = make_pe(exports=("NtWriteVirtualMemory",), machine=0xAA64, code=_ARM64_NOP * 5 + _ARM64_STUB_0x3A)
+    [hit] = _file_stubs(client, sample_dir, past, "arm64")["hits"]
+    assert (hit["offset"], hit["import_present"]) == (0x3D4, False)
+    # and a stub before the export is not inside it
+    before = make_pe(exports=("NtWriteVirtualMemory",), machine=0xAA64, export_rva=0x11C4,
+                     code=_ARM64_STUB_0x3A + _ARM64_NOP)
+    [hit] = _file_stubs(client, sample_dir, before, "arm64")["hits"]
+    assert (hit["offset"], hit["import_present"]) == (0x3C0, False)
+
+
 def test_the_detonation_stage_without_a_sample_file_keeps_import_present_unknown(tdc, target):
     target.view = "x64"
     target.reader = _x64_space(b"\x90" * 0x40 + _X64_STUB_0x3A + b"\xc3")

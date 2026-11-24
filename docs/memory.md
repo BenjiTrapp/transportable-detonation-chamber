@@ -214,8 +214,12 @@ documented entry points to that syscall. An uncommon wrapper to a covered syscal
 reads as a bypass: a false positive on an unusual but clean program that carries a
 raw stub, never a false negative on malware. Each newly found entry point widens
 the table; it does not change the rule. A file's export table counts only where a
-stub is the body of an export under its own Nt or Zw name, as in a copy of `ntdll`;
-a sample that publishes its own stub that way escapes the proof, but a non-`ntdll`
+stub is the body of an export under its own Nt or Zw name, as in a copy of `ntdll`:
+the stub starts at the export's address or less than one stub's read length after it
+(20 bytes on ARM64, 32 on x64), since ARM64 `ntdll` carries a second `SVC` sixteen
+bytes into `NtUnmapViewOfSection`. The bound is what keeps the rule tight: without
+it any stub after an export of that name would match. A sample that publishes its own
+stub that way escapes the proof, but a non-`ntdll`
 PE exporting syscall stubs is a loud indicator in its own right, so a silent free
 escape becomes a noisy one.
 
