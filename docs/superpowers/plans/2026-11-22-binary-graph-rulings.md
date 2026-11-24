@@ -13,9 +13,9 @@ das aber gitignoriert ist und mit dem Worktree verschwindet.
 ## Der Fehlbeschuldigungs-Pfad
 
 Ein `import_present: False` ist ein struktureller Befund mit Gewicht 4.0, der keine
-Bestätigung braucht. Ein falsches `False` beschuldigt ein sauberes Programm. **Fünf
-verschiedene Wege dorthin** sind während dieses Plans gefunden worden, drei erst nachdem
-ein Reviewer sie reproduziert hat.
+Bestätigung braucht. Ein falsches `False` beschuldigt ein sauberes Programm. **Acht
+verschiedene Wege dorthin** sind während dieses Plans gefunden worden; von den ersten fünf
+kamen drei erst ans Licht, nachdem ein Reviewer sie reproduziert hatte.
 
 | Entscheidung | Kosten, wenn falsch |
 |---|---|
@@ -55,7 +55,7 @@ ein Reviewer sie reproduziert hat.
 
 ## Falsche Aussagen, korrigiert statt umgangen
 
-Elf. Jede einzelne kam aus einem Review, keine aus einer Selbstmeldung.
+Vierzehn. Jede einzelne kam aus einem Review, keine aus einer Selbstmeldung.
 
 1. Spec Ziel 7 erzählte von einer Kette „über kernel32 und kernelbase **zu ntdll**", während Ziel 6 selbst sagt, kernelbase **ruft** `NtWriteVirtualMemory` und leitet nicht weiter.
 2. „Der Loader probiert die Hosts der Reihe nach" — eine Behauptung über `ApiSetResolveToHost`, die keiner von uns geprüft hatte. Gestrichen, nicht umgedreht.
@@ -68,6 +68,9 @@ Elf. Jede einzelne kam aus einem Review, keine aus einer Selbstmeldung.
 9. Ein Docstring: „an api-set name has dots of its own (`api-ms-win-core-heap-l1-1-0`)" — das eigene Beispiel hat keine.
 10. Tooltip und Detailpanel einer `zw-alias`-Kante sagten „from the Win32 to Nt table", was keine Tabellenzeile stützt.
 11. Eine Fixture packte `HashedLength` nach Vermutung, gegen zwei dokumentierte Quellen — unbenutzt, und darum eine Zeile wert.
+12. Entscheidung 66 stand an sechs Stellen als Behebung eines Fehlers, der nie gemessen war: 144 Einträge „mit leerem Host nach dem ersten", darunter Memory und Processthreads. Gemessen haben alle 144 einen einzigen Wert ohne Importeur und Host; die Regel für spätere Werte hat auf `26200.9974` keinen Fall (Entscheidung 75).
+13. Der Befundtext eines Stubs, von dessen Kopien nur einige Rumpf eines eigenen Exports sind, nannte alle Kopien „the module's own code" — die übrigen sind gerade mitgebrachte Stubs, und `docs/memory.md` nennt genau diesen Fall einen lauten Hinweis (Entscheidung 76).
+14. VM-Prüfung 5 erwartete für eine echte `ntdll.dll` in der x64-Sicht `True` auf jedem Treffer, was Entscheidung 70 verbietet (Entscheidung 77).
 
 Dazu zwei ungemessene Zahlen, die wie gemessene lasen: „a few hundred MB" (ohne jede
 Quelle, gestrichen) und „a build takes a few minutes über ~4.000 Dateien" (jetzt als

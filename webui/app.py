@@ -8440,8 +8440,8 @@ def _syscall_stage(pid, path):
     file_hits, in_file = _syscall_stage_file(path, baseline)
     in_file["hits"] = list(file_hits)
     findings = memory_evidence.collect({"syscall_scan": measured}, process=identity)
-    # the file's hits go first: a finding takes its answer from its first copy, and the file's speaks for the sample
-    # itself, where the process's speaks for everything loaded beside it
+    # the file's copies decide a finding's answer whatever their place in the list (the weakest claim among them,
+    # Ruling 72): the file speaks for the sample itself, the process for everything loaded beside it
     findings += memory_evidence.from_direct_stubs(in_file["hits"] + in_process["hits"], identity)
     return _syscall_mark_unobserved({
         **{k: v for k, v in measured.items() if k != "states"},
