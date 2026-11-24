@@ -468,9 +468,10 @@ def path_to_syscall(graph, table, baseline, module: str, function: str) -> Answe
             note += " The hops it did take are drawn."
         return ended(note, _CUT_SHORT_NEGATIVE)
     hops = _plural(len(resolution.hops), "hop", "hops")
-    # the stub itself: the baseline keys a syscall by its Nt name, and ntdll exports each also as Zw
+    # the stub itself: ntdll exports each under its Nt and its Zw name, and the baseline holds one of the two, whichever
+    # NTSleuth emitted first (on 26200.9974 ZwWriteVirtualMemory on x64): found under either, drawn under the Nt name
     nt_name = "Nt" + end_function[2:] if end_function.startswith("Zw") and len(end_function) > 2 else end_function
-    stub = baseline.syscalls.get(nt_name) if baseline is not None else None
+    stub = syscall_baseline.find(baseline, nt_name) if baseline is not None else None
     if stub is not None and stub.module.lower() == end_module:
         syscall = Node(f"syscall:{nt_name}", f"{nt_name} ({stub.module}, 0x{stub.number:x})", "syscall", 0, "")
         part.nodes.append(syscall)
@@ -523,7 +524,7 @@ def path_to_syscall(graph, table, baseline, module: str, function: str) -> Answe
                   "ntdll in the binary graph does not export it either, and no syscall of this build has that name")
         return ended(f"The path ends at {end}. The curated table leads {entry.win32} to {entry.nt}: {clause}, so no "
                      f"syscall number can be given. The baseline may be of another build, or incomplete.{more}")
-    target = baseline.syscalls[entry.nt]
+    target = syscall_baseline.find(baseline, entry.nt)        # missing_from accepts the Zw form: so does this
     syscall = Node(f"syscall:{entry.nt}", f"{entry.nt} ({target.module}, 0x{target.number:x})", "syscall", 0, "")
     part.nodes.append(syscall)
     part.edges.append(Edge(end, syscall.id, "reaches_syscall", "curated", f"curated: {entry.source}"))

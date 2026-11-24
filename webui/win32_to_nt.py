@@ -79,9 +79,14 @@ class Table:
 
     def missing_from(self, syscall_names: Iterable[str]) -> tuple[str, ...]:
         """The Nt names of the table that `syscall_names` does not hold, in table order. Against the baseline of a
-        build (`table.missing_from(baseline.syscalls)`) it should be empty: a name it lists is no syscall there."""
+        build (`table.missing_from(baseline.syscalls)`) it should be empty: a name it lists is no syscall there.
+
+        An Nt name is held when its Zw form is (Ruling 69): one number, one stub, and the baseline keeps only the name
+        NTSleuth emitted first, which on 26200.9974 was the Zw one for four covered syscalls in each view. Only that
+        mechanical form counts."""
         held = set(syscall_names)
-        return tuple(dict.fromkeys(e.nt for e in self.entries if e.nt not in held))
+        return tuple(dict.fromkeys(e.nt for e in self.entries
+                                   if e.nt not in held and not (e.nt.startswith("Nt") and "Zw" + e.nt[2:] in held)))
 
 
 def parse_table(payload) -> Table:

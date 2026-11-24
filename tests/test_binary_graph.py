@@ -4033,6 +4033,25 @@ def test_a_door_loaded_during_the_search_takes_back_the_proof_of_a_stub_the_base
     assert [(h["syscall"], h["import_present"]) for h in body["hits"]] == [("NtQueueApcThread", True)]
 
 
+def test_the_path_to_a_syscall_the_baseline_names_zw_gives_its_number_ruling_69():
+    # test 5, sites A, F and G: the table's Nt name is present when the baseline holds its Zw form, the curated hop
+    # finds it there instead of raising KeyError, and a path ending at the Nt stub of ntdll names its number
+    baseline = syscall_baseline.parse_baseline(_zw_first(_fixture("arm64"), "NtWriteVirtualMemory"), "26220.5770",
+                                               "arm64")
+    assert "NtWriteVirtualMemory" not in baseline.syscalls
+    table = win32_to_nt.load_table()
+    assert "NtWriteVirtualMemory" not in table.missing_from(baseline.syscalls)
+    assert "NtWriteVirtualMemory" in table.missing_from({"NtClose"})                 # absent in both forms: missing
+    assert "NtWriteVirtualMemory" in table.missing_from({"XxWriteVirtualMemory"})    # only the mechanical form counts
+    got = _descend(_descent_system(), "kernel32.dll", "WriteProcessMemory", baseline)
+    assert _node(got, "syscall:NtWriteVirtualMemory").label == "NtWriteVirtualMemory (ntdll.dll, 0x3a)"
+    assert "0x3a" in got.note
+    for function in ("NtWriteVirtualMemory", "ZwWriteVirtualMemory"):
+        stub = _descend(_descent_system(), "ntdll.dll", function, baseline)
+        assert _node(stub, "syscall:NtWriteVirtualMemory").label == "NtWriteVirtualMemory (ntdll.dll, 0x3a)", function
+        assert "0x3a" in stub.note, function
+
+
 def test_the_lookup_of_one_syscall_finds_it_under_either_name_ruling_69(client, zw_x64):
     # a hit or a graph node names the syscall by its Nt name; the x64 baseline holds it as Zw
     for name in ("NtWriteVirtualMemory", "ZwWriteVirtualMemory"):
