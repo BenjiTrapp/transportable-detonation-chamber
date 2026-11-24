@@ -219,6 +219,19 @@ a sample that publishes its own stub that way escapes the proof, but a non-`ntdl
 PE exporting syscall stubs is a loud indicator in its own right, so a silent free
 escape becomes a noisy one.
 
+**A file searched in a view its machine does not match claims no absence.** The
+search compares the view against the file's own `FileHeader.Machine`. The export
+table the parser reads describes the file's native view, so a stub found in another
+view cannot be matched against it: an unmodified ARM64X `ntdll` (machine ARM64)
+searched in the x64 view has its x64 stubs near file offset `0x2fb000`, while every
+named export points at an ARM64 stub below `0x2400`. Without this rule every covered
+syscall of Microsoft's own `ntdll` read as a proven bypass. There every hit is `null`
+unless the import table names the function (`true`), `doors_complete` is `false`, and
+`doors_note` names both machines. Reading the hybrid (ARM64X) export table that
+describes the other view is not done: the parser does not expose it, and guessing it
+would be worse than declining. A sample built for x64 searched in the x64 view is
+unaffected.
+
 Two limits follow from the rule. Private executable memory is not the sample's
 alone (a hook engine, a browser sandbox's interception thunks or a runtime put
 stubs there too), so a stub found there is judged against the union of the doors

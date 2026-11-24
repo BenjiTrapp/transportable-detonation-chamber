@@ -614,6 +614,18 @@ mitgebrachten Stub daher nie sähe.
   die Nummer in seiner Tabelle, es gibt keinen Cache, oder der Cache hat eine andere
   Sicht als die Datei —, ist die Tür unbekannt: im Prozessmodus ist die Vereinigung
   unvollständig, und auch im Dateimodus wird dann kein Fehlen behauptet.
+- **Grenze: Eine Sicht, die nicht zur Maschine der Datei passt, trägt kein Fehlen.**
+  Verglichen wird die gesuchte Sicht mit `FileHeader.Machine` der Datei. Die
+  Exporttabelle, die pefile liest, beschreibt die native Sicht der Datei; ein Stub,
+  der in einer anderen Sicht gefunden wird, lässt sich nicht gegen sie abgleichen.
+  Gemessen: eine unveränderte ARM64X-ntdll (Maschine ARM64) in der x64-Sicht hat ihre
+  x64-Stubs um Dateioffset `0x2fb000`, während jeder benannte Export auf einen
+  ARM64-Stub unter `0x2400` zeigt; ohne diese Regel las jeder gedeckte Syscall von
+  Microsofts eigener ntdll als belegte Umgehung. Dort ist jeder Treffer `None`, außer
+  die Importtabelle nennt die Funktion (`True`), `doors_complete` ist `false`, und
+  `doors_note` nennt beide Maschinen. Die hybride (ARM64X-)Exporttabelle, die die
+  andere Sicht beschreibt, wird nicht gelesen: pefile legt sie nicht offen, und sie zu
+  erraten wäre schlechter, als abzulehnen.
 - **Grenzen des Belegs im Prozessspeicher.**
   - **Der Prozessmodus liefert praktisch nie einen Beleg.** `kernelbase.dll`, in
     jedem Win32-Prozess geladen, implementiert die Win32-Türen und importiert deren

@@ -357,6 +357,41 @@ def test_an_export_the_sample_wrote_for_itself_does_not_buy_off_the_proof(client
     assert _exported_stub_hit(client, sample_dir, ("NtAllocateVirtualMemory",))["import_present"] is False
 
 
+_ARM64_STUB_0x3A = bytes.fromhex("410700d4c0035fd6")       # svc #0x3a; ret
+_ARM64_NOP = bytes.fromhex("1f2003d5")
+
+
+def _file_stubs(client, sample_dir, data, view):
+    path = sample_dir / "ntdll.dll"
+    path.write_bytes(data)
+    return client.post("/api/syscalls/stubs", json={"path": str(path), "view": view}).get_json()
+
+
+def test_a_view_the_files_machine_does_not_match_claims_no_absence(client, tdc, target, sample_dir):
+    # Ruling 70, from the VM: an unmodified ARM64X ntdll (Machine 0xAA64) scanned in the x64 view. Its named export
+    # table gives the ARM64 offsets (NtWriteVirtualMemory at 0x9e0); the x64 stubs sit near 0x2fba40, which no export
+    # names, so every covered syscall read as a proven bypass. The export table does not describe that view
+    data = make_pe(exports=("NtWriteVirtualMemory",), machine=0xAA64,
+                   code=_ARM64_STUB_0x3A + _ARM64_NOP * 14 + _X64_STUB_0x3A)
+    body = _file_stubs(client, sample_dir, data, "x64")
+    [hit] = body["hits"]
+    assert (hit["syscall"], hit["offset"], hit["import_present"]) == ("NtWriteVirtualMemory", 0x400, None)
+    assert body["doors_complete"] is False
+    assert "x64" in body["doors_note"] and "arm64" in body["doors_note"] and "export" in body["doors_note"]
+    # the same image in its own view: the export names the stub, the copy of ntdll holds its door
+    body = _file_stubs(client, sample_dir, data, "arm64")
+    [hit] = body["hits"]
+    assert (hit["syscall"], hit["offset"], hit["import_present"]) == ("NtWriteVirtualMemory", 0x3C0, True)
+    assert body["doors_complete"] is True and body["doors_note"] == ""
+
+
+def test_a_mismatched_view_keeps_the_true_of_the_raw_import_table(client, tdc, target, sample_dir):
+    # only an absence is unreadable there: an import of the function still speaks, as it only ever weakens
+    data = make_pe(imports=(("ntdll.dll", ("NtWriteVirtualMemory",)),), machine=0xAA64, code=_X64_STUB_0x3A)
+    [hit] = _file_stubs(client, sample_dir, data, "x64")["hits"]
+    assert hit["import_present"] is True
+
+
 def test_the_detonation_stage_without_a_sample_file_keeps_import_present_unknown(tdc, target):
     target.view = "x64"
     target.reader = _x64_space(b"\x90" * 0x40 + _X64_STUB_0x3A + b"\xc3")

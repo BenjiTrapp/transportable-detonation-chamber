@@ -8706,7 +8706,10 @@ def _syscall_search_file(content, baseline):
 
     A stub that is the body of an export under its own Nt or Zw name is the documented path itself, a copy of ntdll,
     and is imported (True). Nothing else in the export table counts: the author of a sample writes it, so a door name
-    or the Nt name pointing anywhere but at the stub would buy off the proof for one line."""
+    or the Nt name pointing anywhere but at the stub would buy off the proof for one line.
+
+    A view the file's machine does not match claims no absence and reads no export: the export table describes the
+    native view only (an ARM64X ntdll names its ARM64 stubs, not its x64 ones)."""
     info, why = _pe_sample_record(content)
     imports = _record_import_names(info) if info is not None else None
     # the reader's reason says what happened: no PE at all, or which of its directories pefile refused
@@ -8721,12 +8724,21 @@ def _syscall_search_file(content, baseline):
         if info.partial:
             cut = "a table (import, delay-load or export) of the file was cut short when it was read"
             doors_note = f"{cut}; {doors_note}" if doors_note else cut
+    # Ruling 70: the export table pefile reads describes the code of the file's own machine. On an ARM64X image
+    # (Machine ARM64) the x64 stubs lie elsewhere, so a stub found in a view the machine does not match cannot be
+    # matched against it: the denominator is unreadable, no absence is claimed. A True of the imports still stands
+    foreign = info is not None and info.machine != baseline.view
+    if foreign:
+        other = (f"the file's machine is {info.machine} and the view searched is {baseline.view}: its export table "
+                 f"describes the file's native view (as on an ARM64X image), so a stub found in another view cannot "
+                 f"be matched against it")
+        doors_note = f"{other}; {doors_note}" if doors_note else other
     keywords = _syscall_expanded_imports(imports)
     # what could not be named, or was lost when a table was cut short, may be the door: nothing is claimed absent
-    if (named is None or (info is not None and info.partial)) and keywords["covered"] is not None:
+    if (named is None or foreign or (info is not None and info.partial)) and keywords["covered"] is not None:
         keywords["covered"] = frozenset()
     hits = syscall_scan.find_stubs_in_bytes(content, baseline, imports, **keywords)
-    exported = _pe_export_offsets(content) if imports is not None else {}
+    exported = _pe_export_offsets(content) if imports is not None and not foreign else {}
     for hit in hits:
         name = hit.get("syscall")
         if hit.get("import_present") is True or not isinstance(name, str) or not name.startswith("Nt"):
