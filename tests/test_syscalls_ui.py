@@ -2178,6 +2178,20 @@ def test_a_process_hit_is_never_said_to_be_imported_or_not_by_the_sample():
 
 
 @needs_node
+def test_a_file_hit_its_own_export_names_says_so_and_not_that_it_is_imported():
+    # Ruling 73: the rescue fired for this hit, a fact of the hit; "The sample imports this function" would be false
+    r = _run_node(STUB_FUNCTIONS, r"""
+      const hit = (extra) => ({ syscall: 'NtFoo', number: 1, offset: 64, view: 'arm64', pattern: 'p', stub_hex: '01', number_known: true, source: 'file', import_present: true, ...extra });
+      const cell = html => /<td>(<span[^>]*>[^<]*<\/span>)<\/td><td>(<button|)/.exec(html)[1];
+      out({ own: cell(renderSyscallStubs({ hits: [hit({ own_export: true })] })),
+            imported: cell(renderSyscallStubs({ hits: [hit({ own_export: false })] })) });""")
+    assert ">own export<" in r["own"] and "exports this stub under its own name" in r["own"]
+    assert "The sample imports this function" not in r["own"]
+    assert "The sample imports this function as well" in r["imported"]
+    assert 'app.js?v=157"' not in _read(INDEX_HTML), "app.js changed, its version did not"
+
+
+@needs_node
 def test_the_list_says_when_a_stub_is_a_proof_and_when_a_hint():
     html = _stubs("{ hits: [%s] }" % HIT)
     low = html.lower()

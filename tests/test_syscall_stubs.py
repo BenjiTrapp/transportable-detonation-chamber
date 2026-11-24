@@ -386,6 +386,53 @@ def test_copies_of_one_stub_are_one_finding_that_counts_them(x64_baseline):
     assert by_syscall["NtWriteVirtualMemory"]["copies"] == 1
 
 
+def _copy(offset, imported, own_export=None):
+    hit = {"syscall": "NtWriteVirtualMemory", "number": 0x3A, "offset": offset, "view": "arm64",
+           "pattern": "p", "stub_hex": "00", "import_present": imported, "number_known": True,
+           "module": "ntdll.dll"}
+    if own_export is not None:
+        hit["own_export"] = own_export
+    return hit
+
+
+@pytest.mark.parametrize("answers, group", [
+    ((False, True), True), ((True, False), True), ((None, True), True), ((False, None, True), True),
+    ((False, None), None), ((None, False), None), ((False, False), False)])
+def test_a_group_takes_the_weakest_claim_among_its_copies(answers, group):
+    # Ruling 72: a group may not claim more than its most forgiving copy, whichever comes first
+    hits = [_copy(0x10 * i, answer) for i, answer in enumerate(answers)]
+    (finding,) = memory_evidence.from_direct_stubs(hits, "s.dll")
+    assert finding["import_present"] is group
+    assert finding["needs_corroboration"] is (group is not False)
+
+
+def test_the_sample_files_copies_decide_over_its_process_copies():
+    # the ordering runs over one source: a process copy answers for every loaded module (kernelbase imports the Nt
+    # functions), never for the sample, so it must not switch off the file's proof in a detonation
+    process = dict(_copy(0, True), address=0x1F0000)
+    del process["offset"]
+    for others in ([process], [dict(process, import_present=None)]):
+        (finding,) = memory_evidence.from_direct_stubs([_copy(0x400, False, False)] + others, "s.exe")
+        assert finding["import_present"] is False and finding["needs_corroboration"] is False
+    # without a file copy, the process copies decide among themselves
+    (finding,) = memory_evidence.from_direct_stubs([dict(process, import_present=False), process], "s.exe")
+    assert finding["import_present"] is True
+
+
+def test_a_stub_the_file_exports_under_its_own_name_says_so(x64_baseline):
+    # Ruling 73: the fact is per hit, the rescue fired for it; no threshold over the file
+    (finding,) = memory_evidence.from_direct_stubs([_copy(0x8d0, True, True), _copy(0x8e0, True, True)], "ntdll.dll")
+    assert finding["detail"] == ("NtWriteVirtualMemory stub the file exports under its own name: the module's own "
+                                 "code, not a stub carried past the documented path")
+    (finding,) = memory_evidence.from_direct_stubs([_copy(0x8d0, True, True), _copy(0x900, False, False)], "s.dll")
+    assert finding["import_present"] is True
+    assert finding["detail"] == ("NtWriteVirtualMemory stub the file exports under its own name (1 of 2 copies): "
+                                 "the module's own code, not a stub carried past the documented path")
+    # imported by the table, not exported: the old sentence
+    (finding,) = memory_evidence.from_direct_stubs([_copy(0x8d0, True, False)], "s.dll")
+    assert finding["detail"] == "NtWriteVirtualMemory stub carried by the sample, which imports it as well"
+
+
 def test_a_process_hit_gives_its_address_to_the_finding(x64_baseline):
     hit = {"syscall": "NtClose", "number": 0xF, "address": 0x1F0000, "view": "x64",
            "pattern": "p", "stub_hex": "00", "import_present": False, "number_known": True,

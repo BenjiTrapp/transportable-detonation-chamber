@@ -8746,6 +8746,7 @@ def _syscall_search_file(content, baseline):
     span = syscall_baseline.READ_LEN.get(baseline.view, 0)
     for hit in hits:
         name, at = hit.get("syscall"), hit.get("offset")
+        hit["own_export"] = False
         if hit.get("import_present") is True or not isinstance(name, str) or not name.startswith("Nt"):
             continue
         if not isinstance(at, int):
@@ -8753,6 +8754,7 @@ def _syscall_search_file(content, baseline):
         starts = (exported.get(alias) for alias in (name, "Zw" + name[2:]))
         if any(isinstance(start, int) and 0 <= at - start < span for start in starts):
             hit["import_present"] = True
+            hit["own_export"] = True
     return hits, imports, doors_note
 
 

@@ -632,6 +632,20 @@ mitgebrachten Stub daher nie sähe.
   `doors_note` nennt beide Maschinen. Die hybride (ARM64X-)Exporttabelle, die die
   andere Sicht beschreibt, wird nicht gelesen: pefile legt sie nicht offen, und sie zu
   erraten wäre schlechter, als abzulehnen.
+- **Kopien eines Syscalls sind ein Befund, und er sagt den schwächsten Anspruch unter
+  ihnen** (Entscheidung 72): `True`, wenn eine Kopie `True` ist, sonst `None`, wenn eine
+  `None` ist, sonst `False` — gleich in welcher Reihenfolge. Eine Kopie, die die Datei
+  als eigenen Code exportiert, wird so nie von einer früher gefundenen überstimmt. Die
+  Ordnung gilt über die Kopien einer Quelle: Hat die Sample-Datei Kopien, entscheiden
+  diese; eine Kopie im Prozessspeicher spricht für jedes geladene Modul, nie für das
+  Sample, und ließe sonst jeden Datei-Beleg einer Detonation fallen.
+- **Ein Treffer, dessen Tür der eigene Export der Datei ist, sagt das** (Entscheidung
+  73, `own_export`): Die Datei exportiert diesen Stub unter seinem eigenen Namen, er
+  ist eigener Code des Moduls, kein am dokumentierten Weg vorbei mitgebrachter Stub.
+  Das ist eine Tatsache je Treffer und braucht keine Schwelle über die Datei.
+  Ntdll selbst zu durchsuchen ist ein Kategorienfehler, keine Umgehung: fast jeder
+  Stub liest dann so, und das Urteil lautet trotzdem SUSPICIOUS aus mehreren hundert
+  Hinweisen allein, weil seine Gründe die Art nennen, nicht das Detail.
 - **Grenzen des Belegs im Prozessspeicher.**
   - **Der Prozessmodus liefert praktisch nie einen Beleg.** `kernelbase.dll`, in
     jedem Win32-Prozess geladen, implementiert die Win32-Türen und importiert deren

@@ -236,6 +236,21 @@ describes the other view is not done: the parser does not expose it, and guessin
 would be worse than declining. A sample built for x64 searched in the x64 view is
 unaffected.
 
+Copies of one syscall are one finding, and it says the weakest claim among them:
+`true` if any copy is `true`, else `null` if any is `null`, else `false`, whatever
+their order, so a copy the file exports as its own code is never outvoted by one found
+before it. The ordering runs over the copies of one source: where the sample file has
+copies, those decide, since a process copy answers for every loaded module and never
+for the sample.
+
+A hit whose door is the file's own export of that stub carries `own_export`, and its
+finding and row say so: the file exports this stub under its own name, the module's
+own code rather than a stub carried past the documented path. That is a fact of each
+hit and needs no judgment over the file. Searching `ntdll.dll` itself in its own view
+is a category error rather than a bypass: nearly every stub reads that way, and the
+verdict is still SUSPICIOUS on several hundred hints alone, as its reasons name the
+kind and not the detail.
+
 Two limits follow from the rule. Private executable memory is not the sample's
 alone (a hook engine, a browser sandbox's interception thunks or a runtime put
 stubs there too), so a stub found there is judged against the union of the doors

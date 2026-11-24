@@ -604,6 +604,10 @@ def from_direct_stubs(hits, process=""):
 
     Identity is the syscall's name, or the number when the build does not know it, never
     an address: a repeated scan must match the same finding.
+
+    Copies of one syscall are one finding, and it says the weakest claim among them (True over
+    None over False), so a copy the file exports as its own code (``own_export``) is never
+    outvoted by one found before it; the detail then says the file exports the stub.
     """
     if not isinstance(hits, (list, tuple)):
         return []
@@ -620,7 +624,18 @@ def from_direct_stubs(hits, process=""):
         first = group[0]
         named = key[0] == "name"
         name = first["syscall"] if named else None
-        imported = first.get("import_present")
+        # Ruling 72: the group says the weakest claim among its copies, whatever their order: True if any copy is
+        # True, else None if any is None, else False. A group may not claim more than its most forgiving member,
+        # and a copy the file exports as its own code must not be outvoted by a copy found before it. The ordering
+        # runs over the copies of one source: where the group holds copies from the sample file, those decide, as
+        # before. A process copy answers for every loaded module, never for the sample (its None is "unattributable",
+        # its True nearly always kernelbase), so letting it vote would switch off every file proof of a detonation
+        from_file = [h for h in group if "offset" in h]
+        deciding = from_file or group
+        first = deciding[0]
+        answers = [h.get("import_present") for h in deciding]
+        imported = True if any(a is True for a in answers) else None if any(a is None for a in answers) else False
+        exported = sum(1 for h in deciding if h.get("own_export") is True)
         number = f"{first['number']:#x}"
         proven = named and imported is False
         # a process hit has an address, a file hit an offset: only the sentence follows from it
@@ -637,6 +652,11 @@ def from_direct_stubs(hits, process=""):
             detail = f"{name} stub carried by the sample, which does not import it"
         elif imported and in_process:
             detail = f"{name} stub in process memory; a module loaded in the process imports a door to it as well"
+        elif imported and exported:
+            # Ruling 73: the rescue fired for these copies, a fact of each hit, not a judgment over the file
+            copies = f" ({exported} of {len(deciding)} copies)" if exported < len(deciding) else ""
+            detail = (f"{name} stub the file exports under its own name{copies}: the module's own code, not a stub "
+                      "carried past the documented path")
         elif imported:
             detail = f"{name} stub carried by the sample, which imports it as well"
         else:

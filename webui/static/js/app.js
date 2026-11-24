@@ -25611,7 +25611,8 @@ function renderHookAllowlist(state) {
 // in the process is one the binary graph of this system does not hold: that memory is not the sample's alone, so it is
 // judged against the doors every loaded module imports, and only a complete union can prove. For a process hit true and
 // false speak of those modules, never of the sample, and true is nearly every one: kernelbase imports the Nt functions. A stub whose number this build does not have
-// (number_known false) suggests a sample made for another build.
+// (number_known false) suggests a sample made for another build. A file hit whose door is the file's own export of
+// that stub (own_export) says so instead of "imported too": it is the module's own code, as in a copy of ntdll.
 // model: hits ({ ...hit, source: 'process' | 'file' }), notes ({ tone, title, text }), summary, partial.
 function renderSyscallStubs(model) {
     const m = model && typeof model === 'object' ? model : {};
@@ -25626,7 +25627,10 @@ function renderSyscallStubs(model) {
         let imported;
         // in process memory the answer is about every loaded module, never the sample alone (memory_evidence says the same)
         const inProcess = h.source !== 'file';
-        if (h.import_present === true) {
+        if (h.import_present === true && !inProcess && h.own_export === true) {
+            // the file exports this very stub under its own Nt or Zw name: its own code, so no word of its imports
+            imported = '<span title="The file exports this stub under its own name: the module\'s own code, as in a copy of ntdll, not a stub carried past the documented path. A weaker hint.">own export</span>';
+        } else if (h.import_present === true) {
             imported = inProcess
                 ? '<span title="A module loaded in the process imports a door to this syscall, so the documented path is in the address space: a weaker hint. ' +
                   'That is nearly every process hit, since kernelbase.dll, loaded in every process, imports the Nt functions itself; it says nothing of the sample\'s own imports.">imported too</span>'

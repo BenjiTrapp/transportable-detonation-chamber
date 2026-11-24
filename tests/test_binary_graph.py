@@ -410,6 +410,20 @@ def test_a_stub_inside_its_export_within_one_stub_length_holds_its_door(client, 
     assert (hit["offset"], hit["import_present"]) == (0x3C0, False)
 
 
+def test_an_unexported_copy_before_the_exported_one_does_not_make_the_finding_a_proof(client, tdc, target, sample_dir):
+    # Ruling 72, the measured shape: two copies of one syscall, the one no export names first, its export's body
+    # second. The hits keep their own answers; the finding takes the weakest claim among them
+    data = make_pe(exports=("NtWriteVirtualMemory",), machine=0xAA64, export_rva=0x11E0,
+                   code=_ARM64_STUB_0x3A + _ARM64_NOP * 6 + _ARM64_STUB_0x3A)
+    body = _file_stubs(client, sample_dir, data, "arm64")
+    assert [(h["offset"], h["import_present"], h["own_export"]) for h in body["hits"]] == [
+        (0x3C0, False, False), (0x3E0, True, True)]
+    [finding] = [f for f in body["evidence"]["findings"] if f["kind"] == "direct_syscall_stub"]
+    assert finding["import_present"] is True and finding["needs_corroboration"] is True
+    assert "exports under its own name (1 of 2 copies)" in finding["detail"]
+    assert body["evidence"]["label"] != "MALICIOUS"
+
+
 def test_the_detonation_stage_without_a_sample_file_keeps_import_present_unknown(tdc, target):
     target.view = "x64"
     target.reader = _x64_space(b"\x90" * 0x40 + _X64_STUB_0x3A + b"\xc3")
