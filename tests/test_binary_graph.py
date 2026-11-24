@@ -3764,7 +3764,10 @@ def test_who_imports_this_is_partial_when_any_table_it_read_was_cut_even_one_of_
     for cut in ("a_exe", "ntdll_dll", "d_exe"):
         graph = _cut_system(**{cut: True})
         assert binary_graph_query.importers_of(graph, "kernel32.dll").partial is True, cut
-    assert binary_graph_query.importers_of(_cut_system(a_exe=True), "nobody.dll").partial is False, "a name the graph does not know reads no table"
+    # "no binary in it imports it" is concluded from the in-degree of every table: a cut one may hide the only importer
+    unknown = binary_graph_query.importers_of(_cut_system(a_exe=True), "nobody.dll")
+    assert unknown.nodes == () and "no binary in it imports it" in unknown.note and unknown.partial is True
+    assert binary_graph_query.importers_of(_system(), "nobody.dll").partial is False, "over whole tables the same negative is certain"
     none = binary_graph_query.importers_of(_cut_system(a_exe=True), "e.exe")
     assert none.nodes == () and none.partial is True, "'nobody imports it' is a negative over tables that may be cut"
 
@@ -3802,10 +3805,19 @@ def test_the_path_to_a_syscall_is_partial_only_when_a_table_on_its_chain_was_cut
 
 
 def test_the_api_reference_and_the_help_both_name_partial_in_the_payload_of_the_query_route():
+    """What a token test can honestly hold: the two rows say the same sentence about what `partial` means, and the
+    reference says, for every query the route has, that it sets it. It cannot tell whether the rule it states for a query
+    is the rule the code applies (that is what tests of each query above are for), nor catch a change of meaning that
+    keeps these words."""
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     reference = open(os.path.join(root, "docs", "api.md"), encoding="utf-8").read()
     help_page = open(os.path.join(root, "webui", "templates", "index.html"), encoding="utf-8").read()
     row = next(line for line in reference.splitlines() if line.startswith("| GET | `/api/binary-graph/query`"))
     help_row = next(line for line in help_page.splitlines() if "<code>/api/binary-graph/query</code>" in line)
-    for where, text in (("docs/api.md", row), ("help-api", help_row)):
-        assert "partial" in text and "total" in text and "cut short" in text, where
+    meaning = "cut short when it was read, so a negative or a count is not certain"
+    assert meaning in row and meaning in help_row, "the two rows do not say the same of `partial`"
+    assert "`partial` (a table the answer read was" in row and "<code>partial</code>: true when a table it read was" in help_row
+    clause = row[row.index("`partial` ("):row.index("and a `note` in prose")]
+    for query in binary_graph_query.QUERIES:
+        assert f"`{query}`" in clause, f"docs/api.md does not say when {query} is partial"
+    assert "the same word as `partial` of a binary and of a chain" in clause

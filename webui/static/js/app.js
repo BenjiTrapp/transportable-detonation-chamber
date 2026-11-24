@@ -27359,25 +27359,37 @@ function binaryGraphExploreFresh(st, parts) {
     return fresh.size;
 }
 
+// An edge into the drawing: a new one is added; one that is drawn already keeps its place, gains a count it lacked, and
+// keeps its origin only where both say the same. `seen` maps the key of each drawn edge to it.
+function binaryGraphExploreAddEdge(st, seen, e) {
+    const key = `${e.source}\n${e.target}\n${e.kind}`, old = seen.get(key);
+    if (old) {
+        old.origin = binaryGraphCombineOrigin(old.origin, e.origin);
+        if (old.functions === undefined && e.functions !== undefined) Object.assign(old, { functions: e.functions, label: e.label, partial: e.partial });
+        return;
+    }
+    const edge = { source: e.source, target: e.target, kind: e.kind, origin: e.origin, label: typeof e.label === 'string' ? e.label : '' };
+    if (e.functions !== undefined) Object.assign(edge, { functions: e.functions, partial: e.partial === true });
+    seen.set(key, edge);
+    st.edges.push(edge);
+}
+
 // The parts drawn, whole and in order, until one needs a node that does not fit: the cap, or `limit` new nodes of this
-// answer. That part and every later part that needs a new node is dropped (the drawn ones stay the first in name order). A node that is drawn already takes
-// the answer's in-degree and kind, unless the answer only guessed them. An edge that is drawn already keeps its place and
-// gains a count it lacked; its origin stays only where both say the same. { added, dropped, edgeless } as ids of nodes, of
-// the heads of dropped parts, and of the drawn heads whose part was dropped.
+// answer. That part and every later part that needs a new node is held back (the drawn ones stay the first in name order);
+// a part that needs none costs nothing and is drawn whatever came before it. A held part still draws the edges whose two
+// ends are drawn (the edge from an api set to the opened module is real once both are on the canvas) and comes back whole
+// when the nodes it needs are drawn: both are binaryGraphExploreRelease, which the walk runs after every merge. A node that is drawn already takes the answer's in-degree
+// and kind, unless the answer only guessed them. { added, held }: the ids of the nodes drawn and the parts held back.
 function binaryGraphExploreMerge(st, parts, limit) {
     const cap = BINARY_GRAPH_EXPLORE.cap, have = new Map(st.nodes.map(n => [n.id, n]));
-    const edgeKey = e => `${e.source}\n${e.target}\n${e.kind}`;
-    const seen = new Map(st.edges.map(e => [edgeKey(e), e]));
-    const added = [], dropped = [], edgeless = [];
+    const seen = new Map(st.edges.map(e => [`${e.source}\n${e.target}\n${e.kind}`, e]));
+    const added = [], held = [];
     let fresh = 0, full = false;
     for (const part of parts) {
         const news = part.nodes.filter(n => !have.has(n.id));
-        // a part that needs a node the canvas has no room for ends the answer; a part that needs none costs nothing and is
-        // drawn whatever came before it (an edge between two nodes that are on the canvas is real). A part whose head is
-        // drawn but that was dropped for a node it needs (an api set) is the missing edge of a drawn node: it is counted too.
         if (news.length && (full || st.nodes.length + news.length > cap || fresh + news.length > limit)) {
             full = true;
-            (have.has(part.head) ? edgeless : dropped).push(part.head);
+            held.push(part);
             continue;
         }
         for (const n of part.nodes) {
@@ -27399,20 +27411,22 @@ function binaryGraphExploreMerge(st, parts, limit) {
             }
             node.radius = binaryGraphNodeRadius(node);
         }
-        for (const e of part.edges) {
-            const old = seen.get(edgeKey(e));
-            if (old) {
-                old.origin = binaryGraphCombineOrigin(old.origin, e.origin);
-                if (old.functions === undefined && e.functions !== undefined) Object.assign(old, { functions: e.functions, label: e.label, partial: e.partial });
-                continue;
-            }
-            const edge = { source: e.source, target: e.target, kind: e.kind, origin: e.origin, label: typeof e.label === 'string' ? e.label : '' };
-            if (e.functions !== undefined) Object.assign(edge, { functions: e.functions, partial: e.partial === true });
-            seen.set(edgeKey(e), edge);
-            st.edges.push(edge);
+        for (const e of part.edges) binaryGraphExploreAddEdge(st, seen, e);
+    }
+    return { added, held };
+}
+
+// What was held back comes back when it can: every edge of a held part whose two ends are drawn is drawn, and a part all
+// of whose nodes are drawn is no longer held. Without this a neighbour that is drawn later, by another expansion, would
+// sit beside the node it imports with no edge between them, which reads as "does not import it".
+function binaryGraphExploreRelease(st) {
+    const have = new Set(st.nodes.map(n => n.id)), seen = new Map(st.edges.map(e => [`${e.source}\n${e.target}\n${e.kind}`, e]));
+    for (const record of st.cut.values()) {
+        for (const [head, part] of record.held) {
+            for (const e of part.edges) if (have.has(e.source) && have.has(e.target)) binaryGraphExploreAddEdge(st, seen, e);
+            if (part.nodes.every(n => have.has(n.id))) record.held.delete(head);
         }
     }
-    return { added, dropped, edgeless };
 }
 
 // What is cut now, per opened node and level: the parts the server dropped of its own answer, the imported functions it
@@ -27425,14 +27439,13 @@ function binaryGraphExploreCut(st) {
     const drawn = new Set(st.nodes.map(n => n.id)), heads = new Set(), of = new Map(), ofFunctions = new Map(), ofTable = new Set(), ofImporters = new Set(), parents = new Set();
     let server = 0, functions = 0, lastDrawn = false, tableEdges = false;
     for (const record of st.cut.values()) {
-        const left = [...record.dropped].filter(id => !drawn.has(id));
-        const lost = [...record.edgeless];
-        if (!record.server && !record.functions && !record.table && !record.tableIn && !left.length && !lost.length) continue;
+        const held = [...record.held.keys()];
+        if (!record.server && !record.functions && !record.table && !record.tableIn && !held.length) continue;
         server += record.server;
         functions += record.functions;
-        [...left, ...lost].forEach(id => heads.add(id));
+        held.forEach(id => heads.add(id));
         parents.add(record.from);
-        of.set(record.from, (of.get(record.from) || 0) + record.server + left.length + lost.length);
+        of.set(record.from, (of.get(record.from) || 0) + record.server + held.length);
         if (record.functions) {
             ofFunctions.set(record.from, (ofFunctions.get(record.from) || 0) + record.functions);
             if (record.last && drawn.has(record.last)) lastDrawn = true;
@@ -27676,13 +27689,14 @@ async function binaryGraphExploreWalk(id, level) {
                 }
                 const merged = binaryGraphExploreMerge(st, r.found.parts, limit);
                 const key = `${from.id}\n${r.request.dir}\n${r.request.level}`;
-                if (r.found.server || r.found.functions || r.found.tableCut || merged.dropped.length || merged.edgeless.length) {
+                if (r.found.server || r.found.functions || r.found.tableCut || merged.held.length) {
                     st.cut.set(key, { from: from.id, server: r.found.server, functions: r.found.functions, last: r.found.last, table: r.found.tableCut && r.request.dir === 'out', tableIn: r.found.tableCut && r.request.dir === 'in',
-                                      dropped: new Set(merged.dropped), edgeless: new Set(merged.edgeless) });
+                                      held: new Map(merged.held.map(part => [part.head, part])) });
                 } else {
                     st.cut.delete(key);
                 }
                 binaryGraphExploreLayout(st, from.id, merged.added);
+                binaryGraphExploreRelease(st);
                 added.push(...merged.added);
                 if (hop === 0 && !merged.added.length && r.note) notes.push(r.note);
             }

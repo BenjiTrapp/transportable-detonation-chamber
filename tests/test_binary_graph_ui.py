@@ -566,7 +566,7 @@ def test_the_curated_edge_and_the_match_do_not_look_like_a_deviation():
 
 def test_the_assets_moved_on():
     html = _read(INDEX_HTML)
-    for asset, minimum in (("style.css", 89), ("theme-cyberpunk.css", 38), ("app.js", 147)):
+    for asset, minimum in (("style.css", 89), ("theme-cyberpunk.css", 38), ("app.js", 148)):
         version = int(re.search(rf"{re.escape(asset)}\?v=(\d+)", html).group(1))
         assert version >= minimum, f"{asset} was changed and kept its ?v="
 
@@ -1367,7 +1367,7 @@ def test_an_edge_that_could_not_be_drawn_because_its_head_is_drawn_but_its_alias
       })();""")
     assert r["count"] == 400 and not r["alias"] and not r["edge"]
     assert "1 did not fit" in _plain(r["status"]), "c003 is drawn, but its path to c007 is not: that is said, not hidden"
-    assert any("2 not shown" in t or "52 not shown" in t for t in r["texts"]), r["texts"]
+    assert "Not the whole neighbourhood: 52 not shown (the canvas holds 400 nodes)" in r["texts"], "the server's 51 and the one path that did not fit"
 
 
 @needs_node
@@ -1492,3 +1492,51 @@ def test_importers_that_may_be_missing_because_a_table_was_cut_are_said_so():
     assert "importers may be incomplete" in r["info"] and "some import tables" in r["info"] and "the figures say how many" in r["info"]
     assert any("importers" in t and "cut short" in t and "figures" in t for t in r["texts"])
     assert r["ids"] == ["app.exe", "kernel32.dll", "kernelbase.dll", "ntdll.dll", "win32u.dll"], "the importers that are known are still drawn"
+
+
+# --- Re-review: a part that was held comes back when what it needs is drawn --------------------------------------------
+
+@needs_node
+def test_a_dropped_importer_that_is_drawn_later_gets_its_edge_the_reviewers_scenario():
+    r = _explore_flow(r"""
+      (async () => {
+        initSyscalls(); binaryGraphSetMode('explore');
+        GRAPH['r.dll'] = { in_degree: 2, imports: {} };
+        GRAPH['api-ms-r-l1-1-0.dll'] = { is: 'api-set', in_degree: 1, hosts: ['r.dll'] };
+        GRAPH['a1.exe'] = { in_degree: 0, imports: { 'api-ms-r-l1-1-0.dll': ['F'] } };
+        GRAPH['b2.dll'] = { in_degree: 1, imports: { 'r.dll': ['G'] } };
+        GRAPH['z.exe'] = { in_degree: 0, imports: { 'b2.dll': ['H'] } };
+        await binaryGraphExploreStart('r.dll');
+        st.nodes.push({ id: 'z.exe', label: 'z.exe', kind: 'exe', in_degree: 0, category: '', x: 40, y: 40, radius: 6, placed: true, degreeKnown: true });
+        for (let i = 0; st.nodes.length < 399; i++) st.nodes.push({ id: 'fill' + i, label: 'fill' + i, kind: 'dll', in_degree: 1, category: '', x: 0, y: 0, radius: 6, placed: true });
+        await binaryGraphExpand('r.dll');
+        const held = { count: st.nodes.length, b2: !!at('b2.dll'), a1: !!at('a1.exe'), status: _p(els['binary-explore-status'].innerHTML) };
+        await binaryGraphExpand('z.exe');
+        out({ held, count: st.nodes.length, b2: !!at('b2.dll'), a1: !!at('a1.exe'),
+              edge: st.edges.find(e => e.source === 'b2.dll' && e.target === 'r.dll') || null, status: _p(els['binary-explore-status'].innerHTML) });
+      })();""".replace("_p(", "(h => h.replace(/<[^>]+>/g, ' ').replace(/\\s+/g, ' ').trim())("))
+    assert r["held"]["count"] == 399 and not r["held"]["b2"] and not r["held"]["a1"]
+    assert "2 did not fit" in r["held"]["status"], "the two importers that were dropped are counted"
+    assert r["count"] == 400 and r["b2"] and not r["a1"], "z.exe took the last slot with b2.dll"
+    assert r["edge"] and r["edge"]["kind"] == "imports", "b2.dll is drawn, so its edge to r.dll is drawn: the view must not say it does not import it"
+    assert "1 did not fit" in r["status"] and "2 did not fit" not in r["status"], "a1.exe, whose path still needs two nodes, is still counted"
+
+
+@needs_node
+def test_the_edge_between_two_drawn_nodes_of_a_dropped_path_is_drawn_and_its_head_is_still_counted():
+    r = _explore_flow(r"""
+      (async () => {
+        initSyscalls(); binaryGraphSetMode('explore');
+        GRAPH['r.dll'] = { in_degree: 1, imports: {} };
+        GRAPH['api-ms-r-l1-1-0.dll'] = { is: 'api-set', in_degree: 1, hosts: ['r.dll'] };
+        GRAPH['h.exe'] = { in_degree: 0, imports: { 'api-ms-r-l1-1-0.dll': ['F'] } };
+        await binaryGraphExploreStart('r.dll');
+        st.nodes.push({ id: 'api-ms-r-l1-1-0.dll', label: 'api-ms-r-l1-1-0.dll', kind: 'api-set', in_degree: 1, category: '', x: 40, y: 40, radius: 6, placed: true, degreeKnown: true });
+        for (let i = 0; st.nodes.length < 400; i++) st.nodes.push({ id: 'fill' + i, label: 'fill' + i, kind: 'dll', in_degree: 1, category: '', x: 0, y: 0, radius: 6, placed: true });
+        await binaryGraphExpand('r.dll');
+        out({ count: st.nodes.length, h: !!at('h.exe'), resolves: st.edges.some(e => e.source === 'api-ms-r-l1-1-0.dll' && e.target === 'r.dll' && e.kind === 'resolves_to'),
+              imports: st.edges.some(e => e.source === 'h.exe'), status: (h => h.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim())(els['binary-explore-status'].innerHTML) });
+      })();""")
+    assert r["count"] == 400 and not r["h"] and not r["imports"]
+    assert r["resolves"], "the api set and r.dll are both drawn: that edge is real and costs nothing"
+    assert "1 did not fit" in r["status"], "h.exe, who imports through it, is still not shown, and said so"

@@ -194,8 +194,9 @@ def importers_of(graph, module: str, function: str | None = None) -> Answer:
     function = function or None
     what = f"{function} from {target}" if function else target
     if not target or not (target in graph.binaries or target in graph.in_degree or _is_api_set(graph, target)):
+        # "no binary in it imports it" is concluded from the in-degree, which every table makes: a cut one may hide the only importer
         return _empty(f"{target or 'That name'} is not in the binary graph of this system, and no binary in it "
-                      f"imports it.")
+                      f"imports it.", _any_partial(graph))
     label = function or ""
     known = {}
     # every binary's table is read to find the importers, so a cut one anywhere may be hiding one
