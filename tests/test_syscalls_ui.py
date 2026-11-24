@@ -2154,6 +2154,30 @@ def test_an_unknown_import_table_is_never_read_as_not_imported():
 
 
 @needs_node
+def test_a_process_hit_is_never_said_to_be_imported_or_not_by_the_sample():
+    # the final review, I4: in process memory true means some loaded module imports a door, nearly always kernelbase,
+    # and false that none does; neither is a word about the sample's own imports, which only its file can give
+    r = _run_node(STUB_FUNCTIONS, r"""
+      const hit = (extra) => ({ syscall: 'NtFoo', number: 1, address: 4096, offset: 64, view: 'x64', pattern: 'p', stub_hex: '4c8bd1b8', number_known: true, ...extra });
+      const cell = html => /<td>(<span[^>]*>[^<]*<\/span>)<\/td><td>(<button|)/.exec(html)[1];
+      out({ processYes: cell(renderSyscallStubs({ hits: [hit({ source: 'process', import_present: true })] })),
+            processNo: cell(renderSyscallStubs({ hits: [hit({ source: 'process', import_present: false })] })),
+            fileYes: cell(renderSyscallStubs({ hits: [hit({ source: 'file', import_present: true })] })),
+            fileNo: cell(renderSyscallStubs({ hits: [hit({ source: 'file', import_present: false })] })),
+            page: renderSyscallStubs({ hits: [hit({ source: 'process' })] }) });""")
+    for key in ("processYes", "processNo"):
+        assert "the sample imports" not in r[key].lower() and "sample does not import" not in r[key].lower(), key
+        assert "loaded" in r[key] and "module" in r[key], key
+    assert "kernelbase" in r["processYes"], "says why that is nearly every process hit"
+    assert "no module loaded in the process imports a door" in r["processNo"].lower()
+    assert "The sample imports this function as well" in r["fileYes"]
+    assert "proven bypass" in r["fileNo"]
+    page = " ".join(re.sub(r"<[^>]+>", " ", r["page"]).split())
+    assert "stub in the sample's own memory or file whose function the sample does not import" not in page
+    assert "kernelbase.dll" in page and "practically never" in page and "comes from the sample file" in page
+
+
+@needs_node
 def test_the_list_says_when_a_stub_is_a_proof_and_when_a_hint():
     html = _stubs("{ hits: [%s] }" % HIT)
     low = html.lower()

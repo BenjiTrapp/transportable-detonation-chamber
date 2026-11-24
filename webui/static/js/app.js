@@ -25609,7 +25609,8 @@ function renderHookAllowlist(state) {
 // (import_present false) is a proven bypass, imported too (true) a hint. It is unknown (null) where no curated row
 // leads to the syscall or the import table could not be read, and for a stub in process memory whenever a module loaded
 // in the process is one the binary graph of this system does not hold: that memory is not the sample's alone, so it is
-// judged against the doors every loaded module imports, and only a complete union can prove. A stub whose number this build does not have
+// judged against the doors every loaded module imports, and only a complete union can prove. For a process hit true and
+// false speak of those modules, never of the sample, and true is nearly every one: kernelbase imports the Nt functions. A stub whose number this build does not have
 // (number_known false) suggests a sample made for another build.
 // model: hits ({ ...hit, source: 'process' | 'file' }), notes ({ tone, title, text }), summary, partial.
 function renderSyscallStubs(model) {
@@ -25623,10 +25624,17 @@ function renderSyscallStubs(model) {
         const known = h.number_known !== false;
         const where = h.source === 'file' ? `file offset ${syscallHex(h.offset)}` : `process memory ${syscallHex(h.address)}`;
         let imported;
+        // in process memory the answer is about every loaded module, never the sample alone (memory_evidence says the same)
+        const inProcess = h.source !== 'file';
         if (h.import_present === true) {
-            imported = '<span title="The sample imports this function as well: a weaker hint.">imported too</span>';
+            imported = inProcess
+                ? '<span title="A module loaded in the process imports a door to this syscall, so the documented path is in the address space: a weaker hint. ' +
+                  'That is nearly every process hit, since kernelbase.dll, loaded in every process, imports the Nt functions itself; it says nothing of the sample\'s own imports.">imported too</span>'
+                : '<span title="The sample imports this function as well: a weaker hint.">imported too</span>';
         } else if (h.import_present === false) {
-            imported = '<span title="Not imported, by an import set widened through the curated Win32 to Nt table: a proven bypass of the import path.">not imported</span>';
+            imported = inProcess
+                ? '<span title="No module loaded in the process imports a door to this syscall, by import sets widened through the curated Win32 to Nt table: a proven bypass of the import path.">not imported</span>'
+                : '<span title="Not imported by the sample, by an import set widened through the curated Win32 to Nt table: a proven bypass of the import path.">not imported</span>';
         } else {
             imported = '<span class="syscall-muted" title="No curated Win32 to Nt row leads to this syscall, the import table could not be read, or the stub ' +
                        'is in process memory and a module loaded there is not in the binary graph of this system: a missing import proves nothing.">unknown</span>';
@@ -25647,10 +25655,12 @@ function renderSyscallStubs(model) {
     }
     return syscallNoticesHtml(notes) +
         (m.summary ? `<div class="syscall-stubs-summary">${escapeHtml(m.summary)}</div>` : '') +
-        '<p class="syscall-draft-hint"><strong>Proof or hint.</strong> A syscall stub in the sample\'s own memory or file whose function the sample does not import, ' +
+        '<p class="syscall-draft-hint"><strong>Proof or hint.</strong> A syscall stub in the sample file whose function the sample does not import, ' +
         'judged by its import set widened through the curated Win32 to Nt table, is a proven bypass of ntdll. ' +
-        'It stays a hint where the sample imports the function as well, where no curated row leads to the syscall, or where its import table could not be read, ' +
-        'and for a stub in process memory unless every module loaded in the process is one the binary graph of this system holds: only then do their imports together name every door. Look at each hit before drafting a rule.</p>' +
+        'It stays a hint where the sample imports the function as well, where no curated row leads to the syscall, or where its import table could not be read. ' +
+        'A stub in process memory is judged against the doors every loaded module imports, and only when the binary graph of this system holds every one of them. ' +
+        'That practically never proves: kernelbase.dll, loaded in every process, imports the Nt functions itself, so the documented path is in the address space even when the sample does not use it. ' +
+        'The proof comes from the sample file. Look at each hit before drafting a rule.</p>' +
         '<div class="view-table-wrap"><table class="view-table" data-sortable data-sort-id="syscall-stubs"><thead><tr><th>SYSCALL</th><th>NUMBER</th><th>BUILD</th>' +
         `<th>FOUND</th><th>PATTERN</th><th>IMPORTED</th><th></th></tr></thead><tbody>${rows.join('')}</tbody></table></div>`;
 }
