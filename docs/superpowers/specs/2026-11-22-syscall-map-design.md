@@ -610,6 +610,22 @@ mitgebrachten Stub daher nie sähe.
   Sicht als die Datei —, ist die Tür unbekannt: im Prozessmodus ist die Vereinigung
   unvollständig, und auch im Dateimodus wird dann kein Fehlen behauptet.
 - **Grenzen des Belegs im Prozessspeicher.**
+  - **Der Prozessmodus liefert praktisch nie einen Beleg.** `kernelbase.dll`, in
+    jedem Win32-Prozess geladen, implementiert die Win32-Türen und importiert deren
+    Nt-Funktionen deshalb direkt aus ntdll (`NtAllocateVirtualMemory`,
+    `NtProtectVirtualMemory`, `NtWriteVirtualMemory`, `NtCreateThreadEx`,
+    `NtSetContextThread`, `NtOpenProcessToken`, `NtAdjustPrivilegesToken`). Der
+    dokumentierte Pfad liegt damit im Adressraum, auch wenn das Sample ihn nicht
+    benutzt, und ein Stub im privaten Speicher liest als `True`. Diese Antwort ist
+    richtig, kein Fehler des Nenners: bei einem nicht zuordenbaren Stub ist „enthält
+    der Adressraum den dokumentierten Pfad" die einzige beantwortbare Frage, und auf
+    einem echten Windows-Prozess lautet die Antwort ja. Die direkt aus ntdll
+    importierten Nt-Namen aus der Vereinigung zu nehmen, ließe einen Prozess, dessen
+    dokumentierter Pfad wirklich in kernelbase liegt, als Umgehung lesen — die
+    Richtung der falschen Anklage. Ein Beleg im Prozessmodus ist nur für einen
+    gedeckten Syscall möglich, den kein geladenes Modul importiert, und auf einem
+    echten System gibt es einen solchen womöglich nicht. **Der Beleg kommt aus der
+    Sample-Datei, der zuordenbaren Quelle.**
   - **Ein emulierter x64-Prozess auf ARM64 bekommt nie einen Beleg aus dem
     Prozessspeicher.** Das ist auf dieser Kammer der **Normalfall**, kein Rand: ein
     64-Bit-Sample läuft auf der ARM64-VM emuliert, deshalb gibt es überhaupt zwei

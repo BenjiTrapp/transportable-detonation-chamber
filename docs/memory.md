@@ -245,6 +245,21 @@ through the exporting module's record in the graph, in process and in file mode;
 the graph cannot name (its module or number unknown, no graph, a graph of another
 view) is an unknown door, and no absence is claimed.
 
+**Process mode practically never yields a proof.** `kernelbase.dll`, loaded in
+every Win32 process, implements the Win32 doors and so imports their Nt functions
+straight from `ntdll` (`NtAllocateVirtualMemory`, `NtProtectVirtualMemory`,
+`NtWriteVirtualMemory`, `NtCreateThreadEx`, `NtSetContextThread`,
+`NtOpenProcessToken`, `NtAdjustPrivilegesToken`), so the documented path is present
+in the address space even when the sample does not use it, and a stub in private
+memory reads as `true`. That answer is correct, not a flaw of the denominator: for a
+stub that cannot be attributed, whether the address space holds the documented path
+is the only question that can be answered, and on a real Windows process the answer
+is yes. Leaving the Nt names imported straight from `ntdll` out of the union would
+read a process whose documented path genuinely sits in `kernelbase` as a bypass, a
+false accusation. A process-mode proof can fire only for a covered syscall that no
+loaded module imports, and on a real system there may be no such syscall. **The
+proof comes from the sample file, which is the attributable source.**
+
 **An emulated x64 process on ARM64 never gets a proof from process memory.** On this
 chamber that is the normal case, not an edge: a 64-bit sample runs emulated on the
 ARM64 VM, which is why two syscall baselines exist. The graph reads the native side
@@ -284,7 +299,7 @@ and a host without a baseline are not covered for the same reason. Engines that
 live outside System32 (most EDRs install under `Program Files`) leave the union
 incomplete and are not affected.
 
-And some covered syscalls almost never yield a
+In file mode too, some covered syscalls almost never yield a
 proof: nearly every binary imports `FreeLibrary` (a door to
 `NtUnmapViewOfSection`) and `CreateThread` or `_beginthreadex` (doors to
 `NtCreateThreadEx`), so a carried stub for hollowing or remote thread creation is

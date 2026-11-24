@@ -3323,15 +3323,45 @@ def test_a_deleted_cache_lets_go_of_the_graph_it_held(client, tdc, graph_host):
 _SYS32 = "C:\\Windows\\System32\\"
 _IMAGE = "C:\\Samples\\sample.exe"
 
+# NtQueueApcThread, x64 number 0x45: the covered syscall no module of _doors_graph imports, so the one a process-mode
+# proof can be shown for. The x64 fixture of the baseline does not hold it; _apc_document adds it
+_X64_STUB_APC = bytes.fromhex("4c8bd1b8") + (0x45).to_bytes(4, "little") + bytes.fromhex("f604250803fe7f0175030f05")
+
+
+def _apc_document():
+    document = _fixture("x64")
+    document["syscalls"] = list(document["syscalls"]) + [{
+        "name": "NtQueueApcThread", "module": "ntdll.dll", "syscall_number": 0x45, "rva": 644700,
+        "return_type": "NTSTATUS", "calling_convention": "stdcall", "parameters": [],
+        "stub_bytes": _X64_STUB_APC.hex() + "c3cd2ec30f1f840000000000", "is_true_syscall": True}]
+    return document
+
+
+@pytest.fixture
+def apc_baseline():
+    return syscall_baseline.parse_baseline(_apc_document(), "26220.5770", "x64")
+
+
+# what the real kernelbase.dll imports from ntdll of the covered syscalls: it implements the Win32 doors, so it calls
+# their Nt functions itself (the final review, I2). Loaded in every Win32 process, it puts each of them in the union
+_KERNELBASE_NT = ("NtAllocateVirtualMemory", "NtProtectVirtualMemory", "NtWriteVirtualMemory", "NtCreateThreadEx",
+                  "NtSetContextThread", "NtOpenProcessToken", "NtAdjustPrivilegesToken")
+
 
 def _doors_graph(*extra, arch="x64"):
-    """A System32 in which no binary imports a door to NtWriteVirtualMemory, whatever ntdll and kernelbase export."""
+    """A System32 as it can exist: kernelbase exports the Win32 doors and imports the Nt functions it implements them
+    with (_KERNELBASE_NT), so a stub of any of those reads as imported in every process that loads it. No binary
+    imports a door to NtQueueApcThread: the stand-in for a covered syscall no loaded module imports, the narrow case
+    in which process mode can prove at all (on a real system there may be no such syscall)."""
     return _query_graph(
-        _q("ntdll.dll", exports=["NtWriteVirtualMemory", "ZwWriteVirtualMemory", "NtClose", "ZwClose"]),
-        _q("kernelbase.dll", imports={"ntdll.dll": ("NtClose",)}, exports=["WriteProcessMemory", "CloseHandle"]),
+        _q("ntdll.dll", exports=["NtWriteVirtualMemory", "ZwWriteVirtualMemory", "NtClose", "ZwClose",
+                                 "NtQueueApcThread", *_KERNELBASE_NT]),
+        _q("kernelbase.dll", imports={"ntdll.dll": ("NtClose", *_KERNELBASE_NT)},
+           exports=["WriteProcessMemory", "CloseHandle", "QueueUserAPC"]),
         _with_ordinals(_q("kernel32.dll", imports={"kernelbase.dll": ("CloseHandle",)}, exports=["CloseHandle"],
-                          forwarders={"WriteProcessMemory": "kernelbase.WriteProcessMemory"}),
-                       {157: "WriteProcessMemory", 158: "CloseHandle"}),
+                          forwarders={"WriteProcessMemory": "kernelbase.WriteProcessMemory",
+                                      "QueueUserAPC": "kernelbase.QueueUserAPC"}),
+                       {157: "WriteProcessMemory", 158: "CloseHandle", 159: "QueueUserAPC"}),
         *extra, arch=arch)
 
 
@@ -3354,48 +3384,79 @@ def _doors(graph, modules, image=None, view="x64", image_path=_IMAGE):
                                              image_path=image_path, image=image if image is not None else _image())
 
 
-def _process_hit(baseline, doors):
-    """The one hit of a NtWriteVirtualMemory stub in private memory, searched as the web UI searches a process: with
-    the union and its coverage when there is one, with nothing that could prove when there is none."""
+def _process_hit(baseline, doors, stub=None):
+    """The one hit of a NtQueueApcThread stub (or `stub`) in private memory, searched as the web UI searches a
+    process: with the union and its coverage when there is one, with nothing that could prove when there is none."""
     table = win32_to_nt.load_table()
     keywords = {"expanded_imports": doors, "covered": table.covered} if doors is not None else {}
-    (hit,) = syscall_scan.find_stubs_in_process(_x64_space(b"\x90" * 0x40 + _X64_STUB_0x3A + b"\xc3"), baseline,
-                                                None, **keywords)
+    (hit,) = syscall_scan.find_stubs_in_process(_x64_space(b"\x90" * 0x40 + (stub or _X64_STUB_APC) + b"\xc3"),
+                                                baseline, None, **keywords)
     return hit
 
 
-def test_a_loaded_module_the_cache_does_not_know_keeps_the_answer_unknown(x64_baseline):
+def test_a_loaded_module_the_cache_does_not_know_keeps_the_answer_unknown(apc_baseline):
     # a sample's own DLL, and a DLL in System32 the cache does not hold (dropped there after the build, or skipped):
     # its imports are a door the union cannot see, and a missing door is a false accusation
     for stranger in ("C:\\Samples\\helper.dll", _SYS32 + "dropped.dll"):
         doors = _doors(_doors_graph(), _loaded(_IMAGE, *_SYSTEM_MODULES, stranger))
-        assert _process_hit(x64_baseline, doors)["import_present"] is None, stranger
+        assert _process_hit(apc_baseline, doors)["import_present"] is None, stranger
         assert doors is None, stranger
 
 
-def test_a_process_whose_modules_import_no_door_still_proves_a_bypass(x64_baseline):
-    # ntdll exports NtWriteVirtualMemory and kernelbase WriteProcessMemory: a door is what a module imports, never
-    # what one exports, or ntdll alone would switch the proof off in every process
+def test_a_stub_of_a_syscall_kernelbase_imports_is_imported_in_every_process_that_loads_it():
+    # the final review, I2: kernelbase implements the Win32 doors and so imports their Nt functions from ntdll. Loaded
+    # in every Win32 process, it puts the documented path in the address space whether the sample uses it or not: for
+    # these syscalls process mode gives True, and the proof can come only from the sample file
+    baseline = syscall_baseline.parse_baseline(_fixture("x64"), "26220.5770", "x64")
+    doors = _doors(_doors_graph(), _loaded(_IMAGE, *_SYSTEM_MODULES))
+    assert set(_KERNELBASE_NT) <= doors
+    stubs = [name for name in _KERNELBASE_NT if name in baseline.syscalls]
+    assert len(stubs) == 3, "the x64 fixture holds three of them"
+    for name in stubs:
+        stub = bytes.fromhex("4c8bd1b8") + baseline.syscalls[name].number.to_bytes(4, "little") + bytes.fromhex(
+            "f604250803fe7f0175030f05")
+        hit = _process_hit(baseline, doors, stub=stub)
+        assert (hit["syscall"], hit["import_present"]) == (name, True)
+
+
+def test_the_docs_say_plainly_that_process_mode_practically_never_proves():
+    # the final review, I2: a capability that cannot fire on a real process is not presented as one
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    read = lambda *parts: " ".join(open(os.path.join(root, *parts), encoding="utf-8").read().split())
+    memory, spec = read("docs", "memory.md"), read("docs", "superpowers", "specs", "2026-11-22-syscall-map-design.md")
+    assert "**Process mode practically never yields a proof.**" in memory
+    assert "**The proof comes from the sample file, which is the attributable source.**" in memory
+    assert "**Der Prozessmodus liefert praktisch nie einen Beleg.**" in spec
+    assert "**Der Beleg kommt aus der Sample-Datei, der zuordenbaren Quelle.**" in spec
+    for name in _KERNELBASE_NT:
+        assert name in memory and name in spec, name
+
+
+def test_only_in_the_narrow_case_of_a_covered_syscall_no_loaded_module_imports_does_a_process_prove_a_bypass(
+        apc_baseline):
+    # NtQueueApcThread stands in for such a syscall; on a real system there may be none. ntdll exports it and
+    # kernelbase QueueUserAPC: a door is what a module imports, never what one exports, or ntdll alone would switch
+    # the proof off in every process
     doors = _doors(_doors_graph(), _loaded(_IMAGE, *_SYSTEM_MODULES))
     assert "GetLastError" in doors and "CloseHandle" in doors and "NtClose" in doors
-    hit = _process_hit(x64_baseline, doors)
+    hit = _process_hit(apc_baseline, doors)
     assert hit["import_present"] is False
     (finding,) = memory_evidence.from_direct_stubs([hit], "sample.exe")
     assert finding["needs_corroboration"] is False
 
 
-def test_the_doors_of_every_loaded_module_count_as_the_documented_path(x64_baseline):
+def test_the_doors_of_every_loaded_module_count_as_the_documented_path(apc_baseline):
     # dbghelp, not the sample, imports WriteProcessMemory: the process holds a door, whoever's it is
-    dbghelp = _q("dbghelp.dll", imports={"kernel32.dll": ("WriteProcessMemory",)})
+    dbghelp = _q("dbghelp.dll", imports={"kernel32.dll": ("QueueUserAPC",)})
     doors = _doors(_doors_graph(dbghelp), _loaded(_IMAGE, *_SYSTEM_MODULES, _SYS32 + "dbghelp.dll"))
     assert "NtWriteVirtualMemory" in doors
-    assert _process_hit(x64_baseline, doors)["import_present"] is True
+    assert _process_hit(apc_baseline, doors)["import_present"] is True
     # and the image's own imports count as well, read from its file
-    doors = _doors(_doors_graph(), _loaded(_IMAGE, *_SYSTEM_MODULES), image=_image("WriteProcessMemory"))
-    assert _process_hit(x64_baseline, doors)["import_present"] is True
+    doors = _doors(_doors_graph(), _loaded(_IMAGE, *_SYSTEM_MODULES), image=_image("QueueUserAPC"))
+    assert _process_hit(apc_baseline, doors)["import_present"] is True
 
 
-def test_a_module_outside_system32_contributes_no_exports_to_the_union(x64_baseline):
+def test_a_module_outside_system32_contributes_no_exports_to_the_union(apc_baseline):
     # a sample side-loads its own version.dll, or a kernel32.dll of its folder: the cache's record of the System32
     # file of that name says nothing about the file loaded, its imports no more than its exports
     version = _q("version.dll", imports={"kernel32.dll": ("CloseHandle",)}, exports=["GetFileVersionInfoW"])
@@ -3404,55 +3465,55 @@ def test_a_module_outside_system32_contributes_no_exports_to_the_union(x64_basel
         modules = _loaded(_IMAGE, *[m for m in _SYSTEM_MODULES if not planted.endswith("kernel32.dll")
                                     or "kernel32" not in m], planted)
         doors = _doors(_doors_graph(version), modules)
-        assert _process_hit(x64_baseline, doors)["import_present"] is None, planted
+        assert _process_hit(apc_baseline, doors)["import_present"] is None, planted
     # the same name loaded from System32 is the file the cache read
     doors = _doors(_doors_graph(version), _loaded(_IMAGE, *_SYSTEM_MODULES, "c:\\windows\\system32\\VERSION.DLL"))
-    assert _process_hit(x64_baseline, doors)["import_present"] is False
+    assert _process_hit(apc_baseline, doors)["import_present"] is False
 
 
-def test_a_record_cut_short_when_it_was_read_leaves_the_union_incomplete(x64_baseline):
+def test_a_record_cut_short_when_it_was_read_leaves_the_union_incomplete(apc_baseline):
     # the door may be in the part of the import table pefile did not read
     cut = _q("dbghelp.dll", imports={"kernel32.dll": ("CloseHandle",)}, partial=True)
     doors = _doors(_doors_graph(cut), _loaded(_IMAGE, *_SYSTEM_MODULES, _SYS32 + "dbghelp.dll"))
-    assert _process_hit(x64_baseline, doors)["import_present"] is None
+    assert _process_hit(apc_baseline, doors)["import_present"] is None
     cut_image = _q("sample.exe", "exe", imports={"kernel32.dll": ("GetLastError",)}, partial=True)
     doors = _doors(_doors_graph(), _loaded(_IMAGE, *_SYSTEM_MODULES), image=cut_image)
-    assert _process_hit(x64_baseline, doors)["import_present"] is None
+    assert _process_hit(apc_baseline, doors)["import_present"] is None
 
 
 def _with_ordinals(info, ordinal_names):
     return binary_graph.BinaryInfo(**{**info.__dict__, "ordinal_names": dict(ordinal_names)})
 
 
-def test_an_import_by_ordinal_counts_by_the_name_the_cache_gives_it(x64_baseline):
-    kernelbase = _with_ordinals(_q("kernelbase.dll", imports={"ntdll.dll": ("NtClose",)},
-                                   exports=["WriteProcessMemory", "CloseHandle"]), {7: "WriteProcessMemory"})
+def test_an_import_by_ordinal_counts_by_the_name_the_cache_gives_it(apc_baseline):
+    kernelbase = _with_ordinals(_q("kernelbase.dll", imports={"ntdll.dll": ("NtClose", *_KERNELBASE_NT)},
+                                   exports=["WriteProcessMemory", "CloseHandle", "QueueUserAPC"]), {7: "QueueUserAPC"})
     graph = _doors_graph()
     graph = _query_graph(*[kernelbase if name == "kernelbase.dll" else info for name, info in graph.binaries.items()],
                          _q("dbghelp.dll", imports={"kernelbase.dll": ("#7",)}), arch="x64")
     doors = _doors(graph, _loaded(_IMAGE, *_SYSTEM_MODULES, _SYS32 + "dbghelp.dll"))
-    assert _process_hit(x64_baseline, doors)["import_present"] is True
+    assert _process_hit(apc_baseline, doors)["import_present"] is True
     # the image imports by ordinal as well: its record is read like any other
     image = _q("sample.exe", "exe", imports={"kernelbase.dll": ("#7",)})
     doors = _doors(graph, _loaded(_IMAGE, *_SYSTEM_MODULES), image=image)
-    assert _process_hit(x64_baseline, doors)["import_present"] is True
+    assert _process_hit(apc_baseline, doors)["import_present"] is True
 
 
-def test_an_import_by_ordinal_the_cache_cannot_name_leaves_the_union_incomplete(x64_baseline):
+def test_an_import_by_ordinal_the_cache_cannot_name_leaves_the_union_incomplete(apc_baseline):
     # an ordinal of a module the cache does not hold, or one no export of it answers to: it may be a door
     for imports in ({"helper.dll": ("#3",)}, {"kernelbase.dll": ("#99",)}):
         graph = _doors_graph(_q("dbghelp.dll", imports=imports))
         doors = _doors(graph, _loaded(_IMAGE, *_SYSTEM_MODULES, _SYS32 + "dbghelp.dll"))
-        assert _process_hit(x64_baseline, doors)["import_present"] is None, imports
+        assert _process_hit(apc_baseline, doors)["import_present"] is None, imports
 
 
-def test_a_process_of_another_view_than_the_cache_is_not_judged_by_it(x64_baseline):
+def test_a_process_of_another_view_than_the_cache_is_not_judged_by_it(apc_baseline):
     # an x64 process on ARM64 runs the x64 side of System32's ARM64X binaries, whose tables the cache did not read
     doors = _doors(_doors_graph(arch="arm64"), _loaded(_IMAGE, *_SYSTEM_MODULES))
-    assert _process_hit(x64_baseline, doors)["import_present"] is None
+    assert _process_hit(apc_baseline, doors)["import_present"] is None
 
 
-def test_an_image_that_cannot_be_read_or_identified_leaves_the_union_incomplete(x64_baseline):
+def test_an_image_that_cannot_be_read_or_identified_leaves_the_union_incomplete(apc_baseline):
     table = win32_to_nt.load_table()
     graph, modules = _doors_graph(), _loaded(_IMAGE, *_SYSTEM_MODULES)
     for image_path, image, listed in (
@@ -3464,13 +3525,13 @@ def test_an_image_that_cannot_be_read_or_identified_leaves_the_union_incomplete(
             (_IMAGE, _image(), modules + [{"name": "x.dll", "base": 1, "size": 1}])):   # a module without a path
         doors = binary_graph_query.imported_doors(graph, listed, table, view="x64", image_path=image_path,
                                                   image=image)
-        assert _process_hit(x64_baseline, doors)["import_present"] is None, (image_path, image, listed)
+        assert _process_hit(apc_baseline, doors)["import_present"] is None, (image_path, image, listed)
 
 
-def test_the_image_is_matched_by_its_path_not_by_its_name(x64_baseline):
+def test_the_image_is_matched_by_its_path_not_by_its_name(apc_baseline):
     # a sample named kernel32.exe, or one whose path the reader writes in another case
     doors = _doors(_doors_graph(), _loaded("c:\\samples\\SAMPLE.EXE", *_SYSTEM_MODULES))
-    assert _process_hit(x64_baseline, doors)["import_present"] is False
+    assert _process_hit(apc_baseline, doors)["import_present"] is False
 
 
 def test_why_the_union_is_incomplete_names_the_module(x64_baseline):
@@ -3489,14 +3550,17 @@ def test_why_the_union_is_incomplete_names_the_module(x64_baseline):
 @pytest.fixture
 def doors_host(tdc, monkeypatch, target, sample_dir):
     """An x64 host with the cache of _doors_graph(), and an x64 process of System32 modules and a sample image that
-    imports no door: a NtWriteVirtualMemory stub in its private memory. Returns the image path and the builds
+    imports no door: a NtQueueApcThread stub in its private memory, the covered syscall no loaded module imports (the
+    narrow case in which process mode can prove), and a baseline that holds it. Returns the image path and the builds
     started."""
     monkeypatch.setattr(tdc, "_current_os_build", lambda: "26220.5770")
     monkeypatch.setattr(tdc.binary_graph, "host_arch", lambda *a, **k: "x64")
     builds = []
     monkeypatch.setattr(tdc, "_build_binary_graph", lambda build, arch: builds.append((build, arch)))
     os.makedirs(tdc.NTSLEUTH_BASELINE_DIR, exist_ok=True)
-    extra = (_q("dbghelp.dll", imports={"kernel32.dll": ("WriteProcessMemory",)}),
+    with open(os.path.join(tdc.NTSLEUTH_BASELINE_DIR, "ntsleuth-26220.5770-x64.json"), "w", encoding="utf-8") as fh:
+        json.dump(_apc_document(), fh)
+    extra = (_q("dbghelp.dll", imports={"kernel32.dll": ("QueueUserAPC",)}),
              _q("version.dll", imports={"kernel32.dll": ("CloseHandle",)}))
     binary_graph.save_graph(_doors_graph(*extra), os.path.join(tdc.NTSLEUTH_BASELINE_DIR,
                                                          binary_graph.cache_name("26220.5770", "x64")))
@@ -3504,7 +3568,7 @@ def doors_host(tdc, monkeypatch, target, sample_dir):
     image.write_bytes(make_pe(imports=(("kernel32.dll", ("GetLastError",)),)))
     monkeypatch.setattr(tdc, "_image_path_for_pid", lambda pid: str(image))
     target.view = "x64"
-    target.reader = _x64_space(b"\x90" * 0x40 + _X64_STUB_0x3A + b"\xc3")
+    target.reader = _x64_space(b"\x90" * 0x40 + _X64_STUB_APC + b"\xc3")
     target.reader._m = _loaded(str(image), *_SYSTEM_MODULES)
     return str(image), builds
 
@@ -3658,12 +3722,13 @@ def test_a_file_without_imports_by_ordinal_proves_without_a_cache(client, target
 def test_the_detonation_stage_names_the_ordinals_of_the_sample_file_and_of_the_image(tdc, doors_host, sample_dir):
     image, _ = doors_host
     with open(image, "wb") as fh:
-        fh.write(make_pe(imports=(("kernel32.dll", (157,)),)) + _X64_STUB_0x3A)
+        # kernel32!#157 is WriteProcessMemory, the door of the file's stub; #159 QueueUserAPC, that of the process's
+        fh.write(make_pe(imports=(("kernel32.dll", (157, 159)),)) + _X64_STUB_0x3A)
     result = tdc._run_syscall_stage(4812, image, [])
     assert [h["import_present"] for h in result["stubs"]["file"]["hits"]] == [True]
     assert [h["import_present"] for h in result["stubs"]["process"]["hits"]] == [True]
-    [finding] = [f for f in result["evidence"]["findings"] if f["kind"] == "direct_syscall_stub"]
-    assert finding["needs_corroboration"] is True
+    findings = [f for f in result["evidence"]["findings"] if f["kind"] == "direct_syscall_stub"]
+    assert len(findings) == 2 and all(f["needs_corroboration"] is True for f in findings)
 
 
 def test_ordinals_are_named_only_by_a_graph_of_the_importers_view():
@@ -3811,23 +3876,23 @@ def test_system32_is_taken_from_the_system_not_a_literal():
                                            ask=lambda: None) == "D:\\WINNT\\System32"
 
 
-def test_a_module_of_a_system32_elsewhere_counts_when_that_is_the_systems(x64_baseline):
+def test_a_module_of_a_system32_elsewhere_counts_when_that_is_the_systems(apc_baseline):
     doors = binary_graph_query.imported_doors(
         _doors_graph(), _loaded(_IMAGE, *(m.replace("C:\\Windows", "D:\\WINNT") for m in _SYSTEM_MODULES)),
         win32_to_nt.load_table(), view="x64", image_path=_IMAGE, image=_image(), system32="D:\\WINNT\\System32")
-    assert _process_hit(x64_baseline, doors)["import_present"] is False
+    assert _process_hit(apc_baseline, doors)["import_present"] is False
 
 
 # --- Ruling 39: the proof's sentence says what the proof establishes -----------------------------------------------
 
-def test_the_detail_of_a_process_proof_says_no_loaded_module_imports_a_door(x64_baseline):
+def test_the_detail_of_a_process_proof_says_no_loaded_module_imports_a_door(apc_baseline):
     doors = _doors(_doors_graph(), _loaded(_IMAGE, *_SYSTEM_MODULES))
-    (finding,) = memory_evidence.from_direct_stubs([_process_hit(x64_baseline, doors)], "sample.exe")
+    (finding,) = memory_evidence.from_direct_stubs([_process_hit(apc_baseline, doors)], "sample.exe")
     assert "no module loaded in the process imports a door" in finding["detail"]
     assert "carried by the sample" not in finding["detail"]
-    dbghelp = _q("dbghelp.dll", imports={"kernel32.dll": ("WriteProcessMemory",)})
+    dbghelp = _q("dbghelp.dll", imports={"kernel32.dll": ("QueueUserAPC",)})
     doors = _doors(_doors_graph(dbghelp), _loaded(_IMAGE, *_SYSTEM_MODULES, _SYS32 + "dbghelp.dll"))
-    (finding,) = memory_evidence.from_direct_stubs([_process_hit(x64_baseline, doors)], "sample.exe")
+    (finding,) = memory_evidence.from_direct_stubs([_process_hit(apc_baseline, doors)], "sample.exe")
     assert "a module loaded in the process imports a door" in finding["detail"]
     assert "carried by the sample" not in finding["detail"]
 
@@ -3841,9 +3906,9 @@ def test_the_detail_of_a_file_proof_still_speaks_of_the_sample(x64_baseline):
     assert finding["detail"] == "NtAllocateVirtualMemory stub carried by the sample, which imports it as well"
 
 
-def test_the_sentence_of_a_process_proof_changes_nothing_but_the_sentence(x64_baseline):
+def test_the_sentence_of_a_process_proof_changes_nothing_but_the_sentence(apc_baseline):
     doors = _doors(_doors_graph(), _loaded(_IMAGE, *_SYSTEM_MODULES))
-    process = _process_hit(x64_baseline, doors)
+    process = _process_hit(apc_baseline, doors)
     as_file = {k: v for k, v in process.items() if k != "address"}
     as_file["offset"] = 0x40
     (p,), (f,) = (memory_evidence.from_direct_stubs([h], "sample.exe") for h in (process, as_file))
