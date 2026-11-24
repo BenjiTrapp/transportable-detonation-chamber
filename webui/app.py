@@ -9159,7 +9159,7 @@ def _binary_graph_refusal(error, build=None, arch=None):
         attempts = _binary_graph_build_state["attempts"].get((build, arch), 0)
     record = None
     if building:
-        error += " It is being built in the background; that takes a few minutes."
+        error += " It is being built in the background; that takes a minute or two."
     elif failed:
         at, why = failed
         retry = at + BINARY_GRAPH_BUILD_RETRY if attempts < BINARY_GRAPH_BUILD_ATTEMPTS else None

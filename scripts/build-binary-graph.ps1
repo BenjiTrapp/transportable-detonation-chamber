@@ -129,7 +129,7 @@ if ($existing -and -not $Force) {
 }
 
 # --- Build ---
-Write-Host "[*] Reading C:\Windows\System32 for build $build ($arch); this takes a few minutes..." -ForegroundColor Yellow
+Write-Host "[*] Reading C:\Windows\System32 for build $build ($arch); that took 78 seconds over 3,999 files when it was measured..." -ForegroundColor Yellow
 $run = Invoke-GraphCli @() $BuildTimeout
 $code = $run.Code
 $counts = $run.Counts

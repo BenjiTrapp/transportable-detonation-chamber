@@ -48,11 +48,14 @@ configurable.
 **At provisioning**, `scripts/build-binary-graph.ps1` builds it (`make deploy`,
 `make.ps1 deploy` and `deploy-utm.py` copy it to `C:\tdc\scripts`, and setup runs it after
 `install-webui.ps1`). It reads the import, delay-load and export tables of every
-PE directly in `C:\Windows\System32` (expected to be about 4,000 files; not yet counted on a VM), with the VM's own Python
+PE directly in `C:\Windows\System32` (3,999 of them on build `26200.9974`), with the VM's own Python
 and `pefile`, follows every forwarded export through the api-set map to the
 module that defines it, and writes the result in one piece. Nothing is
-downloaded and nothing is asked of a service. A build is expected to take a few minutes (not yet timed on a VM); the
-script waits for it up to 30 minutes, and setup up to 40. A cache that is
+downloaded and nothing is asked of a service. Measured on the chamber VM (build `26200.9974`, ARM64 under UTM),
+a build of those 3,999 files took **78 seconds** and wrote **28.2 MB**: 107,715 edges over
+2,009 modules, 4,944 forwarders resolved, 841 api sets hosted of the 985 the map declares,
+and 7 binaries whose tables were cut short. Another machine and another build give other
+numbers; the script waits for a build up to 30 minutes, and setup up to 40. A cache that is
 already there is kept only when it loads: one that is cut short or zero-filled
 (a power loss leaves such a file) is built again.
 

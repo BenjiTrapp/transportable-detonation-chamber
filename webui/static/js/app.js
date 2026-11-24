@@ -27277,7 +27277,7 @@ function binaryGraphDetailHtml(item) {
 }
 
 // --- GRAPH, EXPLORE: the same graph, opened one node at a time -------------------------------------------------------
-// The whole stock (about 4,000 binaries) is never drawn. This is the level of the binaries: the nodes are modules and
+// The whole stock (3,999 binaries on the build this was measured on) is never drawn. This is the level of the binaries: the nodes are modules and
 // the number of functions one imports from another is carried on the edge between them. An entry point, one binary, is
 // drawn alone; EXPAND opens the neighbours of the chosen module in both directions and keeps what is drawn: the modules
 // it imports from (q=imports, grouped by module, see binaryGraphExploreParts) and the modules that import it

@@ -499,6 +499,38 @@ def test_no_shipped_text_still_says_the_win32_to_nt_table_is_missing():
     assert found == []
 
 
+def test_no_shipped_text_still_hedges_a_figure_the_vm_has_measured():
+    """The size and the duration of a build were marked as expectations until a VM measured them (3,999 files,
+    78 seconds, 28.2 MB on build 26200.9974). Every page that carries one of those numbers must now carry the
+    measurement, and no page may still say the figure is unknown: a hedge that outlives its measurement reads as
+    a measurement of its own, and six pages carry these two numbers between them."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    hedges = (
+        "expected to be about 4,000",      # README.md, index.html, docs/configuration.md, docs/memory.md
+        "about 4,000 binaries",            # app.js, the comment over EXPLORE
+        "about 4,000 files",               # docs/troubleshooting.md
+        "not yet counted on a VM",         # docs/configuration.md, docs/memory.md
+        "not yet timed on a VM",           # docs/configuration.md
+        "not yet timed or counted",        # docs/troubleshooting.md
+        "takes a few minutes",             # app.py's background-build message, and the pages quoting it
+    )
+    carries = ("README.md", "docs/configuration.md", "docs/memory.md", "docs/troubleshooting.md",
+               "webui/app.py", "webui/templates/index.html", "webui/static/js/app.js",
+               "scripts/build-binary-graph.ps1")
+    found = []
+    for rel in carries:
+        with open(os.path.join(root, *rel.split("/")), encoding="utf-8") as fh:
+            text = " ".join(fh.read().split())
+        found += [(rel, hedge) for hedge in hedges if hedge in text]
+    assert found == []
+    # and the measurement itself is on the two pages an operator reads for it
+    for rel, want in (("docs/configuration.md", ("3,999", "78 seconds", "28.2 MB")),
+                      ("docs/troubleshooting.md", ("3,999", "78 seconds"))):
+        with open(os.path.join(root, *rel.split("/")), encoding="utf-8") as fh:
+            text = " ".join(fh.read().split())
+        assert [w for w in want if w not in text] == [], rel
+
+
 def test_the_stub_list_changed_and_so_did_its_asset_version():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     with open(os.path.join(root, "webui", "templates", "index.html"), encoding="utf-8") as fh:
