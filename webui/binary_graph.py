@@ -326,10 +326,12 @@ def _api_set_hosts(data, offset, count):
         host = _api_set_text(data, host_at, host_len)
         if host is None or (not host and index == 0):
             return None
-        # Ruling 66, replacing Ruling 20: on Windows 11 26200.9974, 144 of 985 real entries have an empty host in a
-        # value after the first, api-ms-win-core-memory-l1-1-0 and api-ms-win-core-processthreads-l1-1-0 among them,
-        # the two most imported api-sets of the system. Dropping only that value keeps the default first and the
-        # remaining hosts in order, so no override is promoted into the default's place
+        # Ruling 66, replacing Ruling 20: an empty host in a value after the first drops only that value, so the
+        # default stays first and the remaining hosts keep their order, and no override is promoted into the
+        # default's place. On Windows 11 26200.9974 this rule has no instance: the map declares 985 entries and 841
+        # are hosted; the 144 others carry a single value with no importer and no host (an api-set this edition does
+        # not host), which the empty value[0] above drops, rightly, as the loader cannot resolve them either. The
+        # rule is a model that can express a case the real map does not contain today
         if host:
             hosts.append(host)
     return tuple(hosts)
@@ -353,7 +355,9 @@ def parse_api_set_map(data: bytes) -> dict[str, tuple[str, ...]]:
     - One unreadable value drops its whole entry, never only its host, and so does an empty host in value[0]: with
       the default lost or unknown the chain would resolve through the wrong module. An empty host in a later value
       is dropped alone and the other hosts keep their order (Ruling 66): the default stays first and no override
-      takes its place. Real maps carry such values: 144 of 985 entries on Windows 11 26200.9974.
+      takes its place. That later-value case has no instance on Windows 11 26200.9974: of the 985 entries the map
+      declares, 841 are hosted, and the 144 others carry one value with no host (an api-set the edition does not
+      host), dropped by the value[0] rule as the loader cannot resolve them either.
     - The map is the window the header's Size gives (above), never a wider one."""
     if len(data) < _API_SET_HEADER.size:
         return {}

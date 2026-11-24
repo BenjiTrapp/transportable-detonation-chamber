@@ -441,11 +441,18 @@ ARM64-VM der falsche. Nach WinGraph wird nur verlinkt.
     an `api-ms-win-*` — das ist ehrlicher als ein falscher Sprung. Ein leerer
     Hostname in einem **späteren** Wert dagegen fällt allein weg, und die übrigen
     Hosts behalten ihre Reihenfolge: der Standard bleibt vorn, und keine Ausnahme
-    rückt an seine Stelle. Echte Maps tragen solche Werte: auf Windows 11
-    `26200.9974` haben 144 von 985 Einträgen einen leeren Host nach dem ersten,
-    darunter `api-ms-win-core-memory-l1-1-0` und
-    `api-ms-win-core-processthreads-l1-1-0`, die beiden meistimportierten Module
-    des Systems. Sie ganz zu verwerfen, brach einen großen Teil aller Ketten.
+    rückt an seine Stelle. Diese Regel hat auf Windows 11 `26200.9974` **keinen
+    Fall**: die Map erklärt 985 Einträge, 841 davon haben einen Host. Die 144
+    übrigen tragen einen einzigen Wert ohne Importeur und ohne Host (Flag `0x1`),
+    also ein API-Set, das diese Edition nicht hostet; sie fallen nach der Regel für
+    `value[0]` weg, und das ist richtig, denn auch der Loader löst sie nicht auf.
+    Die Regel für spätere Werte ist ein Modell, das einen Fall ausdrücken kann, den
+    die echte Map derzeit nicht enthält, wie der Platz für mehrere `nt` je
+    Win32-Name. `api-ms-win-core-memory-l1-1-0` und
+    `api-ms-win-core-processthreads-l1-1-0` fehlen unter diesen Namen aus einem
+    anderen Grund: die Map führt `api-ms-win-core-memory-l1-1-9` und
+    `api-ms-win-core-processthreads-l1-1-8`, und die `-l1-1-0`-Weiterleitungen löst
+    der Rückfall auf die Familie auf (Entscheidung 23), gemessen für 35 Namen.
   - Die Map endet dort, wo `Size` im Kopf es sagt (ist `Size` null oder größer
     als die Sektion, gilt die Sektion). Ein Eintrag, der zwischen `Size` und dem
     Ende der Sektion liegt, wird verworfen.

@@ -1141,21 +1141,22 @@ def test_a_name_that_is_not_valid_utf16_or_is_empty_drops_its_entry():
 
 
 def test_an_empty_host_after_the_default_is_dropped_alone_and_the_default_stays_ruling_66():
-    # the real shape: on Windows 11 26200.9974, 144 of 985 entries carry an empty host in a value after the first,
-    # api-ms-win-core-memory-l1-1-0 and api-ms-win-core-processthreads-l1-1-0 among them, the two most imported
-    # modules of System32. Before Ruling 66 each of them was dropped whole and every chain through them died there
-    data = _api_set_map({"api-ms-win-core-memory-l1-1-0": ("kernelbase.dll", ("kernel32.dll", "")),
+    # a model, not a measured case: on Windows 11 26200.9974 no entry has an empty host in a later value. Of the 985
+    # entries the map declares 841 are hosted; the 144 others carry a single value with no importer and no host, an
+    # api-set the edition does not host, and go with value[0] (next test). The rule keeps the default first should a
+    # later build carry the case
+    data = _api_set_map({"api-ms-win-late-l1-1-0": ("kernelbase.dll", ("kernel32.dll", "")),
                          "api-ms-win-mid-l1-1-0": ("kernelbase.dll", "", "ntdll.dll"),
                          "api-ms-win-ok-l1-1-0": ("kernelbase.dll", "ntdll.dll")})
     assert binary_graph.parse_api_set_map(data) == {
-        "api-ms-win-core-memory-l1-1-0": ("kernelbase.dll",),
+        "api-ms-win-late-l1-1-0": ("kernelbase.dll",),
         "api-ms-win-mid-l1-1-0": ("kernelbase.dll", "ntdll.dll"),          # in order: no override moves ahead
         "api-ms-win-ok-l1-1-0": ("kernelbase.dll", "ntdll.dll")}
 
 
 def test_an_empty_default_host_still_takes_its_entry_with_it_ruling_66():
     # value[0] is the default host: without it the default is unknown, and taking the next host would promote an
-    # override into the default's place
+    # override into the default's place. ("",) is the measured shape of the 144 unhosted entries of 26200.9974
     data = _api_set_map({"ext-ms-win-gone-l1-1-0": ("",), "api-ms-win-first-l1-1-0": ("", "kernelbase.dll"),
                          "api-ms-win-ok-l1-1-0": ("kernelbase.dll", "ntdll.dll")})
     assert binary_graph.parse_api_set_map(data) == {"api-ms-win-ok-l1-1-0": ("kernelbase.dll", "ntdll.dll")}
