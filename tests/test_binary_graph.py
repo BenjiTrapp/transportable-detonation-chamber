@@ -1116,6 +1116,9 @@ def test_a_forwarder_is_split_at_its_last_dot_so_an_api_set_name_survives():
 def test_a_module_name_with_dots_of_its_own_survives_the_split():
     # this is the case that tells the last dot from the first: api-set names are hyphenated and do not
     assert binary_graph.split_forwarder("Windows.Storage.SomeFunction") == ("windows.storage.dll", "SomeFunction")
+    # and the docstring gives that reason, not the api-set one its own example contradicts (the final review, M1)
+    doc = binary_graph.split_forwarder.__doc__
+    assert "Windows.Storage" in doc and "api-set name has dots" not in doc
 
 
 @pytest.mark.parametrize("raw", ["", "NODOT", ".F", "B.", ".", ".."])

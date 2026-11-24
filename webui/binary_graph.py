@@ -343,7 +343,8 @@ def split_forwarder(raw: str) -> tuple[str, str]:
     """`"NTDLL.RtlAllocateHeap"` -> `("ntdll.dll", "RtlAllocateHeap")`; `("", "")` when the string names no module and
     function (empty, no dot, or nothing on one side of it).
 
-    Split at the LAST dot, never the first: an api-set name has dots of its own ("api-ms-win-core-heap-l1-1-0")."""
+    Split at the LAST dot, never the first: a module name may have dots of its own ("Windows.Storage.SomeFunction" is
+    windows.storage.dll's SomeFunction). An api-set name is hyphenated and has none ("api-ms-win-core-heap-l1-1-0")."""
     module, dot, function = raw.rpartition(".")
     if not dot or not module or not function:
         return "", ""
