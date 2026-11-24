@@ -27042,8 +27042,13 @@ function binaryGraphLegend(mode, edges) {
     return parts.join('');
 }
 
-// What the line above the graph says: the note of an answer that has nodes, and that it was cut, if it was.
-// { tone, html } with html '' when there is nothing to say.
+// What an answer read over a table cut short says, whatever its note says: a negative or a count over it is not
+// certain. It points at the figure rather than warning on its own, as the exploration does (Ruling 58).
+const BINARY_GRAPH_PARTIAL = 'A table (import, delay-load or export) this answer read was cut short when it was read, '
+    + 'so a negative or a count here is not certain; the figures say how many.';
+
+// What the line above the graph says: the note of an answer that has nodes, that it was cut, if it was, and that a
+// table it read was cut short. { tone, html } with html '' when there is nothing to say.
 function binaryGraphStatus() {
     const st = binaryGraphState, a = st.answer;
     // a cut answer says so whether or not it kept a node; the note stands in the canvas when it kept none
@@ -27057,6 +27062,7 @@ function binaryGraphStatus() {
             + 'a node that is missing here is not shown, which does not mean it is not imported.</strong> ';
     }
     if (st.note && st.nodes.length) html += `<span class="binary-graph-note">${escapeHtml(st.note)}</span>`;
+    if (a.partial === true && st.nodes.length) html += ` <span class="binary-graph-partial">${escapeHtml(BINARY_GRAPH_PARTIAL)}</span>`;
     const stamp = [a.build ? `build ${a.build}` : '', a.arch || ''].filter(Boolean).join(' · ');
     if (stamp) html += ` <span class="syscall-muted">${escapeHtml(stamp)}</span>`;
     return { tone: a.truncated ? 'warn' : 'info', html };
@@ -27091,7 +27097,8 @@ function renderBinaryGraph() {
         const text = st.loading ? 'Asking the binary graph…'
             : st.note || 'Choose a query and its start, then QUERY: the answer is drawn here, one layer per hop.';
         const error = !st.loading && !st.answer && st.note;
-        host.innerHTML = `<p class="syscall-empty${error ? ' syscall-empty-error' : ''}">${escapeHtml(text)}</p>`;
+        const cut = !st.loading && st.answer && st.answer.partial === true ? ` ${BINARY_GRAPH_PARTIAL}` : '';
+        host.innerHTML = `<p class="syscall-empty${error ? ' syscall-empty-error' : ''}">${escapeHtml(text + cut)}</p>`;
         return;
     }
     host.innerHTML = binaryGraphSvg(binaryGraphLayout(st.nodes, st.edges, st.answer ? st.answer.roots : []), binaryGraphModel());

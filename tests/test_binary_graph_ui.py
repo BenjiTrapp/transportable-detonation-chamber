@@ -275,6 +275,33 @@ def test_a_note_from_the_answer_is_shown_instead_of_an_empty_canvas():
 
 
 @needs_node
+def test_an_answer_over_a_table_cut_short_says_so_in_the_status_and_on_the_empty_canvas():
+    # the final review, I3: several answers set partial without a caveat in their note (importers, shared, a
+    # syscall's callers over the graph-wide flag), so "No binary imports X." would stand unhedged over a cut table
+    r = _graph_flow(r"""
+      (async () => {
+        initSyscalls(); syscallSetView('graph');
+        const empty = { nodes: [], edges: [], truncated: false, total: 0, roots: [], build: '26220.5770', arch: 'arm64', created: '',
+                        note: 'No binary in the graph imports x.dll.' };
+        await ask({ body: { ...empty, partial: true } }, 'x.dll', '');
+        const emptyCut = els['binary-graph-canvas'].innerHTML;
+        await ask({ body: { ...PATH(), partial: true } });
+        const drawnCut = [els['binary-graph-status'].innerHTML, els['binary-graph-status'].hidden];
+        await ask({ body: { ...empty, partial: false } }, 'x.dll', '');
+        const emptyWhole = els['binary-graph-canvas'].innerHTML;
+        await ask({ body: PATH() });
+        out({ emptyCut, drawnCut, emptyWhole, drawnWhole: els['binary-graph-status'].innerHTML });
+      })();""")
+    clause = "cut short when it was read"
+    flat = lambda html: " ".join(re.sub(r"<[^>]+>", " ", html).split())
+    empty = flat(r["emptyCut"])
+    assert "No binary in the graph imports x.dll." in empty and clause in empty and "the figures say how many" in empty
+    status = flat(r["drawnCut"][0])
+    assert clause in status and "the figures say how many" in status and r["drawnCut"][1] is False
+    assert clause not in r["emptyWhole"] and clause not in r["drawnWhole"]
+
+
+@needs_node
 def test_a_truncated_answer_says_so_in_the_view():
     # the cap keeps the first parts in name order and never draws half a path, so a
     # missing node means "not shown", never "does not import" — the view must say which
@@ -1936,10 +1963,11 @@ def test_the_surface_reads_its_figures_when_it_is_shown_and_the_list_is_asked_as
 
 
 def test_the_warning_of_the_explore_view_points_at_a_figure_that_is_in_the_table():
-    """The explore view says "the figures say how many" of the tables that were cut short; the figure it points at is the
-    row of that name, the `partial` count, and a list of the binaries it counts."""
+    """The explore view says "the figures say how many" of the tables that were cut short, and so does the PATH view
+    (BINARY_GRAPH_PARTIAL, the final review's I3); the figure both point at is the row of that name, the `partial`
+    count, and a list of the binaries it counts."""
     js = _read(APP_JS)
-    assert js.count("the figures say how many") == 3
+    assert js.count("the figures say how many") == 4
     meta = _const_source("BINARY_GRAPH_METRICS")
     assert re.search(r"partial: \{ name: 'Binaries with a cut table', means: '[^']*import, delay-load or export[^']*cut short[^']*', jump: 'binary' \}", meta)
 
