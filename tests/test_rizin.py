@@ -7357,7 +7357,7 @@ def _state(rz, sid):
 def _offer(rz, sid):
     """What the pane is told about the **timeline** (it asks rizin, so it waits for the gate): the offer without
     ``refused``, which is the other question -- see _refused."""
-    offer = rz.mgr.get(sid).restore_offer()
+    offer = rz.mgr.get(sid)._restore_offer()
     offer.pop("refused")
     return offer
 
@@ -7367,14 +7367,14 @@ _NO_RECORD = "the project holds no timeline of the emulation to restore"
 
 def _offered(session):
     """A session's offer without ``refused`` (the three fields of the timeline's own question)."""
-    offer = session.restore_offer()
+    offer = session._restore_offer()
     offer.pop("refused")
     return offer
 
 
 def _refused(rz, sid):
     """Why POST /restore would refuse now, as the offer says it (None where it would run)."""
-    return rz.mgr.get(sid).restore_offer()["refused"]
+    return rz.mgr.get(sid)._restore_offer()["refused"]
 
 
 def _wrote(rz, sid, addr="0x140002200", data="41424344"):
@@ -7648,7 +7648,8 @@ def test_the_console_filter_agrees_with_the_lists_of_what_spoils(rz):
 
     for cmd in SPOILING:
         assert rizin_sessions.check_console_command(cmd) is None, cmd
-        kind = ("_RESTORE_HAND_WRITE" if cmd.startswith(("w", "px 4; w")) else
+        kind = ("_RESTORE_GONE" if cmd.startswith("wc-") else
+                "_RESTORE_HAND_WRITE" if cmd.startswith(("w", "px 4; w")) else
                 "_RESTORE_HAND_SETTING" if cmd.startswith(("e ", "ah")) else
                 "_RESTORE_HAND_SETUP" if cmd.replace('"', "").split()[0] in ("aei", "aeim", "aepc") else "_RESTORE_HAND_EMULATION")
         assert rizin_sessions._console_spoils(cmd) == getattr(rizin_sessions, kind), cmd
@@ -8254,12 +8255,12 @@ def test_a_rizin_restart_drops_the_timeline_and_says_why(sessions, sample, fake,
     # says what happened to its own.
     assert _offered(session) == {"actions": 2, "reason": None, "digests": 1}
     saved, session._restore_saved = session._restore_saved, None
-    offer = session.restore_offer()
+    offer = session._restore_offer()
     assert offer["actions"] == 0 and offer["digests"] == 0
     assert offer["reason"] == rizin_sessions._RESTORE_RESTARTED and "restarted" in offer["reason"]
     session._restore_saved = saved
     session.emulation_start(0x140001440)
-    assert session.restore_offer()["actions"] == 1 and session._restore["tainted"] is None
+    assert session._restore_offer()["actions"] == 1 and session._restore["tainted"] is None
     assert session._restore_gone is None
 
 
@@ -8390,13 +8391,13 @@ def test_the_offer_waits_for_the_gate_like_any_view(rz):
     session._gate.enter("test", 1.0)
     try:
         with pytest.raises(rizin_sessions.RizinBusy):
-            session.restore_offer(wait=0.05)
+            session._restore_offer(wait=0.05)
     finally:
         session._gate.leave()
     # and it waits as long as it is told to, not for ever and not for nothing
     session._gate.enter("test", 1.0)
     threading.Timer(0.3, session._gate.leave).start()
-    assert session.restore_offer(wait=5.0)["actions"] == 1
+    assert session._restore_offer(wait=5.0)["actions"] == 1
 
 
 @pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")
@@ -8452,12 +8453,12 @@ def test_real_rizin_the_recorded_skip_value_is_what_was_applied(tmp_path, monkey
         assert session._restore["breakpoints"] == [0x20], "dblj's address, the one the timeline began with"
         assert session._restore["tainted"] is None
         # the four pushes wrote into the emulation's stack, which is the run's too: one range to prove
-        offer = session.restore_offer()
+        offer = session._restore_offer()
         assert _offered(session) == {"actions": 3 * (1 + 4 + 1), "reason": None, "digests": 1}, offer
         stack = session._emulation_stack_map
         assert [r["addr"] for r in session.patches()["patches"] if not r["mine"]] and stack
         session._pipe.cmd("wx 4142 @ 0x30")  # and what a run leaves elsewhere
-        assert session.restore_offer()["digests"] == 2
+        assert session._restore_offer()["digests"] == 2
 
         # a console write before the first start is a foreign row of the cache: the timeline begins spoilt
         session = opened("loop32.bin")
@@ -8465,15 +8466,15 @@ def test_real_rizin_the_recorded_skip_value_is_what_was_applied(tmp_path, monkey
         session.console("wx 90 @ 0x30")
         assert [row["mine"] for row in session.patches()["patches"]] == [False]
         session.emulation_start(0)
-        assert "cache" in session.restore_offer()["reason"]
+        assert "cache" in session._restore_offer()["reason"]
 
         # and a run that ends at the time limit spoils one that began clean
         session.unpatch()
-        assert session.restore_offer()["actions"] == 0, "taking it out of the cache dropped the timeline"
+        assert session._restore_offer()["actions"] == 0, "taking it out of the cache dropped the timeline"
         session.emulation_start(0)
         assert session._restore["tainted"] is None
         assert session.emulation_run("cont")["stopped"] == "timeout"
-        offer = session.restore_offer()
+        offer = session._restore_offer()
         assert offer["actions"] == 2 and "time limit" in offer["reason"]
 
         # a register set before the first start is read by the run: rizin takes `ar` before aei and keeps it
@@ -8668,7 +8669,7 @@ def test_the_patches_win_the_budget_and_the_record_falls_away_whole(rz, monkeypa
     assert "did not fit" not in (rz.status(sid)["analysis"]["note"] or "")
 
 
-def test_the_patches_alone_filling_the_budget_leave_the_record_nothing(rz, monkeypatch):
+def test_the_patches_alone_filling_the_budget_leave_the_record_only_its_marker(rz, monkeypatch):
     import rizin_sessions
 
     path, sid, line = _saved_with_a_record(rz)
@@ -8676,7 +8677,8 @@ def test_the_patches_alone_filling_the_budget_leave_the_record_nothing(rz, monke
     _mark_dirty(rz, sid)
     rz.mgr.get(sid).flush()
     text = _project_text(rz.project())
-    assert "\npatches=140001441:90:r\n" in text and "restore=" not in text
+    assert "\npatches=140001441:90:r\n" in text and _restore_value(rz.project()) == _marker(), \
+        "the patches are whole, and the record that did not fit says so in the one thing that costs no room worth the name"
 
 
 def test_a_waiting_patch_that_the_budget_cuts_is_still_listed_and_the_note_counts_it(rz, monkeypatch):
@@ -9071,20 +9073,21 @@ def test_a_record_that_had_to_be_dropped_leaves_a_marker_and_the_open_says_so(rz
     assert "could not be kept" not in (rz.status(sid)["analysis"]["note"] or "")
 
 
-def test_the_marker_is_written_only_where_the_patches_leave_room_for_it(rz, monkeypatch):
-    # the patches have priority: where they leave less than the marker's own length, nothing is written for the record
+def test_the_marker_is_written_whatever_the_patches_leave(rz, monkeypatch):
+    # the patches have the budget first and are never cut for the record; the marker is a few characters over it at most. Where
+    # the patches leave less than its own length it was suppressed with left_out 0, and the next open said nothing at all
     import rizin_sessions
 
     path, sid, line = _saved_with_a_record(rz)
     session = rz.mgr.get(sid)
     patches = "140001441:90:r"
-    for room, written in ((len(_marker()), _marker()), (len(_marker()) - 1, None), (0, None)):
+    for room in (len(_marker()), len(_marker()) - 1, 1, 0):
         monkeypatch.setattr(rizin_sessions, "PROJECT_PATCH_CHARS", len(patches) + room)
         _mark_dirty(rz, sid)
         session.flush()
         text = _project_text(rz.project())
         assert "\npatches=" + patches + "\n" in text, room
-        assert _restore_value(rz.project()) == written, room
+        assert _restore_value(rz.project()) == _marker(), room
 
 
 def test_a_project_with_no_record_and_one_that_lost_it_are_told_apart(rz, tmp_path):
@@ -9409,7 +9412,7 @@ def test_restoring_refuses_when_the_breakpoints_are_not_the_ones_the_timeline_ra
 
     sid, session = _reopened(rz, path)
     session._pipe.cmd("db-*")  # the fake does not bring the project's breakpoints back: another set
-    offer = rz.mgr.get(sid).restore_offer()
+    offer = rz.mgr.get(sid)._restore_offer()
     assert offer["actions"] == 3 and offer["reason"] is None, "the record is clean: it is the button that is refused"
     assert "breakpoints" in offer["refused"] and "0x140001490" in offer["refused"], offer
     mark = len(rz.commands())
@@ -9719,12 +9722,12 @@ def test_the_replay_does_not_throw_the_record_away_the_way_a_take_back_does(rz, 
     assert discarded == [] and session._restore_gone is None and session._restore_saved is not None
     # the moment a pane reads the offer again, right after the press: the timeline is the session's own and clean, and the
     # button is refused -- for the emulation that the replay left running, and then for the cache, which is the run's
-    offer = session.restore_offer()
+    offer = session._restore_offer()
     assert offer["actions"] == 3 and offer["reason"] is None and offer["refused"] == rizin_sessions._RESTORE_RUNNING, offer
     response = _restore(rz, sid)
     assert response.status_code == 400 and response.get_json()["refused"] == offer["refused"]
     rz.send(f"/api/rizin/{sid}/emulation/stop")
-    offer = session.restore_offer()
+    offer = session._restore_offer()
     assert offer["refused"] == rizin_sessions._RESTORE_CACHE and "write cache holds more or other" in offer["refused"], offer
     response = _restore(rz, sid)
     assert response.status_code == 400 and response.get_json()["refused"] == offer["refused"]
@@ -9929,7 +9932,7 @@ def test_real_rizin_a_replayed_timeline_gives_the_same_bytes(tmp_path):
     try:
         assert [(w["addr"], w["after"]) for w in session.patches()["waiting"]] == [(0x1002, "9090")]
         assert session.json("pxj 64 @ 0x1000")[0] == 0x06, "encrypted again: the open held the patch back"
-        assert session.restore_offer() == {"actions": 3, "reason": None, "digests": 1, "refused": None}
+        assert session._restore_offer() == {"actions": 3, "reason": None, "digests": 1, "refused": None}
         answer = session.restore_run()
         assert answer["restored"] is True, answer["reason"]
         assert session.json("pxj 64 @ 0x1000") == first, "the same bytes, patch included"
@@ -10115,11 +10118,11 @@ def test_get_patches_carries_the_offer_and_reads_the_cache_once(rz):
     sid, session = _reopened(rz, path)
     answer, wcj, dblj = reads(sid)
     assert answer["restore"] == {"actions": 3, "reason": None, "digests": 1, "refused": None} and (wcj, dblj) == (1, 1)
-    assert answer["restore"] == session.restore_offer()
+    assert answer["restore"] == session._restore_offer()
     rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": f"{DECRYPT_AT:#x}"})
     _run(rz, sid, "until", addr=f"{DECRYPT_END:#x}")
     answer, wcj, dblj = reads(sid)
-    assert answer["restore"] == session.restore_offer() and answer["restore"]["actions"] == 2 and wcj == 1, "a live timeline"
+    assert answer["restore"] == session._restore_offer() and answer["restore"]["actions"] == 2 and wcj == 1, "a live timeline"
     assert answer["restore"]["refused"] == rizin_sessions._RESTORE_RUNNING and answer["restore"]["reason"] is None
     rz.send(f"/api/rizin/{sid}/emulation/stop")
     answer, wcj, dblj = reads(sid)
@@ -10350,21 +10353,21 @@ def test_the_offer_says_why_the_button_is_refused_in_every_shape_a_session_has(r
 
     sid = rz.session()
     session = rz.mgr.get(sid)
-    assert session.restore_offer() == {"actions": 0, "reason": None, "digests": 0, "refused": _NO_RECORD}
+    assert session._restore_offer() == {"actions": 0, "reason": None, "digests": 0, "refused": _NO_RECORD}
     rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
     _wrote(rz, sid)
-    offer = session.restore_offer()
+    offer = session._restore_offer()
     assert offer == {"actions": 1, "reason": None, "digests": 1, "refused": _NO_RECORD}, "its own timeline, none in the project"
     assert _restore(rz, sid).json == {"refused": _NO_RECORD}
     session.unpatch()
-    assert session.restore_offer() == {"actions": 0, "reason": rizin_sessions._RESTORE_GONE, "digests": 0,
+    assert session._restore_offer() == {"actions": 0, "reason": rizin_sessions._RESTORE_GONE, "digests": 0,
                                        "refused": rizin_sessions._RESTORE_GONE}
     assert _restore(rz, sid).json == {"refused": rizin_sessions._RESTORE_GONE}
     rz.send(f"/api/rizin/{sid}/emulation/stop")
     rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
     _wrote(rz, sid)
     rz.send(f"/api/rizin/{sid}/emulation/register", {"name": "rax", "value": "0x5"})
-    offer = session.restore_offer()
+    offer = session._restore_offer()
     assert "register" in offer["reason"] and offer["refused"] == _NO_RECORD, "the taint and the button are two answers"
 
 
@@ -10474,3 +10477,156 @@ def test_the_offer_of_a_session_with_a_record_is_not_made_without_rizin(rz):
     sid, session = _reopened(rz, path)
     with pytest.raises(AssertionError):
         session._restore_offered(None, None)
+
+
+# --- The branch fix wave ------------------------------------------------------------------------------------------
+
+def test_a_timeline_that_is_not_kept_is_said_by_the_status_band_and_not_only_by_the_dock(rz, monkeypatch):
+    # Spec 4 and Nachtrag 4: the Hinweisbox says why, as soon as it is true. The commonest spoiler is a decryption that
+    # outlives esil.timeout; the analyst who reads the decrypted code and NOPs the check from the menu never opens the dock
+    import rizin_sessions
+
+    path, line = _decrypted_and_saved(rz, before=[(UNCOVERED, "9090")])
+    monkeypatch.setenv("FAKE_RIZIN_ESIL_RUNAWAY", "1")
+    sid, session = _reopened(rz, path)
+    before = rz.status(sid)["analysis"]["note"]
+    assert "The way to this state" not in before and "Held back" in before
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": f"{DECRYPT_AT:#x}"})
+    assert "The way to this state" not in (rz.status(sid)["analysis"]["note"] or ""), "nothing is spoiled yet"
+    assert _run(rz, sid, "cont")["stopped"] == "timeout"
+    note = rz.status(sid)["analysis"]["note"]
+    words = f"The way to this state is not kept in the project: {rizin_sessions._RESTORE_TIMEOUT}."
+    assert words in note, note
+    assert note.index("Held back") < note.index(words), "after the notes about the patches, which are the user's work"
+    assert note.endswith(rizin_sessions._RESTORE_NOTICE_EARLIER), "and the project still holds the record it was opened with"
+    assert note.count("The way to this state") == 1
+
+
+def test_the_note_of_a_timeline_that_is_not_kept_is_said_while_it_is_true_and_has_no_second_sentence_without_a_record(rz):
+    # computed, not stored: a breakpoint put back takes it away (spec 4's standing change), and with no record in the project
+    # there is no earlier timeline to say anything of
+    import rizin_sessions
+
+    sid = rz.session()
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    _wrote(rz, sid)
+    rz.send(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})
+    note = rz.status(sid)["analysis"]["note"]
+    assert note == f"The way to this state is not kept in the project: {rizin_sessions._RESTORE_HAND_BREAKPOINT}.", note
+    rz.remove(f"/api/rizin/{sid}/breakpoints", {"addr": "0x1400014b7"})
+    assert "The way to this state" not in (rz.status(sid)["analysis"]["note"] or "")
+    _hand_set_a_register(rz, sid)
+    assert rizin_sessions._RESTORE_HAND_REGISTER in rz.status(sid)["analysis"]["note"]
+
+
+def test_a_timeline_that_is_gone_is_said_by_the_status_band_too(rz):
+    import rizin_sessions
+
+    sid = rz.session()
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    _wrote(rz, sid)
+    _console(rz, sid, "wc-*")
+    assert f"is not kept in the project: {rizin_sessions._RESTORE_GONE}." in rz.status(sid)["analysis"]["note"]
+
+
+@pytest.mark.parametrize("command", ["wc- 0x1000 0x1001", "wc-*", "wc- 0x1000", "wc-"])
+def test_a_console_take_back_is_a_take_back_and_not_a_write(command):
+    import rizin_sessions
+
+    assert rizin_sessions._console_spoils(command) == rizin_sessions._RESTORE_GONE
+    assert rizin_sessions._console_spoils("wx 90 @ 0x1000") == rizin_sessions._RESTORE_HAND_WRITE
+    assert rizin_sessions._console_spoils("wc") is None and rizin_sessions._console_spoils("wcj") is None
+
+
+def test_a_console_take_back_taints_a_live_timeline_with_the_take_back_reason(rz):
+    import rizin_sessions
+
+    sid = rz.session()
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    _wrote(rz, sid)
+    _console(rz, sid, "wc- 0x140001440 0x140001441")
+    assert _state(rz, sid)["tainted"] == rizin_sessions._RESTORE_GONE
+
+
+def test_the_replay_hashes_overlapping_writes_in_write_order_and_the_address_ordered_proof_is_another_one(rz):
+    # R-T2a where the digest decides whether the patch is applied. The run writes a byte and then four bytes over it (the shape
+    # `wx ee @ 0x1101`, `wx aabbccdd @ 0x1100` has): the proof by address is a plausible SHA-256 of bytes the run never left,
+    # and run_digests cannot tell, so the test has to
+    import rizin_emulation
+
+    path, line = _decrypted_and_saved(rz, over=[], stub=(ORDER_AT, ORDER_END))
+    saved = _the_saved_record(rz)["digests"]
+    sid, session = _reopened(rz, path)
+    assert rz.ok(_restore(rz, sid))["restored"] is True
+    rows = session.patches_made()
+    by_write = rizin_emulation.run_digests(rows, rizin_emulation.run_only_ranges(rows))
+    by_address = rizin_emulation.run_digests(sorted(rows, key=lambda row: row["addr"]), rizin_emulation.run_only_ranges(rows))
+    assert by_write == saved, "the replay left what the save proved"
+    assert by_address != saved and by_address[0]["sha256"] == hashlib.sha256(bytes.fromhex("41414141")).hexdigest()
+
+
+def test_the_offer_of_a_live_timeline_counts_with_one_pass_and_neither_makes_the_ranges_nor_hashes(rz, monkeypatch):
+    # the route's cost: the offer is asked on every read of GET /patches (after every run, start, stop and edit), with the gate
+    # held. It does not make run_only_ranges and digest_ranges any more (five passes over the rows): one count
+    import rizin_emulation
+
+    sid = rz.session()
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": f"{DECRYPT_AT:#x}"})
+    _run(rz, sid, "until", addr=f"{DECRYPT_END:#x}")
+    rz.mgr.get(sid).flush()
+    for name in ("run_only_ranges", "digest_ranges", "run_digests"):
+        monkeypatch.setattr(rizin_emulation, name, lambda *args, _name=name, **kwargs: pytest.fail(f"the offer made {_name}"))
+    answer = rz.read(f"/api/rizin/{sid}/patches")
+    assert answer["restore"]["digests"] == 1 and answer["restore"]["actions"] == 2
+
+
+def test_the_offer_with_nothing_the_run_wrote_says_so_and_nothing_is_the_fallback_of_a_clean_timeline(rz):
+    # reachable: a start, then a step over an instruction that writes no memory; the documented guarantee of GET /patches
+    import rizin_sessions
+
+    sid = _started(rz)
+    _run(rz, sid, "step")
+    answer = rz.read(f"/api/rizin/{sid}/patches")["restore"]
+    assert answer["digests"] == 0 and answer["reason"] == rizin_sessions._RESTORE_NOTHING, answer
+    assert "The way to this state" not in (rz.status(sid)["analysis"]["note"] or ""), "it needs the cache to know: the pane's block says it"
+
+
+def test_a_replay_says_how_many_actions_of_the_record_it_ran_and_not_how_many_the_timeline_has_now(rz):
+    # the block's `actions` is the timeline the session holds afterwards: the patch written after the proof is one more
+    path, line = _decrypted_and_saved(rz)
+    sid, session = _reopened(rz, path)
+    session._waiting.append((0x140002005, "cc", True))
+    answer = rz.ok(_restore(rz, sid))
+    assert answer["restored"] is True and answer["replayed"] == 3
+    assert answer["patches"]["restore"]["actions"] == 4, "which is why the count is not read from there"
+
+
+def test_a_replay_that_did_not_hold_ran_no_action_of_the_record(rz, monkeypatch):
+    path, line = _decrypted_and_saved(rz)
+    monkeypatch.setenv("FAKE_RIZIN_XOR_KEY", "0x42")
+    sid, session = _reopened(rz, path)
+    answer = rz.ok(_restore(rz, sid))
+    assert answer["restored"] is False and answer["replayed"] == 0
+
+
+def test_a_project_with_no_room_for_the_marker_after_the_patches_still_says_the_record_was_lost(rz, monkeypatch):
+    # measured by the review: 32 767 characters of patches left 1 of the 7 the marker needs, the marker was suppressed and
+    # left_out was 0, so the next open said nothing of a record that was gone. The marker is written whatever is left
+    import rizin_sessions
+
+    path, sid, line = _saved_with_a_record(rz)
+    record = rizin_sessions.rizin_emulation.read_restore(line)
+    src = rz.tmp / "src.rzdb"
+    src.write_text("/\ntype=rizin\n", encoding="utf-8")
+    dst = rz.tmp / "dst.rzdb"
+    monkeypatch.setattr(rizin_sessions, "PROJECT_PATCH_CHARS", 1000)
+    patches = [(0x1000 + i, "90", False) for i in range(125)]
+    line_of_patches, left = rizin_sessions._patches_line(patches)
+    assert 1000 - len(line_of_patches) < len(rizin_sessions._RESTORE_DROPPED_MARK) and left == 0, \
+        "a patches line that leaves fewer characters than the marker's own length, and cuts nothing"
+    left_out, fitted, alone = rizin_sessions._sanitize_project(str(src), str(dst), "aaa", "one", ["aaa"], patches, (), record)
+    text = dst.read_text(encoding="utf-8")
+    assert (left_out, fitted) == (0, False)
+    assert text.endswith("\nrestore=dropped\n") and "\npatches=" + line_of_patches + "\n" in text, text[-40:]
+    meta = rizin_sessions._read_project_meta(str(dst))
+    assert meta["restore_dropped"] is True and len(meta["patches"]) == 125, "the next open says it, and has every patch"

@@ -25462,7 +25462,7 @@ function rizinEmuOffer(restore) {
 // null and no action of the pane is out, and off with the sentence of the refusal as its title everywhere else; the
 // reason is shown whenever there is one, whatever the button says. Both texts are the server's: escaped.
 function rizinEmuRestoreHtml(restore, options) {
-    const { busy = '', wait = '' } = options || {};
+    const { busy = '', wait = '', sessionNote = '' } = options || {};
     const offer = rizinEmuOffer(restore), plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
     let title = 'The offer of the restore comes with the patches and was not in the answer: it is read again with the next one.';
     let disabled = true;
@@ -25476,8 +25476,11 @@ function rizinEmuRestoreHtml(restore, options) {
             + `${offer.actions === null ? '' : ` (${plural(offer.actions, 'action')})`} and check the bytes it leaves against the SHA-256 the project holds`
             + `${offer.digests === null ? '' : ` (${plural(offer.digests, 'range')})`}. This runs the file's code in the emulator again.`;
     }
-    const note = offer && offer.reason
-        ? `<div class="rizin-emu-note rizin-emu-warn rizin-emu-restore-note" role="note">The way to this state is not kept in the project: ${escapeHtml(offer.reason.replace(/[.\s]+$/, ''))}.</div>` : '';
+    // The status band says the same (the session's note, which the server makes while it is true): not twice in one pane. Where the
+    // button is on while the timeline is not kept, the project holds an earlier timeline and the button replays that one.
+    const said = offer && offer.reason ? `The way to this state is not kept in the project: ${offer.reason.replace(/[.\s]+$/, '')}.` : '';
+    const note = said && !String(sessionNote || '').includes(said)
+        ? `<div class="rizin-emu-note rizin-emu-warn rizin-emu-restore-note" role="note">${escapeHtml(said)}${offer.refused === null ? ' The project still holds an earlier timeline, which the restore button replays.' : ''}</div>` : '';
     return `<div class="rizin-emu-restore"><button type="button" class="rizin-tool" data-rizin-act="restore"${disabled ? ' disabled' : ''} `
         + `title="${escapeHtml(title)}">Restore the run</button></div>${note}`;
 }
@@ -25494,7 +25497,10 @@ function rizinEmuRestoreWords(data) {
     const count = (n, word, many = `${word}s`) => `${n} ${n === 1 ? word : many}`;
     if (d.restored === true) {
         const applied = (Array.isArray(d.applied) ? d.applied : []).map(addr => rizinEmuRowAddr(addr) || '?');
-        let text = `Session restored: the saved timeline was replayed${offer && offer.actions !== null ? ` (${count(offer.actions, 'action')})` : ''}`
+        // how many actions ran is the answer's own count: the block's `actions` is the timeline the session holds afterwards, which
+        // is longer by the patches that were written after the proof
+        const replayed = Number.isSafeInteger(d.replayed) && d.replayed >= 0 ? d.replayed : null;
+        let text = `Session restored: the saved timeline was replayed${replayed !== null ? ` (${count(replayed, 'action')})` : ''}`
             + ` and the bytes it left match the SHA-256 the project holds${offer && offer.digests !== null ? ` for ${count(offer.digests, 'range')}` : ''}.`;
         if (applied.length) text += ` ${count(applied.length, 'patch', 'patches')} that waited ${applied.length === 1 ? 'was' : 'were'} written: ${applied.join(', ')}.`;
         if (waiting) text += ` ${waiting} still ${waiting === 1 ? 'waits' : 'wait'}: no run's bytes lie under ${waiting === 1 ? 'it' : 'them'}.`;
@@ -25524,7 +25530,7 @@ function rizinEmuPaneHtml(emu, patches, breakpoints, options) {
         + section('registers', head('REGISTERS', regs.length ? `${regs.length}${marked ? ` · Δ ${marked} changed` : ''}` : ''), rizinEmuRegistersHtml(emu))
         + section('stack', head('STACK', sp ? `from ${sp}` : ''), rizinEmuStackHtml(emu))
         + '</div><div class="rizin-emu-col">'
-        + (ready ? rizinEmuRestoreHtml(restore, { busy, wait }) : '') + said + notes
+        + (ready ? rizinEmuRestoreHtml(restore, { busy, wait, sessionNote: note }) : '') + said + notes
         + (ready
             ? section('breakpoints', head('BREAKPOINTS', String(breakpoints.length)), rizinEmuBreakpointsHtml(breakpoints, functions))
                 + section('patches', rizinEmuPatchesHeadHtml(patches, busy), rizinEmuPatchesHtml(patches, functions, { exported, busy, waiting }))

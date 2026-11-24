@@ -7553,6 +7553,14 @@ def test_rizin_the_restore_button_says_why_it_is_not_offered():
         // reason is the notice and no more: it neither turns the button on nor off
         r.reasonOn = await offer(OFFER({ reason: HAND }));
         r.reasonOff = await offer(OFFER({ reason: HAND, refused: NONE }));
+        // the status band says it too (the session's note, which the server makes while it is true): not twice in one pane
+        const BAND = 'The way to this state is not kept in the project: ' + HAND.replace(/[.\s]+$/, '') + '.';
+        rizinState.analysis = { ...rizinState.analysis, note: 'Held back, not applied: 1 saved patch (0x1). ' + BAND + ' The project still holds an earlier timeline, which the restore button replays.' };
+        r.band = await offer(OFFER({ reason: HAND }));
+        r.bandSessionNotes = pane.querySelectorAll('.rizin-emu-session-note').length;
+        rizinState.analysis = { ...rizinState.analysis, note: 'Another note.' };
+        r.bandOther = await offer(OFFER({ reason: HAND }));
+        rizinState.analysis = { ...rizinState.analysis, note: null };
         r.refusedOnly = await offer(OFFER({ refused: 'the emulation is running: stop it first' }));
         r.blankReason = [await offer(OFFER({ reason: '   ' })), await offer(OFFER({ reason: '' })), await offer(OFFER({ reason: 5 }))];
         // an offer that does not say is no offer
@@ -7664,7 +7672,11 @@ def test_rizin_the_restore_button_says_why_it_is_not_offered():
         and "not kept" in r["reasonOn"]["note"], r["reasonOn"]
     assert r["reasonOff"]["off"] is True and r["reasonOff"]["title"] == "the project holds no timeline of the emulation to restore", \
         "the reason took the title's place: " + str(r["reasonOff"])
-    assert r["reasonOff"]["note"] == r["reasonOn"]["note"]
+    EARLIER = " The project still holds an earlier timeline, which the restore button replays."
+    assert r["reasonOn"]["note"].endswith(EARLIER), "the button is on while the timeline is not kept: it replays the earlier one, and the note says so"
+    assert r["reasonOff"]["note"] == r["reasonOn"]["note"].replace(EARLIER, ""), "no second sentence where the button is off"
+    assert r["band"]["note"] is None and r["bandSessionNotes"] == 1, "the session's note has said it: not a second note of the dock: " + str(r["band"])
+    assert r["bandOther"]["note"] == r["reasonOn"]["note"], "a session note that does not say it leaves the dock's to say it"
     assert r["refusedOnly"]["off"] is True and r["refusedOnly"]["note"] is None, "a refusal alone made a notice: " + str(r["refusedOnly"])
     assert [(b["off"], b["note"]) for b in r["blankReason"]] == [(False, None)] * 3, "a reason with nothing in it made a notice: " + str(r["blankReason"])
     assert r["noCounts"]["off"] is False and "(" not in r["noCounts"]["title"], \
@@ -7707,10 +7719,13 @@ def test_rizin_the_notice_says_what_was_restored_and_what_was_not():
         const out = {};
         const block = over => ({ actions: 5, reason: null, digests: 2, refused: 'the emulation is running: stop it first', ...over });
         const held = n => Array.from({ length: n }, (_, i) => ({ addr: 0x140002000 + i, after: '90', reason: 'r' }));
-        const ok = over => ({ restored: true, reason: null, state: { running: true }, applied: [], patches: { patches: [], waiting: [], restore: block() }, ...over });
+        const ok = over => ({ restored: true, reason: null, state: { running: true }, applied: [], replayed: 5, patches: { patches: [], waiting: [], restore: block() }, ...over });
         out.plain = rizinEmuRestoreWords(ok());
         out.applied = rizinEmuRestoreWords(ok({ applied: [0x140002003, 0x140002005], patches: { patches: [], waiting: held(1), restore: block() } }));
-        out.one = rizinEmuRestoreWords(ok({ applied: [0x140002003], patches: { patches: [], waiting: held(2), restore: block({ actions: 1, digests: 1 }) } }));
+        out.one = rizinEmuRestoreWords(ok({ applied: [0x140002003], replayed: 1, patches: { patches: [], waiting: held(2), restore: block({ actions: 1, digests: 1 }) } }));
+        // the block's `actions` is the timeline the session holds afterwards (longer by the patches written after the proof): not the count
+        out.longer = rizinEmuRestoreWords(ok({ applied: [0x140002003], replayed: 3, patches: { patches: [], waiting: [], restore: block({ actions: 4 }) } }));
+        out.noReplayed = [rizinEmuRestoreWords(ok({ replayed: undefined })), rizinEmuRestoreWords(ok({ replayed: 'many' })), rizinEmuRestoreWords(ok({ replayed: -1 })), rizinEmuRestoreWords(ok({ replayed: 2 ** 60 }))];
         out.many = rizinEmuRestoreWords(ok({ patches: { patches: [], waiting: held(3), restore: block() } }));
         out.noList = rizinEmuRestoreWords(ok({ patches: null, applied: [0x140002003] }));
         out.noBlock = rizinEmuRestoreWords(ok({ patches: { patches: [], waiting: [] } }));
@@ -7730,10 +7745,13 @@ def test_rizin_the_notice_says_what_was_restored_and_what_was_not():
     assert "1 patch that waited was written: 0x140002003. 2 still wait" in words["one"]["text"] and "(1 action)" in words["one"]["text"] \
         and "for 1 range." in words["one"]["text"], words["one"]
     assert words["many"]["text"].endswith("3 still wait: no run's bytes lie under them."), words["many"]
-    assert words["noList"]["kind"] == "ok" and "(" not in words["noList"]["text"] and "still wait" not in words["noList"]["text"] \
-        and "1 patch that waited was written: 0x140002003." in words["noList"]["text"], \
+    assert words["longer"]["text"].startswith("Session restored: the saved timeline was replayed (3 actions) and"), words["longer"]
+    assert all(w["text"].startswith("Session restored: the saved timeline was replayed and the bytes") for w in words["noReplayed"]), \
+        "a count that is none was said: " + str(words["noReplayed"])
+    assert words["noList"]["kind"] == "ok" and "(5 actions)" in words["noList"]["text"] and "for 2 ranges" not in words["noList"]["text"] \
+        and "still wait" not in words["noList"]["text"] and "1 patch that waited was written: 0x140002003." in words["noList"]["text"], \
         "a counted statement from a block that was not there: " + str(words["noList"])
-    assert words["noBlock"]["text"] == "Session restored: the saved timeline was replayed and the bytes it left match the SHA-256 the project holds.", words["noBlock"]
+    assert words["noBlock"]["text"] == "Session restored: the saved timeline was replayed (5 actions) and the bytes it left match the SHA-256 the project holds.", words["noBlock"]
     assert words["badBlock"] == words["noBlock"], "counts that are no counts were said: " + str(words["badBlock"])
     assert "?" in words["unsafe"]["text"] and "written: ?." in words["unsafe"]["text"], words["unsafe"]
     assert words["failed"]["kind"] == "error" and words["failed"]["text"].startswith("Not restored: replaying the timeline left other bytes than the ones saved with it") \
@@ -7764,7 +7782,7 @@ def test_rizin_the_notice_says_what_was_restored_and_what_was_not():
             s.patches = [...s.patches, { addr: 0x140001521, size: 1, before: '41', after: '90', mine: true }];
             s.waiting = s.waiting.filter(w => w.addr !== 0x140001521);
             s.restore = OFFER({ actions: 6, digests: 2, refused: 'the emulation is running: stop it first' });
-            return [200, { restored: true, reason: null, state: emuRead(s.emu), applied: [0x140001521],
+            return [200, { restored: true, reason: null, state: emuRead(s.emu), applied: [0x140001521], replayed: 5,
                            patches: { patches: rows(s.patches), waiting: rows(s.waiting), restore: s.restore } }, 5];
         };
         let f = await pressRestore();
@@ -7876,7 +7894,7 @@ def test_rizin_the_notice_says_what_was_restored_and_what_was_not():
     assert "error" not in r, r.get("error")
     ok = r["restored"]
     assert ok["emu"] is True and ok["pc"] == "0x1400014c4" and ok["strip"] is True and ok["wait"] == "" and ok["busy"] == "", ok
-    assert ok["said"] == ("Session restored: the saved timeline was replayed (6 actions) and the bytes it left match the SHA-256 the project "
+    assert ok["said"] == ("Session restored: the saved timeline was replayed (5 actions) and the bytes it left match the SHA-256 the project "
                           "holds for 2 ranges. 1 patch that waited was written: 0x140001521. 1 still waits: no run's bytes lie under it."), ok["said"]
     assert "rizin-emu-note-ok" in ok["kind"] and ok["waiting"] == ["0x140009000"] and ok["hand"] == ["0x1400014c0", "0x1400014d0", "0x140001521"], ok
     assert ok["lists"] == 0, "the answer carried the lists, and they were asked for again: " + str(ok)

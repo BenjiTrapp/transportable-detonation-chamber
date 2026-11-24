@@ -788,6 +788,36 @@ def digest_ranges(rows, ranges):
         [row for row in rows if row.get("mine")])))
 
 
+def proved_range_count(rows):
+    """How many ranges a timeline proves with the cache as it is: ``len(digest_ranges(rows, run_only_ranges(rows)))``
+    without making either (an offer asks it on every read of the pane's own route, and those make five passes over the
+    rows where this makes one and a sort).
+
+    It is that because the ranges ``run_digests`` hashes are the run's **own** writes, whole: ``run_only_ranges`` is the
+    run's writes without the bytes a patch covers (O \\ P), and ``digest_ranges`` puts back the part of each patch that lies
+    over the run's bytes ((O \\ P) u (O n P) = O), then merges. That holds for the one form the design has, ``ranges =
+    run_only_ranges(rows)`` -- measured equal over 4000 random row sets (tests/test_rizin_emulation.py) -- and says nothing of
+    any other ``ranges``, which is why ``digest_ranges`` and ``run_digests`` keep their general form.
+
+    A row that holds fewer bytes than it says (``parse_cache`` checks the types of a row and not that) raises the ValueError
+    ``run_digests`` raises for it: a count of ranges that the save skips and the replay refuses is not one to state."""
+    spans = []
+    for row in rows:
+        if len(row["after"]) != 2 * row["size"]:
+            raise ValueError("a row of the cache does not hold as many bytes as it says")
+        if not row.get("mine") and row["size"] > 0:
+            spans.append((row["addr"], row["addr"] + row["size"] - 1))
+    spans.sort()
+    count, end = 0, None
+    for low, high in spans:
+        if end is None or low > end + 1:  # a range that touches the one before is the same range, as written_ranges merges
+            count += 1
+            end = high
+        elif high > end:
+            end = high
+    return count
+
+
 def run_digests(rows, ranges):
     """The SHA-256 of what a run left in each range: [{"start", "end", "sha256"}], lowest first, both ends
     in the range. It is what a replay has to give the same bytes for, and it is made while the cache is

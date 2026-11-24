@@ -935,7 +935,8 @@ def test_read_restore_refuses_a_hand_edited_record():
         "a patch with a half byte": _swap(line, "patch:140001470:9090", "patch:140001470:909"),
         "a patch with bytes that are no hex": _swap(line, "patch:140001470:9090", "patch:140001470:90zz"),
         "a patch in capitals": _swap(line, "patch:140001470:9090", "patch:140001470:90AB"),
-        "a patch with a command in it": _swap(line, "patch:140001470:9090", "patch:140001470:90;wx 90"),
+        "a patch with a command in it": _swap(line, "patch:140001470:9090", "patch:140001470:90 wx"),
+        "a patch with a section in it": _swap(line, "patch:140001470:9090", "patch:140001470:90;wx 90"),
         "a patch longer than a patch can be": _swap(line, "patch:140001470:9090",
                                                    "patch:140001470:" + "90" * (rizin_emulation.MAX_PATCH_BYTES + 1)),
         "a patch with no address": _swap(line, "patch:140001470:9090", "patch:9090"),
@@ -1060,6 +1061,9 @@ def test_restore_line_refuses_a_record_that_read_restore_would_refuse():
         "a breakpoint that is a bool": dict(good, breakpoints=[True]),
         "breakpoints that are no list": dict(good, breakpoints=None),
         "a record that is no dict": [start],
+        # a KeyError is not a ValueError, and one that got out of restore_line would be a crash of the save thread (R-T2c)
+        "an empty record": {},
+        "a record with no breakpoints": {key: value for key, value in good.items() if key != "breakpoints"},
     }
     for what, record in bad.items():
         try:
@@ -1240,3 +1244,31 @@ def test_digest_ranges_are_the_ranges_run_digests_hashes_and_hash_nothing():
     with pytest.raises(ValueError):
         rizin_emulation.run_digests(bad, rizin_emulation.run_only_ranges(bad))
     assert len(rizin_emulation.digest_ranges(bad, rizin_emulation.run_only_ranges(bad))) == 1
+
+
+def test_proved_range_count_is_the_number_of_ranges_run_digests_hashes():
+    """The offer counts what a save would hash, in one pass: for the one form the design has (the ranges are the run's own
+    writes less what a patch covers) the count is the length of what run_digests returns -- over random row sets with
+    patches inside, over and beside the run's bytes, rows that touch, overlap and repeat, and rows of no size."""
+    import random
+
+    rng = random.Random(7)
+    for _ in range(4000):
+        rows = []
+        for _ in range(rng.randint(0, 12)):
+            size = rng.randint(1, 5)
+            rows.append({"addr": rng.randint(0, 30), "size": size, "before": "00" * size, "after": "ab" * size,
+                         "mine": rng.random() < 0.4, "over_run": False})
+        ranges = rizin_emulation.run_only_ranges(rows)
+        assert rizin_emulation.proved_range_count(rows) == len(rizin_emulation.run_digests(rows, ranges)) \
+            == len(rizin_emulation.digest_ranges(rows, ranges)), rows
+    # the touching ranges are one (written_ranges merges at a distance of 1), a gap of one byte is two
+    rows = [{"addr": 0, "size": 2, "before": "0000", "after": "abab", "mine": False},
+            {"addr": 2, "size": 1, "before": "00", "after": "ab", "mine": False},
+            {"addr": 4, "size": 1, "before": "00", "after": "ab", "mine": False}]
+    assert rizin_emulation.proved_range_count(rows) == 2 == len(rizin_emulation.run_digests(rows, rizin_emulation.run_only_ranges(rows)))
+    assert rizin_emulation.proved_range_count([]) == 0
+    # a row that holds fewer bytes than it says is refused as run_digests refuses it, and a patch's is no exception
+    for mine in (False, True):
+        with pytest.raises(ValueError):
+            rizin_emulation.proved_range_count([dict(rows[0], size=4, mine=mine)])

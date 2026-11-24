@@ -1563,6 +1563,7 @@ def test_the_guide_says_what_a_waiting_patch_is_and_how_a_session_comes_back():
         "Not restored:",
         "The patches that wait still wait.",
         "The way to this state is not kept in the project:",
+        "The project still holds an earlier timeline, which the restore button replays.",
         "not applied \u00b7 kept with the project",
         "These are not in rizin's cache: written into the file's own bytes, which are still encrypted, the next "
         "decryption would run over them. Apply now is there once a run's bytes lie under a patch; \u2715 removes "
@@ -1591,6 +1592,8 @@ def test_the_guide_says_what_a_waiting_patch_is_and_how_a_session_comes_back():
     said = [v for v in vars(rizin_sessions).values() if isinstance(v, str)]
     server_fragments = [
         "Held back, not applied: ",
+        "The way to this state is not kept in the project: ",
+        "The project still holds an earlier timeline, which the restore button replays.",
         "replaying the timeline left other bytes than the ones saved with it",
         "the replay stopped at action",
         ": nothing was applied, and the cache is as it was when the file was opened",
@@ -1599,6 +1602,34 @@ def test_the_guide_says_what_a_waiting_patch_is_and_how_a_session_comes_back():
         assert any(text in v for v in said), "the server no longer says %r" % text
     for text in server_fragments:
         assert text in guide, "docs/rizin.md does not quote %r" % text
+
+    # The doors of the table of causes, as the code takes them. The loop above ties each reason to a cell; what it cannot see is a
+    # cell whose **cause** the code gives another reason (the console's wc- was documented as "taken out of the cache" and the
+    # code called it "a console command wrote to the cache"). So each console cause of the table is run through the code that
+    # decides it, and has to give the reason of its own row.
+    rows = {}
+    for line in _doc("rizin.md").replace("`", "").splitlines():
+        cells = [cell.strip() for cell in line.strip().strip("|").split(" | ")]
+        if line.startswith("| ") and len(cells) == 2:
+            rows[cells[0]] = cells[1]
+    doors = [
+        ("A console command that writes into the cache", "wx 90 @ 0x1000"),
+        ("A console command that writes into the cache", "wa nop @ 0x1000"),
+        ("A console command that sets a register or steps the emulation", "ar rax=1"),
+        ("A console command that sets a register or steps the emulation", "aes"),
+        ("A console command that arms the emulation", "aei"),
+        ("A console command that arms the emulation", "aeim"),
+        ("A console command that arms the emulation", "aepc 0x1000"),
+        ("A setting (e <key>=<value>)", "e asm.arch=x86"),
+        ("A setting (e <key>=<value>)", "ah 4 @ 0x1000"),
+        ("Something taken out of the cache", "wc- 0x1000 0x1001"),
+        ("Something taken out of the cache", "wc-*"),
+    ]
+    for cause, command in doors:
+        cell = [reason for key, reason in rows.items() if key.startswith(cause)]
+        assert len(cell) == 1, "the table of causes has no single row that begins %r" % cause
+        assert rizin_sessions._console_spoils(command) == cell[0], \
+            "the guide says %r is %r, and the code says %r" % (command, cell[0], rizin_sessions._console_spoils(command))
 
     # the numbers: the code's own
     assert rizin_emulation.RESTORE_MAX_ACTIONS == 500 and "at most 500 actions" in guide
