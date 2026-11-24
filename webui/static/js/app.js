@@ -27466,21 +27466,28 @@ function binaryGraphExploreRelease(st) {
 
 // What is cut now, per opened node and level: the parts the server dropped of its own answer, the imported functions it
 // dropped from a list grouped by module (and the module whose count is a lower bound), the nodes with a table (import, delay-load or
-// export) that was cut short when the graph was read, the nodes whose importers were read over a cut table, and the heads of the parts that
-// did not fit on the canvas (or whose drawn head lost its edge) and are still not drawn. { hidden (neighbours known to be
+// export) that was cut short when the graph was read, the nodes whose importers were read over a cut table, and what the
+// parts held back because they did not fit still miss: the head of each, or where the head is drawn, the nodes of its path
+// that are not, each counted once. { hidden (neighbours known to be
 // missing), server, functions, tables, importers, dropped, any, parents, of, ofFunctions, ofTable, ofImporters, lastDrawn,
 // tableEdges }
 function binaryGraphExploreCut(st) {
     const drawn = new Set(st.nodes.map(n => n.id)), heads = new Set(), of = new Map(), ofFunctions = new Map(), ofTable = new Set(), ofImporters = new Set(), parents = new Set();
     let server = 0, functions = 0, lastDrawn = false, tableEdges = false;
     for (const record of st.cut.values()) {
-        const held = [...record.held.keys()];
-        if (!record.server && !record.functions && !record.table && !record.tableIn && !held.length) continue;
+        // what a held part still misses: its head while that is not drawn, and once another expansion drew the head,
+        // the nodes of its path that are not (an api set), counted once however many parts miss the same one
+        const held = new Set();
+        for (const [head, part] of record.held) {
+            if (!drawn.has(head)) held.add(head);
+            else part.nodes.forEach(n => { if (!drawn.has(n.id)) held.add(n.id); });
+        }
+        if (!record.server && !record.functions && !record.table && !record.tableIn && !held.size) continue;
         server += record.server;
         functions += record.functions;
         held.forEach(id => heads.add(id));
         parents.add(record.from);
-        of.set(record.from, (of.get(record.from) || 0) + record.server + held.length);
+        of.set(record.from, (of.get(record.from) || 0) + record.server + held.size);
         if (record.functions) {
             ofFunctions.set(record.from, (ofFunctions.get(record.from) || 0) + record.functions);
             if (record.last && drawn.has(record.last)) lastDrawn = true;

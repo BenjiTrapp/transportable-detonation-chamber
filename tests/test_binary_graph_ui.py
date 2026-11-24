@@ -1424,6 +1424,30 @@ def test_an_edge_that_could_not_be_drawn_because_its_head_is_drawn_but_its_alias
 
 
 @needs_node
+def test_held_parts_whose_heads_are_drawn_count_the_one_alias_they_miss_not_their_heads():
+    # the final review, M5: c003 and c004 are drawn by the first expansion and both import c007 through one api set that
+    # does not fit. What is missing is that one node, not two importers that are on the canvas
+    r = _explore_flow(r"""
+      (async () => {
+        initSyscalls(); binaryGraphSetMode('explore');
+        const name = i => 'c' + String(i).padStart(3, '0') + '.dll';
+        GRAPH['hub.dll'] = { in_degree: 450, imports: {} };
+        for (let i = 0; i < 450; i++) GRAPH[name(i)] = { in_degree: 1, imports: { 'hub.dll': ['F'] } };
+        GRAPH['api-ms-x-l1-1-0.dll'] = { is: 'api-set', in_degree: 5, hosts: ['c007.dll'] };
+        GRAPH['c003.dll'].imports = { 'hub.dll': ['F'], 'api-ms-x-l1-1-0.dll': ['H'] };
+        GRAPH['c004.dll'].imports = { 'hub.dll': ['F'], 'api-ms-x-l1-1-0.dll': ['H'] };
+        await binaryGraphExploreStart('hub.dll'); await binaryGraphExpand('hub.dll');
+        await binaryGraphExpand('c007.dll');
+        out({ count: st.nodes.length, heads: !!at('c003.dll') && !!at('c004.dll'), alias: !!at('api-ms-x-l1-1-0.dll'),
+              status: els['binary-explore-status'].innerHTML, texts: frame().texts });
+      })();""")
+    assert r["count"] == 400 and r["heads"] and not r["alias"]
+    status = _plain(r["status"])
+    assert "1 did not fit" in status and "2 did not fit" not in status, status
+    assert "Not the whole neighbourhood: 52 not shown (the canvas holds 400 nodes)" in r["texts"], "the server's 51 and the one api set"
+
+
+@needs_node
 def test_a_cut_table_keeps_its_caveat_once_modules_are_drawn():
     r = _explore_flow(r"""
       (async () => {
