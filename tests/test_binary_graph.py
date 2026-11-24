@@ -1018,10 +1018,24 @@ def test_a_name_that_is_not_valid_utf16_or_is_empty_drops_its_entry():
     assert set(binary_graph.parse_api_set_map(_patched(data, _ENTRY_1 + 8, 0))) == {"api-first-l1-1-0", "api-third-l1-1-0"}
 
 
-def test_an_empty_host_is_an_unreadable_value_and_takes_its_entry_with_it():
-    # value[0] is the default host: skipping an empty one would promote an override into the default's place
+def test_an_empty_host_after_the_default_is_dropped_alone_and_the_default_stays_ruling_66():
+    # the real shape: on Windows 11 26200.9974, 144 of 985 entries carry an empty host in a value after the first,
+    # api-ms-win-core-memory-l1-1-0 and api-ms-win-core-processthreads-l1-1-0 among them, the two most imported
+    # modules of System32. Before Ruling 66 each of them was dropped whole and every chain through them died there
+    data = _api_set_map({"api-ms-win-core-memory-l1-1-0": ("kernelbase.dll", ("kernel32.dll", "")),
+                         "api-ms-win-mid-l1-1-0": ("kernelbase.dll", "", "ntdll.dll"),
+                         "api-ms-win-ok-l1-1-0": ("kernelbase.dll", "ntdll.dll")})
+    assert binary_graph.parse_api_set_map(data) == {
+        "api-ms-win-core-memory-l1-1-0": ("kernelbase.dll",),
+        "api-ms-win-mid-l1-1-0": ("kernelbase.dll", "ntdll.dll"),          # in order: no override moves ahead
+        "api-ms-win-ok-l1-1-0": ("kernelbase.dll", "ntdll.dll")}
+
+
+def test_an_empty_default_host_still_takes_its_entry_with_it_ruling_66():
+    # value[0] is the default host: without it the default is unknown, and taking the next host would promote an
+    # override into the default's place
     data = _api_set_map({"ext-ms-win-gone-l1-1-0": ("",), "api-ms-win-first-l1-1-0": ("", "kernelbase.dll"),
-                         "api-ms-win-last-l1-1-0": ("kernelbase.dll", ""), "api-ms-win-ok-l1-1-0": ("kernelbase.dll", "ntdll.dll")})
+                         "api-ms-win-ok-l1-1-0": ("kernelbase.dll", "ntdll.dll")})
     assert binary_graph.parse_api_set_map(data) == {"api-ms-win-ok-l1-1-0": ("kernelbase.dll", "ntdll.dll")}
 
 

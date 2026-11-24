@@ -75,7 +75,7 @@ Erwartung, bis die VM misst).
 | **`Answer` trägt `total` und `partial` strukturiert**, nicht als Satz in der Prosa. | Drei Frontend-Tasks müssten Prosa parsen. |
 | **Die Warnung zeigt auf die Zahl**, statt dauernd sichtbar zu sein; die konservative Regel bleibt. | Eine dauernde Warnung erzieht zum Ignorieren. Die engere Regel wäre eine schwächere Behauptung als die Wahrheit. |
 | **Der Hinweis muss das Ende nennen, das wirklich eintrat** — nicht eine fehlende Baseline einer kuratierten Zeile anlasten. | Der Analyst handelt nach dem falschen Grund. |
-| **Ein leerer Host verwirft seinen API-Set-Eintrag.** Teilannahme verschiebt die Reihenfolge. | Ein Override rutscht auf den Platz der Vorgabe. |
+| **Ein leerer Host verwirft seinen API-Set-Eintrag nur, wenn er in `value[0]` steht** (Entscheidung 66, ersetzt 20 nach der VM-Messung). Die alte Regel verwarf auch einen leeren Host nach dem Standard und verlor so 144 von 985 echten Einträgen, darunter die zwei meistimportierten. Ein leerer späterer Wert fällt allein weg, die übrigen behalten ihre Reihenfolge. | Ein Override rutscht auf den Platz der Vorgabe — das geht nur über `value[0]`, und dort bleibt die Regel streng. |
 | **Ein Teil-Parse wird sichtbar** (`BinaryInfo.partial`), statt still eine abgeschnittene Tabelle zu behalten. | Eine Kante hinter dem Schnitt fehlt stillschweigend. |
 | **Eine Fixture darf keinen Wert packen, den wir für falsch halten**, auch einen unbenutzten. | Der nächste Leser glaubt ihm. |
 | **Die Doors-Fixture wurde realistisch gemacht** — und zwölf Prozessmodus-Tests fielen um. Das war der Beweis, dass die Fixture sie grün hielt. | Ein Mechanismus, der nur gegen ein unmögliches System32 funktioniert. |

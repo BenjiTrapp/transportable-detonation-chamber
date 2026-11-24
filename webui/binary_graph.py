@@ -274,22 +274,28 @@ def _api_set_text(data, offset, length):
 
 
 def _api_set_hosts(data, offset, count):
-    """The host modules of one entry in the map's order, or None when any value of it is unreadable, an empty host
-    included: with one value lost, the default (value[0]) might be it, or an override would move into the default's
-    place, and either way the chain resolves through the wrong module. Never relax this into partial acceptance."""
+    """The host modules of one entry in the map's order, or None when any value of it is unreadable or the default's
+    (value[0]) host is empty: with a value lost the default might be it, and without the default the chain would
+    resolve through the wrong module. An empty host after the default is dropped alone (Ruling 66)."""
     end = offset + _API_SET_VALUE.size * count
     if not count or end > len(data):
         return None
     hosts = []
-    for _, name_at, name_len, host_at, host_len in _API_SET_VALUE.iter_unpack(bytes(data[offset:end])):
+    for index, (_, name_at, name_len, host_at, host_len) in enumerate(
+            _API_SET_VALUE.iter_unpack(bytes(data[offset:end]))):
         # the importer name is not used (the resolution is importer-independent, see parse_api_set_map), but must lie
         # inside the map too
         if name_len and _api_set_text(data, name_at, name_len) is None:
             return None
         host = _api_set_text(data, host_at, host_len)
-        if not host:
+        if host is None or (not host and index == 0):
             return None
-        hosts.append(host)
+        # Ruling 66, replacing Ruling 20: on Windows 11 26200.9974, 144 of 985 real entries have an empty host in a
+        # value after the first, api-ms-win-core-memory-l1-1-0 and api-ms-win-core-processthreads-l1-1-0 among them,
+        # the two most imported api-sets of the system. Dropping only that value keeps the default first and the
+        # remaining hosts in order, so no override is promoted into the default's place
+        if host:
+            hosts.append(host)
     return tuple(hosts)
 
 
@@ -308,9 +314,10 @@ def parse_api_set_map(data: bytes) -> dict[str, tuple[str, ...]]:
       defines the function. A chain may so pass a host the loader would use for a different importer than the one in
       the path: an edge between two real modules the map does associate, never an invented one. The order is not
       rearranged (a default put first would be made-up data).
-    - One unreadable value, an empty host included, drops its whole entry, never only its host. With a value lost the
-      default might be the one gone, or an override would move into the default's place: either way the chain would
-      resolve through the wrong module. Do not relax this into partial acceptance.
+    - One unreadable value drops its whole entry, never only its host, and so does an empty host in value[0]: with
+      the default lost or unknown the chain would resolve through the wrong module. An empty host in a later value
+      is dropped alone and the other hosts keep their order (Ruling 66): the default stays first and no override
+      takes its place. Real maps carry such values: 144 of 985 entries on Windows 11 26200.9974.
     - The map is the window the header's Size gives (above), never a wider one."""
     if len(data) < _API_SET_HEADER.size:
         return {}
