@@ -900,10 +900,10 @@ def test_every_skip_reason_is_a_fixed_string_of_the_vocabulary():
 
 # --- the ApiSetMap: api-ms-win-* names, which no file on disk carries ---------------------------
 
-_API_SET_HEADER, _API_SET_ENTRY, _API_SET_VALUE = 28, 24, 20     # bytes; the entries start right behind the header
+_API_SET_HEADER, _API_SET_ENTRY, _API_SET_VALUE = 28, 24, 20     # bytes; the packer's entries start behind the header
 
 
-def _api_set_map(mapping, version=6):
+def _api_set_map(mapping, version=6, entry_offset=_API_SET_HEADER):
     """A version-6 ApiSetMap: alias -> hosts. A host is a module name, or an (importing module, host) pair.
 
     Header (u32 x 7): Version, Size, Flags, Count, EntryOffset, HashOffset, HashFactor.
@@ -911,10 +911,11 @@ def _api_set_map(mapping, version=6):
     Value  (u32 x 5, from the entry's ValueOffset): Flags, NameOffset, NameLength, ValueOffset, ValueLength.
     Every offset counts from the base of the map, every name is UTF-16LE and every length is in bytes. Behind the
     header come the entries, then the hash table (8 bytes an entry, never read), then the value arrays, then the
-    names; entry i sits at _API_SET_HEADER + _API_SET_ENTRY * i."""
+    names; entry i sits at entry_offset + _API_SET_ENTRY * i. A real map need not put its entries right behind the
+    header: `entry_offset` leaves a gap of filler bytes there, as Windows 11 26200.9974 has (EntryOffset 152)."""
     import struct
     n = len(mapping)
-    hash_at = _API_SET_HEADER + _API_SET_ENTRY * n
+    hash_at = entry_offset + _API_SET_ENTRY * n
     values_at = hash_at + 8 * n
     names_at = values_at + _API_SET_VALUE * sum(len(hosts) for hosts in mapping.values())
     names = bytearray()
@@ -938,12 +939,23 @@ def _api_set_map(mapping, version=6):
             (importer_at, importer_len), (module_at, module_len) = name(importer), name(module)
             values += struct.pack("<5I", 0, importer_at, importer_len, module_at, module_len)
     size = names_at + len(names)
-    return struct.pack("<7I", version, size, 0, n, _API_SET_HEADER, hash_at, 31) + entries + hashes + values + bytes(names)
+    gap = b"\xcc" * (entry_offset - _API_SET_HEADER)
+    return (struct.pack("<7I", version, size, 0, n, entry_offset, hash_at, 31) + gap + entries + hashes + values
+            + bytes(names))
 
 
 def test_an_api_set_alias_resolves_to_its_host_modules_in_order():
     data = _api_set_map({"api-ms-win-core-memory-l1-1-0": ("kernelbase.dll", "kernel32.dll")})
     assert binary_graph.parse_api_set_map(data)["api-ms-win-core-memory-l1-1-0"] == ("kernelbase.dll", "kernel32.dll")
+
+
+def test_entries_are_read_at_entry_offset_not_behind_the_header():
+    # the plan's VM check asserted EntryOffset == 28; the real map of 26200.9974 has 152. The reader goes by the field
+    mapping = {"api-ms-win-core-memory-l1-1-0": ("kernelbase.dll",), "ext-ms-win-fs-clfs-l1-1-0": ("clfs.sys",)}
+    data = _api_set_map(mapping, entry_offset=152)
+    import struct
+    assert struct.unpack_from("<7I", data)[4] == 152 and data[28:152] == b"\xcc" * 124
+    assert binary_graph.parse_api_set_map(data) == mapping
 
 
 def test_the_packer_lays_the_map_out_as_the_version_6_table_says():
