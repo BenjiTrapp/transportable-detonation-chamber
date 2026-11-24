@@ -561,6 +561,33 @@ def test_selecting_a_cell_in_the_map_marks_the_same_node_in_the_graph():
     assert len(r["marked"]) == 1 and 'data-id="syscall:Nt5"' in r["marked"][0]
 
 
+@needs_node
+def test_a_syscall_the_baseline_holds_under_its_zw_name_is_the_same_cell_and_node_ruling_69():
+    # the graph names a syscall by its Nt name; on 26200.9974 the x64 baseline holds ZwWriteVirtualMemory and not
+    # NtWriteVirtualMemory. Choosing either one chooses the other
+    r = _graph_flow(r"""
+      (async () => {
+        ALL[5].name = 'Zw5'; freshRoutes();
+        initSyscalls(); syscallsTabShown(); await settle(); syscallSetView('graph');
+        await ask({ body: PATH('Nt5', 5) });
+        binaryGraphSelect('syscall:Nt5'); await settle();
+        const fromGraph = { selected: syscallState.selected, asked: requests.some(q => q.url.startsWith('/api/syscalls/Zw5')),
+                            row: /<button[^>]*class="syscall-row selected"[^>]*data-name="Zw5"/.test(els['syscall-rows'].innerHTML),
+                            graph: binaryGraphState.selected };
+        syscallSelect(''); await settle();
+        syscallSelect('Zw5'); await settle();
+        const svg = els['binary-graph-canvas'].innerHTML;
+        out({ fromGraph, fromMap: { graph: binaryGraphState.selected,
+              marked: (svg.match(/<g class="binary-graph-node [^"]*\bselected\b[^"]*"[^>]*data-id="([^"]+)"/g) || []) },
+              plain: (syscallSelect('Nt7'), syscallState.selected), other: (syscallSelect('Xx5'), syscallState.selected) });
+      })();""")
+    assert r["fromGraph"] == {"selected": "Zw5", "asked": True, "row": True, "graph": "syscall:Nt5"}
+    assert r["fromMap"]["graph"] == "syscall:Nt5"
+    assert len(r["fromMap"]["marked"]) == 1 and 'data-id="syscall:Nt5"' in r["fromMap"]["marked"][0]
+    assert (r["plain"], r["other"]) == ("Nt7", "Xx5")
+    assert 'app.js?v=156"' not in _read(INDEX_HTML), "app.js changed, its version did not"
+
+
 # --- Escaping ------------------------------------------------------------------------------------------------------
 
 @needs_node

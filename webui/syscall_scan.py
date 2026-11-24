@@ -13,12 +13,13 @@ import ntpath
 import os
 import re
 import threading
+from dataclasses import replace
 from typing import Iterable, NamedTuple
 
 from syscall_baseline import (READ_LEN, STATE_DIVERGED, STATE_HOOKED, STATE_INTACT,
                               STATE_PATCHED, STATE_UNREADABLE, NON_MODULE_OWNERS, OWNER_MAPPED,
                               OWNER_PRIVATE, Baseline, Syscall, classify_stub, jump_authenticated,
-                              jump_pattern, jump_pointer, jump_target, strip_pointer_auth)
+                              jump_pattern, jump_pointer, jump_target, nt_name, strip_pointer_auth)
 
 MEM_COMMIT = 0x1000
 MEM_IMAGE = 0x1000000
@@ -581,11 +582,21 @@ _USER_SPACE_END = 0x7FFFFFFF0000
 def _numbers(baseline: Baseline) -> dict[int, Syscall]:
     """Each syscall number of the baseline with the syscall that owns it. ntdll and win32u
     number apart in practice (the table is in the number's upper bits); were they not to,
-    ntdll is the one named."""
+    ntdll is the one named.
+
+    A syscall the baseline holds under its Zw name is handed on under its Nt name, same number,
+    module and RVA (Ruling 69): parse_baseline keeps one name a number, whichever NTSleuth emitted
+    first, and on 26200.9974 that was the Zw name for four covered syscalls in each view
+    (ZwWriteVirtualMemory on x64, ZwProtectVirtualMemory on arm64, ...). Everything that judges a
+    hit (the coverage of the Win32 to Nt table, the expanded imports, the doors of a process, the
+    export of a copy of ntdll) speaks the Nt form, and the evidence model keys a finding by the
+    name, so one syscall is one finding in either view."""
     ordered = sorted(baseline.by_number.items(),
                      key=lambda item: (item[0][0] != "ntdll.dll", item[0]))
     out: dict[int, Syscall] = {}
     for (_, number), sc in ordered:
+        if number not in out and nt_name(sc.name) != sc.name:
+            sc = replace(sc, name=nt_name(sc.name))
         out.setdefault(number, sc)
     return out
 

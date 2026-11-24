@@ -150,6 +150,30 @@ def load_baseline(path: str, check_shape: bool = True) -> Baseline:
     return bl
 
 
+def twin_name(name: str) -> str | None:
+    """The other name of one syscall: `NtX` for `ZwX` and the reverse; None for a name that is neither. Mechanical
+    only, the rename the curated table calls zw-alias: one number, one stub, one RVA."""
+    if not isinstance(name, str) or len(name) < 3 or name[:2] not in ("Nt", "Zw"):
+        return None
+    return ("Zw" if name[:2] == "Nt" else "Nt") + name[2:]
+
+
+def nt_name(name: str) -> str:
+    """`name` in its Nt form, the one the curated table, the graph and every hit use (Ruling 69)."""
+    return "Nt" + name[2:] if isinstance(name, str) and len(name) > 2 and name.startswith("Zw") else name
+
+
+def find(baseline: Baseline, name: str) -> Syscall | None:
+    """The syscall of `baseline` named `name` or its twin (twin_name). parse_baseline keeps the first name of a
+    number, and NTSleuth emits the Nt and the Zw name of one syscall in no fixed order: on 26200.9974 the x64 baseline
+    holds ZwWriteVirtualMemory and not NtWriteVirtualMemory, the arm64 one NtWriteVirtualMemory and
+    ZwProtectVirtualMemory."""
+    sc = baseline.syscalls.get(name)
+    if sc is None and twin_name(name) is not None:
+        sc = baseline.syscalls.get(twin_name(name))
+    return sc
+
+
 # How many of the stubs of a baseline must have the shape of its view. Not all: an extraction may hold an odd entry.
 SHAPE_SHARE = 0.8
 _X64_STUB_HEAD = b"\x4c\x8b\xd1\xb8"

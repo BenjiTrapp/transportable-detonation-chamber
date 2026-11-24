@@ -3966,6 +3966,82 @@ def test_an_empty_import_descriptor_keeps_the_proof_and_a_discarded_one_allows_n
     assert hit["import_present"] is None and "cut short" in body["doors_note"]
 
 
+# --- Ruling 69: a syscall the baseline holds under its Zw name is the syscall of its Nt name -----------------------
+
+def _zw_first(document, *names):
+    """`document` with the Zw twin of each of `names` listed right before it, as NTSleuth emitted it on 26200.9974:
+    parse_baseline keeps the first name of a number, so the baseline holds the Zw name and not the Nt one."""
+    out = []
+    for entry in document["syscalls"]:
+        if entry["name"] in names:
+            out.append({**entry, "name": "Zw" + entry["name"][2:]})
+        out.append(entry)
+    return {**document, "syscalls": out}
+
+
+@pytest.fixture
+def zw_x64(tdc, target, fake_baseline_dir):
+    path = fake_baseline_dir / "ntsleuth-26220.5770-x64.json"
+    path.write_text(json.dumps(_zw_first(_fixture("x64"), "NtWriteVirtualMemory")), encoding="utf-8")
+    baseline = syscall_baseline.load_baseline(str(path))
+    # the measured shape: the x64 baseline of 26200.9974 lacks NtWriteVirtualMemory and holds ZwWriteVirtualMemory
+    assert "ZwWriteVirtualMemory" in baseline.syscalls and "NtWriteVirtualMemory" not in baseline.syscalls
+    return baseline
+
+
+def test_a_stub_the_baseline_names_zw_is_imported_through_its_win32_door_ruling_69(client, zw_x64, sample_dir):
+    # test 1: before Ruling 69 the hit was ZwWriteVirtualMemory, which neither the expanded imports nor the coverage
+    # (both in the Nt form) held, so the answer was None
+    path = sample_dir / "door.exe"
+    path.write_bytes(make_pe(imports=(("kernel32.dll", ("WriteProcessMemory",)),)) + _X64_STUB_0x3A)
+    hit, _ = _file_hit(client, path)
+    assert (hit["syscall"], hit["import_present"]) == ("NtWriteVirtualMemory", True)
+
+
+def test_a_stub_the_baseline_names_zw_is_a_proven_bypass_when_nothing_of_its_path_is_imported_ruling_69(
+        client, zw_x64, sample_dir):
+    # test 2: the headline claim of the branch, for the syscalls that matter most on the real build
+    path = sample_dir / "bare.exe"
+    path.write_bytes(make_pe(imports=(("kernel32.dll", ("GetLastError",)),)) + _X64_STUB_0x3A)
+    hit, body = _file_hit(client, path)
+    assert (hit["syscall"], hit["import_present"]) == ("NtWriteVirtualMemory", False)
+    assert body["doors_complete"] is True
+    # one fact, one finding: named as the arm64 baseline (which keeps NtWriteVirtualMemory) names it, so a sample
+    # scanned in both views matches the same finding
+    [finding] = [f for f in body["evidence"]["findings"] if f["kind"] == "direct_syscall_stub"]
+    assert "NtWriteVirtualMemory" in json.dumps(finding) and "ZwWriteVirtualMemory" not in json.dumps(finding)
+
+
+def test_a_real_shaped_ntdll_holds_its_door_when_the_baseline_names_the_stub_zw_ruling_69(client, zw_x64, sample_dir):
+    # test 3, site E: VM check 5 sends a real ntdll.dll through file mode. Its stub is the body of the export of its
+    # own Nt name; were the hit named ZwWriteVirtualMemory and covered, the export check (Nt names only) would pass
+    # it over and a system file would read as a proven bypass
+    assert _exported_stub_hit(client, sample_dir, ("NtWriteVirtualMemory", "ZwWriteVirtualMemory"))[
+        "import_present"] is True
+    assert _exported_stub_hit(client, sample_dir, ("NtWriteVirtualMemory",))["import_present"] is True
+
+
+def test_a_door_loaded_during_the_search_takes_back_the_proof_of_a_stub_the_baseline_names_zw_ruling_69(
+        client, tdc, target, doors_host):
+    # test 4, site D: the recheck after the module list changed compares the hit's name with the doors in the Nt form
+    with open(os.path.join(tdc.NTSLEUTH_BASELINE_DIR, "ntsleuth-26220.5770-x64.json"), "w", encoding="utf-8") as fh:
+        json.dump(_zw_first(_apc_document(), "NtQueueApcThread"), fh)
+    body = client.post("/api/syscalls/stubs", json={"pid": 4812}).get_json()
+    assert [(h["syscall"], h["import_present"]) for h in body["hits"]] == [("NtQueueApcThread", False)]
+    _changing(target, lambda first: first + _loaded(_SYS32 + "dbghelp.dll"))
+    body = client.post("/api/syscalls/stubs", json={"pid": 4812}).get_json()
+    assert [(h["syscall"], h["import_present"]) for h in body["hits"]] == [("NtQueueApcThread", True)]
+
+
+def test_the_lookup_of_one_syscall_finds_it_under_either_name_ruling_69(client, zw_x64):
+    # a hit or a graph node names the syscall by its Nt name; the x64 baseline holds it as Zw
+    for name in ("NtWriteVirtualMemory", "ZwWriteVirtualMemory"):
+        r = client.get(f"/api/syscalls/{name}?view=x64")
+        assert r.status_code == 200 and r.get_json()["name"] == "ZwWriteVirtualMemory", name
+    assert client.get("/api/syscalls/NtNoSuchThing?view=x64").status_code == 404
+    assert client.get("/api/syscalls/XxWriteVirtualMemory?view=x64").status_code == 404
+
+
 # --- Ruling 37: an empty or thinned module list is not a complete one ---------------------------------------------
 
 def test_a_module_list_that_comes_back_empty_after_the_search_takes_the_proof_back(client, target, doors_host):

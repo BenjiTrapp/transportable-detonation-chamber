@@ -1761,9 +1761,9 @@
                             <tr><td class="api-get">GET</td><td><code>/api/memory/baseline</code></td><td>Host memory baseline status</td></tr>
                             <tr><td class="api-get">GET</td><td><code>/api/syscalls/status</code></td><td>NTSleuth installed, baselines per build and view, background extraction</td></tr>
                             <tr><td class="api-get">GET</td><td><code>/api/syscalls/baseline</code></td><td>Syscall catalog, paged. Params: <code>view</code>, <code>query</code>, <code>module</code>, <code>offset</code>, <code>limit</code></td></tr>
-                            <tr><td class="api-get">GET</td><td><code>/api/syscalls/&lt;name&gt;</code></td><td>One syscall with parameters and stub. Param: <code>view</code></td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/syscalls/&lt;name&gt;</code></td><td>One syscall with parameters and stub, found under its Nt or its Zw name (the baseline holds one of the two; a stub hit names it by its Nt name). Param: <code>view</code></td></tr>
                             <tr><td class="api-post">POST</td><td><code>/api/syscalls/scan</code></td><td>Measure the syscall stubs of a PID against the baseline. Params: <code>pid</code>, <code>modules</code></td></tr>
-                            <tr><td class="api-post">POST</td><td><code>/api/syscalls/stubs</code></td><td>Syscall stubs outside ntdll, in a PID or a file. Params: <code>pid</code> or <code>path</code> with <code>view</code></td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/syscalls/stubs</code></td><td>Syscall stubs outside ntdll, in a PID or a file, each named by its Nt name. Params: <code>pid</code> or <code>path</code> with <code>view</code></td></tr>
                             <tr><td class="api-get">GET</td><td><code>/api/syscalls/hook-baseline</code></td><td>Known hooks (also <code>POST</code> to record a PID's hooks on a clean host, <code>DELETE</code> to forget)</td></tr>
                             <tr><td class="api-post">POST</td><td><code>/api/syscalls/rule</code></td><td>Draft a YARA rule from a stub hit, or a signature from a deviation. Writes nothing. Params: <code>hit</code> or <code>deviation</code>, <code>view</code>, <code>build</code></td></tr>
                             <tr><td class="api-post">POST</td><td><code>/api/syscalls/rule/apply</code></td><td>Write a YARA draft where Rustinel reads its rules; it should load within about two seconds (not yet verified on a VM)</td></tr>
@@ -1952,6 +1952,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
         <div id="decision-toasts" class="decision-stack" role="region" aria-label="Firewall decisions"></div>
     </div>
 
-    <script src="/static/js/app.js?v=156"></script>
+    <script src="/static/js/app.js?v=157"></script>
 </body>
 </html>

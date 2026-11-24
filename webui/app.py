@@ -8553,12 +8553,13 @@ def api_syscalls_baseline():
 
 @app.route("/api/syscalls/<name>")
 def api_syscalls_lookup(name):
-    """One syscall with its parameters and stub. Param: view."""
+    """One syscall with its parameters and stub, found under its Nt or its Zw name (the baseline holds one of the two;
+    a hit and the graph name it by its Nt name). Param: view."""
     view = _syscall_view_param(request.args.get("view"))
     baseline, why = _syscall_baseline_for(view)
     if baseline is None:
         return jsonify({"error": why, "view": view}), 503
-    sc = baseline.syscalls.get(name)
+    sc = syscall_baseline.find(baseline, name)
     if sc is None:
         return jsonify({"error": f"unknown syscall {name[:100]}", "view": view}), 404
     return jsonify({**syscall_baseline.describe(sc), "build": baseline.build, "view": baseline.view,

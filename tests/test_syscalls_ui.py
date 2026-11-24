@@ -436,7 +436,7 @@ FLOW_FUNCTIONS = [
     "syscallLoadBaseline", "syscallDropForeignScan", "syscallRefresh", "syscallSchedulePoll", "syscallLoadTargets", "syscallOnTarget",
     "syscallEmptyText", "syscallEnsureBands", "syscallPaintCanvas", "renderSyscallMap", "renderSyscallLegend",
     "renderSyscallRows", "renderSyscallNotices", "renderSyscallToolbar", "renderSyscallTargets", "renderSyscallScan",
-    "syscallRenderAll", "syscallApplyFilter", "syscallOnFilter", "syscallSelect", "syscallCellFromEvent",
+    "syscallRenderAll", "syscallApplyFilter", "syscallOnFilter", "syscallMapName", "syscallSelect", "syscallCellFromEvent",
     "syscallShowTip", "syscallHideTip", "syscallOnMapMove", "syscallOnMapLeave", "syscallOnMapClick",
     "syscallSetScanNote", "runSyscallScan", "syscallSetView", "syscallResized", "initSyscalls", "syscallsTabShown",
     # the detail panel, the deviation list, the rule draft and the known hooks

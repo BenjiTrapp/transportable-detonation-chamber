@@ -26073,10 +26073,20 @@ function syscallOnFilter() {
     syscallApplyFilter();
 }
 
+// The name the map holds for a syscall: `name`, or its Nt or Zw twin when the baseline holds that one instead. One
+// number, one stub: the baseline keeps whichever name NTSleuth listed first (ZwWriteVirtualMemory in the x64 view of
+// 26200.9974), and the graph names every syscall by its Nt name
+function syscallMapName(name) {
+    const items = syscallState.baseline ? syscallState.baseline.items : [];
+    if (!/^(Nt|Zw)./.test(name) || items.some(item => item.name === name)) return name;
+    const twin = (name.startsWith('Nt') ? 'Zw' : 'Nt') + name.slice(2);
+    return items.some(item => item.name === twin) ? twin : name;
+}
+
 // A syscall is chosen, on the map, in the catalog or in the graph. The map rings it, the catalog and the graph mark it.
 function syscallSelect(name) {
-    syscallState.selected = String(name || '');
-    binaryGraphFollowMap(syscallState.selected);
+    syscallState.selected = syscallMapName(String(name || ''));
+    binaryGraphFollowMap(syscallState.selected.replace(/^Zw(?=.)/, 'Nt'));
     renderSyscallMap();
     renderSyscallRows();
     renderSyscallDeviationPanel();
