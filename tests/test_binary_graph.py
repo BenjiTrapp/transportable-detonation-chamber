@@ -760,6 +760,49 @@ def test_a_system32_with_small_loaders_in_it_is_not_a_graph_of_cut_tables_ruling
     assert binary_graph_query.importers_of(graph, "helper.dll").partial is False
 
 
+def test_pefiles_note_on_an_import_descriptor_with_no_thunks_is_no_cut_table_ruling_67(tmp_path):
+    # pefile says "Damaged Import Table information. ILT and/or IAT appear to be broken." for a descriptor whose
+    # lookup and address tables both read empty, and reads the other descriptors on. On Windows 11 26200.9974 it said
+    # so 1328 times in 851 of 3994 System32 binaries, which all read as cut short before Ruling 67
+    hollow = make_pe(imports=(("kernel32.dll", ("GetLastError",)), ("ext-ms-win-none-l1-1-0.dll", ())))
+    import pefile
+    pe = pefile.PE(data=hollow, fast_load=True)
+    pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"]])
+    assert any("Damaged Import Table information" in w for w in pe.get_warnings())    # the fixture makes the note
+    info = binary_graph.extract_bytes(hollow, "hollow.dll")
+    assert info.partial is False and info.imports == {"kernel32.dll": ("GetLastError",)}
+    (tmp_path / "hollow.dll").write_bytes(hollow)
+    assert binary_graph.extract_binary(str(tmp_path / "hollow.dll")).partial is False
+    # only the lone thunk table counts as empty: one whose first thunk is zero, or no table at all
+    lazy = make_pe(delay=(("user32.dll", ("MessageBoxW",)), ("ext-ms-win-none-l1-1-0.dll", ())))
+    assert binary_graph.extract_bytes(lazy, "lazy.dll").partial is False
+    # and a System32 of such binaries is no graph of cut tables: no standing caveat on every answer (Ruling 58)
+    (tmp_path / "lazy.dll").write_bytes(lazy)
+    binaries, skipped = binary_graph.extract_tree(str(tmp_path))
+    assert skipped == [] and binary_graph_query._any_partial(_query_graph(*binaries)) is False
+
+
+def test_the_same_note_over_a_descriptor_pefile_threw_away_whole_is_still_a_cut_ruling_67():
+    # pefile gives the same words when it discards a table it read as bogus: an ordinal thunk with bits above 0xFFFF
+    # set, which the loader masks off and binds, empties the whole descriptor. Its functions are then lost unread, and
+    # a sample that imports its door that way must not read as one that does not import it (a false import_present)
+    crafted = make_pe(imports=(("kernel32.dll", ("WriteProcessMemory", 0x10005)), ("ntdll.dll", ("NtClose",))))
+    info = binary_graph.extract_bytes(crafted, "crafted.exe")
+    assert info.imports == {"ntdll.dll": ("NtClose",)}                   # WriteProcessMemory is gone
+    assert info.partial is True
+
+
+def test_only_the_notes_about_content_are_excluded_and_the_real_cuts_of_system32_still_count():
+    # after Ruling 67 the partial figure of a real System32 is expected to be single digits (7 on 26200.9974, from the
+    # three warnings below), not hundreds: a figure in the hundreds again means a pefile release reworded a note,
+    # and _any_partial puts the caveat back on every answer (Ruling 58)
+    assert len(binary_graph.HEURISTIC_WARNINGS) == 2
+    for real in ("Export directory contains more than 8192 ordinal entries. Assuming corrupt.",
+                 "Too many errors parsing the import directory. Invalid import data at RVA: 0x1000",
+                 "Too many errors parsing the Delay import directory. Invalid import data at RVA: 0x1000"):
+        assert not any(known in real for known in binary_graph.HEURISTIC_WARNINGS), real
+
+
 def test_a_warning_the_exclusions_do_not_name_still_counts_as_a_cut(monkeypatch):
     # the safe default: a warning not on the list, a reworded heuristic included, reads as a table cut short
     import pefile
@@ -3892,6 +3935,23 @@ def test_a_loader_importing_loadlibrary_and_getprocaddress_keeps_its_proof_in_a_
     hit, body = _file_hit(client, path)
     assert (hit["syscall"], hit["import_present"]) == ("NtWriteVirtualMemory", False)
     assert body["doors_complete"] is True and body["doors_note"] == ""
+
+
+def test_an_empty_import_descriptor_keeps_the_proof_and_a_discarded_one_allows_none_in_a_file_ruling_67(
+        client, target, sample_dir):
+    # a descriptor with no thunks is nothing unread: the proof stands
+    path = sample_dir / "hollow.exe"
+    path.write_bytes(make_pe(imports=(("kernel32.dll", ("GetLastError",)), ("ext-ms-win-none-l1-1-0.dll", ())))
+                     + _X64_STUB_0x3A)
+    hit, body = _file_hit(client, path)
+    assert (hit["syscall"], hit["import_present"]) == ("NtWriteVirtualMemory", False)
+    assert body["doors_complete"] is True
+    # the same pefile note over a descriptor it threw away is a door that may be lost: no proof
+    path = sample_dir / "crafted.exe"
+    path.write_bytes(make_pe(imports=(("kernel32.dll", ("WriteProcessMemory", 0x10005)), ("ntdll.dll", ("NtClose",))))
+                     + _X64_STUB_0x3A)
+    hit, body = _file_hit(client, path)
+    assert hit["import_present"] is None and "cut short" in body["doors_note"]
 
 
 # --- Ruling 37: an empty or thinned module list is not a complete one ---------------------------------------------

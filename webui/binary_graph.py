@@ -123,19 +123,54 @@ DIRECTORIES = (("IMAGE_DIRECTORY_ENTRY_IMPORT", "DIRECTORY_ENTRY_IMPORT", "unrea
                ("IMAGE_DIRECTORY_ENTRY_EXPORT", "DIRECTORY_ENTRY_EXPORT", "unreadable export directory"))
 
 
-# Warnings pefile gives about what a directory holds, not about failing to read it (Ruling 65). Matched by substring and
-# left out of the partial decision; every other warning, a reworded one included, still counts as a cut, so an upgrade
-# of pefile can only make the record say "cut short" too often, never too seldom.
+# Warnings pefile gives about what a directory holds, not about failing to read it (Rulings 65 and 67). Matched by
+# substring and left out of the partial decision; every other warning, a reworded one included, still counts as a cut,
+# so an upgrade of pefile can only make the record say "cut short" too often, never too seldom.
+_EMPTY_THUNKS_NOTE = "Damaged Import Table information. ILT and/or IAT appear to be broken."
 HEURISTIC_WARNINGS = (
     # parse_import_directory: LoadLibrary* and GetProcAddress* among fewer than 20 imported symbols. A guess that the
     # image is packed, made from a table pefile read whole: the shape of every small loader, the very samples the
     # file-mode proof is for
     "Imported symbols contain entries typical of packed executables",
+    # parse_imports, for an import or delay-load descriptor whose lookup and address tables both read empty; pefile
+    # skips that descriptor and reads the others on. On Windows 11 26200.9974 it was said 1328 times in 851 of 3994
+    # System32 binaries, which all read as cut short. pefile gives the same words when it threw a table away as bogus
+    # (an ordinal above 0xFFFF, one name repeated 15 times), so it is a note only when the tables it names hold nothing:
+    # _names_empty_thunk_tables
+    _EMPTY_THUNKS_NOTE,
 )
+_THUNK_RVAS = re.compile(r"OriginalFirstThunk: 0x([0-9a-fA-F]+) FirstThunk: 0x([0-9a-fA-F]+)")
 
 
-def _read_failures(warnings):
-    return [w for w in warnings if not any(known in str(w) for known in HEURISTIC_WARNINGS)]
+def _names_empty_thunk_tables(pe, warning):
+    """Whether both tables the warning names are absent (RVA 0) or end at their first thunk; False when that cannot
+    be read, or the warning does not name them in pefile's words."""
+    found = _THUNK_RVAS.search(warning)
+    if not found:
+        return False
+    size = 8 if pe.PE_TYPE == 0x20B else 4
+    for rva in (int(found.group(1), 16), int(found.group(2), 16)):
+        if not rva:
+            continue
+        try:
+            thunk = pe.get_data(rva, size)
+        except Exception:
+            return False
+        if len(thunk) != size or any(thunk):
+            return False
+    return True
+
+
+def _is_note(pe, warning):
+    text = str(warning)
+    for known in HEURISTIC_WARNINGS:
+        if known in text:
+            return known != _EMPTY_THUNKS_NOTE or _names_empty_thunk_tables(pe, text)
+    return False
+
+
+def _read_failures(pe, warnings):
+    return [w for w in warnings if not _is_note(pe, w)]
 
 
 def _parse_directories(pefile, pe):
@@ -151,14 +186,15 @@ def _parse_directories(pefile, pe):
     # test_a_directory_pefile_cannot_read_skips_only_when_it_is_one_the_record_needs and
     # test_a_parse_that_warned_and_still_produced_entries_is_kept_and_marked_partial are the tripwire for that.
     # Only warnings of a read count: HEURISTIC_WARNINGS lists the notes about content that do not, and
-    # test_pefiles_packed_executable_heuristic_is_no_cut_table_ruling_65 is the tripwire for a reworded one
+    # test_pefiles_packed_executable_heuristic_is_no_cut_table_ruling_65 and
+    # test_pefiles_note_on_an_import_descriptor_with_no_thunks_is_no_cut_table_ruling_67 are the tripwire for a reworded one
     declared = pe.OPTIONAL_HEADER.DATA_DIRECTORY
     partial = False
     for index_name, attribute, reason in DIRECTORIES:
         index = pefile.DIRECTORY_ENTRY[index_name]
         before = len(pe.get_warnings())
         pe.parse_data_directories(directories=[index])
-        if not _read_failures(pe.get_warnings()[before:]):
+        if not _read_failures(pe, pe.get_warnings()[before:]):
             continue
         if getattr(pe, attribute, None):
             partial = True
