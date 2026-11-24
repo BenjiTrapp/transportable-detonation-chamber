@@ -1203,3 +1203,15 @@ def test_run_digests_take_the_territory_from_the_ranges_they_are_given():
         rizin_emulation.run_digests([dict(_cache_row(0x10, "0102"), size=3)], [(0x10, 0x12)])
     with pytest.raises(ValueError):
         rizin_emulation.run_digests([dict(_cache_row(0x10, "0102"), after="zz01")], [(0x10, 0x11)])
+
+
+def test_run_covers_says_whether_a_write_that_is_not_ours_lies_under_any_byte_of_a_patch():
+    # the one question a waiting patch is let through by: a run's row (mine false) over any byte of its span
+    rows = [{"addr": 0x100, "size": 4, "mine": False}, {"addr": 0x200, "size": 4, "mine": True}]
+    covers = rizin_emulation.run_covers
+    assert covers(rows, 0x100, 1) and covers(rows, 0x103, 1), "the first and the last byte of the run's row"
+    assert not covers(rows, 0x104, 1) and not covers(rows, 0xFF, 1), "the byte after it and the one before it"
+    assert covers(rows, 0xFE, 3) and covers(rows, 0x103, 5), "a patch that overlaps the row at either end"
+    assert not covers(rows, 0xFD, 3) and not covers(rows, 0x104, 5), "and one that ends or starts at its edge"
+    assert not covers(rows, 0x200, 4), "a row of this session's own is no run"
+    assert not covers([], 0x100, 1)

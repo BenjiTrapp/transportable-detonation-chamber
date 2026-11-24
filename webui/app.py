@@ -5767,14 +5767,29 @@ def _rizin_breakpoint_clear(session):
     return session.breakpoint_clear(None if addr is None else _rizin_address(addr))
 
 
+def _rizin_waiting(body):
+    """The ``waiting`` flag of a patch request: true says the request is about the patches that wait (held
+    back over a run's bytes) at ``addr``, and not about the cache."""
+    waiting = body.get("waiting", False)
+    if not isinstance(waiting, bool):
+        raise rizin_sessions.RizinRefused("waiting is true or false")
+    return waiting
+
+
 def _rizin_patch(session):
-    """POST: addr, plus either bytes (hex digits) or kind (one of the four patch kinds)."""
+    """POST: addr, plus either bytes (hex digits) or kind (one of the four patch kinds), or ``waiting: true``
+    alone: write the patches that wait at addr now (only where a run's bytes lie under it again)."""
     body = _rizin_body()
     addr = _rizin_address(body.get("addr"))
     data, kind = body.get("bytes"), body.get("kind")
-    if (data is None) == (kind is None):
-        raise rizin_sessions.RizinRefused("a patch takes bytes or kind, not both and not neither")
     try:
+        if _rizin_waiting(body):
+            if data is not None or kind is not None:
+                raise rizin_sessions.RizinRefused("a patch that waits is written as it was held back: "
+                                                  "waiting takes no bytes and no kind")
+            return session.patch_waiting(addr)
+        if (data is None) == (kind is None):
+            raise rizin_sessions.RizinRefused("a patch takes bytes or kind, not both and not neither")
         return session.patch(addr, data) if kind is None else session.patch_op(addr, kind)
     finally:
         _rizin_forget(session)  # patched bytes: the strings, imports, flags and functions are stale
@@ -5782,10 +5797,25 @@ def _rizin_patch(session):
 
 def _rizin_unpatch(session):
     """DELETE: addr takes that patch back; a request without one (an empty object, or no body) the whole
-    cache, an emulation run's bytes included (rizin has one)."""
-    addr = _rizin_body(optional=True).get("addr")
+    cache, an emulation run's bytes included (rizin has one). With ``waiting: true`` it takes the patches that
+    wait at addr out of the project instead, and then addr is required."""
+    body = _rizin_body(optional=True)
+    addr = body.get("addr")
     try:
+        if _rizin_waiting(body):
+            if addr is None:
+                raise rizin_sessions.RizinRefused("a patch that waits is named by its addr")
+            return session.drop_waiting(_rizin_address(addr))
         return session.unpatch(None if addr is None else _rizin_address(addr))
+    finally:
+        _rizin_forget(session)
+
+
+def _rizin_restore(session):
+    """POST (no body): replay the project's timeline of the emulation and prove the bytes it gave. A replay
+    runs the emulation and writes the cache, so the copies of the views are stale after it, whatever came of it."""
+    try:
+        return session.restore_run()
     finally:
         _rizin_forget(session)
 
@@ -6331,6 +6361,13 @@ def api_rizin_patch(sid):
 @app.route("/api/rizin/<sid>/patch", methods=["DELETE"])
 def api_rizin_unpatch(sid):
     return _rizin_call(sid, _rizin_unpatch)
+
+
+@app.route("/api/rizin/<sid>/restore", methods=["POST"])
+def api_rizin_restore(sid):
+    """Replay the timeline of the emulation the project keeps, check it gave the same bytes, then write the
+    patches that were held back."""
+    return _rizin_call(sid, _rizin_restore)
 
 
 @app.route("/api/rizin/<sid>/export", methods=["POST"])

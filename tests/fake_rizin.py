@@ -42,9 +42,15 @@ Environment:
                     those inside [analysis.from, analysis.to) -- the way rizin bounds af's recursion
   FAKE_RIZIN_ARCH   the arch ``ij`` and ``e asm.arch`` report (default x86); the API assistant covers
                     x86 only and switches itself off for any other
+  FAKE_RIZIN_XOR_KEY  "<key>": the byte a decryption store really XORs with (``pdj`` still says 0x41): a run that
+                    writes **other bytes** than the one that was recorded, which is what a replay that does not hold
+                    looks like
   FAKE_RIZIN_ASSIST  set: the calls into the imports the API assistant answers for (see ASSIST_OPS),
                     with their flags and import entries. They are behind a variable of their own
                     because the flag and import lists of the default model are counted in tests
+
+``ara0`` zeroes every register, the PC and the stack pointer too, and forgets what ``ar`` set before ``aei``
+(measured on rizin 0.9.1: rcx=0x1234 survives aei and aeim, and is 0 after ara0; there is no ``ar0``).
 
 A command line longer than RIZIN_LINE_MAX characters is **cut**, as rizin's
 own stdin reader cuts it (see main()): a write on such a line does not go
@@ -276,6 +282,18 @@ DECRYPT_END = DECRYPT_AT + DECRYPT_SIZE * 7
 LOOSE_OPS += [_op(DECRYPT_AT + i * 7, 7, f"xor byte [{DECRYPT_TARGET + i:#x}], {DECRYPT_KEY:#x}", "xor",
                   ptr=DECRYPT_TARGET + i) for i in range(DECRYPT_SIZE)]
 LOOSE_OPS.append(_op(DECRYPT_END, 1, "ret", "ret"))
+# A stub whose two stores **overlap**: a byte at ORDER_TARGET + 1, then four bytes from ORDER_TARGET. The later
+# write wins over the byte they share, which a list of the cache by address cannot say (it puts the four bytes
+# first), so a digest made over rows in the wrong order is another SHA-256 -- plausible, and not what the run left.
+# ORDER_END is the ret. The four-byte store is the only one in the model that is wider than a byte.
+ORDER_AT, ORDER_TARGET = 0x140002A00, 0x140002100
+ORDER_END = ORDER_AT + 14
+ORDER_WIDTH = {ORDER_AT + 7: 4}
+LOOSE_OPS += [_op(ORDER_AT, 7, f"xor byte [{ORDER_TARGET + 1:#x}], {DECRYPT_KEY:#x}", "xor", ptr=ORDER_TARGET + 1),
+              _op(ORDER_AT + 7, 7, f"xor dword [{ORDER_TARGET:#x}], {DECRYPT_KEY:#x}", "xor", ptr=ORDER_TARGET),
+              _op(ORDER_END, 1, "ret", "ret")]
+# what a store XORs with: DECRYPT_KEY, or the key of FAKE_RIZIN_XOR_KEY
+XOR_KEY = int(os.environ["FAKE_RIZIN_XOR_KEY"], 0) if os.environ.get("FAKE_RIZIN_XOR_KEY") else DECRYPT_KEY
 # The calls the API assistant answers for. One import per answer its table can give, each with its flag
 # and its import entry, so that a session can be stepped onto the call and skipped. They are behind
 # FAKE_RIZIN_ASSIST because the flag and import lists of the default model are counted in tests.
@@ -740,7 +758,7 @@ def esil_step_one(execute=True):
         nxt = 0
     elif kind == "xor" and op.get("ptr") is not None:
         # a store (`xor byte [<addr>], <key>`): the byte goes through the write cache, as rizin's ESIL does
-        cache_write(op["ptr"], bytes([byte_at(op["ptr"]) ^ DECRYPT_KEY]))
+        cache_write(op["ptr"], bytes(byte_at(op["ptr"] + i) ^ XOR_KEY for i in range(ORDER_WIDTH.get(pc, 1))))
     regs[ROLES["PC"]] = nxt % 2 ** BITS
     return esil_stop_at_breakpoint()
 
@@ -1287,6 +1305,12 @@ def answer(cmd):
     stepped = esil_command(word, rest, seek)
     if stepped is not None:
         return stepped
+    if word == "ara0":
+        # every register to zero, the PC and the stack pointer with them (measured), and what ar set before aei is gone
+        esil["pre"].clear()
+        if esil["regs"] is not None:
+            esil["regs"] = dict.fromkeys(REG_NAMES, 0)
+        return ""
     if word == "aei":
         # like rizin's reinit: a new VM, the registers stay, the PC goes to the seek
         if esil["regs"] is None:

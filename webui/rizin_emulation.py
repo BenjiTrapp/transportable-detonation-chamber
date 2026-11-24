@@ -430,6 +430,14 @@ def rows_gone(before, after):
     return gone
 
 
+def run_covers(rows, addr, size):
+    """Whether a write that is **not** this session's own (an emulation run's) covers any byte of
+    ``addr``..``addr + size``: the one question a waiting patch is let through by. ``rows`` are the cache as
+    ``patch_rows`` marks it, in any order. A patch over bytes only the file holds is not one that waits for a
+    run, and writing it before the run is what held it back in the first place."""
+    return any(not row["mine"] and row["addr"] < addr + size and addr < row["addr"] + row["size"] for row in rows)
+
+
 # --- Re-analysing the range an emulation run decrypted ---------------------
 
 # Writes no further apart than this belong to one range: a decryption loop writes byte by byte, and a

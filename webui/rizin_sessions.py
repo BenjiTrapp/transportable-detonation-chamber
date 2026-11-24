@@ -235,6 +235,40 @@ _RESTORE_GONE = ("something was taken out of the cache, so the way to the state 
 _RESTORE_RESTARTED = ("rizin was restarted, which emptied the cache the run had written to: the way to its "
                       "bytes can no longer be proven")
 _RESTORE_NOTHING = "the run left nothing in the cache that a restore could bring back"
+# Why the restore button refuses (RizinSession.restore_run), and what it says when a replay did not hold. The
+# first group is said before anything was touched; the second after the replay was undone.
+_RESTORE_NO_RECORD = "the project holds no timeline of the emulation to restore"
+_RESTORE_RUNNING = ("the emulation is running: stop it first, because restoring starts it again from the "
+                    "beginning of the timeline")
+_RESTORE_CACHE = ("the write cache holds more or other than the patches the file was opened with (the timeline's "
+                  "own run, a patch made since, or a write of the console), and replaying would take them away: "
+                  "take back what was written since the file was opened, or open the file again")
+_RESTORE_CACHE_UNREAD = "rizin did not say what the write cache holds"
+_RESTORE_BREAKPOINTS = ("the breakpoints are not the ones the timeline ran under ({then} then, {now} now), and a run "
+                        "stops at a breakpoint: a replay under another set would stop elsewhere and give other bytes")
+_RESTORE_OTHER_BYTES = ("replaying the timeline left other bytes than the ones saved with it ({wrong} of {count} "
+                        "saved ranges differ{more}{stopped}): nothing was applied, and the cache is as it was when "
+                        "the file was opened")
+_RESTORE_MIDWAY = ("the replay stopped at action {number} of {count} ({what}): {why}; nothing was applied, and the "
+                   "cache is as it was when the file was opened")
+_RESTORE_UNEXPECTED = "the replay could not go on ({why}); nothing was applied"
+_RESTORE_STOPPED_AT_TIME_LIMIT = "it ended at the time limit, which a replay does not wait out again"
+_RESTORE_NOT_PUT_BACK = (" -- the patches at {where} could not be written into the cache again and are kept in "
+                         "the project, but not applied")
+_RESTORE_WAITING_DROPPED = ("a patch the timeline makes was taken out of the project, and a replay would make it "
+                            "again: the timeline is not kept")
+_PATCH_NOT_WAITING = "no patch waits at {addr:#x}"
+_PATCH_NOT_COVERED = ("no run's bytes lie under {addr:#x} (the cache holds none written by an emulation there), so "
+                      "the patch would go into the file's own bytes and the next decryption would run over it: "
+                      "run the decryption first, or take the patch out")
+
+
+class _ReplayFailed(Exception):
+    """A replay that did not hold, with the reason it says (RizinSession._restore_replay)."""
+
+    def __init__(self, reason):
+        super().__init__(reason)
+        self.reason = reason
 # The console commands that read what the emulation or the cache holds and change nothing of it; every
 # other name of these families spoils the timeline (_console_spoils).
 _SETUP_COMMANDS = frozenset(("aei", "aei-", "aeim", "aeim-", "aepc", "aeip"))
@@ -1005,6 +1039,24 @@ def _named_addresses(addrs):
     return shown + (", ..." if len(addrs) > _NOTE_ADDRESSES else "")
 
 
+def _named_set(addrs):
+    """A set of addresses for a sentence: "none", or _named_addresses."""
+    return _named_addresses(addrs) if addrs else "none"
+
+
+def _action_words(action):
+    """An action of the timeline in a few words, for the reason a replay stopped at it. Numbers only: nothing of
+    a project's text reaches a message."""
+    kind = action["kind"]
+    if kind == "start":
+        return f"start at {action['addr']:#x}"
+    if kind == "run":
+        return f"run {action['run']}" + (f" {action['addr']:#x}" if action["run"] == "until" else "")
+    if kind == "skip":
+        return f"skip the call at {action['addr']:#x}"
+    return f"patch at {action['addr']:#x}"
+
+
 def _sanitize_project(src, dst, level, mode, done, patches, ranges=(), restore=None, restore_lost=False):
     """Copy a project written by ``Ps`` so that rizin 0.9.1 can load it again; (how many patches did not fit,
     whether ``restore`` did, whether it would have with the whole budget to itself).
@@ -1534,6 +1586,11 @@ class RizinSession:
         self._restore_saved = None
         self._restore_lost = False
         self._restore_dropped_note = None
+        # What the cache held when the file was opened, or when rizin was restarted (_opened: this session's own
+        # writes as the mirror has them, in the order they were made in), and whether a timeline is being
+        # replayed this moment (restore_run), which nothing may record.
+        self._opened = []
+        self._replaying = False
         # Notes that outlive a re-plan: what the session starts with (a project that could not be
         # loaded, patches that could not be applied) and the standing warning that patches did not fit
         # into the project. _start_analysis plans again and drops the notes of the run before it; these
@@ -1547,6 +1604,7 @@ class RizinSession:
             # Before the analysis and before the first view: the patched bytes are what rizin reads from
             # here on, so the first disassembly and the first hexdump already show them.
             patch_note = self._replay_patches(patches)
+            self._opened = list(self._mine)
         except BaseException:
             self._pipe.close()
             raise
@@ -1725,31 +1783,32 @@ class RizinSession:
         """
         if addr is not None:
             addr = _address(addr)
+        return self._call("emulation", wait, lambda pipe: self._emulation_started(pipe, addr))
 
-        def run(pipe):
-            self._emulation = None
-            pc = self.at if addr is None else addr
-            if pc is None:
-                raise RizinRefused("addr is missing: the session has no current address")
-            pipe.cmd("e " + " ".join(ESIL_SETTINGS))
-            self._require_io_cache(pipe)
-            self._emulation_unmap(pipe)
-            pipe.cmd("aei")
-            pipe.cmd("aeim")
-            pipe.cmd(f"aepc {pc:#x}")
-            stack = rizin_emulation.stack_map(pipe.cmdj("omlj"), self._emulation_role(pipe, "SP"),
-                                              ESIL_STACK_SIZE)
-            if stack is None:
-                raise RizinRefused("rizin could not map the emulation's stack (aeim)")
-            self._emulation_stack_map = stack
-            self._emulation_remember(stack[0], stack[1])
-            self._emulation_big_endian = pipe.cmd("e cfg.bigendian").strip() == "true"
-            self._emulation_before = self._emulation_after = None
-            self._emulation = pipe
-            self._restore_start(pipe, pc)  # before the read: a read that fails leaves the emulation started
-            return self._emulation_read(pipe)
-
-        return self._call("emulation", wait, run)
+    def _emulation_started(self, pipe, addr):
+        """The start itself (gate held): what emulation_start does, and what a replay does for a ``start``
+        action. ``addr`` None is the current seek."""
+        self._emulation = None
+        pc = self.at if addr is None else addr
+        if pc is None:
+            raise RizinRefused("addr is missing: the session has no current address")
+        pipe.cmd("e " + " ".join(ESIL_SETTINGS))
+        self._require_io_cache(pipe)
+        self._emulation_unmap(pipe)
+        pipe.cmd("aei")
+        pipe.cmd("aeim")
+        pipe.cmd(f"aepc {pc:#x}")
+        stack = rizin_emulation.stack_map(pipe.cmdj("omlj"), self._emulation_role(pipe, "SP"),
+                                          ESIL_STACK_SIZE)
+        if stack is None:
+            raise RizinRefused("rizin could not map the emulation's stack (aeim)")
+        self._emulation_stack_map = stack
+        self._emulation_remember(stack[0], stack[1])
+        self._emulation_big_endian = pipe.cmd("e cfg.bigendian").strip() == "true"
+        self._emulation_before = self._emulation_after = None
+        self._emulation = pipe
+        self._restore_start(pipe, pc)  # before the read: a read that fails leaves the emulation started
+        return self._emulation_read(pipe)
 
     def emulation_stop(self, wait=2.0):
         """Leave the emulation: its memory is unmapped (_emulation_unmap). The cache's writes stay
@@ -1815,7 +1874,11 @@ class RizinSession:
 
     def _restore_start(self, pipe, pc):
         """The emulation started at ``pc`` (gate held): the first start of the session begins the timeline,
-        a later one is an action of it -- aei, aeim and aepc replay like any other."""
+        a later one is an action of it -- aei, aeim and aepc replay like any other. Not while a timeline is being
+        replayed (restore_run): the replay is not an action of anybody's, and a start that began a timeline
+        would record the replay as it goes."""
+        if self._replaying:
+            return
         if self._restore is None:
             self._restore = self._restore_begin(pipe)
             self._restore_gone = None
@@ -1949,6 +2012,12 @@ class RizinSession:
         timeline whose cache has lost the run's bytes says 0, which is what a replay would compare. It asks
         rizin, so it waits for the gate like any view (RizinBusy), and costs one ``wcj`` and the hashing of
         what the run wrote; with no timeline it asks nothing.
+
+        **A session with no timeline of its own that holds the project's** (a file just opened) answers for
+        that one: what restore_run would replay, its actions and the ranges it proves, and whether restore_run
+        would let it through (_restore_blocked) -- there is nothing a live cache could prove there, and the
+        record carries its digests. A session that has run a timeline of its own answers for that, as above:
+        its cache is not the one from opening, so the button is not what it needs.
         """
         def offer(digests):
             reason = self._restore_reason()
@@ -1957,10 +2026,230 @@ class RizinSession:
                     "reason": reason or (None if digests or record is None else _RESTORE_NOTHING),
                     "digests": digests}
 
+        saved = self._restore_saved
+        if self._restore is None and saved is not None:
+            return self._call("emulation", wait, lambda pipe: {
+                "actions": len(saved["actions"]), "reason": self._restore_blocked(pipe, saved),
+                "digests": len(saved["digests"])})
         if self._restore is None:
             return offer(0)
         return self._call("emulation", wait,
                           lambda pipe: offer(len(self._restore_digests(pipe)) if self._restore else 0))
+
+    # --- Replaying the timeline ---------------------------------------------
+    #
+    # restore_run plays the project's timeline (``_restore_saved``) back into the cache and proves it gave the
+    # bytes the project says it did. The order, with the gate held for all of it:
+    #
+    #   1. refuse, touching nothing, unless the cache is the one from opening (_restore_blocked)
+    #   2. ``wc-*`` -- not unpatch(), which would throw the timeline away -- and the registers to zero
+    #   3. the patches of the open that the timeline does not make (_restore_before_first_action)
+    #   4. the assistant's counters to where the timeline began
+    #   5. every action, in order, through the methods that did it the first time (_restore_do)
+    #   6. the digests of the cache, in write order, against the ones saved
+    #   7. the patches that were held back and a run's bytes cover again, except what the timeline made
+    #
+    # and where 5 or 6 fail, ``wc-*`` and the patches of the open again (_restore_undo): the promise is that
+    # nothing was applied, not that the cache is somewhere in between. Nothing in it records: the live timeline
+    # is dropped before 2 (it describes a cache that is being replaced) and ``_replaying`` keeps a start from
+    # beginning one; nothing in it asks for a save either, because it calls the bodies of the actions and not
+    # the methods that end in ``_schedule_save``.
+
+    def _restore_blocked(self, pipe, record=None):
+        """Why restore_run would refuse now, or None (gate held): spec 6, and the breakpoints.
+
+        The cache has to be exactly what the open left (``_opened``, in the order it was written): anything
+        else is something a ``wc-*`` would take away -- a patch made since, a console write, the bytes of a run.
+        That is also what keeps ``_restore_saved``'s snapshot-time inaccuracy out of a replay: it can say
+        something the project does not hold only in the session that wrote it, whose cache holds the run.
+        The breakpoints have to be the ones the timeline ran under, because a run stops at a breakpoint and
+        rizin keeps them where this does not reach: the replay would stop elsewhere and the digests would
+        say "other bytes" for what is "other breakpoints"."""
+        record = record or self._restore_saved
+        if not record["digests"]:
+            return _RESTORE_NOTHING
+        if self._emulation is pipe:  # a restarted rizin has none, whatever the one before it ran
+            return _RESTORE_RUNNING
+        try:
+            rows = self._patch_list(pipe, ordered=True)
+            points = sorted({found["addr"] for found in self._breakpoint_list(pipe)})
+        except (ValueError, RizinTooLarge):
+            return _RESTORE_CACHE_UNREAD
+        if [(row["addr"], row["size"], row["after"]) for row in rows] != self._opened:
+            return _RESTORE_CACHE
+        if points != record["breakpoints"]:
+            return _RESTORE_BREAKPOINTS.format(then=_named_set(record["breakpoints"]), now=_named_set(points))
+        return None
+
+    def restore_run(self, wait=2.0):
+        """Replay the project's timeline of the emulation and prove it: {"restored", "reason", "state",
+        "applied", "patches"}.
+
+        ``restored`` true: every action ran in the order it was made in, the SHA-256 of what the run left in
+        each range is the one the project holds, and then the patches that were held back and a run's bytes
+        cover again were written (``applied``: their addresses; the others stay waiting). ``state`` is the
+        emulation as the replay leaves it, running.
+
+        ``restored`` false: the replay did not hold -- an action was refused or ended at the time limit, or it
+        gave other bytes -- and **nothing was applied**: the cache is what the open left (``wc-*``, then the
+        patches of the open again), the emulation is stopped, the counters are where they were, and the patches
+        wait as they did. ``reason`` says why, as the run itself says it.
+
+        Refused (RizinRefused, nothing touched) when there is no timeline, an emulation runs, the cache is not
+        the one from opening or the breakpoints are not the ones the timeline ran under. It never runs on its
+        own: it is one button press, and one request that holds the gate like a run -- RESTORE_MAX_ACTIONS bounds
+        how long, and a run of it is bounded by ``esil.timeout``.
+        """
+        return self._call("emulation", wait, self._restore_replay)
+
+    def _restore_replay(self, pipe):
+        record = self._restore_saved
+        if record is None:
+            raise RizinRefused(self._restore_gone or (_RESTORE_LOST_AT_OPEN if self._restore_lost
+                                                      else _RESTORE_NO_RECORD))
+        reason = self._restore_blocked(pipe, record)
+        if reason:
+            raise RizinRefused(reason)
+        counters, lost = (self._assist_tick, self._assist_handle, self._assist_pseudo), self._lost
+        # the live timeline describes a cache that is about to be replaced, and a clean one that stayed would
+        # be saved with the digests of the replayed run: it goes, and what it said of the breakpoints with it
+        self._restore, self._restore_gone, self._restore_pending, self._restore_bp_moved = None, None, None, False
+        self._replaying = True
+        failed = state = applied = None
+        try:
+            try:
+                state, applied = self._restore_play(pipe, record)
+            except _ReplayFailed as err:
+                failed = err.reason
+            except (RizinRefused, ValueError, RizinTooLarge) as err:
+                failed = _RESTORE_UNEXPECTED.format(why=getattr(err, "reason", None) or err)
+            if failed is not None:
+                note, missing = self._restore_undo(pipe, counters)
+                failed += note
+                lost = lost + missing
+        finally:
+            self._replaying = False
+            self._lost = lost  # patches a restarted rizin could not take back are the project's, whatever happened here
+        return {"restored": failed is None, "reason": failed, "state": state, "applied": applied or [],
+                "patches": self._patches_answer(pipe)}
+
+    def _restore_play(self, pipe, record):
+        """Steps 2 to 7 (gate held): (the emulation's state, the addresses of the waiting patches written).
+        Raises _ReplayFailed for an action that did not hold or bytes that are not the saved ones."""
+        pipe.cmd("wc-*")  # not unpatch(): that discards the timeline, and this is a replay of it
+        self._mine, self._mine_over = [], []
+        pipe.cmd("ara0")  # the registers a rizin that has not emulated has: aei keeps what an earlier run left
+        for addr, after in self._restore_before_first_action(record):
+            self._patch_write(pipe, addr, bytes.fromhex(after))
+        self._assist_tick, self._assist_handle, self._assist_pseudo = (
+            record["counters"][name] for name in ("tick", "handle", "pseudo"))
+        actions, stopped = record["actions"], None
+        for number, action in enumerate(actions, 1):
+            what = _action_words(action)
+            try:
+                answer = self._restore_do(pipe, action)
+            except RizinRefused as err:
+                raise _ReplayFailed(_RESTORE_MIDWAY.format(number=number, count=len(actions), what=what,
+                                                           why=err.reason)) from None
+            if answer.get("stopped") == "timeout":
+                raise _ReplayFailed(_RESTORE_MIDWAY.format(number=number, count=len(actions), what=what,
+                                                           why=_RESTORE_STOPPED_AT_TIME_LIMIT))
+            stopped = answer.get("stopped", stopped)
+        found = self._restore_digests(pipe)  # in write order, as the save made them
+        if found != record["digests"]:
+            wrong = len([d for d in record["digests"] if d not in found])
+            more = len(found) - (len(record["digests"]) - wrong)
+            raise _ReplayFailed(_RESTORE_OTHER_BYTES.format(
+                wrong=wrong, count=len(record["digests"]),
+                more=f", and the replay left {more} more" if more else "",
+                stopped=f"; the last run stopped: {stopped}" if stopped else ""))
+        state = self._emulation_read(pipe)
+        return state, self._restore_apply_waiting(pipe, record)
+
+    def _restore_do(self, pipe, action):
+        """One action of the timeline, through the body that did it the first time (gate held)."""
+        kind = action["kind"]
+        if kind == "start":
+            return self._emulation_started(pipe, action["addr"])
+        if kind == "run":
+            return self._emulation_ran(pipe, action["run"], rizin_emulation.STEP_COMMANDS[action["run"]],
+                                       action.get("addr"))
+        if kind == "skip":
+            return self._call_skipped(pipe, action["addr"], action["value"], action["fix"])
+        if kind == "patch":
+            return self._patch_write(pipe, action["addr"], bytes.fromhex(action["data"]))
+        raise _ReplayFailed(f"the timeline holds an action of a kind this version does not replay: {kind}")
+
+    def _restore_before_first_action(self, record):
+        """The patches the open applied that the timeline does not make, as (addr, after_hex) in the order they
+        were written: the ones made **before the first start**, which are no action (they are in the cache from
+        the open, and the replay's ``wc-*`` takes them out with the rest).
+
+        The timeline's own patch actions are in the open's list too, when they were not held back (a patch over
+        bytes no run had written yet). Those the timeline makes again, at their place in it; so each one is
+        taken out of the open's list, **from the end**: two entries that do not differ are the same patch, and the
+        one that was written first is the one that was written before the start. What the open held back is not in
+        the cache, so it does not stand for a patch action either (``self._waiting``): a patch made before the
+        start at an address and with bytes that a later one over the run's bytes has too is still one of each."""
+        made = collections.Counter((action["addr"], action["data"]) for action in record["actions"]
+                                   if action["kind"] == "patch")
+        made.subtract(collections.Counter((addr, after) for addr, after, _ in self._waiting))
+        before = []
+        for addr, _, after in reversed(self._opened):
+            if made[(addr, after)] > 0:
+                made[(addr, after)] -= 1
+            else:
+                before.append((addr, after))
+        return before[::-1]
+
+    def _restore_apply_waiting(self, pipe, record):
+        """The patches that were held back, written now that the timeline's run has left bytes under them (gate
+        held): their addresses. What no run's bytes cover stays waiting, as does what rizin does not take.
+
+        A patch the timeline made again is no longer waiting and is not written twice -- counted as
+        _restore_before_first_action counts it, per patch action and not by address and bytes: a twin that the
+        open applied (a patch of the same bytes made before the start) is not the held one, and the cache's own
+        twin of it (``_waiting_left``) would hide a patch the timeline does not make."""
+        rows = self._patch_list(pipe, ordered=True)
+        made = collections.Counter((action["addr"], action["data"]) for action in record["actions"]
+                                   if action["kind"] == "patch")
+        applied, still = [], []
+        for patch in self._waiting:
+            addr, after, _ = patch
+            if made[(addr, after)] > 0:
+                made[(addr, after)] -= 1
+            elif rizin_emulation.run_covers(rows, addr, len(after) // 2):
+                try:
+                    self._patch_write(pipe, addr, bytes.fromhex(after))
+                    applied.append(addr)
+                    continue
+                except RizinRefused:
+                    still.append(patch)
+            else:
+                still.append(patch)
+        self._waiting = still
+        return applied
+
+    def _restore_undo(self, pipe, counters):
+        """The state of the open again (gate held), after a replay that did not hold: the emulation stopped, the
+        cache emptied and the patches of the open written back, the counters where they were. Returns (the text
+        to add to the reason, the patches that could not be written back as _lost entries): rizin took them at
+        the open and does not take them now, and the project keeps them all the same."""
+        self._emulation_unmap(pipe)
+        self._emulation = None
+        pipe.cmd("wc-*")
+        self._mine, self._mine_over = [], []
+        pipe.cmd("ara0")
+        missing = []
+        for addr, _, after in self._opened:
+            try:
+                self._patch_write(pipe, addr, bytes.fromhex(after))
+            except RizinRefused:
+                missing.append((addr, after, False))
+        self._assist_tick, self._assist_handle, self._assist_pseudo = counters
+        if not missing:
+            return "", []
+        return _RESTORE_NOT_PUT_BACK.format(where=_named_addresses(addr for addr, _, _ in missing)), missing
 
     def emulation_state(self, wait=2.0):
         """The emulation's registers, PC, stack and the registers that changed (see _emulation_read)."""
@@ -2011,18 +2300,19 @@ class RizinSession:
                 raise RizinRefused("addr is missing: until runs to an address")
             addr = _address(addr)
 
-        def run(pipe):
-            maps = self._emulation_prepare(pipe)
-            with self._restore_guard():
-                if kind == "to_call":
-                    stopped = self._emulation_to_call(pipe)
-                else:
-                    stopped = self._emulation_command(pipe, kind, command, addr)
-            self._restore_add({"kind": "run", "run": kind, **({"addr": addr} if kind == "until" else {})},
-                              timed_out=stopped == "timeout")
-            return self._emulation_finish(pipe, stopped, maps)
+        return self._call("emulation", wait, lambda pipe: self._emulation_ran(pipe, kind, command, addr))
 
-        return self._call("emulation", wait, run)
+    def _emulation_ran(self, pipe, kind, command, addr):
+        """The run itself (gate held): what emulation_run does, and what a replay does for a ``run`` action."""
+        maps = self._emulation_prepare(pipe)
+        with self._restore_guard():
+            if kind == "to_call":
+                stopped = self._emulation_to_call(pipe)
+            else:
+                stopped = self._emulation_command(pipe, kind, command, addr)
+        self._restore_add({"kind": "run", "run": kind, **({"addr": addr} if kind == "until" else {})},
+                          timed_out=stopped == "timeout")
+        return self._emulation_finish(pipe, stopped, maps)
 
     def _emulation_finish(self, pipe, stopped, maps):
         """The state after a run (gate held), with ``stopped``: why it stopped. A PC where nothing can
@@ -2238,29 +2528,84 @@ class RizinSession:
         (_waiting_left). The reason says in addition where no map holds the address at the moment. The
         cache is read first, because that read is what lets the mirror forget a write the console took out.
         """
-        def run(pipe):
-            rows = self._patch_list(pipe)
-            waiting = sorted(self._waiting_left(self._own_patches()), key=lambda patch: patch[0])
-            maps = None
-            if waiting:
-                try:
-                    maps = pipe.cmdj("omlj")
-                except ValueError:
-                    pass  # what is mapped is not known, so the reason does not say
-                except (RizinTimeout, RizinDied):
-                    # The read is for one sentence of prose and must not cost the answer: the rows above were
-                    # read before it. But rizin is gone (a timeout kills it), so the session ends as _call
-                    # ends one, and the next request is told so rather than finding a live-looking session.
-                    if not self._closed:
-                        self._end()
-            return {"patches": rows,
-                    "waiting": [{"addr": addr, "after": after,
-                                 "reason": _PATCH_WAITING_REASON + (
-                                     _PATCH_UNMAPPED_REASON if isinstance(maps, list)
-                                     and not rizin_emulation.maps_hold(addr, len(after) // 2, maps) else "")}
-                                for addr, after, _ in waiting]}
+        return self._call("emulation", wait, self._patches_answer)
 
-        return self._call("emulation", wait, run)
+    def _patches_answer(self, pipe):
+        """patches()'s answer (gate held)."""
+        rows = self._patch_list(pipe)
+        waiting = sorted(self._waiting_left(self._own_patches()), key=lambda patch: patch[0])
+        maps = None
+        if waiting:
+            try:
+                maps = pipe.cmdj("omlj")
+            except ValueError:
+                pass  # what is mapped is not known, so the reason does not say
+            except (RizinTimeout, RizinDied):
+                # The read is for one sentence of prose and must not cost the answer: the rows above were
+                # read before it. But rizin is gone (a timeout kills it), so the session ends as _call
+                # ends one, and the next request is told so rather than finding a live-looking session.
+                if not self._closed:
+                    self._end()
+        return {"patches": rows,
+                "waiting": [{"addr": addr, "after": after,
+                             "reason": _PATCH_WAITING_REASON + (
+                                 _PATCH_UNMAPPED_REASON if isinstance(maps, list)
+                                 and not rizin_emulation.maps_hold(addr, len(after) // 2, maps) else "")}
+                            for addr, after, _ in waiting]}
+
+    def patch_waiting(self, addr, wait=2.0):
+        """Apply the patches that wait at ``addr`` now: one of the two ways out of waiting (the other is
+        drop_waiting). It is offered **only** where the bytes under the address are a run's again -- a row of the
+        cache that is not this session's own covers it -- and the server decides, not the pane: a patch written
+        before that is the harm that held it back, the file's still encrypted bytes with a patch in them and
+        the next decryption XORing over it. Returns patches()'s answer; refused for an address where nothing waits
+        and for one no run's bytes cover. It is a patch like any other afterwards, and a patch action of the
+        timeline there is one."""
+        addr = _address(addr)
+
+        def run(pipe):
+            self._patch_list(pipe)  # what the console took out of the cache is not what is waiting
+            mine = [patch for patch in self._waiting_left(self._own_patches()) if patch[0] == addr]
+            if not mine:
+                raise RizinRefused(_PATCH_NOT_WAITING.format(addr=addr))
+            rows = self._patch_list(pipe, ordered=True)
+            if not all(rizin_emulation.run_covers(rows, patch[0], len(patch[1]) // 2) for patch in mine):
+                raise RizinRefused(_PATCH_NOT_COVERED.format(addr=addr))
+            for patch in mine:
+                self._patch_write(pipe, addr, bytes.fromhex(patch[1]))
+                self._waiting = [kept for kept in self._waiting if kept != patch]
+            return self._patches_answer(pipe)
+
+        result = self._call("emulation", wait, run)
+        self._schedule_save()
+        return result
+
+    def drop_waiting(self, addr, wait=2.0):
+        """Take the patches that wait at ``addr`` out of the list and the project: the other way out. Returns
+        patches()'s answer; refused where nothing waits. What is not in the cache is not touched, and a patch of
+        the same bytes a restart lost (``_lost``) is the same patch and goes with it.
+
+        A timeline that makes the patch again is dropped with it (_restore_saved): replaying it would put back
+        what was taken out of the project."""
+        addr = _address(addr)
+
+        def run(pipe):
+            self._patch_list(pipe)
+            mine = [patch for patch in self._waiting_left(self._own_patches()) if patch[0] == addr]
+            if not mine:
+                raise RizinRefused(_PATCH_NOT_WAITING.format(addr=addr))
+            gone = {(patch[0], patch[1]) for patch in mine}
+            self._waiting = [kept for kept in self._waiting if kept not in mine]
+            self._lost = [kept for kept in self._lost if (kept[0], kept[1]) not in gone]
+            saved = self._restore_saved
+            if saved is not None and any(action["kind"] == "patch" and (action["addr"], action["data"]) in gone
+                                         for action in saved["actions"]):
+                self._restore_saved, self._restore_gone = None, _RESTORE_WAITING_DROPPED
+            return self._patches_answer(pipe)
+
+        result = self._call("emulation", wait, run)
+        self._schedule_save()
+        return result
 
     def patches_made(self, wait=2.0):
         """``patches()`` in the order the writes were made, not by address: [{"addr", "size", "before",
@@ -2552,47 +2897,49 @@ class RizinSession:
         if isinstance(stack_fix, bool) or not isinstance(stack_fix, int) or stack_fix < 0:
             raise RizinRefused("stack_fix must be a whole number of bytes, 0 or more")
 
-        def run(pipe):
-            maps = self._emulation_prepare(pipe)
-            conv = rizin_emulation.convention(self.arch, self.bits, None)
-            if conv is None:
-                raise RizinRefused(self._assist_off()["reason"])
-            pc = self._emulation_role(pipe, "PC")
-            if pc != addr:
-                raise RizinRefused(f"the emulation's PC is at {'nowhere' if pc is None else f'{pc:#x}'}, "
-                                   f"not at {addr:#x}: a skip applies to the call the PC stands on")
-            api = rizin_emulation.lookup_api(self._assist_call(pipe, addr)[1])
-            conv = rizin_emulation.convention(self.arch, self.bits, api)
-            fix = self._assist_fix(pipe, conv, stack_fix)
-            # planned before the skip: the arguments sit on the stack that the correction moves
-            plan = self._assist_plan(pipe, conv, api, maps) if api else None
-            notes = []
-            with self._restore_guard():
-                if plan is not None and plan["buffer"] and value is not None:
-                    notes.append(self._assist_map(pipe, maps, plan, value))
-                stopped = self._emulation_command(pipe, "skip", rizin_emulation.STEP_COMMANDS["skip"], None)
-                if value is not None:
-                    pipe.cmd(f"ar {conv['ret_reg']}={value:#x}")
-                    notes.insert(0, f"{conv['ret_reg']} = {value:#x}")
-                if fix:
-                    # `ar SP=<value>` takes the role name, as `ar SP` does for reading (measured)
-                    sp = self._emulation_role(pipe, "SP")
-                    pipe.cmd(f"ar SP={sp + fix:#x}")
-                    notes.append(f"the stack pointer went up by {fix} bytes")
-                if plan is not None:
-                    notes += self._assist_apply(pipe, plan)
-                    self._assist_advance(plan)
-            # what the register holds: rizin cuts the value to its width (measured: eax=0x100000041 is 0x41)
-            applied = None if value is None else value & ((1 << 8 * conv["word"]) - 1)
-            self._restore_add({"kind": "skip", "addr": addr, "value": applied, "fix": fix},
-                              timed_out=stopped == "timeout")
-            state = self._emulation_finish(pipe, stopped, maps)
-            state["summary"] = (f"skipped {api['name'] if api else 'the call'} at {addr:#x}: "
-                                + ("; ".join(notes) if notes else "the PC is after the call, and nothing "
-                                                                  "else was changed"))
-            return state
+        return self._call("emulation", wait, lambda pipe: self._call_skipped(pipe, addr, value, stack_fix))
 
-        return self._call("emulation", wait, run)
+    def _call_skipped(self, pipe, addr, value, stack_fix):
+        """The skip itself (gate held): what call_skip does with a request that was checked, and what a replay
+        does for a ``skip`` action."""
+        maps = self._emulation_prepare(pipe)
+        conv = rizin_emulation.convention(self.arch, self.bits, None)
+        if conv is None:
+            raise RizinRefused(self._assist_off()["reason"])
+        pc = self._emulation_role(pipe, "PC")
+        if pc != addr:
+            raise RizinRefused(f"the emulation's PC is at {'nowhere' if pc is None else f'{pc:#x}'}, "
+                               f"not at {addr:#x}: a skip applies to the call the PC stands on")
+        api = rizin_emulation.lookup_api(self._assist_call(pipe, addr)[1])
+        conv = rizin_emulation.convention(self.arch, self.bits, api)
+        fix = self._assist_fix(pipe, conv, stack_fix)
+        # planned before the skip: the arguments sit on the stack that the correction moves
+        plan = self._assist_plan(pipe, conv, api, maps) if api else None
+        notes = []
+        with self._restore_guard():
+            if plan is not None and plan["buffer"] and value is not None:
+                notes.append(self._assist_map(pipe, maps, plan, value))
+            stopped = self._emulation_command(pipe, "skip", rizin_emulation.STEP_COMMANDS["skip"], None)
+            if value is not None:
+                pipe.cmd(f"ar {conv['ret_reg']}={value:#x}")
+                notes.insert(0, f"{conv['ret_reg']} = {value:#x}")
+            if fix:
+                # `ar SP=<value>` takes the role name, as `ar SP` does for reading (measured)
+                sp = self._emulation_role(pipe, "SP")
+                pipe.cmd(f"ar SP={sp + fix:#x}")
+                notes.append(f"the stack pointer went up by {fix} bytes")
+            if plan is not None:
+                notes += self._assist_apply(pipe, plan)
+                self._assist_advance(plan)
+        # what the register holds: rizin cuts the value to its width (measured: eax=0x100000041 is 0x41)
+        applied = None if value is None else value & ((1 << 8 * conv["word"]) - 1)
+        self._restore_add({"kind": "skip", "addr": addr, "value": applied, "fix": fix},
+                          timed_out=stopped == "timeout")
+        state = self._emulation_finish(pipe, stopped, maps)
+        state["summary"] = (f"skipped {api['name'] if api else 'the call'} at {addr:#x}: "
+                            + ("; ".join(notes) if notes else "the PC is after the call, and nothing "
+                                                              "else was changed"))
+        return state
 
     def _assist_off(self):
         """The answer on an arch the assistant does not cover: it offers nothing and says so."""
@@ -3456,6 +3803,7 @@ class RizinSession:
                 return
             wanted, self._mine, self._mine_over = self._own_patches(), [], []
             patch_note = self._replay_patches(wanted)
+            self._opened = list(self._mine)  # the cache a restore of the project's timeline starts from
             # what went back is a patch in the file's own bytes; a held-back one is in self._waiting
             back = {(addr, after, False) for addr, _, after in self._mine}
             held = set(self._waiting)
