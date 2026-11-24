@@ -150,7 +150,7 @@ RIZIN_FUNCTIONS = [
     "rizinUnpatch", "rizinUnbreak", "rizinReanalyze", "rizinExportPatched", "rizinEmuEmpty", "rizinEmuHandSignature",
     "rizinEmuPatchesHeadHtml",
     # The waiting patches and the restore button (Task 6): the third group, its two ways out, the offer and the notice
-    "rizinEmuRunCovers", "rizinEmuWaitingHtml", "rizinEmuOffer", "rizinEmuRestoreHtml", "rizinEmuRestoreWords",
+    "rizinEmuWaitingHtml", "rizinEmuOffer", "rizinEmuRestoreHtml", "rizinEmuRestoreWords",
     "rizinEmuTakeLists", "rizinRestoreRun", "rizinApplyWaiting", "rizinDropWaiting",
     # The hand-off of the exported copy to the Submit tab (Task 13)
     "rizinDetonatePatched",
@@ -1161,8 +1161,11 @@ function serve(sid, s) {
     // the rows, what waits (s.waiting [{addr, after, reason}], integers as the route answers them) and the offer of the
     // restore button (s.restore {actions, reason, digests, refused}; left out where a test does not set one). The hooks
     // applyWaiting, dropWaiting and restoreRun answer instead.
-    const patchesOf = () => ({ patches: rows(s.patches), waiting: rows(s.waiting), ...(s.restore !== undefined ? { restore: s.restore } : {}) });
+    // an entry of `waiting` carries the server's `apply_now` (here the fake's own run_covers); a test that sets the key itself
+    // (also to undefined: the key is left out) is the server saying something else than the rows do
     const covers = w => (s.patches || []).some(p => !p.mine && p.addr < w.addr + w.after.length / 2 && w.addr < p.addr + p.size);
+    const patchesOf = () => ({ patches: rows(s.patches), waiting: rows(s.waiting).map(w => ('apply_now' in w ? w : { ...w, apply_now: covers(w) })),
+                               ...(s.restore !== undefined ? { restore: s.restore } : {}) });
     on('GET', `/api/rizin/${sid}/patches`, url => {
         if (s.ended) return ENDED;
         return (s.patchesAnswer && s.patchesAnswer(s)) || [200, patchesOf(), s.listDelay ?? 1];
@@ -7201,6 +7204,7 @@ def test_rizin_emulation_pane_styles_and_markup():
         "asset versions not raised for the EMULATION pane"
     assert "style.css?v=89" not in html and 'theme-layout.css?v=12"' not in html and "app.js?v=132" not in html, \
         "asset versions not raised for the waiting patches and the restore button"
+    assert "app.js?v=133" not in html, "app.js changed again (Apply now is drawn from the server's flag), its version did not"
 
 
 # --- Task 6: the waiting patches, the restore button and its notice ----------------------------------------------
@@ -7296,7 +7300,7 @@ def test_rizin_waiting_patches_are_a_group_of_their_own_with_two_ways_out():
         await rizinLoadEmuPane(true);
         // text of the file, an address of no exact form, and many rows
         const HOSTILE = '<img src=x onerror=alert(1)>';
-        S.waiting = [{ addr: 0x140009000, after: HOSTILE, reason: HOSTILE }, { addr: 2 ** 60, after: '90', reason: 'far away' }];
+        S.waiting = [{ addr: 0x140009000, after: HOSTILE, reason: HOSTILE }, { addr: 2 ** 60, after: '90', reason: 'far away', apply_now: true }];
         await rizinLoadEmuPane(true);
         const far = pane.querySelectorAll('.rizin-emu-wait').filter(e => !attr(e, 'data-addr'))[0];
         r.hostile = { tags: pane.querySelectorAll('*').map(e => e.tagName).filter(t => t === 'IMG'), shown: text(pane).includes(HOSTILE),
@@ -7372,21 +7376,25 @@ RIZIN_EMU_PANE_ROWS = 100
 
 @needs_node
 def test_rizin_apply_now_appears_only_when_a_runs_bytes_cover_the_address():
-    # "Apply now" is on a waiting row only while a row of the cache that is not the user's own -- a run's -- overlaps one
-    # of its bytes; the edges count (a run's row that ends where the patch starts, or starts where it ends, covers
-    # nothing), a patch of the user's own is no run, and a run's row taken back takes the button with it. The press is the
-    # server's to decide: the request goes out as {addr, waiting:true} whatever the pane drew, and a refusal, a busy rizin
-    # or a patch that nothing waits for any more is said in the server's words and changes nothing; an answer is the
-    # lists, which the pane takes without asking again.
+    # "Apply now" is on a waiting row only where the server says `apply_now: true` for it (it asks run_covers: a run's row
+    # of the cache overlaps one of its bytes) and nowhere else -- not where the rows of the same answer would cover it,
+    # not for a flag that is not true, not for one that is missing -- and a run's row taken back takes the button with
+    # it at the next read. The press is the server's to decide: the request goes out as {addr, waiting:true} whatever the
+    # pane drew, and a refusal, a busy rizin or a patch that nothing waits for any more is said in the server's words and
+    # changes nothing; an answer is the lists, which the pane takes without asking again.
     r = _scripted(WAITING_SETUP + r"""
         const W = (addr, after) => ({ addr, after, reason: REASON });
         S.waiting = [W(0x140001521, '90'), W(0x140009000, '9090'), W(0x1400014c0, '90'), W(0x14000151f, '9090'),
-                     W(0x140001526, '90'), W(0x140001525, '90'), W(0x140001520, '9090'), W(0x140001523, '')];
+                     W(0x140001526, '90'), W(0x140001525, '90'), W(0x140001520, '9090'),
+                     // the server's word against the rows: true where nothing lies under it, false (and not true, and missing) where a run does
+                     { ...W(0x140001530, '90'), apply_now: true }, { ...W(0x140001522, '90'), apply_now: false },
+                     { ...W(0x140001540, '90'), apply_now: 'yes' }, { ...W(0x140001541, '90'), apply_now: 1 },
+                     { ...W(0x140001542, '90'), apply_now: undefined }];
         S.restore = OFFER();
         await listed();
         const apply = () => pane.querySelectorAll('.rizin-emu-wait').filter(e => e.querySelector('[data-rizin-act="apply-waiting"]'))
             .map(e => attr(e, 'data-addr')).sort();
-        r.offered = apply();     // 0x140001523 holds no bytes, and lies inside a run's row: no button for a patch of nothing
+        r.offered = apply();
         r.label = text(wait('0x140001521').querySelector('[data-rizin-act="apply-waiting"]'));
         r.drop = pane.querySelectorAll('.rizin-emu-wait').map(e => !!e.querySelector('[data-rizin-act="drop-waiting"]')).every(Boolean);
 
@@ -7480,10 +7488,10 @@ def test_rizin_apply_now_appears_only_when_a_runs_bytes_cover_the_address():
         rizinState.emuPane.busy = ''; await quiet();
     """)
     assert "error" not in r, r.get("error")
-    assert r["offered"] == ["0x140001520", "0x140001521", "0x140001525"], \
-        "Apply now where no run's bytes lie under the patch, or not where they do: " + str(r["offered"])
+    assert r["offered"] == ["0x140001520", "0x140001521", "0x140001525", "0x140001530"], \
+        "Apply now where the server did not say so, or not where it did: " + str(r["offered"])
     assert r["label"] == "Apply now" and r["drop"] is True, r
-    assert r["noRun"] == [] and r["again"] == ["0x140001520", "0x140001521", "0x140001525"], (r["noRun"], r["again"])
+    assert r["noRun"] == ["0x140001530"] and r["again"] == ["0x140001520", "0x140001521", "0x140001525", "0x140001530"], (r["noRun"], r["again"])
     assert r["during"]["busy"] == "apply-waiting" and all(r["during"]["off"]), r["during"]
     assert r["applied"]["posts"] == [{"addr": "0x140001521", "waiting": True}], r["applied"]
     assert r["applied"]["lists"] == 0, "the answer carried the lists, and they were asked for again"

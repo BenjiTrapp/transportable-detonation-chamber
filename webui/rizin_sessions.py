@@ -2610,12 +2610,15 @@ class RizinSession:
         and ``written`` are left out: the index changes with every removal, and nothing here ever
         commits the cache, so ``written`` is always false.
 
-        ``waiting`` is [{"addr", "after", "reason"}], lowest address first: the patches the project holds
+        ``waiting`` is [{"addr", "after", "reason", "apply_now"}], lowest address first: the patches the project holds
         that were set over bytes a run had written and were **not** written into the cache when the
         file was opened (_replay_patches). They are not in ``patches`` and so not in an export, and a
         patch the cache holds since (the same address and bytes made again) is not waiting any more
-        (_waiting_left). The reason says in addition where no map holds the address at the moment. The
-        cache is read first, because that read is what lets the mirror forget a write the console took out.
+        (_waiting_left). The reason says in addition where no map holds the address at the moment.
+        ``apply_now`` is true where patch_waiting would write the entry now -- a row of the cache that is not this
+        session's own overlaps a byte of it (rizin_emulation.run_covers, which does not care about the order of the
+        rows) -- and it is made from the rows this answer is made from: no second read. The press is decided again
+        on arrival. The cache is read first, because that read is what lets the mirror forget a write the console took out.
 
         ``restore`` is restore_offer's answer, {"actions", "reason", "digests"}, made from the same read of the
         cache: the reader of the restore button, which is asked for by the user and not on the poll. It costs
@@ -2648,7 +2651,10 @@ class RizinSession:
                 "waiting": [{"addr": addr, "after": after,
                              "reason": _PATCH_WAITING_REASON + (
                                  _PATCH_UNMAPPED_REASON if isinstance(maps, list)
-                                 and not rizin_emulation.maps_hold(addr, len(after) // 2, maps) else "")}
+                                 and not rizin_emulation.maps_hold(addr, len(after) // 2, maps) else ""),
+                             # whether patch_waiting would take it now: the same question over the same rows, asked
+                             # once here, so that the pane draws "Apply now" from the answer and keeps no copy of it
+                             "apply_now": rizin_emulation.run_covers(rows, addr, len(after) // 2)}
                             for addr, after, _ in waiting],
                 "restore": self._restore_offered(pipe, rows)}
 

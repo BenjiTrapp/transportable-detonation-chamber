@@ -4696,7 +4696,7 @@ def test_a_patch_over_a_runs_bytes_is_held_back_when_the_file_is_opened_again(rz
     assert set(answer) == {"patches", "waiting", "restore"}
     assert answer["patches"] == [], "not in the cache, so it is not exported either"
     assert [(w["addr"], w["after"]) for w in answer["waiting"]] == [(0x140001441, "90")]
-    assert set(answer["waiting"][0]) == {"addr", "after", "reason"}
+    assert set(answer["waiting"][0]) == {"addr", "after", "reason", "apply_now"}
     assert isinstance(answer["waiting"][0]["addr"], int) and answer["waiting"][0]["reason"]
     assert rz.read(f"/api/rizin/{sid}/hex?addr=0x140001441&len=1")["bytes"] != [0x90]
     response = rz.post(f"/api/rizin/{sid}/export", {})
@@ -4801,6 +4801,43 @@ def _reopened_with_a_waiting_patch(rz):
 
 def _project_patches(rz):
     return rz.project().read_text(encoding="utf-8", errors="surrogateescape").split("\npatches=")[1].split("\n")[0]
+
+
+def test_a_waiting_entry_says_whether_apply_now_would_be_taken(rz):
+    # The pane draws "Apply now" from this flag and decides nothing itself: it is rizin_emulation.run_covers over the
+    # rows of the very read the answer is made from (no second wcj), so it is true exactly where a press would be
+    # accepted -- a row of the cache that is not the user's own overlaps a byte of the patch -- and a press of the
+    # route says the same. The edges count, and the user's own row is no run's.
+    path, sid = _reopened_with_a_waiting_patch(rz)
+    session = rz.mgr.get(sid)
+    session._waiting.append((0x50000000, "90", True))  # in no map, no run anywhere near
+
+    def flags():
+        return {w["addr"]: w["apply_now"] for w in _waiting(rz, sid)}
+
+    assert flags() == {0x140001441: False, 0x50000000: False}, "nothing has run in this session"
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    _console(rz, sid, "wx 41 @ 0x140001440")
+    assert flags()[0x140001441] is False, "a run's row that ends where the patch starts covers nothing"
+    _console(rz, sid, "wx 90 @ 0x140001448")
+    assert flags()[0x140001441] is False, "one that lies elsewhere neither"
+    # the length of the patch counts, in bytes: the row at ...48 is under the second byte of a two-byte patch at ...47, and
+    # one byte past the end of the one at ...46
+    session._waiting += [(0x140001447, "9090", True), (0x140001446, "9090", True)]
+    assert flags()[0x140001447] is True and flags()[0x140001446] is False
+    _console(rz, sid, "wx 4142 @ 0x140001440")
+    assert flags() == {0x140001441: True, 0x50000000: False, 0x140001447: True, 0x140001446: False}
+    assert all(type(w["apply_now"]) is bool for w in _waiting(rz, sid))
+
+    mark = len(rz.commands())
+    assert flags()[0x140001441] is True
+    assert rz.commands()[mark:].count("wcj") == 1, "the flag is made from the read of the answer, not a second one"
+    # the press agrees with the flag, in both directions
+    refused = rz.post(f"/api/rizin/{sid}/patch", {"addr": "0x50000000", "waiting": True})
+    assert refused.status_code == 400 and "no run's bytes" in refused.get_json()["refused"]
+    answer = rz.ok(rz.post(f"/api/rizin/{sid}/patch", {"addr": "0x140001441", "waiting": True}))
+    assert {w["addr"]: w["apply_now"] for w in answer["waiting"]} == {0x50000000: False, 0x140001447: True, 0x140001446: False}
+    assert [r["addr"] for r in answer["patches"] if r["mine"]] == [0x140001441]
 
 
 def test_a_patch_made_again_over_the_run_is_not_in_both_lists_of_one_answer(rz):

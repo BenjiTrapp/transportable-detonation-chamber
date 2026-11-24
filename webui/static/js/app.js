@@ -25398,7 +25398,7 @@ function rizinEmuPatchesHtml(patches, functions, options) {
         + `<span class="rizin-emu-actions"><button type="button" class="rizin-tool" data-rizin-act="export"${off(!hand.length || busy)} `
         + `title="Write a copy of the file with these patches in it, and a note beside it">Export</button>`
         + `</span></div>${overLine}${result}${list(hand, true, 'Nothing set by hand.')}</div>`
-        + rizinEmuWaitingHtml(waiting, rows, functions, { busy })
+        + rizinEmuWaitingHtml(waiting, functions, { busy })
         + `<div class="rizin-emu-group rizin-emu-run" data-rizin-group="run"><div class="rizin-emu-subhead">`
         + `<span class="rizin-emu-group-title">WRITTEN BY THE RUN · ${run.length}${run.length ? ` · ${written} B` : ''}</span>`
         + `<span class="rizin-emu-fate">these end with the session</span>`
@@ -25408,24 +25408,13 @@ function rizinEmuPatchesHtml(patches, functions, options) {
         + `${list(run, false, 'Nothing written by a run.')}</div>`;
 }
 
-// Whether a write of the cache that is not the user's own (a run's: mine is not true) overlaps one of the `size` bytes at
-// addr (integers: the rows of /patches). Nothing but "may the button be drawn": the server asks the same of the same rows
-// when the button is pressed, and the press is its to answer -- a row that ends where the patch starts, or starts where
-// it ends, covers nothing, and an address a double cannot hold exactly covers nothing here rather than something wrong.
-function rizinEmuRunCovers(rows, addr, size) {
-    if (!Number.isSafeInteger(addr) || !Number.isSafeInteger(size) || size < 1 || !Number.isSafeInteger(addr + size)) return false;
-    return (Array.isArray(rows) ? rows : []).some(row => row && typeof row === 'object' && row.mine !== true
-        && Number.isSafeInteger(row.addr) && Number.isSafeInteger(row.size) && Number.isSafeInteger(row.addr + row.size)
-        && row.addr < addr + size && addr < row.addr + row.size);
-}
-
 // What waits: the patches the project holds that were set over bytes a run wrote and are not in the cache (the open ran
 // before any run, so they would have gone into the file's own, still encrypted bytes, and the next decryption would run
 // over them). A group of its own with the reason of each row and two ways out: ✕ takes it out of the project, Apply now
-// writes it -- drawn only where a run's bytes lie under it (rizinEmuRunCovers over the rows of the cache), and the
-// server decides again when it is pressed. Nothing waits: no group. Every text here is the server's or the file's:
-// escaped.
-function rizinEmuWaitingHtml(waiting, patches, functions, options) {
+// writes it -- drawn only where the server says `apply_now: true` for the entry (it asked run_covers over the rows of
+// the same answer; the pane keeps no copy of that rule), and the server decides again when it is pressed. Nothing waits:
+// no group. Every text here is the server's or the file's: escaped.
+function rizinEmuWaitingHtml(waiting, functions, options) {
     const { busy = '' } = options || {};
     const entries = (Array.isArray(waiting) ? waiting : []).filter(entry => entry && typeof entry === 'object');
     if (!entries.length) return '';
@@ -25435,12 +25424,12 @@ function rizinEmuWaitingHtml(waiting, patches, functions, options) {
         const bytes = typeof entry.after === 'string' ? entry.after : '';
         const size = Math.floor(bytes.length / 2), why = typeof entry.reason === 'string' ? entry.reason : '';
         const title = `${addr || 'an address that cannot be shown exactly'} · ${size} byte${size === 1 ? '' : 's'}${fn ? ` · ${fn}` : ''} · waiting: ${why}`;
-        const apply = addr && rizinEmuRunCovers(patches, entry.addr, size);
+        const apply = !!addr && entry.apply_now === true;
         return `<div class="rizin-row rizin-emu-row rizin-emu-wait${addr ? '' : ' rizin-row-none'}"${addr ? ` data-addr="${addr}"` : ''} title="${escapeHtml(title)}">`
             + `<span class="rz-addr">${escapeHtml(addr || '?')}</span><span class="rizin-emu-fn">${escapeHtml(fn || '—')}</span>`
             + `<span class="rizin-emu-bytes">${size} B · ${escapeHtml(rizinEmuBytes(bytes))}</span>`
-            + (apply ? `<button type="button" class="rizin-tool" data-rizin-act="apply-waiting"${off(busy)} title="A run's bytes lie under this patch again: write it into the cache now. `
-                + `The server checks that once more." aria-label="Apply the waiting patch at ${addr} now">Apply now</button>` : '<span></span>')
+            + (apply ? `<button type="button" class="rizin-tool" data-rizin-act="apply-waiting"${off(busy)} title="The server says a run's bytes lie under this patch again: write it into the cache now. `
+                + `It checks once more." aria-label="Apply the waiting patch at ${addr} now">Apply now</button>` : '<span></span>')
             + (addr ? `<button type="button" class="rizin-tool rizin-emu-del" data-rizin-act="drop-waiting"${off(busy)} title="Remove this patch from the project: it will not come back when the file is opened again" `
                 + `aria-label="Remove the waiting patch at ${addr} from the project">✕</button>` : '<span></span>')
             + `<span class="rizin-emu-note rizin-emu-wait-why">${escapeHtml(why)}</span></div>`;
