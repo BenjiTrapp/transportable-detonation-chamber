@@ -780,7 +780,9 @@ def digest_ranges(rows, ranges):
     there are is what an offer of a restore says (``len``), and it has no use for the hashing of megabytes that
     every ``GET /patches`` of a session with a timeline would pay (measured: 1.65 s for 2^20 one-byte rows of a
     decryption loop, more than reading them). Same arguments as ``run_digests``, and the same spans, which is the
-    one thing the count may not differ in."""
+    one thing the count may not differ in. It does **not** check that a row holds as many bytes as it says (``parse_cache`` does
+    not either, only the types): that is ``run_digests``' ValueError, and a caller that states the count has to ask first
+    (RizinSession._restore_offered does)."""
     owned = written_ranges([row for row in rows if not row.get("mine")])
     return _merged(_common(owned, _merged(ranges)) + _common(owned, written_ranges(
         [row for row in rows if row.get("mine")])))

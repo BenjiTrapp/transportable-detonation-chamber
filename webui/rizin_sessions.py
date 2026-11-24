@@ -2047,23 +2047,33 @@ class RizinSession:
     def _restore_offered(self, pipe, rows):
         """restore_offer's answer (gate held when ``pipe`` is given): ``rows`` the cache **in write order**, read
         once by the caller, which is also what the answer of GET /patches is made from. Nothing in it hashes."""
-        record, saved = self._restore, self._restore_saved
-        refused = self._restore_refusal(pipe, rows)
+        record, saved = self._restore, self._restore_saved  # after the caller's read of the cache: see _restore_refusal
+        assert pipe is not None or (record is None and saved is None), "a timeline is asked about with rizin"
+        refused = self._restore_refusal(pipe, rows, saved)
         if record is None and saved is None:
             return {"actions": 0, "reason": self._restore_gone, "digests": 0, "refused": refused}
         if record is None:
             return {"actions": len(saved["actions"]), "reason": None, "digests": len(saved["digests"]),
                     "refused": refused}
         # how many ranges the cache proves now: counted, not hashed (rizin_emulation.digest_ranges) -- the hashing is
-        # for a save and a replay, and a read of the pane's own route would pay it for nothing
+        # for a save and a replay, and a read of the pane's own route would pay it for nothing. What the hashing would
+        # have refused is refused here too: parse_cache checks the types of a row and not that ``after`` holds ``size``
+        # bytes, and a count of ranges that the save skips and the replay refuses is not one to state
+        if any(len(row["after"]) != 2 * row["size"] for row in rows):
+            return {"actions": len(record["actions"]), "reason": _RESTORE_CACHE_UNREAD, "digests": 0, "refused": refused}
         digests = len(rizin_emulation.digest_ranges(rows, rizin_emulation.run_only_ranges(rows)))
         return {"actions": len(record["actions"]), "digests": digests, "refused": refused,
                 "reason": self._restore_reason() or (None if digests else _RESTORE_NOTHING)}
 
-    def _restore_refusal(self, pipe, rows=None):
+    def _restore_refusal(self, pipe, rows, saved):
         """Why restore_run would refuse now, or None (gate held when there is a record): the sentence it raises with.
-        No record: why there is none; else _restore_blocked."""
-        saved = self._restore_saved
+        No record: why there is none; else _restore_blocked.
+
+        Both come from what the caller passes: ``rows`` the cache **in write order**, read by the caller, and ``saved``
+        the project's record **as the caller took it after that read**. The read is where a take-back is noticed
+        (_patch_list drops the record), so a record taken before it can be one the read has just dropped -- and a
+        refusal made over the dropped record would be a "go" for a press that has none. This function reads nothing
+        that can change either, and asks ``self`` for neither."""
         if saved is None:
             return self._restore_gone or (_RESTORE_LOST_AT_OPEN if self._restore_lost else _RESTORE_NO_RECORD)
         return self._restore_blocked(pipe, saved, rows)
@@ -2098,7 +2108,7 @@ class RizinSession:
     # the open left, so a second press is refused (the cache is the run's). A record that is at
     # RESTORE_MAX_ACTIONS already spoils at the first action that follows, as any timeline does.
 
-    def _restore_blocked(self, pipe, record=None, rows=None):
+    def _restore_blocked(self, pipe, record, rows=None):
         """Why restore_run would refuse now, or None (gate held): spec 6, and the breakpoints.
 
         The cache has to be exactly what the open left (``_opened``, in the order it was written): anything
@@ -2111,7 +2121,6 @@ class RizinSession:
 
         ``rows`` are the cache in write order where the caller has read them already (one ``wcj`` for an
         answer that needs the list and the gate), as _restore_digests takes them."""
-        record = record or self._restore_saved
         if not record["digests"]:
             return _RESTORE_NOTHING
         if self._emulation is pipe:  # a restarted rizin has none, whatever the one before it ran
@@ -2153,10 +2162,15 @@ class RizinSession:
         return self._call("emulation", wait, self._restore_replay)
 
     def _restore_replay(self, pipe):
-        reason = self._restore_refusal(pipe)
+        # The cache is read **first**: that read is where a take-back is noticed and the record dropped (_patch_list).
+        # The record is taken after it and the refusal is made over that very record and those rows -- one observation,
+        # so that a record the read dropped is a refusal and not a "go" with nothing to replay. Nothing between this
+        # read and the first command of the replay reads the cache again (it holds the gate).
+        rows = self._patch_list(pipe, ordered=True)
+        record = self._restore_saved
+        reason = self._restore_refusal(pipe, rows, record)
         if reason:
             raise RizinRefused(reason)
-        record = self._restore_saved
         counters, lost = (self._assist_tick, self._assist_handle, self._assist_pseudo), self._lost
         # the live timeline describes a cache that is about to be replaced, and a clean one that stayed would
         # be saved with the digests of the replayed run: it goes, and what it said of the breakpoints with it

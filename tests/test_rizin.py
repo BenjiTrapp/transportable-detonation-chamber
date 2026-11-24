@@ -10296,6 +10296,7 @@ def test_a_write_that_never_reached_the_cache_is_no_take_back(rz):
     # makes a patch at that very place, stays. (2^64-1 is where rizin writes nothing at all, measured.)
     path, line = _decrypted_and_saved(rz)
     sid, session = _reopened(rz, path)
+    _patch(rz, sid, addr="0x140001600", bytes="9090")  # one the cache holds: the mirror is not empty beforehand
     last = 2 ** 64 - 1
     session._restore_saved = dict(session._restore_saved, actions=session._restore_saved["actions"] + [
         {"kind": "patch", "addr": last, "data": "90"}])
@@ -10348,3 +10349,91 @@ def test_the_budget_is_counted_from_the_first_command_and_not_from_the_first_act
     monkeypatch.setattr(session, "_patch_write", slow)
     answer = rz.ok(_restore(rz, sid))
     assert answer["restored"] is False and "before action 1 of 3" in answer["reason"] and "the 0 before it" in answer["reason"]
+
+
+# --- Fix round 3 for the replay ----------------------------------------------------------------------------------
+
+def test_a_restore_whose_record_went_in_the_read_of_its_own_gate_is_refused_and_touches_nothing(rz):
+    # Measured by the review: "apply now" on a waiting patch (a patch action of the timeline by construction), then a
+    # console wc- of it and of the run: the cache is the open's again, the breakpoints match, and the gate's read is
+    # what notices the take-back and drops the record. The press then ran with no record, wiped the open's patch with its
+    # wc-* and died on a TypeError the undo does not catch.
+    import rizin_sessions
+
+    path, line = _decrypted_and_saved(rz, before=[(UNCOVERED, "9090")])
+    sid, session = _reopened(rz, path)
+    assert session._opened == [(UNCOVERED, 2, "9090")]
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": f"{DECRYPT_AT:#x}"})
+    _run(rz, sid, "until", addr=f"{DECRYPT_END:#x}")
+    rz.send(f"/api/rizin/{sid}/patch", {"addr": "0x140002003", "waiting": True})
+    rz.send(f"/api/rizin/{sid}/emulation/stop")
+    _console(rz, sid, "wc- 0x140002000 0x140002010")  # the patch and the run's rows: the cache is the open's again
+    saved = session._restore_saved
+    assert saved is not None, "nothing has read the cache since the console"
+    mark = len(rz.commands())
+
+    response = _restore(rz, sid)
+    assert response.status_code == 400 and response.get_json()["refused"] == rizin_sessions._RESTORE_PATCH_TAKEN_BACK
+    assert _the_replay(rz, mark) == [], "a refusal sends nothing that changes anything"
+    assert [(r["addr"], r["after"], r["mine"]) for r in _patches(rz, sid)] == [(UNCOVERED, "9090", True)], "the open's patch is still there"
+    assert session._replaying is False and session._emulation is None and session._restore_saved is None
+    _mark_dirty(rz, sid)
+    assert session.flush() is True
+    assert "140001500:9090" in _project_patches(rz), "and the next save writes it"
+    assert "\nrestore=" not in _project_text(rz.project())
+
+
+def test_taking_back_a_patch_the_timeline_does_not_make_keeps_the_record_while_another_it_does_make_stays(rz):
+    # the cache holds a patch the timeline makes (A) and one it does not (B, made before the first start); B is taken back, and
+    # A -- which is still there -- is no reason to drop the record. Only what went counts, not what is there
+    path, line = _decrypted_and_saved(rz, before=[(UNCOVERED, "9090")], over=[(0x140002003, "90"), (0x140001600, "9090")])
+    sid, session = _reopened(rz, path)
+    assert [(r["addr"], r["after"]) for r in _patches(rz, sid)] == [(UNCOVERED, "9090"), (0x140001600, "9090")]
+    saved = session._restore_saved
+    rz.remove(f"/api/rizin/{sid}/patch", {"addr": f"{UNCOVERED:#x}"})
+    assert [(r["addr"], r["after"]) for r in _patches(rz, sid)] == [(0x140001600, "9090")]
+    assert session._restore_saved is saved and session._restore_gone is None
+    rz.remove(f"/api/rizin/{sid}/patch", {"addr": "0x140001600"})
+    assert session._restore_saved is None, "and A going is"
+
+
+def test_a_restart_that_could_not_read_the_cache_claims_nothing_and_drops_nothing(rz, monkeypatch):
+    # _replay_patches' failure branch: the writes went, the read of what rizin holds did not. The mirror is emptied (a patch
+    # nobody has seen in the cache is not the session's own, and a save would write it), and the project's record is not
+    # touched by it
+    import rizin_sessions
+
+    path, line = _decrypted_and_saved(rz)
+    sid, session = _reopened(rz, path)
+    saved = session._restore_saved
+    real = session._patch_list
+    monkeypatch.setattr(session, "_patch_list", lambda pipe, ordered=False: (_ for _ in ()).throw(ValueError("wcj")))
+    note = session._replay_patches([(0x140001600, "9090", False)])
+    assert "could not be applied" in note and session._mine == [] and session._mine_over == []
+    monkeypatch.setattr(session, "_patch_list", real)
+    rows = _patches(rz, sid)
+    assert [(r["addr"], r["after"], r["mine"]) for r in rows] == [(0x140001600, "9090", False)], "written, and nobody's own"
+    assert session._restore_saved is saved and session._restore_gone is None
+
+
+def test_an_offer_does_not_state_a_count_over_a_row_that_holds_fewer_bytes_than_it_says(rz, monkeypatch):
+    # parse_cache checks types and not sizes; the save skips such a timeline and the replay refuses it, and the count of
+    # ranges that the offer would state for it is refused with the same sentence
+    import rizin_emulation
+    import rizin_sessions
+
+    sid = rz.session()
+    session = rz.mgr.get(sid)
+    rz.send(f"/api/rizin/{sid}/emulation/start", {"addr": "0x140001440"})
+    _wrote(rz, sid)
+    real = rizin_emulation.parse_cache
+    monkeypatch.setattr(rizin_emulation, "parse_cache", lambda text: [dict(row, size=8) for row in real(text)])
+    answer = rz.read(f"/api/rizin/{sid}/patches")
+    assert answer["restore"] == {"actions": 1, "reason": rizin_sessions._RESTORE_CACHE_UNREAD, "digests": 0, "refused": _NO_RECORD}
+
+
+def test_the_offer_of_a_session_with_a_record_is_not_made_without_rizin(rz):
+    path, line = _decrypted_and_saved(rz)
+    sid, session = _reopened(rz, path)
+    with pytest.raises(AssertionError):
+        session._restore_offered(None, None)
