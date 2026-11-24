@@ -1065,6 +1065,13 @@ def _named_addresses(addrs):
     return shown + (", ..." if len(addrs) > _NOTE_ADDRESSES else "")
 
 
+def _reason_words(reason):
+    """A reason as the sentence that names it ends: without its closing stops and spaces. The pane (app.js,
+    ``rizinEmuRestoreHtml``) ends the same reason with the same pattern, ``/[.\\s]+$/``, so that the sentence the band says
+    and the one the dock would say are the same words and the dock can leave out the second one."""
+    return re.sub(r"[.\s]+$", "", reason)
+
+
 def _named_set(addrs):
     """A set of addresses for a sentence: "none", or _named_addresses."""
     return _named_addresses(addrs) if addrs else "none"
@@ -1683,8 +1690,11 @@ class RizinSession:
             # before the one that cannot wait. It needs no pipe: the record's own taint, and what a console did to it.
             lost = self._restore_reason()
             if lost:
-                notes = notes + [_RESTORE_NOTICE.format(reason=lost.rstrip(".")) + (
-                    _RESTORE_NOTICE_EARLIER if self._restore_saved is not None else "")]
+                # The second sentence is a statement about the **project**, and ``_restore_saved`` is not one: it is set when a
+                # save is asked, so after a record that did not fit it is the record the session would keep while the project
+                # holds the marker (``_restore_dropped_note`` is set exactly then, and goes when a save fits it again)
+                held = self._restore_saved is not None and self._restore_dropped_note is None
+                notes = notes + [_RESTORE_NOTICE.format(reason=_reason_words(lost)) + (_RESTORE_NOTICE_EARLIER if held else "")]
             if self._dirty and self._state == "running":
                 notes = notes + [_WAITING_NOTE]
             return {"state": self._state, "step": self._step, "done_steps": list(self._done),

@@ -1625,6 +1625,14 @@ def test_the_guide_says_what_a_waiting_patch_is_and_how_a_session_comes_back():
         ("Something taken out of the cache", "wc- 0x1000 0x1001"),
         ("Something taken out of the cache", "wc-*"),
     ]
+    # a row of the table that names a console command and has no door above is one this test cannot drive: it would go unchecked
+    # as the table grows. So each row whose cause says "console" (or names a console command) has to be one of the doors'
+    # (two rows mention the console and are not decided by _console_spoils: the breakpoints, by _console_moves_breakpoints, and the
+    # cache that held writes before the start, by _restore_begin; tests/test_rizin.py drives both)
+    elsewhere = ("A breakpoint changed", "The cache already held writes of its own")
+    console_rows = [key for key in rows if ("console" in key.lower() or "(e <key>" in key) and not key.startswith(elsewhere)]
+    undriven = [key for key in console_rows if not any(key.startswith(cause) for cause, _ in doors)]
+    assert not undriven, "a console cause of the table of causes has no command in `doors` to run through the code: %r" % undriven
     for cause, command in doors:
         cell = [reason for key, reason in rows.items() if key.startswith(cause)]
         assert len(cell) == 1, "the table of causes has no single row that begins %r" % cause
@@ -1642,3 +1650,16 @@ def test_the_guide_says_what_a_waiting_patch_is_and_how_a_session_comes_back():
     # the API page keeps one row each and says what a waiting entry holds
     row = [line for line in _doc("api.md").splitlines() if line.startswith("| GET | `/api/rizin/<sid>/patches` |")]
     assert len(row) == 1 and "waiting: [{addr, after, reason, apply_now}]" in row[0]
+
+
+def test_the_api_page_names_only_methods_the_code_has():
+    # the page quotes the names of the server's own methods in places; nothing else checks that they are still there (the offer
+    # was called restore_offer in a row after it became _restore_offer)
+    import re
+    import rizin_sessions
+
+    page = _doc("api.md")
+    names = set(re.findall(r"`RizinSession\.(\w+)`", page)) | set(re.findall(r"`(_restore_\w+|restore_\w+)`", page))
+    assert names, "the page names no method of the session any more: this test has nothing to hold"
+    for name in names:
+        assert hasattr(rizin_sessions.RizinSession, name), "docs/api.md names RizinSession.%s, which is not there" % name

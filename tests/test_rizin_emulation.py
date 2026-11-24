@@ -1256,7 +1256,7 @@ def test_proved_range_count_is_the_number_of_ranges_run_digests_hashes():
     for _ in range(4000):
         rows = []
         for _ in range(rng.randint(0, 12)):
-            size = rng.randint(1, 5)
+            size = rng.randint(0, 5)  # a row of no size too: rizin writes none, and the count may not state a range for one
             rows.append({"addr": rng.randint(0, 30), "size": size, "before": "00" * size, "after": "ab" * size,
                          "mine": rng.random() < 0.4, "over_run": False})
         ranges = rizin_emulation.run_only_ranges(rows)
@@ -1268,6 +1268,9 @@ def test_proved_range_count_is_the_number_of_ranges_run_digests_hashes():
             {"addr": 4, "size": 1, "before": "00", "after": "ab", "mine": False}]
     assert rizin_emulation.proved_range_count(rows) == 2 == len(rizin_emulation.run_digests(rows, rizin_emulation.run_only_ranges(rows)))
     assert rizin_emulation.proved_range_count([]) == 0
+    # a foreign row of no size is no range (a span of (addr, addr - 1) would be counted as one): run_digests and digest_ranges say 0
+    empty = [{"addr": 5, "size": 0, "before": "", "after": "", "mine": False}]
+    assert rizin_emulation.proved_range_count(empty) == 0 == len(rizin_emulation.run_digests(empty, rizin_emulation.run_only_ranges(empty)))
     # a row that holds fewer bytes than it says is refused as run_digests refuses it, and a patch's is no exception
     for mine in (False, True):
         with pytest.raises(ValueError):

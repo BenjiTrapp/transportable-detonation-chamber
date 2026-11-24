@@ -10630,3 +10630,46 @@ def test_a_project_with_no_room_for_the_marker_after_the_patches_still_says_the_
     assert text.endswith("\nrestore=dropped\n") and "\npatches=" + line_of_patches + "\n" in text, text[-40:]
     meta = rizin_sessions._read_project_meta(str(dst))
     assert meta["restore_dropped"] is True and len(meta["patches"]) == 125, "the next open says it, and has every patch"
+
+
+# --- The last fix ---------------------------------------------------------------------------------------------------
+
+def test_the_band_does_not_say_the_project_holds_a_timeline_that_a_save_could_not_keep(rz, monkeypatch):
+    # _restore_saved is set when a save is asked, not when it is written: after a record that did not fit it is the record the
+    # session would keep, and the project holds the marker. The note says the way is not kept; it must not also say the button
+    # replays an earlier timeline the project holds -- the first sentence is true and the second is not
+    import rizin_sessions
+
+    path, sid, line = _saved_with_a_record(rz)
+    session = rz.mgr.get(sid)
+    monkeypatch.setattr(rizin_sessions, "PROJECT_PATCH_CHARS", len("140001441:90:r") + len(line) - 1)
+    _mark_dirty(rz, sid)
+    assert session.flush() is True
+    assert _restore_value(rz.project()) == _marker() and session._restore_saved is not None
+    _hand_set_a_register(rz, sid)
+    note = rz.status(sid)["analysis"]["note"]
+    assert "will not be there when the file is opened again" in note, note
+    assert f"The way to this state is not kept in the project: {rizin_sessions._RESTORE_HAND_REGISTER}." in note, note
+    assert rizin_sessions._RESTORE_NOTICE_EARLIER not in note, note
+    # and where the project does hold the record, the sentence is true and is said (the earlier tests)
+    monkeypatch.setattr(rizin_sessions, "PROJECT_PATCH_CHARS", 32 * 1024)
+    session._restore = None
+    session._restore_gone = rizin_sessions._RESTORE_GONE
+    _mark_dirty(rz, sid)
+    assert session.flush() is True
+    assert session._restore_dropped_note is None and _restore_value(rz.project()).startswith("1;")
+    assert rizin_sessions._RESTORE_NOTICE_EARLIER in rz.status(sid)["analysis"]["note"]
+
+
+def test_the_band_and_the_pane_end_a_reason_with_the_same_pattern():
+    # the band and the pane's own notice must be the same words, or the pane says it twice: one pattern, in both, and what it does
+    import re
+    import rizin_sessions
+
+    with open(os.path.join(ROOT, "webui", "static", "js", "app.js"), encoding="utf-8") as fh:
+        assert r"offer.reason.replace(/[.\s]+$/, '')" in fh.read()
+    for text, words in (("a reason.", "a reason"), ("a reason. ", "a reason"), ("a reason...\n", "a reason"), ("a reason", "a reason"),
+                        ("a. b.", "a. b"), ("", "")):
+        assert rizin_sessions._reason_words(text) == words, repr(text)
+    for reason in [v for k, v in vars(rizin_sessions).items() if k.startswith("_RESTORE_") and isinstance(v, str)]:
+        assert rizin_sessions._reason_words(reason) == re.sub(r"[.\s]+$", "", reason)
