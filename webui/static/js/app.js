@@ -27302,7 +27302,10 @@ function binaryGraphCombineOrigin(a, b) {
 // kernel32.dll!CreateFileW *is* the datum that app.exe imports from kernel32.dll, and counting those reads the answer
 // without adding to it. The origin of the edge is derived only if every edge it stands for is (binaryGraphCombineOrigin).
 // When the server cut the list, the last module's count is a lower bound and the modules after it are missing: the edge
-// says "at least", and `functions` of the result says how many functions were cut.
+// says "at least", `functions` of the result says how many functions were cut and `last` which module is the lower bound.
+// When the opened module's own import table was cut short when the graph was built (`request.partial`, from its /node
+// answer: the query answer carries that only as a sentence in its note), every count of it is a lower bound and modules
+// may be missing: `tableCut`.
 function binaryGraphExploreParts(request, answer) {
     const a = answer && typeof answer === 'object' ? answer : {};
     const known = new Map((Array.isArray(a.nodes) ? a.nodes : []).filter(n => n && typeof n.id === 'string').map(n => [n.id, n]));
@@ -27323,12 +27326,12 @@ function binaryGraphExploreParts(request, answer) {
         }
         const last = cutShort && by.size ? [...by.keys()][by.size - 1] : '';
         const parts = [...by.keys()].sort().map(module => {
-            const n = by.get(module).functions.size, partial = module === last;
-            const label = `${partial ? 'at least ' : ''}${n.toLocaleString('en-US')} function${n === 1 && !partial ? '' : 's'}`;
+            const n = by.get(module).functions.size, partial = module === last || request.partial === true;
+            const label = `${partial ? 'at least ' : ''}${n.toLocaleString('en-US')} function${n === 1 ? '' : 's'}`;
             return { head: module, nodes: [{ id: module, label: module, kind: binaryGraphGuessKind(module), in_degree: 0, category: '', guess: true }],
                      edges: [{ source: root, target: module, kind: 'imports', origin: by.get(module).origin, label, functions: n, partial }] };
         });
-        return { parts, server: 0, functions: cutShort ? Math.max(0, total - shown) : 0 };
+        return { parts, server: 0, functions: cutShort ? Math.max(0, total - shown) : 0, last, tableCut: request.partial === true };
     }
     const end = e => (request.via && e.target === root ? { ...e, target: request.via } : e);
     const grouped = new Map();
@@ -27346,7 +27349,7 @@ function binaryGraphExploreParts(request, answer) {
     }
     const parts = [...grouped.values()].filter(p => known.has(p.head))
         .map(p => ({ head: p.head, nodes: [...p.ids].map(id => known.get(id)).filter(Boolean), edges: p.edges }));
-    return { parts, server: cutShort ? Math.max(0, total - parts.length) : 0, functions: 0 };
+    return { parts, server: cutShort ? Math.max(0, total - parts.length) : 0, functions: 0, last: '', tableCut: request.dir === 'out' && request.partial === true };
 }
 
 // How many nodes of these parts are not drawn yet
@@ -27356,76 +27359,90 @@ function binaryGraphExploreFresh(st, parts) {
     return fresh.size;
 }
 
-// The parts drawn, whole and in order, until one does not fit: the cap, or `limit` new nodes of this answer. That part
-// and every part after it is dropped (the drawn ones stay the first in name order). A node that is drawn already takes
+// The parts drawn, whole and in order, until one needs a node that does not fit: the cap, or `limit` new nodes of this
+// answer. That part and every later part that needs a new node is dropped (the drawn ones stay the first in name order). A node that is drawn already takes
 // the answer's in-degree and kind, unless the answer only guessed them. An edge that is drawn already keeps its place and
-// gains a count it lacked; its origin stays only where both say the same. { added, dropped } as ids of nodes and of the
-// heads of dropped parts.
+// gains a count it lacked; its origin stays only where both say the same. { added, dropped, edgeless } as ids of nodes, of
+// the heads of dropped parts, and of the drawn heads whose part was dropped.
 function binaryGraphExploreMerge(st, parts, limit) {
     const cap = BINARY_GRAPH_EXPLORE.cap, have = new Map(st.nodes.map(n => [n.id, n]));
     const edgeKey = e => `${e.source}\n${e.target}\n${e.kind}`;
     const seen = new Map(st.edges.map(e => [edgeKey(e), e]));
-    const added = [], dropped = [];
+    const added = [], dropped = [], edgeless = [];
     let fresh = 0, full = false;
     for (const part of parts) {
-        if (!full) {
-            const news = part.nodes.filter(n => !have.has(n.id));
-            if (st.nodes.length + news.length > cap || fresh + news.length > limit) full = true;
-            else {
-                for (const n of part.nodes) {
-                    let node = have.get(n.id);
-                    const isNew = !node;
-                    if (isNew) {
-                        node = { id: n.id, label: typeof n.label === 'string' ? n.label : n.id, kind: n.kind, in_degree: 0, category: '', x: 0, y: 0, placed: false };
-                        st.nodes.push(node);
-                        have.set(n.id, node);
-                        added.push(n.id);
-                        fresh++;
-                    }
-                    if (isNew || !n.guess) {
-                        node.kind = n.kind;
-                        node.in_degree = Math.max(0, Number(n.in_degree) || 0);
-                        node.category = typeof n.category === 'string' ? n.category : '';
-                        if (typeof n.machine === 'string' && n.machine) node.machine = n.machine;
-                    }
-                    node.radius = binaryGraphNodeRadius(node);
-                }
-                for (const e of part.edges) {
-                    const old = seen.get(edgeKey(e));
-                    if (old) {
-                        old.origin = binaryGraphCombineOrigin(old.origin, e.origin);
-                        if (old.functions === undefined && e.functions !== undefined) Object.assign(old, { functions: e.functions, label: e.label, partial: e.partial });
-                        continue;
-                    }
-                    const edge = { source: e.source, target: e.target, kind: e.kind, origin: e.origin, label: typeof e.label === 'string' ? e.label : '' };
-                    if (e.functions !== undefined) Object.assign(edge, { functions: e.functions, partial: e.partial === true });
-                    seen.set(edgeKey(e), edge);
-                    st.edges.push(edge);
-                }
-            }
+        const news = part.nodes.filter(n => !have.has(n.id));
+        // a part that needs a node the canvas has no room for ends the answer; a part that needs none costs nothing and is
+        // drawn whatever came before it (an edge between two nodes that are on the canvas is real). A part whose head is
+        // drawn but that was dropped for a node it needs (an api set) is the missing edge of a drawn node: it is counted too.
+        if (news.length && (full || st.nodes.length + news.length > cap || fresh + news.length > limit)) {
+            full = true;
+            (have.has(part.head) ? edgeless : dropped).push(part.head);
+            continue;
         }
-        if (full) dropped.push(part.head);
+        for (const n of part.nodes) {
+            let node = have.get(n.id);
+            const isNew = !node;
+            if (isNew) {
+                node = { id: n.id, label: typeof n.label === 'string' ? n.label : n.id, kind: n.kind, in_degree: 0, category: '', x: 0, y: 0, placed: false };
+                st.nodes.push(node);
+                have.set(n.id, node);
+                added.push(n.id);
+                fresh++;
+            }
+            if (isNew || !n.guess) {
+                node.kind = n.kind;
+                node.in_degree = Math.max(0, Number(n.in_degree) || 0);
+                node.degreeKnown = !n.guess;
+                node.category = typeof n.category === 'string' ? n.category : '';
+                if (typeof n.machine === 'string' && n.machine) node.machine = n.machine;
+            }
+            node.radius = binaryGraphNodeRadius(node);
+        }
+        for (const e of part.edges) {
+            const old = seen.get(edgeKey(e));
+            if (old) {
+                old.origin = binaryGraphCombineOrigin(old.origin, e.origin);
+                if (old.functions === undefined && e.functions !== undefined) Object.assign(old, { functions: e.functions, label: e.label, partial: e.partial });
+                continue;
+            }
+            const edge = { source: e.source, target: e.target, kind: e.kind, origin: e.origin, label: typeof e.label === 'string' ? e.label : '' };
+            if (e.functions !== undefined) Object.assign(edge, { functions: e.functions, partial: e.partial === true });
+            seen.set(edgeKey(e), edge);
+            st.edges.push(edge);
+        }
     }
-    return { added, dropped };
+    return { added, dropped, edgeless };
 }
 
-// What is cut now, per opened node and direction: the parts the server dropped of its own answer, the imported functions
-// it dropped from a list grouped by module, and the heads of the parts that did not fit on the canvas and are still not
-// drawn. { hidden (neighbours known to be missing), server, functions, dropped, any, parents, of, ofFunctions }
+// What is cut now, per opened node and level: the parts the server dropped of its own answer, the imported functions it
+// dropped from a list grouped by module (and the module whose count is a lower bound), the nodes whose own import table was
+// cut short when the graph was read, and the heads of the parts that did not fit on the canvas (or whose drawn head lost
+// its edge) and are still not drawn. { hidden (neighbours known to be missing), server, functions, tables, dropped, any,
+// parents, of, ofFunctions, ofTable, lastDrawn, tableEdges }
 function binaryGraphExploreCut(st) {
-    const drawn = new Set(st.nodes.map(n => n.id)), heads = new Set(), of = new Map(), ofFunctions = new Map();
-    let server = 0, functions = 0;
+    const drawn = new Set(st.nodes.map(n => n.id)), heads = new Set(), of = new Map(), ofFunctions = new Map(), ofTable = new Set(), parents = new Set();
+    let server = 0, functions = 0, lastDrawn = false, tableEdges = false;
     for (const record of st.cut.values()) {
         const left = [...record.dropped].filter(id => !drawn.has(id));
-        if (!record.server && !record.functions && !left.length) continue;
+        const lost = [...record.edgeless];
+        if (!record.server && !record.functions && !record.table && !left.length && !lost.length) continue;
         server += record.server;
         functions += record.functions;
-        left.forEach(id => heads.add(id));
-        of.set(record.from, (of.get(record.from) || 0) + record.server + left.length);
-        if (record.functions) ofFunctions.set(record.from, (ofFunctions.get(record.from) || 0) + record.functions);
+        [...left, ...lost].forEach(id => heads.add(id));
+        parents.add(record.from);
+        of.set(record.from, (of.get(record.from) || 0) + record.server + left.length + lost.length);
+        if (record.functions) {
+            ofFunctions.set(record.from, (ofFunctions.get(record.from) || 0) + record.functions);
+            if (record.last && drawn.has(record.last)) lastDrawn = true;
+        }
+        if (record.table) {
+            ofTable.add(record.from);
+            if (st.edges.some(e => e.source === record.from && e.partial)) tableEdges = true;
+        }
     }
-    const parents = new Set([...of.keys(), ...ofFunctions.keys()]);
-    return { hidden: server + heads.size, server, functions, dropped: heads.size, any: !!(server || functions || heads.size), parents: parents.size, of, ofFunctions };
+    return { hidden: server + heads.size, server, functions, tables: ofTable.size, dropped: heads.size, any: parents.size > 0, parents: parents.size,
+             of, ofFunctions, ofTable, lastDrawn, tableEdges };
 }
 
 // The line above the canvas: that the picture is cut, in words, and the note of the last step. { tone, html }
@@ -27438,8 +27455,12 @@ function binaryGraphExploreStatus(st) {
         const why = [];
         if (cut.server) why.push(`${n(cut.server, 'was', 'were')} cut by the server from its own answer`);
         if (cut.functions) {
-            why.push(`${n(cut.functions, 'imported function was', 'imported functions were')} cut by the server from a list of imports, so the modules after the last one drawn `
-                + 'are missing and the count on that edge is at least what it says');
+            why.push(`${n(cut.functions, 'imported function was', 'imported functions were')} cut by the server from a list of imports, so the modules after the last one it kept are missing`
+                + `${cut.lastDrawn ? ' and the count on that edge is at least what it says' : ''}`);
+        }
+        if (cut.tables) {
+            why.push(`${n(cut.tables, 'opened node has', 'opened nodes have')} an import table that was cut short when it was read, so modules may be missing`
+                + `${cut.tableEdges ? ' and the counts on its edges are at least what they say' : ''}`);
         }
         if (cut.dropped) why.push(`${n(cut.dropped, 'did', 'did')} not fit on this canvas, which holds at most ${escapeHtml(String(BINARY_GRAPH_EXPLORE.cap))} nodes`);
         html += `<strong class="binary-graph-cut">Not the whole neighbourhood${cut.hidden ? `: ${n(cut.hidden, 'neighbour is', 'neighbours are')} not shown, ` : ', '}`
@@ -27448,6 +27469,15 @@ function binaryGraphExploreStatus(st) {
     }
     if (st.note) html += `<span class="binary-graph-note">${escapeHtml(st.note)}</span>`;
     return { tone: cut.any ? 'warn' : 'info', html };
+}
+
+// What a node says of how many binaries import it: not a number it was not given (a module whose read failed is "not
+// read", not zero), and for a function the module it is of
+function binaryGraphExploreDegree(node) {
+    const bang = node.id.indexOf('!');
+    if (node.kind === 'function' && bang > 0) return `of ${node.id.slice(0, bang)}`;
+    if (node.degreeKnown === false) return 'in-degree not read';
+    return `imported by ${(Number(node.in_degree) || 0).toLocaleString('en-US')} binaries of System32`;
 }
 
 // The line under the canvas: the chosen node, or how much is drawn. Everything from a binary is escaped.
@@ -27459,12 +27489,11 @@ function binaryGraphExploreInfo(st) {
             + 'Choose a node, then EXPAND opens its neighbours (a double click does both) and FUNCTIONS the functions it imports.';
     }
     const kind = (binaryGraphOwn(BINARY_GRAPH_KINDS, node.kind) || { name: String(node.kind || 'unknown') }).name;
-    const bang = node.id.indexOf('!');
-    let html = `<strong>${escapeHtml(node.label)}</strong> · ${escapeHtml(kind)}${node.machine ? ` · ${escapeHtml(node.machine)}` : ''}`;
-    html += node.kind === 'function' && bang > 0 ? ` · of ${escapeHtml(node.id.slice(0, bang))}` : ` · imported by ${escapeHtml((Number(node.in_degree) || 0).toLocaleString('en-US'))} binaries of System32`;
+    let html = `<strong>${escapeHtml(node.label)}</strong> · ${escapeHtml(kind)}${node.machine ? ` · ${escapeHtml(node.machine)}` : ''} · ${escapeHtml(binaryGraphExploreDegree(node))}`;
     const cut = binaryGraphExploreCut(st), left = cut.of.get(node.id), lost = cut.ofFunctions.get(node.id);
     if (left) html += ` · ${escapeHtml(left.toLocaleString('en-US'))} of its neighbours are not shown`;
     if (lost) html += ` · ${escapeHtml(lost.toLocaleString('en-US'))} of its imported functions are not shown`;
+    if (cut.ofTable.has(node.id)) html += ' · its import table was cut short when it was read: modules may be missing';
     return html;
 }
 
@@ -27529,12 +27558,12 @@ async function binaryGraphExploreStart(name) {
     }
     const id = d.name.toLowerCase();
     const node = { id, label: id, kind: binaryGraphDetailKind(d, id), in_degree: Math.max(0, Number(d.in_degree) || 0), category: '',
-                   machine: typeof d.machine === 'string' ? d.machine : '', x: 0, y: 0, placed: true };
+                   machine: typeof d.machine === 'string' ? d.machine : '', degreeKnown: true, x: 0, y: 0, placed: true };
     node.radius = binaryGraphNodeRadius(node);
     st.nodes = [node];
     st.edges = [];
     st.cut = new Map();
-    st.modules = new Map([[id, { kind: node.kind, in_degree: node.in_degree, machine: node.machine }]]);
+    st.modules = new Map([[id, { kind: node.kind, in_degree: node.in_degree, machine: node.machine, partial: d.partial === true }]]);
     st.selected = id;
     st.hovered = null;
     st.dragging = null;
@@ -27559,8 +27588,8 @@ async function binaryGraphExploreModules(st, names) {
         await Promise.all(todo.slice(i, i + BINARY_GRAPH_EXPLORE.batch).map(async name => {
             const r = await syscallApi(`/api/binary-graph/node?${new URLSearchParams({ name })}`);
             const d = r.data && typeof r.data === 'object' ? r.data : {};
-            if (r.ok) st.modules.set(name, { kind: binaryGraphDetailKind(d, name), in_degree: Math.max(0, Number(d.in_degree) || 0), machine: typeof d.machine === 'string' ? d.machine : '' });
-            else if (r.status === 404) st.modules.set(name, { kind: binaryGraphGuessKind(name), in_degree: Math.max(0, Number(d.in_degree) || 0), machine: '' });
+            if (r.ok) st.modules.set(name, { kind: binaryGraphDetailKind(d, name), in_degree: Math.max(0, Number(d.in_degree) || 0), machine: typeof d.machine === 'string' ? d.machine : '', partial: d.partial === true });
+            else if (r.status === 404) st.modules.set(name, { kind: binaryGraphGuessKind(name), in_degree: Math.max(0, Number(d.in_degree) || 0), machine: '', partial: false });
         }));
     }
     return todo.length;
@@ -27603,13 +27632,18 @@ async function binaryGraphExploreWalk(id, level) {
         for (let i = 0; i < current.length; i++) {
             const from = st.nodes.find(n => n.id === current[i]), requests = from ? binaryGraphExploreRequests(from, level) : [];
             if (!requests.length) continue;
-            if (hop > 0 && (st.nodes.length >= g.cap || reads + requests.length > g.reads)) {
+            // what its import table was when the graph was read (the query answer says it only in a sentence of its note)
+            const needsTable = requests.some(r => r.dir === 'out') && !st.modules.has(from.id);
+            if (hop > 0 && (st.nodes.length >= g.cap || reads + requests.length + (needsTable ? 1 : 0) > g.reads)) {
                 unopened = current.length - i;
                 break;
             }
             reads += requests.length;
-            const answers = await Promise.all(requests.map(r => binaryGraphExploreAsk(r.params)));
+            const [answers, tableRead] = await Promise.all([Promise.all(requests.map(r => binaryGraphExploreAsk(r.params))),
+                                                            needsTable ? binaryGraphExploreModules(st, [from.id]) : 0]);
             if (seq !== st.seq) return false;
+            reads += tableRead;
+            const tableCut = !!st.modules.get(from.id) && st.modules.get(from.id).partial === true;
             const results = [];
             answers.forEach((a, k) => {
                 if (!a.ok) {
@@ -27618,7 +27652,7 @@ async function binaryGraphExploreWalk(id, level) {
                     return;
                 }
                 if (hop === 0) opened = true;
-                const found = binaryGraphExploreParts(requests[k], a.answer);
+                const found = binaryGraphExploreParts({ ...requests[k], partial: tableCut }, a.answer);
                 results.push({ request: requests[k], found, note: typeof a.answer.note === 'string' ? a.answer.note : '' });
             });
             // the direction with fewer new nodes first, held to its share of the room
@@ -27638,9 +27672,10 @@ async function binaryGraphExploreWalk(id, level) {
                     binaryGraphExploreFill(st, r.found.parts);
                 }
                 const merged = binaryGraphExploreMerge(st, r.found.parts, limit);
-                const key = `${from.id}\n${r.request.dir}`;
-                if (r.found.server || r.found.functions || merged.dropped.length) {
-                    st.cut.set(key, { from: from.id, server: r.found.server, functions: r.found.functions, dropped: new Set(merged.dropped) });
+                const key = `${from.id}\n${r.request.dir}\n${r.request.level}`;
+                if (r.found.server || r.found.functions || r.found.tableCut || merged.dropped.length || merged.edgeless.length) {
+                    st.cut.set(key, { from: from.id, server: r.found.server, functions: r.found.functions, last: r.found.last, table: r.found.tableCut,
+                                      dropped: new Set(merged.dropped), edgeless: new Set(merged.edgeless) });
                 } else {
                     st.cut.delete(key);
                 }
@@ -27828,6 +27863,7 @@ function binaryGraphDraw() {
         const pieces = [];
         if (cut.hidden) pieces.push(`${cut.hidden.toLocaleString('en-US')} not shown`);
         if (cut.functions) pieces.push(`${cut.functions.toLocaleString('en-US')} imported functions not shown`);
+        if (cut.tables) pieces.push(`${cut.tables.toLocaleString('en-US')} import ${cut.tables === 1 ? 'table' : 'tables'} cut short`);
         ctx.fillStyle = themeColor('--severity-medium');
         ctx.fillText(`Not the whole neighbourhood: ${pieces.join(', ')} (the canvas holds ${BINARY_GRAPH_EXPLORE.cap} nodes)`, 12, 10);
     }
@@ -27924,7 +27960,7 @@ function binaryGraphOnCanvasMove(ev) {
     if (node === st.hovered) return;
     st.hovered = node;
     const canvas = document.getElementById('binary-explore-canvas');
-    if (canvas) canvas.title = node ? `${node.id} · imported by ${(Number(node.in_degree) || 0).toLocaleString('en-US')} binaries` : '';
+    if (canvas) canvas.title = node ? `${node.id} · ${binaryGraphExploreDegree(node)}` : '';
     binaryGraphDraw();
 }
 

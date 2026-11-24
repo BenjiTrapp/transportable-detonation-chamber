@@ -566,7 +566,7 @@ def test_the_curated_edge_and_the_match_do_not_look_like_a_deviation():
 
 def test_the_assets_moved_on():
     html = _read(INDEX_HTML)
-    for asset, minimum in (("style.css", 89), ("theme-cyberpunk.css", 38), ("app.js", 144)):
+    for asset, minimum in (("style.css", 89), ("theme-cyberpunk.css", 38), ("app.js", 145)):
         version = int(re.search(rf"{re.escape(asset)}\?v=(\d+)", html).group(1))
         assert version >= minimum, f"{asset} was changed and kept its ?v="
 
@@ -643,7 +643,7 @@ const nodeRoute = (url) => {
   const g = GRAPH[name];
   if (!g) return { status: 404, body: { error: name + ' is neither a binary nor an api set in the binary graph of this system.', in_degree: 0 } };
   return { body: { name, is: g.is || 'binary', kind: g.is === 'api-set' ? 'api-set' : /[.]exe$/.test(name) ? 'exe' : 'dll', machine: g.machine || '',
-                   in_degree: g.in_degree, partial: false, imports: g.imports || {}, exports: [], forwarders: {}, hosts: g.hosts || [] } };
+                   in_degree: g.in_degree, partial: g.partial === true, imports: g.imports || {}, exports: [], forwarders: {}, hosts: g.hosts || [] } };
 };
 const modNode = name => { const g = GRAPH[name] || {}; return { id: name, label: name, kind: g.is === 'api-set' ? 'api-set' : /[.]exe$/.test(name) ? 'exe' : 'dll', in_degree: g.in_degree || 0, category: '' }; };
 const STAMP = { build: '26220.5770', arch: 'arm64', created: '' };
@@ -669,7 +669,8 @@ const importsOf = name => {
     parts.push({ nodes: [{ id, label: fn, kind: 'function', in_degree: 0, category: '' }], edges: [derived(name, id, 'imports', imported)], roots: [] });
   }
   if (!parts.length) return none(name + ' imports nothing.');
-  return cutAnswer({ nodes: [modNode(name)], edges: [], roots: [name] }, parts, name + ' imports ' + parts.length + ' functions.', 'imported functions');
+  return cutAnswer({ nodes: [modNode(name)], edges: [], roots: [name] }, parts, name + ' imports ' + parts.length + ' functions.'
+    + (g.partial ? ' Its import table was cut short when it was read, so the list may be incomplete.' : ''), 'imported functions');
 };
 const importersOf = (target, fn) => {
   const t = GRAPH[target];
@@ -928,9 +929,10 @@ def test_a_deep_walk_stops_after_its_budget_of_requests_and_says_how_much_it_lef
         await binaryGraphExpand('pool.dll');
         out({ queries: queries(asked).length, requests: requests.length - asked, note: st.note, status: els['binary-explore-status'].innerHTML });
       })();""")
-    assert r["queries"] == 60 and r["requests"] == 60, "two for the first hop, two for each of 29 modules of the second"
-    assert "after 60 requests" in r["note"] and "71 nodes" in r["note"] and "not opened" in r["note"], r["note"]
-    assert "71 nodes" in _plain(r["status"])
+    # two for the first hop, then three for each module of the second (its imports, its importers, and what its import table was)
+    assert r["requests"] == 59 and r["queries"] == 40, "the budget counts every request, the reads of a table too"
+    assert "after 59 requests" in r["note"] and "81 nodes" in r["note"] and "not opened" in r["note"], r["note"]
+    assert "81 nodes" in _plain(r["status"])
 
 
 @needs_node
@@ -1318,3 +1320,133 @@ def test_a_list_of_imports_the_server_cut_makes_the_last_count_a_lower_bound_and
     assert "201 imported functions were cut by the server" in status and "at least what it says" in status and "does not mean" in status, status
     assert "201 of its imported functions are not shown" in r["info"]
     assert any("201 imported functions not shown" in t for t in r["texts"]) and "at least 99 functions" in r["texts"]
+
+
+# --- Review: an edge between drawn nodes is never dropped silently, a cut table keeps its caveat -----------------------
+
+@needs_node
+def test_an_edge_between_two_drawn_nodes_is_drawn_even_when_the_canvas_is_full():
+    # the reviewer's reproduction: c010 imports a module that does not fit, one that is drawn, and hub
+    r = _explore_flow(r"""
+      (async () => {
+        initSyscalls(); binaryGraphSetMode('explore');
+        const name = i => 'c' + String(i).padStart(3, '0') + '.dll';
+        GRAPH['hub.dll'] = { in_degree: 450, imports: {} };
+        for (let i = 0; i < 450; i++) GRAPH[name(i)] = { in_degree: 1, imports: { 'hub.dll': ['F'] } };
+        GRAPH['c010.dll'].imports = { 'hub.dll': ['F'], 'a.dll': ['A'], 'c005.dll': ['G'] };
+        await binaryGraphExploreStart('hub.dll'); await binaryGraphExpand('hub.dll');
+        const full = st.nodes.length;
+        await binaryGraphExpand('c010.dll');
+        out({ full, count: st.nodes.length, drawn: !!at('c005.dll'), a: !!at('a.dll'),
+              edge: st.edges.find(e => e.source === 'c010.dll' && e.target === 'c005.dll') || null,
+              status: els['binary-explore-status'].innerHTML });
+      })();""")
+    assert r["full"] == 400 and r["count"] == 400 and r["drawn"] and not r["a"]
+    assert r["edge"] and r["edge"]["functions"] == 1, "the edge between two nodes that are on the canvas is real and costs no node"
+    assert "1 did not fit" in _plain(r["status"])
+
+
+@needs_node
+def test_an_edge_that_could_not_be_drawn_because_its_head_is_drawn_but_its_alias_is_not_is_counted():
+    r = _explore_flow(r"""
+      (async () => {
+        initSyscalls(); binaryGraphSetMode('explore');
+        const name = i => 'c' + String(i).padStart(3, '0') + '.dll';
+        GRAPH['hub.dll'] = { in_degree: 450, imports: {} };
+        for (let i = 0; i < 450; i++) GRAPH[name(i)] = { in_degree: 1, imports: { 'hub.dll': ['F'] } };
+        GRAPH['api-ms-x-l1-1-0.dll'] = { is: 'api-set', in_degree: 5, hosts: ['c007.dll'] };
+        GRAPH['c003.dll'].imports = { 'hub.dll': ['F'], 'api-ms-x-l1-1-0.dll': ['H'] };
+        await binaryGraphExploreStart('hub.dll'); await binaryGraphExpand('hub.dll');
+        await binaryGraphExpand('c007.dll');
+        out({ count: st.nodes.length, alias: !!at('api-ms-x-l1-1-0.dll'), edge: st.edges.some(e => e.source === 'c003.dll' && e.target === 'api-ms-x-l1-1-0.dll'),
+              status: els['binary-explore-status'].innerHTML, texts: frame().texts });
+      })();""")
+    assert r["count"] == 400 and not r["alias"] and not r["edge"]
+    assert "1 did not fit" in _plain(r["status"]), "c003 is drawn, but its path to c007 is not: that is said, not hidden"
+    assert any("2 not shown" in t or "52 not shown" in t for t in r["texts"]), r["texts"]
+
+
+@needs_node
+def test_a_cut_import_table_keeps_its_caveat_once_modules_are_drawn():
+    r = _explore_flow(r"""
+      (async () => {
+        initSyscalls(); binaryGraphSetMode('explore');
+        GRAPH['cutbin.exe'] = { in_degree: 0, partial: true, imports: { 'kernel32.dll': ['A', 'B'], 'user32.dll': ['C'] } };
+        await binaryGraphExploreStart('app.exe'); await binaryGraphExpand('app.exe');
+        const whole = { status: els['binary-explore-status'].innerHTML, labels: st.edges.map(e => e.label), texts: frame().texts };
+        await binaryGraphExploreStart('cutbin.exe'); await binaryGraphExpand('cutbin.exe');
+        const cut = { status: els['binary-explore-status'].innerHTML, edges: st.edges.map(e => [e.target, e.functions, e.label, e.partial]),
+                      info: els['binary-explore-info'].innerHTML, texts: frame().texts };
+        // functions of a cut table are a list that may be incomplete too
+        await binaryGraphOpenFunctions('cutbin.exe');
+        out({ whole, cut, afterFunctions: _p(els['binary-explore-status'].innerHTML), keys: st.cut.size });
+      })();""".replace("_p(", "(h => h.replace(/<[^>]+>/g, ' ').replace(/\\s+/g, ' ').trim())("))
+    assert r["whole"]["status"] == "" and not any("cut" in t for t in r["whole"]["texts"]), "a whole table says nothing"
+    assert all(label.startswith("at least") is False for label in r["whole"]["labels"])
+    cut = r["cut"]
+    assert sorted(cut["edges"]) == sorted([["kernel32.dll", 2, "at least 2 functions", True], ["user32.dll", 1, "at least 1 function", True]])
+    status = _plain(cut["status"])
+    assert "import table" in status and "cut short when it was read" in status and "modules may be missing" in status, status
+    assert "at least what they say" in status and "does not mean" in status
+    assert "import table was cut short" in cut["info"] and "modules may be missing" in cut["info"]
+    assert any("import table" in t and "cut short" in t for t in cut["texts"]) and "at least 2 functions" in cut["texts"]
+    assert "cut short when it was read" in r["afterFunctions"], "the list of functions of a cut table says so too"
+
+
+@needs_node
+def test_a_read_that_failed_says_the_in_degree_is_unknown_and_not_zero():
+    r = _explore_flow(r"""
+      (async () => {
+        initSyscalls(); binaryGraphSetMode('explore');
+        GRAPH['x.exe'] = { in_degree: 0, imports: { 'broken.dll': ['F'], 'kernel32.dll': ['G'] } };
+        const route = routes['/api/binary-graph/node'];
+        routes['/api/binary-graph/node'] = url => new URL(url, 'http://x').searchParams.get('name') === 'broken.dll' ? { status: 500, body: { error: 'down' } } : route(url);
+        await binaryGraphExploreStart('x.exe'); await binaryGraphExpand('x.exe');
+        binaryGraphOnCanvasClick(screenOf('broken.dll'));
+        const broken = els['binary-explore-info'].innerHTML;
+        binaryGraphOnCanvasMove(screenOf('broken.dll'));
+        const tip = els['binary-explore-canvas'].title;
+        binaryGraphOnCanvasClick(screenOf('kernel32.dll'));
+        out({ broken, tip, good: els['binary-explore-info'].innerHTML, known: at('kernel32.dll').in_degree });
+      })();""")
+    assert "not read" in r["broken"] and "0 binaries" not in r["broken"] and "not read" in r["tip"] and "0 binaries" not in r["tip"]
+    assert "3,900 binaries" in r["good"] and r["known"] == 3900
+
+
+@needs_node
+def test_expanding_and_opening_the_functions_keep_each_its_own_record_of_what_was_cut():
+    r = _explore_flow(r"""
+      (async () => {
+        initSyscalls(); binaryGraphSetMode('explore');
+        const fns = (p, n) => [...Array(n)].map((_, i) => p + String(i).padStart(3, '0'));
+        GRAPH['big.exe'] = { in_degree: 0, imports: { 'kernel32.dll': fns('K', 300), 'user32.dll': fns('U', 250), 'gdi32.dll': fns('G', 50) } };
+        await binaryGraphExploreStart('big.exe'); await binaryGraphExpand('big.exe');
+        const label = () => st.edges.find(e => e.target === 'user32.dll').label;
+        const first = { label: label(), status: els['binary-explore-status'].innerHTML, keys: st.cut.size };
+        await binaryGraphOpenFunctions('big.exe');
+        out({ first, label: label(), status: els['binary-explore-status'].innerHTML, keys: st.cut.size });
+      })();""")
+    assert r["first"]["keys"] == 1 and r["keys"] == 2
+    assert r["label"] == r["first"]["label"] == "at least 99 functions"
+    status = _plain(r["status"])
+    assert "imported functions were cut by the server" in status and "at least what it says" in status, "opening the functions did not replace the wording of the table"
+
+
+@needs_node
+def test_the_status_points_at_the_edge_of_the_cut_list_only_where_that_edge_is_drawn():
+    r = _explore_flow(r"""
+      (async () => {
+        initSyscalls(); binaryGraphSetMode('explore');
+        const fns = (p, n) => [...Array(n)].map((_, i) => p + String(i).padStart(3, '0'));
+        GRAPH['big.exe'] = { in_degree: 0, imports: { 'kernel32.dll': fns('K', 300), 'user32.dll': fns('U', 250), 'gdi32.dll': fns('G', 50) } };
+        const room = async free => {
+          await binaryGraphExploreStart('big.exe');
+          for (let i = 0; i < 400 - 1 - free; i++) st.nodes.push({ id: 'fill' + i, label: 'fill' + i, kind: 'dll', in_degree: 1, category: '', x: 0, y: 0, radius: 6, placed: true });
+          await binaryGraphExpand('big.exe');
+          return { user32: !!at('user32.dll'), text: (h => h.replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim())(els['binary-explore-status'].innerHTML) };
+        };
+        out({ two: await room(2), one: await room(1) });
+      })();""")
+    assert r["two"]["user32"] and "the count on that edge is at least what it says" in r["two"]["text"]
+    assert not r["one"]["user32"] and "imported functions were cut by the server" in r["one"]["text"]
+    assert "the count on that edge" not in r["one"]["text"], "the edge that the sentence points at is not drawn"
