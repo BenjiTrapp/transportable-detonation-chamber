@@ -6,6 +6,7 @@ layouts and tabs that were gone; screenshots showed an old UI.
 """
 
 import ast
+import inspect
 import os
 import re
 
@@ -1476,3 +1477,137 @@ def test_the_help_and_the_guide_say_the_same_where_they_say_it_twice():
     projects = re.sub(r"\s+", " ", _section_of(_doc("rizin.md"), "Projects"))
     assert "renamed, commented, patched by hand or given a breakpoint" in projects
     assert "Names, comments, patches set by hand and breakpoints are saved" in help_text
+
+
+def _subsection(text, title):
+    """The lines of one "### " subsection of a page, by its title."""
+    start = text.index("\n### " + title + "\n")
+    ends = [i for i in (text.find("\n### ", start + 1), text.find("\n## ", start + 1)) if i != -1]
+    return text[start:min(ends) if ends else len(text)]
+
+
+def test_the_guide_says_what_a_waiting_patch_is_and_how_a_session_comes_back():
+    """A patch set over bytes a run wrote used to be written at the open, into the file's still encrypted bytes, and
+    the next decryption XORed over it. The pages have to say what happens instead, in the words the tab uses: what a
+    waiting patch is and why it waits, its two exits (and that Apply now is the server's to offer), that the restore is
+    one press and why it is not automatic, that the SHA-256 is the proof and what a mismatch leaves, what spoils the
+    timeline, and why the decrypted bytes are not stored (64 KB read, 32 KB shared).
+
+    Three kinds of claim, each held against the thing it is about: the sentences both the help and the guide say
+    (word for word, in both), the sentences of the guide alone, and every string the guide quotes from the interface
+    (against rizin_sessions or app.js, so a reworded notice fails here and not in front of the user). The numbers are
+    the code's. The help is read in its Rizin entry only: another place cannot stand in for it."""
+    import html as htmllib
+    import rizin_emulation
+    import rizin_sessions
+
+    def words(text):
+        return re.sub(r"\s+", " ", htmllib.unescape(text).replace("`", ""))
+
+    guide = words(_subsection(_doc("rizin.md"), "Waiting patches and the way back"))
+    help_text = words(_plain(HELP[HELP.index("<h4>Rizin</h4>"):HELP.index("<h4>LitterBox</h4>")]))
+
+    shared = [
+        # what a waiting patch is, and why it waits
+        "A patch set over bytes a run wrote is not written when the file is opened",
+        "so it would land in the file's own, still encrypted bytes, and the next decryption would XOR over it",
+        "in a group of its own, WAITING",
+        # the two exits
+        "two ways out, and no third",
+        "\u2715 takes it out of the project",
+        "Apply now appears only where a run's bytes cover the address again, and the server decides that, not the pane",
+        # the restore is a press, and not an automatic one
+        "Restore the run, at the head of the right column of the EMULATION",
+        "one button press, and never on its own when a file is opened",
+        "because it runs the file's code in the emulator again and a run can take as long as esil.timeout (5 s)",
+        # the proof
+        "The SHA-256 is the proof",
+        "made over the bytes as the run left them",
+        "nothing is applied, and the cache is as it was when the file was opened",
+        # what spoils the timeline
+        "a run that ended at the time limit, a register set by hand, a console command that writes or sets, "
+        "a breakpoint that stands other than the timeline began with, a rizin that restarted, something taken out "
+        "of the cache, and a run with nothing to prove",
+        # why the bytes are not stored, with both numbers
+        "The decrypted bytes are not stored in the project",
+        "reads only the last 64 KB of the project file",
+        "share 32 KB of characters, the patches first",
+        "a timeline that does not fit is dropped whole",
+    ]
+    for claim in shared:
+        assert claim in help_text, "the in-tab help no longer says %r" % claim
+        assert claim in guide, "docs/rizin.md no longer says %r" % claim
+
+    guide_only = [
+        "in the order they were made in",                       # a patch of the decrypted code stands in the timeline
+        "the server checks it again when it is pressed",        # Apply now is drawn from the answer, decided on the press
+        "an Apply now that is always there would be the harm above with a button in front of it",
+        "the SHA-256 does not cover your patches",              # what the proof is over, and what it is not
+        "Taking back a patch that the timeline makes drops the timeline",
+        "A timeline that is spoiled is not offered and not saved",
+        "a timeline of the project that was clean before stays",
+        "the patches that wait still wait",                     # after a mismatch
+        "restore=dropped",                                      # the marker, so that the open can say it
+        "an emulation that runs",                               # when the button is off
+    ]
+    for claim in guide_only:
+        assert claim in guide, "docs/rizin.md no longer says %r" % claim
+
+    # the strings the tab shows, as the tab has them: the pane's from app.js (its long sentences are joined from
+    # pieces), the server's from the module that says them
+    pane = re.sub(r"[`'\"]\s*\n\s*\+\s*[`'\"]", "", APP_JS)
+    assert "Restore the run</button>" in pane, "the button of the pane is not called Restore the run any more"
+    pane_words = [
+        "Session restored: the saved timeline was replayed",
+        "and the bytes it left match the SHA-256 the project holds",
+        "Not restored:",
+        "The patches that wait still wait.",
+        "The way to this state is not kept in the project:",
+        "not applied \u00b7 kept with the project",
+        "These are not in rizin's cache: written into the file's own bytes, which are still encrypted, the next "
+        "decryption would run over them. Apply now is there once a run's bytes lie under a patch; \u2715 removes "
+        "one from the project.",
+        "This address cannot be sent exactly, so this patch cannot be removed from here",
+    ]
+    for text in pane_words:
+        assert text in pane, "the app no longer says %r" % text
+        assert text in guide, "docs/rizin.md does not quote %r" % text
+    # what the server says whole: the guide quotes the constant itself, as a cell of the table of causes (the whole
+    # cell: a guide that says more than the code does has drifted) or between quotation marks
+    reasons = [
+        rizin_sessions._RESTORE_HAND_REGISTER, rizin_sessions._RESTORE_HAND_WRITE,
+        rizin_sessions._RESTORE_HAND_EMULATION, rizin_sessions._RESTORE_HAND_SETUP,
+        rizin_sessions._RESTORE_HAND_SETTING, rizin_sessions._RESTORE_HAND_BREAKPOINT,
+        rizin_sessions._RESTORE_TIMEOUT, rizin_sessions._RESTORE_HALF,
+        rizin_sessions._RESTORE_TOO_LONG.format(count=rizin_emulation.RESTORE_MAX_ACTIONS),
+        rizin_sessions._RESTORE_UNREAD, rizin_sessions._RESTORE_FOREIGN, rizin_sessions._RESTORE_GONE,
+        rizin_sessions._RESTORE_RESTARTED, rizin_sessions._RESTORE_NOTHING,
+    ]
+    for text in reasons:
+        assert "| %s |" % text in guide, "the table of causes in docs/rizin.md does not say %r" % text
+    for text in (rizin_sessions._RESTORE_LOST_AT_OPEN, rizin_sessions._RESTORE_NO_RECORD):
+        assert '"%s"' % text in guide, "docs/rizin.md does not quote %r" % text
+    # and what it says around a placeholder: the words between them, which have to be the constant's
+    said = [v for v in vars(rizin_sessions).values() if isinstance(v, str)]
+    server_fragments = [
+        "Held back, not applied: ",
+        "replaying the timeline left other bytes than the ones saved with it",
+        "the replay stopped at action",
+        ": nothing was applied, and the cache is as it was when the file was opened",
+    ]
+    for text in server_fragments:
+        assert any(text in v for v in said), "the server no longer says %r" % text
+    for text in server_fragments:
+        assert text in guide, "docs/rizin.md does not quote %r" % text
+
+    # the numbers: the code's own
+    assert rizin_emulation.RESTORE_MAX_ACTIONS == 500 and "at most 500 actions" in guide
+    assert rizin_sessions.RESTORE_BUDGET == 60 and "It has 60 s from its first command to its last action" in guide
+    assert rizin_sessions.ESIL_TIMEOUT == 5
+    assert rizin_sessions.PROJECT_PATCH_CHARS == 32 * 1024
+    assert "65536" in inspect.getsource(rizin_sessions._read_project_meta), "the project is no longer read from its last 64 KB"
+    assert "fh.seek(max(0, fh.tell() - 65536))" in inspect.getsource(rizin_sessions._read_project_meta)
+
+    # the API page keeps one row each and says what a waiting entry holds
+    row = [line for line in _doc("api.md").splitlines() if line.startswith("| GET | `/api/rizin/<sid>/patches` |")]
+    assert len(row) == 1 and "waiting: [{addr, after, reason, apply_now}]" in row[0]

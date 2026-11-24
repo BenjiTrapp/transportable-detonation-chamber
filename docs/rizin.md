@@ -123,8 +123,9 @@ While the emulation runs, a strip sits between the toolbar and the views:
 **EMULATION** in the dock holds the whole state: REGISTERS (every one an
 editable field; the ones the last step or edit changed are marked Δ), STACK
 (16 words from the stack pointer, each with the function or flag its value
-points to; a click goes there), BREAKPOINTS and PATCHES, the last in two
-groups described below. When the stack pointer has left the stack the
+points to; a click goes there), BREAKPOINTS and PATCHES, the last in three
+groups described below, with the **Restore the run** button at the head of that column
+([Waiting patches and the way back](#waiting-patches-and-the-way-back)). When the stack pointer has left the stack the
 emulation mapped, STACK says why it is empty: "No stack words to show: the
 stack pointer is outside the stack the emulation mapped, or that map is gone.
 Restarting the emulation (STOP, then EMULATE) maps it again."
@@ -221,33 +222,89 @@ that rizin itself does not tell apart (it has one cache):
   session, and the group says so ("These bytes end with the session: they are
   not saved with the project and not in an export.").
 
+A third group, **WAITING**, appears only where a patch waits. It is not in the
+cache at all: see [Waiting patches and the way back](#waiting-patches-and-the-way-back).
+
 **Clear rizin's whole cache**, in the head of PATCHES, clears both groups
-(`wc-*`). It asks first: "rizin has one cache, and what a run wrote is back
+(`wc-*`) and leaves WAITING alone. It asks first: "rizin has one cache, and what a run wrote is back
 only by running it again."
 
 ### What stays and what does not
 
 | | In the project | In an export | After the session |
 |-|----------------|--------------|-------------------|
-| Patches set by hand | Yes | Yes | Written back when the file is opened again, before the views load |
+| Patches set by hand | Yes | Yes | Written back when the file is opened again, before the views load; one set over bytes a run wrote waits instead |
 | Breakpoints | Yes (rizin's own project holds them) | No | Set again |
-| What a run wrote | No | No | Gone |
+| What a run wrote | No (only a SHA-256 of it) | No | Gone: **Restore the run** replays the timeline below and proves the same bytes came back |
+| The timeline of the emulation (what the session did) | Yes, while it can be replayed | No | **Restore the run**, one press |
 | What Re-analyse found | No | No | Gone |
-| The emulation itself (PC, registers, stack) | No | No | Gone: a reopened file has its patches and breakpoints, but no running emulation |
+| The emulation itself (PC, registers, stack) | No | No | Gone: a reopened file has its patches and breakpoints, but no running emulation until **Restore the run** starts one again |
 
-In short: what a run wrote ends with the session, and so does the emulation. A project
-is now also made by a patch or a breakpoint, not only by a rename or a comment.
+In short: what a run wrote ends with the session, and so does the emulation; the
+project keeps the way to it, which is a different thing from the bytes. A project
+is made by a patch, a breakpoint or a run of the emulation, not only by a rename or a comment.
 At most 32 KB of patches fit into a project; what does not is left out of the
 save and the session's note says how many. A saved patch whose address is in
 none of the reopened file's maps is left out, and the note says which.
 
-A patch set over bytes a run wrote (marked ⚠ in SET BY HAND) is **not** written
-when the file is opened again: opening happens before any run, so it would land
-in the file's own, still encrypted bytes, and the next decryption would XOR over
-it. It stays in the project, the session's note names it once when the file is
-opened, and `GET /patches` lists it under `waiting`, not among the patches --
-so it is not exported either. A patch saved by an older version has no such
-mark and is written back as it always was.
+### Waiting patches and the way back
+
+The point of the emulator is a patch inside freshly decrypted code: run the
+decryption, read the code, switch off the anti-VM check in it. The project
+saves such a patch with a mark (`:r`, the ⚠ of SET BY HAND), and this section
+is what the project does with it when the file is opened again, and how the run
+comes back.
+
+**What a waiting patch is, and why it waits.** A patch set over bytes a run wrote is not written when the file is opened: opening happens before any run, so it would land in the file's own, still encrypted bytes, and the next decryption would XOR over it instead of over the file's bytes. The patch would be gone, and the decrypted output would be wrong at exactly the place you wanted to read. So it waits. It stays in the project through every save, and the session's note names it once when the file is opened ("Held back, not applied: 1 saved patch over bytes an emulation run wrote (0x…). The file's own bytes there are still encrypted, and a patch written into them would be decrypted over by the next run."). PATCHES shows it in a group of its own, WAITING, between SET BY HAND and WRITTEN BY THE RUN: the address, the function, the bytes and the reason on a line below, under the heading "not applied · kept with the project". The group says "These are not in rizin's cache: written into the file's own bytes, which are still encrypted, the next decryption would run over them. Apply now is there once a run's bytes lie under a patch; ✕ removes one from the project." A waiting patch is no write of rizin's cache, so it is not among the patches, not touched by "Clear rizin's whole cache" and not exported (`GET /patches` lists it under `waiting`). A patch saved by an older version has no mark and is written back as it always was.
+
+**Two ways out, and no third.** A waiting patch has two ways out, and no third:
+
+- ✕ takes it out of the project, as for any other patch, and it does not come back when the file is opened again. Taking back a patch that the timeline makes drops the timeline too, because a replay would write the patch again and the SHA-256 would not notice (below).
+- Apply now writes the patch into the cache now. Apply now appears only where a run's bytes cover the address again, and the server decides that, not the pane: the server says it with each waiting entry (`apply_now`), and the server checks it again when it is pressed, and refuses with its reason where no run's bytes lie under the address by then. That is the case when you have decrypted again yourself and the patch makes sense again. It is a patch like any other afterwards.
+
+There is no other exit, on purpose: an Apply now that is always there would be the harm above with a button in front of it. A waiting patch at an address the browser cannot hold exactly (above 2^53) has a ✕ that is off, titled "This address cannot be sent exactly, so this patch cannot be removed from here"; the way out is `DELETE /patch` with `waiting` in the [API](api.md#rizin).
+
+**The button.** Restore the run, at the head of the right column of the EMULATION pane, replays the timeline the project keeps and proves the result. It is one button press, and never on its own when a file is opened, because it runs the file's code in the emulator again and a run can take as long as `esil.timeout` (5 s). Nothing starts on the VM, but it is the sample's code. Done by opening a file, it would execute sample code because a file was looked at, and a timeout would block the tab while it opens.
+
+The timeline is what the session did while you worked, in the order it was done in: the start, the runs, each skipped call with the value that was applied and the stack correction, and your patches. Your patches stand in the timeline with the rest, in the order they were made in, so a patch of the decrypted code is there when the replay runs on through the patched check, and not the original code. The button is on when the project holds a timeline that can prove something, no emulation runs, the cache holds nothing but the patches the file was opened with, and the breakpoints are the ones the timeline ran under (a run stops at a breakpoint). Otherwise it is off, with an emulation that runs, a cache that holds more or other than the open left, or other breakpoints, and its title is the server's sentence; for example "the project holds no timeline of the emulation to restore". A press that is refused changes nothing.
+
+The replay begins with `wc-*` and the registers reset, writes the patches the file was opened with that the timeline does not make (those made before the first start), sets the assistant's counters back to where the timeline began, and then does every action through the code that did it the first time. It has 60 s from its first command to its last action, which is why a record of 500 runs of `esil.timeout` does not hold the tab for 40 minutes. It cannot be stopped once it started; it is one request.
+
+**The SHA-256 is the proof.** A restore that quietly gave other bytes would be the worst result: you would read code that was never decrypted so. So the project holds one SHA-256 for each range the run decrypted, made over the bytes as the run left them, and the replay is checked against them in the order the writes were made. Because they are the bytes of the run, the SHA-256 does not cover your patches: a patch is replayed at its place in the timeline, not proven, which is also why taking one back drops the timeline.
+
+If the bytes are the ones saved, the emulation is left running at the replay's PC, every view moves there, and the patches that waited and that a run's bytes cover again are written; the others keep waiting. If a range differs, or an action is refused, or a run ends at the time limit, or the 60 s are used up, nothing is applied, and the cache is as it was when the file was opened (`wc-*`, then the file's patches again); the emulation is stopped, the counters are where they were, and the patches that wait still wait. The notice says which of four things happened:
+
+| What happened | What the pane says |
+|---------------|--------------------|
+| Restored | "Session restored: the saved timeline was replayed (3 actions) and the bytes it left match the SHA-256 the project holds for 2 ranges." and, where they apply, how many patches that waited were written, at which addresses, and how many still wait |
+| Other bytes | "Not restored: replaying the timeline left other bytes than the ones saved with it (1 of 2 saved ranges differ): nothing was applied, and the cache is as it was when the file was opened." |
+| Failed on the way | "Not restored: the replay stopped at action 3 of 5 (…): …; nothing was applied, and the cache is as it was when the file was opened." (the reason is the run's own: a refusal, a run that ended at the time limit, the 60 s) |
+| Nothing recorded | The button is off. The pane's note says "The way to this state is not kept in the project: …" with the reason, and the title of the button says what a press would be refused with |
+
+Where patches wait, a failure adds "The patches that wait still wait." A refused press is shown as the server worded it, after "Not restored:".
+
+**What spoils the timeline.** Only what the emulation routes of the server did is recorded; everything else that touched the emulation or the cache spoils it. The causes are a run that ended at the time limit, a register set by hand, a console command that writes or sets, a breakpoint that stands other than the timeline began with, a rizin that restarted, something taken out of the cache, and a run with nothing to prove. A timeline that is spoiled is not offered and not saved, and the pane's notice says which cause it was, with these reasons:
+
+| Cause | The reason in the notice |
+|-------|----------------------------------------------------------------------|
+| A register set by hand (in the pane or with `/emulation/register`) | a register was set by hand, which the timeline does not record |
+| A console command that writes into the cache (`w…`) | a console command wrote to the cache, which the timeline does not record |
+| A console command that sets a register or steps the emulation (`ar x=…`, `aes…`) | a console command set a register or stepped the emulation, which the timeline does not record |
+| A console command that arms the emulation, maps its memory or sets its PC (`aei`, `aeim`, `aepc`) in the middle of a timeline | a console command armed the emulation, mapped its memory or set its PC, which the timeline does not record |
+| A setting (`e <key>=<value>`) or a hint (`ah…`) changed while the timeline ran | a setting or a hint was changed while the timeline ran, and the timeline does not record it |
+| A breakpoint changed, from the pane, the gutter or the console, with an action after it (put the breakpoints back before that and nothing is lost) | a breakpoint was changed, and a run stops at the breakpoints there are |
+| A run that ended at `esil.timeout`: the result hangs on the clock and cannot be repeated | a run ended at the time limit, a result that hangs on the clock and cannot be repeated |
+| An action that failed half-way | an action failed half-way, after it had already changed the emulation or the cache |
+| A timeline longer than the project keeps | an action was dropped: a project keeps 500 actions at most |
+| rizin could not be asked what the cache or the breakpoints held when the timeline began | rizin did not say what the cache or the breakpoints held when the timeline began |
+| The cache already held writes of its own when the timeline began (a console `wx` before the first start) | the cache already held writes of its own when the timeline began, which no replay makes |
+| Something taken out of the cache: ✕ on a patch, **Clear rizin's whole cache**, a console `wc-` | something was taken out of the cache, so the way to the state it held is no longer kept |
+| A rizin that restarted (a hung step) | rizin was restarted, which emptied the cache the run had written to: the way to its bytes can no longer be proven |
+| A run with nothing to prove | the run left nothing in the cache that a restore could bring back |
+
+A timeline that is spoiled is not written to the project, and a timeline of the project that was clean before stays: it still proves its own run. The patches stay waiting either way, and the two exits are the way out: decrypt again and Apply now, or ✕.
+
+**The decrypted bytes are not stored in the project.** The arithmetic forbids it. `_read_project_meta` reads only the last 64 KB of the project file, and the patches and the timeline share 32 KB of characters, the patches first. A decrypted section is a few hundred KB as hex. So the project holds the way to the bytes (the actions, at most 500 actions) and a 32-byte SHA-256 for each range, and not the bytes. The timeline is saved after the patches, with what they left of the 32 KB; a timeline that does not fit is dropped whole, never saved in part, because one that ends where the budget did would replay to somewhere nobody named. The project then holds `restore=dropped` in its place, the session's note says so when the save happens, and the file's next open says "The project's timeline of the emulation could not be kept when the file was last saved (it was too long for the room the project has): the way to the decrypted bytes is gone, and decrypting again is the only way back." A timeline that is longer than the room on its own is dropped the same way.
 
 ### Re-analysing a decrypted range
 
@@ -372,7 +429,7 @@ place.
   runs.
 - A session ending ends its emulation and the bytes a run wrote; what comes
   back with the file is its project (names, comments, breakpoints, patches set
-  by hand).
+  by hand, and the timeline of the emulation, which one press replays).
 - At most three sessions run at once; a fourth ends the one unused longest.
   rizin ends with the web UI, also when that is killed (on Windows each rizin
   runs in a job object).
@@ -398,10 +455,14 @@ place.
 - They are saved as a rizin project in `webui/rizin_projects/<sha256>.rzdb`
   (`C:\DetonationChamberUI\rizin_projects\` on the VM, git-ignored like
   `webui/memory_results/`): 3 s after the last change and when the session
-  ends. A file gets a project only once something is renamed, commented,
-  patched by hand or given a breakpoint.
+  ends. A file gets a project once something is renamed, commented,
+  patched by hand or given a breakpoint, and also once the emulation has run:
+  the project then keeps the timeline of the run and a SHA-256 of what it
+  left, not the bytes.
 - The same file opened again, under any path, loads its project: names,
-  comments, breakpoints and patches set by hand are back (while its session
+  comments, breakpoints and patches set by hand are back, except that a patch
+  set over a run's bytes waits, and the timeline of the emulation is there for
+  **Restore the run** (while its session
   still closes, it waits for that session's last save). A project that cannot
   be loaded is kept as `<sha256>.rzdb.broken`, and the file opens without it.
 - A loaded project is disarmed on open. A breakpoint can carry a rizin
@@ -467,6 +528,13 @@ development; without rz-ghidra DECOMPILER says "Decompiler not available
   possibilities instead of guessing.
 - A run's bytes do not leave the tab: only patches set by hand are exported,
   and a patch with no place in the file is named and skipped.
+- **What comes back with a file is the way to the bytes, not the bytes.**
+  **Restore the run** replays at most 500 actions in at most 60 s, as one
+  request that cannot be stopped, and only what the emulation routes did; a
+  timeline that something spoiled is not offered. It wants the cache the file
+  was opened with, so a patch made since the open, a console `wx` or a run
+  keeps it off until the cache is cleared or the file is opened again. Its
+  SHA-256 proves a run's bytes and not a patch of yours.
 - After the emulation is restarted, the stack view can show words the previous
   run wrote into the old ESIL map. `GET /patches` ([API](api.md#rizin)) lists
   them as `mine: false`, and **Clear rizin's whole cache** removes them.
