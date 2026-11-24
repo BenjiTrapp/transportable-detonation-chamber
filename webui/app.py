@@ -8697,26 +8697,31 @@ def _syscall_search_file(content, baseline):
     the Win32 to Nt table, that table (None when the file is no PE that can be read), and why no absence could be
     claimed, "" when one could.
 
+    The file is read by binary_graph's reader (_pe_sample_record), as process mode reads its image: a directory
+    pefile refused leaves the table unread (None), and a record cut short keeps its True but claims no absence.
+
     An import by ordinal is named through the binary graph (binary_graph_query.name_ordinal_imports), never built
     from here. One it cannot name may be a door: the hits keep their True, and no stub becomes a proof.
 
     A stub that is the body of an export under its own Nt or Zw name is the documented path itself, a copy of ntdll,
     and is imported (True). Nothing else in the export table counts: the author of a sample writes it, so a door name
     or the Nt name pointing anywhere but at the stub would buy off the proof for one line."""
-    imports = _pe_import_names(content)
-    doors_note = "" if imports is not None else "the file is no PE whose import table can be read"
+    info, why = _pe_sample_record(content)
+    imports = _record_import_names(info) if info is not None else None
+    doors_note = "" if info is not None else f"the file is no PE whose import table can be read ({why})"
     named = set()
-    if imports is not None:
-        ordinals = _pe_ordinal_imports(content)
-        if ordinals is None:
-            named, doors_note = None, "the imports by ordinal of the file cannot be read"
-        elif ordinals:
+    if info is not None:
+        if any(f.startswith("#") for functions in info.imports.values() for f in functions):
             graph, _ = _binary_graph_for(start_build=False)
-            named, doors_note = binary_graph_query.name_ordinal_imports(graph, ordinals, view=baseline.view)
+            named, doors_note = binary_graph_query.name_ordinal_imports(graph, info.imports, view=baseline.view)
         if named:
             imports = imports | named
+        if info.partial:
+            cut = "a table (import, delay-load or export) of the file was cut short when it was read"
+            doors_note = f"{cut}; {doors_note}" if doors_note else cut
     keywords = _syscall_expanded_imports(imports)
-    if named is None and keywords["covered"] is not None:
+    # what could not be named, or was lost when a table was cut short, may be the door: nothing is claimed absent
+    if (named is None or (info is not None and info.partial)) and keywords["covered"] is not None:
         keywords["covered"] = frozenset()
     hits = syscall_scan.find_stubs_in_bytes(content, baseline, imports, **keywords)
     exported = _pe_export_offsets(content) if imports is not None else {}
@@ -8727,29 +8732,6 @@ def _syscall_search_file(content, baseline):
         if any(exported.get(alias) == hit.get("offset") for alias in (name, "Zw" + name[2:])):
             hit["import_present"] = True
     return hits, imports, doors_note
-
-
-def _pe_ordinal_imports(data):
-    """The imports by ordinal of a PE, delay-loaded ones included: module, lower case -> ("#<n>", ...); None when
-    `data` is not a PE that can be read."""
-    try:
-        import pefile
-        pe = pefile.PE(data=data, fast_load=True)
-        try:
-            pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"],
-                                                   pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT"]])
-            out = {}
-            for table in ("DIRECTORY_ENTRY_IMPORT", "DIRECTORY_ENTRY_DELAY_IMPORT"):
-                for entry in getattr(pe, table, []):
-                    for imp in entry.imports:
-                        if imp.import_by_ordinal and imp.ordinal is not None:
-                            module = (entry.dll or b"").decode("ascii", "replace").lower()
-                            out.setdefault(module, []).append(f"#{imp.ordinal}")
-            return {module: tuple(functions) for module, functions in out.items()}
-        finally:
-            pe.close()
-    except Exception:
-        return None
 
 
 def _pe_export_offsets(data):
@@ -8775,23 +8757,28 @@ def _pe_export_offsets(data):
         return {}
 
 
-def _pe_import_names(data):
-    """The names a PE imports, delay-loaded ones included, None when `data` is not a PE that can be read. Expanded
-    through the Win32 to Nt table the set can say that a function is not imported, so a function the sample
-    delay-loads has to be in it: it is a path the sample has."""
+def _pe_sample_record(data):
+    """`(record, why)`: a sample's bytes read by binary_graph's reader, the one process mode reads its image and the
+    loaded modules with, or `(None, the reason)` when it yields no record. A declared import, delay-load or export
+    directory pefile refused yields none, so an unread table never reads as one that imports nothing; one cut short
+    yields a record marked partial."""
     try:
-        import pefile
-        pe = pefile.PE(data=data, fast_load=True)
-        try:
-            pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_IMPORT"],
-                                                   pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT"]])
-            return {imp.name.decode("ascii", "replace")
-                    for table in ("DIRECTORY_ENTRY_IMPORT", "DIRECTORY_ENTRY_DELAY_IMPORT")
-                    for entry in getattr(pe, table, []) for imp in entry.imports if imp.name}
-        finally:
-            pe.close()
-    except Exception:
-        return None
+        return binary_graph.extract_bytes(data, "sample"), ""
+    except binary_graph.ExtractError as exc:
+        return None, str(exc)
+
+
+def _record_import_names(info):
+    """The names `info` imports, delay-loaded ones included; its imports by ordinal ("#<n>") are left to the graph.
+    Expanded through the Win32 to Nt table the set can say that a function is not imported, so a function the sample
+    delay-loads has to be in it: it is a path the sample has."""
+    return {f for functions in info.imports.values() for f in functions if not f.startswith("#")}
+
+
+def _pe_import_names(data):
+    """The names a PE imports (_record_import_names), None when `data` yields no record (_pe_sample_record)."""
+    info, _ = _pe_sample_record(data)
+    return None if info is None else _record_import_names(info)
 
 
 @app.route("/api/syscalls/stubs", methods=["POST"])
@@ -8800,8 +8787,9 @@ def api_syscalls_stubs():
 
     Each hit names the syscall of its number. For a file `import_present` is tri-state: False for a syscall a curated
     Win32 to Nt row leads to and the file's imports and exports, expanded through that table, do not hold (a proven
-    bypass); True for one they hold; None where no row leads to the syscall, the file is no PE that can be read, or
-    it imports by an ordinal the binary graph cannot name (see syscall_scan.find_stubs_in_bytes). For a process it is judged against the doors every loaded module imports
+    bypass); True for one they hold; None where no row leads to the syscall, the file is no PE that can be read, a
+    table of it was cut short, or it imports by an ordinal the binary graph cannot name (see
+    syscall_scan.find_stubs_in_bytes). For a process it is judged against the doors every loaded module imports
     (_syscall_search_process): False only when the binary graph of this system holds every loaded module and none of
     them, the image included, imports a door to the syscall; True when one does, or the image imports the function;
     None otherwise. `doors_complete` says whether that union could be built, and `doors_note` why not."""

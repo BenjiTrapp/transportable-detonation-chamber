@@ -176,6 +176,23 @@ def extract_binary(path: str) -> BinaryInfo:
         raise ExtractError("malformed") from None
 
 
+def extract_bytes(data: bytes, name: str) -> BinaryInfo:
+    """The record of a PE already held in memory (a sample read whole), read as extract_binary reads a file;
+    raises ExtractError with the same reasons, the size cap aside, which is the caller's."""
+    try:
+        import pefile
+    except ImportError:
+        raise ExtractError("pefile is not available") from None
+    if not data:
+        raise ExtractError("empty file")
+    try:
+        return _record(pefile, name.lower(), data)
+    except ExtractError:
+        raise
+    except Exception:
+        raise ExtractError("malformed") from None
+
+
 def _record(pefile, name, data):
     try:
         pe = pefile.PE(data=data, fast_load=True)

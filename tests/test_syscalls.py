@@ -3312,6 +3312,13 @@ def test_a_stub_in_a_file_is_found(client, tdc, target, sample_dir):
     assert body["partial"] is False and target.opened == []         # a file opens no process
 
 
+def _sample_record(names, partial=False):
+    """The record binary_graph's reader would give a sample importing `names` from kernel32."""
+    import binary_graph
+    return binary_graph.BinaryInfo(name="sample", kind="exe", machine="x64", imports={"kernel32.dll": tuple(names)},
+                                   exports=(), forwarders={}, ordinal_names={}, partial=partial)
+
+
 def test_a_file_says_whether_it_imports_the_function_through_the_win32_to_nt_table(client, tdc, target, sample_dir,
                                                                                     monkeypatch):
     path = sample_dir / "loader.bin"
@@ -3319,9 +3326,8 @@ def test_a_file_says_whether_it_imports_the_function_through_the_win32_to_nt_tab
     for imports, present in (({"NtWriteVirtualMemory"}, True), ({"WriteProcessMemory"}, True),
                              # no path the curated table knows to NtWriteVirtualMemory: a proven bypass
                              ({"CreateFileW"}, False)):
-        monkeypatch.setattr(tdc, "_pe_import_names", lambda data, imports=imports: imports)
-        # the import table stands in for a PE's: none of it is by ordinal
-        monkeypatch.setattr(tdc, "_pe_ordinal_imports", lambda data: {})
+        # the record stands in for a PE's: none of its imports is by ordinal, and no table was cut short
+        monkeypatch.setattr(tdc, "_pe_sample_record", lambda data, imports=imports: (_sample_record(imports), ""))
         hit = client.post("/api/syscalls/stubs", json={"path": str(path), "view": "x64"}).get_json()["hits"][0]
         assert hit["import_present"] is present, imports
 
@@ -4651,8 +4657,7 @@ def test_the_stage_hands_the_search_the_raw_and_the_expanded_import_table(tdc, t
     [finding] = result["evidence"]["findings"]
     assert finding["needs_corroboration"] is True
     calls.clear()
-    monkeypatch.setattr(tdc, "_pe_import_names", lambda data: {"VirtualAllocEx"})
-    monkeypatch.setattr(tdc, "_pe_ordinal_imports", lambda data: {})
+    monkeypatch.setattr(tdc, "_pe_sample_record", lambda data: (_sample_record({"VirtualAllocEx"}), ""))
     _run_stage(tdc, path=str(path))
     [((raw,), kw)] = calls
     assert raw == {"VirtualAllocEx"}

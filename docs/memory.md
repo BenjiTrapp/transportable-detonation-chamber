@@ -205,7 +205,10 @@ address, protection or process, so neither is a door. A stub whose function the 
 not import, by its import table widened through that table, is a proven bypass
 (`import_present` `false`); one it imports as well is a hint (`true`). Outside the
 table `import_present` stays `null`, and so does every hit when the import table
-cannot be read: a hint. That is a boundary, not a gap: for a syscall no curated row
+cannot be read or a table of the file was cut short when it was read: a hint. The
+file is read by the same reader as the binary graph, so a declared import,
+delay-load or export directory the parser refuses leaves the table unread rather
+than empty. That is a boundary, not a gap: for a syscall no curated row
 leads to, a missing import proves nothing. A proof assumes the table names the
 documented entry points to that syscall. An uncommon wrapper to a covered syscall
 reads as a bypass: a false positive on an unusual but clean program that carries a

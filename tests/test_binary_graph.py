@@ -3674,8 +3674,65 @@ def test_ordinals_are_named_only_by_a_graph_of_the_importers_view():
 
 def test_the_imports_by_ordinal_of_a_pe_are_read_delay_loaded_ones_included(tdc):
     data = make_pe(imports=(("KERNEL32.dll", (157, "GetLastError")),), delay=(("ws2_32.dll", (115,)),))
-    assert tdc._pe_ordinal_imports(data) == {"kernel32.dll": ("#157",), "ws2_32.dll": ("#115",)}
-    assert tdc._pe_ordinal_imports(b"not a pe") is None
+    info, why = tdc._pe_sample_record(data)
+    assert info.imports == {"kernel32.dll": ("#157", "GetLastError"), "ws2_32.dll": ("#115",)} and why == ""
+    assert tdc._record_import_names(info) == {"GetLastError"}
+    assert tdc._pe_sample_record(b"not a pe") == (None, "not a PE")
+
+
+# --- the final review, C1: file mode reads the sample through binary_graph's reader, as process mode does ---------
+
+def _import_directory_outside_the_image(data):
+    """`data` with the import directory's RVA (data directory 1 of make_pe's PE32+) pointed far past the image."""
+    import struct
+    out = bytearray(data)
+    at = 0x40 + 4 + 20 + 112 + 8
+    assert struct.unpack_from("<I", out, at)[0], "make_pe declared no import directory"
+    struct.pack_into("<I", out, at, 0x7FFF0000)
+    return bytes(out)
+
+
+def test_a_sample_whose_import_directory_cannot_be_read_is_no_proven_bypass_in_a_file(client, target, sample_dir):
+    # the reviewer's reproduction: the same bytes give True, and with the import directory unreadable they gave
+    # False with an empty note, because pefile's warning was ignored and the unread table read as "imports nothing"
+    whole = make_pe(imports=(("kernel32.dll", ("WriteProcessMemory",)),)) + _X64_STUB_0x3A
+    (sample_dir / "whole.exe").write_bytes(whole)
+    hit, body = _file_hit(client, sample_dir / "whole.exe")
+    assert hit["import_present"] is True
+    (sample_dir / "broken.exe").write_bytes(_import_directory_outside_the_image(whole))
+    with pytest.raises(binary_graph.ExtractError, match="^unreadable import directory$"):
+        binary_graph.extract_binary(str(sample_dir / "broken.exe"))
+    hit, body = _file_hit(client, sample_dir / "broken.exe")
+    assert (hit["syscall"], hit["import_present"]) == ("NtWriteVirtualMemory", None)
+    assert body["imports_read"] is False and body["doors_complete"] is False and body["doors_note"]
+    assert body["evidence"]["findings"][0]["needs_corroboration"] is True
+
+
+def test_a_sample_whose_tables_were_cut_short_claims_no_absence_in_a_file(client, target, sample_dir):
+    # a partial record kept what pefile read before it stopped: what it lost may be the door, or the stub's export
+    path = sample_dir / "cut.exe"
+    path.write_bytes(make_pe(imports=(("kernel32.dll", ("GetLastError",)),), exports=("A",),
+                             nameless=tuple((n, None) for n in range(2, 132))) + _X64_STUB_0x3A)
+    hit, body = _file_hit(client, path)
+    assert hit["import_present"] is None
+    assert body["imports_read"] is True and body["doors_complete"] is False and "cut short" in body["doors_note"]
+    # what was read still says the function is imported
+    path = sample_dir / "cut-door.exe"
+    path.write_bytes(make_pe(imports=(("kernel32.dll", ("WriteProcessMemory",)),), exports=("A",),
+                             nameless=tuple((n, None) for n in range(2, 132))) + _X64_STUB_0x3A)
+    hit, _ = _file_hit(client, path)
+    assert hit["import_present"] is True
+
+
+def test_the_detonation_stage_reads_an_unreadable_import_directory_as_unknown_in_the_file(tdc, target, sample_dir):
+    target.view = "x64"
+    target.reader = _x64_space(b"\x90" * 8)
+    path = sample_dir / "broken.exe"
+    path.write_bytes(_import_directory_outside_the_image(
+        make_pe(imports=(("kernel32.dll", ("WriteProcessMemory",)),)) + _X64_STUB_0x3A))
+    result = tdc._run_syscall_stage(4812, str(path), [])
+    assert [h["import_present"] for h in result["stubs"]["file"]["hits"]] == [None]
+    assert result["stubs"]["file"]["doors_complete"] is False
 
 
 # --- Ruling 37: an empty or thinned module list is not a complete one ---------------------------------------------
