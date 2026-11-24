@@ -4122,3 +4122,151 @@ def test_both_pages_name_the_figures_route_every_figure_and_the_curated_zw_edge(
     # a metric the table cannot give is null, never 0, and both pages say so for the route
     assert "`null`" in docs["/api/binary-graph/metrics"] and "null" in helps["/api/binary-graph/metrics"]
     assert "the only curated edge of any answer" not in query
+
+
+# --- Ruling 60: a list far above the cap is not built whole ---------------------------------------------------------------
+
+def _vast_system():
+    """A System32 whose every list is above the cap: 1,500 binaries that each import one module that is not System32's, 600
+    that import api sets, 700 that form pairs, a DLL with 1,000 forwarded exports, 500 cut tables and 500 skipped files."""
+    infos = []
+    for i in range(1500):
+        infos.append(_q(f"b{i:04d}.exe", "exe", imports={f"m{i:04d}.dll": ("F",)}, partial=i < 500))
+    for i in range(600):
+        infos.append(_q(f"a{i:04d}.exe", "exe", imports={f"api-ms-win-v{i:04d}-l1-1-0.dll": ("F",)}))
+    for i in range(350):
+        infos.append(_q(f"p{i:04d}x.dll", imports={f"p{i:04d}y.dll": ("F",)}))
+        infos.append(_q(f"p{i:04d}y.dll", imports={f"p{i:04d}x.dll": ("F",)}))
+    infos.append(_q("fwd.dll", forwarders={f"f{i}": f"X.f{i}" for i in range(1000)}))
+    infos.append(_q("host.dll"))
+    graph = _query_graph(*infos, api_sets={f"api-ms-win-v{i:04d}-l1-1-0": ("host.dll",) for i in range(600)})
+    graph = dataclasses.replace(graph, skipped=tuple((f"skip{i:04d}.dll", "not a PE file") for i in range(500)))
+    rows = [{"win32": f"Door{i}", "nt": f"NtThing{i}", "source": "documented", "note": "x"} for i in range(300)]
+    return graph, win32_to_nt.parse_table({"version": 1, "entries": rows})
+
+
+@pytest.fixture
+def parts_made(monkeypatch):
+    """How many parts a call makes: _Part is counted as it is built."""
+    made = []
+
+    class Counting(binary_graph_query._Part):
+        def __init__(self, *args, **kwargs):
+            made.append(1)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(binary_graph_query, "_Part", Counting)
+    return made
+
+
+def test_a_list_far_above_the_cap_takes_its_total_from_the_figure_and_builds_only_what_the_cap_holds(parts_made):
+    graph, table = _vast_system()
+    figures = binary_graph_query.metrics(graph, table)
+    above = [name for name in binary_graph_query.METRICS
+             if name != "most_imported" and figures[name] > binary_graph_query.MAX_NODES // 2]
+    assert set(above) == {"binaries", "edges", "api_sets_resolved", "forwarders", "isolated", "circular_pairs",
+                          "curated_transitions", "skipped", "partial"}, figures
+    for name in above:
+        del parts_made[:]
+        got = binary_graph_query.metric_members(graph, table, name)
+        assert got.total == figures[name], f"{name}: two numbers for one fact"
+        assert got.truncated is True and 0 < len(got.nodes) <= binary_graph_query.MAX_NODES, name
+        assert f"of {figures[name]} " in got.note, name
+        # the cut parts: the ones that fit, the first that did not, and the empty fixed start; not one of the thousands more
+        assert len(parts_made) <= binary_graph_query.MAX_NODES + 2, (name, len(parts_made))
+        _whole(got)
+
+
+def test_the_cut_list_is_the_first_parts_in_the_order_the_whole_list_would_have_had():
+    graph, table = _vast_system()
+    got = binary_graph_query.metric_members(graph, table, "edges")
+    # a part per edge: an importer and the module it imports, two nodes, so 200 of them fit
+    half = binary_graph_query.MAX_NODES // 2
+    first = [f"a{i:04d}.exe" for i in range(half)]       # the a-binaries sort first: each imports an api set
+    assert list(got.roots) == first and len(got.nodes) == binary_graph_query.MAX_NODES
+    assert [(e.source, e.target) for e in got.edges] == [(f"a{i:04d}.exe", f"api-ms-win-v{i:04d}-l1-1-0.dll") for i in range(half)]
+    names = binary_graph_query.metric_members(graph, table, "binaries")
+    assert [n.id for n in names.nodes] == sorted(graph.binaries)[:binary_graph_query.MAX_NODES]
+    assert (names.total, names.truncated) == (len(graph.binaries), True) and f"Only the first 400 of {len(graph.binaries)}" in names.note
+
+
+def test_a_list_that_fits_is_not_cut_and_its_total_is_still_the_figure():
+    graph = _figures_system()
+    figures = binary_graph_query.metrics(graph, win32_to_nt.load_table())
+    for name in ("binaries", "edges", "forwarders", "isolated", "circular_pairs", "api_sets_resolved"):
+        got = _members(graph, name)
+        assert (got.total, got.truncated) == (figures[name], False), name
+
+
+def test_a_list_that_gives_another_number_of_parts_than_its_figure_says_so_instead_of_showing_two_numbers():
+    parts = [binary_graph_query._Part([binary_graph_query.Node(f"n{i}", f"n{i}", "dll", 0, "")], [], [f"n{i}"]) for i in range(3)]
+    with pytest.raises(ValueError, match="had 3 parts and its figure said 5"):
+        binary_graph_query._answer(binary_graph_query._Part([], [], []), iter(parts), "Note.", "things", total=5)
+    # a cut one never reaches the end of its iterator, so what is behind the cap is not asked
+    many = (binary_graph_query._Part([binary_graph_query.Node(f"n{i}", f"n{i}", "dll", 0, "")], [], []) for i in range(10_000_000))
+    got = binary_graph_query._answer(binary_graph_query._Part([], [], []), many, "Note.", "things", total=10_000_000)
+    assert got.total == 10_000_000 and got.truncated and len(got.nodes) == binary_graph_query.MAX_NODES
+
+
+# --- Ruling 59: where a curated edge may be -------------------------------------------------------------------------------
+
+def _every_answer_with_its_label(descent_baseline):
+    """Every answer of every query on the graphs of this file, labelled by the query (and the figure of `metric`)."""
+    table = win32_to_nt.load_table()
+    answers = []
+    for graph in (_system(), _descent_system(), _figures_system(lone_exe=True)):
+        ctx = binary_graph_query.Context(graph, table, descent_baseline)
+        names = sorted(graph.binaries)
+        for name in names:
+            answers.append(("importers", binary_graph_query.QUERIES["importers"](ctx, {"module": name})))
+            answers.append(("imports", binary_graph_query.QUERIES["imports"](ctx, {"module": name})))
+            answers.append(("forwarders", binary_graph_query.QUERIES["forwarders"](ctx, {"module": name})))
+            for other in names[:4]:
+                answers.append(("shared", binary_graph_query.QUERIES["shared"](ctx, {"module": name, "other": other})))
+            for function in ("WriteProcessMemory", "VirtualAllocEx", "CloseHandle", "NtClose", "NtWriteVirtualMemory",
+                             "ZwWriteVirtualMemory", "VirtualProtect", "CreateRemoteThread", "Gone", "MessageBoxW"):
+                answers.append(("path-to-syscall", binary_graph_query.QUERIES["path-to-syscall"](
+                    ctx, {"module": name, "function": function})))
+        for syscall in ("NtClose", "NtWriteVirtualMemory", "ZwClose", "NtNothing"):
+            answers.append(("syscall-callers", binary_graph_query.QUERIES["syscall-callers"](ctx, {"syscall": syscall})))
+        for figure in binary_graph_query.METRICS:
+            answers.append((f"metric:{figure}", binary_graph_query.QUERIES["metric"](ctx, {"metric": figure})))
+    return answers
+
+
+def test_a_curated_edge_is_only_the_last_of_a_path_and_the_rows_of_the_curated_table_and_nowhere_else(descent_baseline):
+    table = win32_to_nt.load_table()
+    answers = _every_answer_with_its_label(descent_baseline)
+    assert len(answers) > 400, "the guard looks at many answers, not at a few"
+    carriers = {}
+    for label, answer in answers:
+        curated = [(index, edge) for index, edge in enumerate(answer.edges) if edge.origin == "curated"]
+        if curated:
+            carriers[label] = carriers.get(label, 0) + 1
+        if label == "path-to-syscall":
+            # the guard the spec's anti-goal rests on: at most one, and only ever the last
+            assert len(curated) <= 1, answer.edges
+            assert all(index == len(answer.edges) - 1 and edge.kind == "reaches_syscall" for index, edge in curated), answer.edges
+        elif label == "metric:curated_transitions":
+            # the decided exception: every row of the table is one curated edge, and every edge of the list is one of them
+            assert len(answer.edges) == len(curated) and curated, label
+            assert all(edge.kind == "reaches_syscall" and edge.label.startswith("curated: ") for _, edge in curated)
+        else:
+            assert curated == [], (label, curated)
+        assert all(edge.origin in ("derived", "curated") for edge in answer.edges), label
+    # not vacuous: the two carriers really carry curated edges in these answers, and nobody else does
+    assert set(carriers) == {"path-to-syscall", "metric:curated_transitions"}, carriers
+    assert carriers["path-to-syscall"] >= 5
+    rows = [a for label, a in answers if label == "metric:curated_transitions"]
+    assert all(a.total == len(table.entries) for a in rows)
+
+
+def test_the_exception_is_said_where_the_rule_is_and_names_the_query_and_the_reason():
+    """A token test, and no more: it holds that the rule and its one exception are stated together, in the module and on
+    the function that lists the rows. That the rule is *kept* is the test above, which looks at the answers."""
+    module = binary_graph_query.__doc__
+    assert "at most one, and only ever the last" in module
+    assert 'metric_members("curated_transitions")' in module and "exactly one exception" in module
+    assert "every row of the table is a curated mapping" in module
+    function = binary_graph_query.metric_members.__doc__
+    assert "curated_transitions" in function and "path_to_syscall" in function and "No other list may carry one" in function
