@@ -4142,7 +4142,7 @@ def test_both_pages_name_the_figures_route_every_figure_and_the_curated_zw_edge(
 def test_every_page_that_says_which_edges_are_curated_names_the_zw_one_and_the_limit():
     """The curated edge is the one thing the view must never pass off as read from a binary, and it has two kinds: the
     last hop from a Win32 function to its Nt name, and a Zw name to its Nt name. A page that names only the first reads
-    as if the second were derived, so the five pages that say which edges are curated say the same four things. It cannot
+    as if the second were derived, so the five pages that say which edges are curated say the same four things (curated and at most one per path, the Zw edge, and that a path ending at an Nt name is derived throughout). It cannot
     tell whether the sentence around the words is right, only that none of them is left out or dropped later."""
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     read = lambda *parts: open(os.path.join(root, *parts), encoding="utf-8").read()
@@ -4153,10 +4153,16 @@ def test_every_page_that_says_which_edges_are_curated_names_the_zw_one_and_the_l
     usage = help_page[help_page.index("<h4>SYSCALLS</h4>"):help_page.index("<h4>LitterBox</h4>")]
     pages = {"README.md": row, "docs/memory.md": section, "#help-usage": usage,
              "docs/api.md": docs["/api/binary-graph/query"], "#help-api": helps["/api/binary-graph/query"]}
+    derived = {"README.md": "derived throughout", "docs/memory.md": "derived from end to end", "#help-usage": "derived throughout",
+               "docs/api.md": "the whole path is `derived`", "#help-api": "derived throughout"}
+    assert set(derived) == set(pages)
     for name, text in pages.items():
         flat = " ".join(re.sub(r"<[^>]+>", " ", text).split())
-        for needle in ("curated", "Zw", "naming convention", "at most one per path"):
-            assert needle in flat, f"{name} does not say {needle!r} of the curated edge"
+        assert "curated" in flat and "at most one per path" in flat, f"{name} does not say what is curated and how many"
+        # the Zw name and the convention in one sentence, so that neither word is matched in unrelated text
+        assert re.search(r"Zw[^.]{0,200}naming convention", flat), f"{name} does not say that a Zw name's edge is a naming convention"
+        # a direct Nt import has no curated edge: said in one wording on each page, and api.md has its own
+        assert re.search(derived[name], flat), f"{name} does not say that a path ending at an Nt name is derived throughout"
         assert "except one kind" not in flat and "the one dashed edge" not in flat, name
 
 
