@@ -262,11 +262,12 @@ _RESTORE_PATCH_TAKEN_BACK = ("a patch the timeline makes was taken back, and a r
 _RESTORE_REGISTERS = ("rizin did not reset the registers ({pc}), so the replay would start from what an earlier run "
                       "left; nothing was applied")
 _RESTORE_REGISTERS_UNDONE = " -- and rizin did not reset the registers either: they are what the replay left"
-_RESTORE_OUT_OF_TIME = ("the replay stopped before action {number} of {count} ({what}): it has {budget:g} seconds "
-                        "and they were used up; nothing was applied, and the cache is as it was when the file was "
-                        "opened")
-# How long one replay may take, checked between the actions (so it is overshot by at most the action that was running:
-# esil.timeout and its grace). Spec 6: the cap on the actions is the lever against a restore that takes minutes, and
+_RESTORE_OUT_OF_TIME = ("the replay stopped before action {number} of {count} ({what}): the {done} before it, "
+                        "and what was written first, took the {budget:g} seconds a replay has; nothing was applied, "
+                        "and the cache is as it was when the file was opened")
+# How long one replay may take, from its first command (``wc-*``) to the last action, checked between the actions (so it is
+# overshot by at most the action that was running: esil.timeout and its grace). What follows the last action is outside it:
+# one ``wcj`` and the hashing for the proof, and the patches that waited, which are at most what 32 KB of project keep. Spec 6: the cap on the actions is the lever against a restore that takes minutes, and
 # 500 runs of esil.timeout each is not that -- the request holds the gate like a console command, and has the time
 # one has.
 RESTORE_BUDGET = CONSOLE_TIMEOUT
@@ -2013,26 +2014,30 @@ class RizinSession:
         return rizin_emulation.run_digests(rows, rizin_emulation.run_only_ranges(rows))
 
     def restore_offer(self, wait=2.0):
-        """What the pane needs to offer the restore button, or to say why not: {"actions", "reason",
-        "digests"}. GET /patches carries it as ``restore`` (_patches_answer).
+        """What the pane needs to offer the restore button, or to say why not: {"actions", "reason", "digests",
+        "refused"}. GET /patches carries it as ``restore`` (_patches_answer). Two questions, two fields:
 
-        ``reason`` is the **one** field that says why it is not offered, or None where it is: a hand-set
-        register, a console write, a run that hit the time limit, a breakpoint that is not the one the
-        timeline began with, a rizin that was restarted, something taken out of the cache -- or that a restore
-        would bring back nothing (no range for ``digests``). The record keeps its own taint
-        (``_restore["tainted"]``), which is a part of it.
+        ``reason`` is why the **timeline** cannot be offered -- the record's own taint, the thing spec 4's notice says:
+        a hand-set register, a console write, a run that hit the time limit, a breakpoint that is not the one the
+        timeline began with, a rizin that was restarted, something taken out of the cache, or that a restore would
+        bring back nothing (no range for ``digests``). None where it can. It is the field the record's taint reaches the
+        pane by, and nothing else carries it.
 
-        Two things answer, and ``digests`` is not the same thing in them:
+        ``refused`` is why **POST /restore would refuse now**, in the words it refuses with (_restore_refusal), or
+        None where it would run: no timeline in the project, an emulation that runs (also the adopted timeline of a
+        replay that has just held), a cache that is not the one from opening, other breakpoints than the timeline
+        ran under. The button is enabled by ``refused`` being None and says ``refused`` when it is not. A session
+        with no timeline of its own that holds the project's has no taint to report: its ``reason`` is None.
+
+        ``actions`` and ``digests`` are not the same figures in the two cases:
 
         * A session that has run a timeline of its own (``_restore``) answers for **that**: ``digests`` is how
           many ranges the record would prove **right now**, from the cache as it is -- a timeline whose cache has
-          lost the run's bytes says 0 -- and ``reason`` is why that timeline would not be saved. The cache is
-          the run's, so a restore (restore_run) would refuse such a session whatever the reason says.
+          lost the run's bytes says 0.
         * A session with none of its own that holds the project's (a file just opened, or a rizin that was
-          restarted) answers for **that one**: ``actions`` and ``digests`` are what the record stores, which is
-          what a replay will be held to, and ``reason`` is what restore_run would refuse for (_restore_blocked).
+          restarted) answers for **that one**: what the record stores, which is what a replay will be held to.
 
-        It asks rizin (one ``wcj``, and ``dblj`` for the project's record), so it waits for the gate like any
+        It asks rizin (one ``wcj``, and ``dblj`` where the project holds a record), so it waits for the gate like any
         view (RizinBusy); with no timeline of either kind it asks nothing and takes no gate."""
         if self._restore is None and self._restore_saved is None:
             return self._restore_offered(None, None)
@@ -2041,21 +2046,27 @@ class RizinSession:
 
     def _restore_offered(self, pipe, rows):
         """restore_offer's answer (gate held when ``pipe`` is given): ``rows`` the cache **in write order**, read
-        once by the caller, which is also what the answer of GET /patches is made from. Rizin answering something
-        that is no cache is not the offer's to raise: it says so as its reason."""
+        once by the caller, which is also what the answer of GET /patches is made from. Nothing in it hashes."""
         record, saved = self._restore, self._restore_saved
+        refused = self._restore_refusal(pipe, rows)
         if record is None and saved is None:
-            return {"actions": 0, "reason": self._restore_gone, "digests": 0}
-        try:
-            if record is None:
-                return {"actions": len(saved["actions"]), "reason": self._restore_blocked(pipe, saved, rows),
-                        "digests": len(saved["digests"])}
-            digests = len(self._restore_digests(pipe, rows))
-        except ValueError:
-            return {"actions": 0 if record is None else len(record["actions"]), "reason": _RESTORE_CACHE_UNREAD,
-                    "digests": 0}
-        return {"actions": len(record["actions"]), "digests": digests,
+            return {"actions": 0, "reason": self._restore_gone, "digests": 0, "refused": refused}
+        if record is None:
+            return {"actions": len(saved["actions"]), "reason": None, "digests": len(saved["digests"]),
+                    "refused": refused}
+        # how many ranges the cache proves now: counted, not hashed (rizin_emulation.digest_ranges) -- the hashing is
+        # for a save and a replay, and a read of the pane's own route would pay it for nothing
+        digests = len(rizin_emulation.digest_ranges(rows, rizin_emulation.run_only_ranges(rows)))
+        return {"actions": len(record["actions"]), "digests": digests, "refused": refused,
                 "reason": self._restore_reason() or (None if digests else _RESTORE_NOTHING)}
+
+    def _restore_refusal(self, pipe, rows=None):
+        """Why restore_run would refuse now, or None (gate held when there is a record): the sentence it raises with.
+        No record: why there is none; else _restore_blocked."""
+        saved = self._restore_saved
+        if saved is None:
+            return self._restore_gone or (_RESTORE_LOST_AT_OPEN if self._restore_lost else _RESTORE_NO_RECORD)
+        return self._restore_blocked(pipe, saved, rows)
 
     # --- Replaying the timeline ---------------------------------------------
     #
@@ -2142,13 +2153,10 @@ class RizinSession:
         return self._call("emulation", wait, self._restore_replay)
 
     def _restore_replay(self, pipe):
-        record = self._restore_saved
-        if record is None:
-            raise RizinRefused(self._restore_gone or (_RESTORE_LOST_AT_OPEN if self._restore_lost
-                                                      else _RESTORE_NO_RECORD))
-        reason = self._restore_blocked(pipe, record)
+        reason = self._restore_refusal(pipe)
         if reason:
             raise RizinRefused(reason)
+        record = self._restore_saved
         counters, lost = (self._assist_tick, self._assist_handle, self._assist_pseudo), self._lost
         # the live timeline describes a cache that is about to be replaced, and a clean one that stayed would
         # be saved with the digests of the replayed run: it goes, and what it said of the breakpoints with it
@@ -2179,6 +2187,7 @@ class RizinSession:
     def _restore_play(self, pipe, record):
         """Steps 2 to 7 (gate held): (the emulation's state, the addresses of the waiting patches written).
         Raises _ReplayFailed for an action that did not hold or bytes that are not the saved ones."""
+        deadline = _replay_clock() + RESTORE_BUDGET
         pipe.cmd("wc-*")  # not unpatch(): that discards the timeline, and this is a replay of it
         self._mine, self._mine_over = [], []
         if not self._registers_reset(pipe):
@@ -2188,12 +2197,11 @@ class RizinSession:
         self._assist_tick, self._assist_handle, self._assist_pseudo = (
             record["counters"][name] for name in ("tick", "handle", "pseudo"))
         actions, stopped = record["actions"], None
-        deadline = _replay_clock() + RESTORE_BUDGET
         for number, action in enumerate(actions, 1):
             what = _action_words(action)
             if _replay_clock() > deadline:
                 raise _ReplayFailed(_RESTORE_OUT_OF_TIME.format(number=number, count=len(actions), what=what,
-                                                                budget=RESTORE_BUDGET))
+                                                                done=number - 1, budget=RESTORE_BUDGET))
             try:
                 answer = self._restore_do(pipe, action)
             except RizinRefused as err:
@@ -2716,8 +2724,7 @@ class RizinSession:
             held = self._patch_list(pipe)  # what the cache holds before the removal, to say what went
             try:
                 if addr is None:
-                    pipe.cmd("wc-*")
-                    self._mine = []
+                    pipe.cmd("wc-*")  # the mirror forgets what went when the cache is read (_patch_list)
                 else:
                     # The range, not the address: `wc- <addr>` with no second argument drops every write in
                     # a whole block (0x100 bytes) from there, the neighbours' included (measured).
@@ -2729,30 +2736,30 @@ class RizinSession:
             went = rizin_emulation.rows_gone(held, found)
             if went:
                 self._restore_discard()
-                self._restore_saved_without([row for row in went if row["mine"]])
             if addr is not None and any(r["addr"] <= addr < r["addr"] + r["size"] for r in found):
                 raise RizinRefused(f"rizin kept the patch at {addr:#x}")
-            gone = [{"addr": r["addr"], "size": r["size"]}
-                    for r in rizin_emulation.rows_gone(held, found) if not r["mine"]]
+            gone = [{"addr": r["addr"], "size": r["size"]} for r in went if not r["mine"]]
             return {"patches": found, "run_removed": sorted(gone, key=lambda r: r["addr"])}
 
         result = self._call("emulation", wait, run)
         self._schedule_save()
         return result
 
-    def _restore_saved_without(self, rows):
-        """The project's timeline does not survive the take-back of a patch it makes (gate held): ``rows`` are this
-        session's own writes that went out of the cache. The live timeline is dropped for any row that goes
-        (_restore_discard), but the project's record is not the live one -- a reopened session has none -- and a
-        replay of it would write the patch again, and say "restored": the patch lies outside the hashed ranges, so
-        the SHA-256 cannot tell. The way a patch that waits is dropped (drop_waiting) has the same cause and the same
-        answer. A patch of the open that the timeline does not make (one before the first start) costs it nothing."""
+    def _restore_saved_without(self, entries):
+        """The project's timeline does not survive the take-back of a patch it makes (gate held): ``entries`` are this
+        session's own writes, (addr, size, after_hex), that went out of the cache (_patch_list). The live timeline is
+        dropped for any row that goes (_restore_discard), but the project's record is not the live one -- a reopened
+        session has none -- and a replay of it would write the patch again, and say "restored": the patch lies outside
+        the hashed ranges, so the SHA-256 cannot tell. The way a patch that waits is dropped (drop_waiting) has the
+        same cause and the same answer. A patch of the open that the timeline does not make (one before the first
+        start) costs it nothing."""
         saved = self._restore_saved
         if saved is None:
             return
         made = {(action["addr"], action["data"]) for action in saved["actions"] if action["kind"] == "patch"}
-        if any((row["addr"], row["after"]) in made for row in rows):
+        if any((addr, after) in made for addr, _, after in entries):
             self._restore_saved, self._restore_gone = None, _RESTORE_PATCH_TAKEN_BACK
+            self._schedule_save()  # the project holds the line, and a take-back by the console asked for nothing
 
     def _patch_write(self, pipe, addr, data):
         """``wx`` of ``data`` at ``addr`` through the cache (gate held); {"patches": the list}."""
@@ -2775,10 +2782,22 @@ class RizinSession:
         restarted) is dropped from it, so that a later write there is not taken for a patch.
 
         The rows are read in rizin's order, which is the order of the mirror, so that what each of this
-        session's rows says about ``over_run`` can be kept beside the mirror's entries (``_mine_over``)."""
+        session's rows says about ``over_run`` can be kept beside the mirror's entries (``_mine_over``).
+
+        **This is where a patch that left the cache is noticed**, whoever took it out (the take-back route, a console
+        ``wc-``, a restart): an entry the last read **confirmed** and this one does not find is a take-back, and the
+        project's timeline of the emulation does not survive that where it makes the patch
+        (_restore_saved_without). The mirror is the one place all of them pass, and nothing about it needs the
+        console to be watched. What the last read had not confirmed (an entry a write appended whose row never
+        came, or one a restart's replay of the mirror could not write) was never in the cache, and is not a take-back;
+        and the replay empties the mirror before it reads, so its own ``wc-*`` is nobody's."""
+        confirmed = self._mine[:len(self._mine_over)]
         rows, self._mine = rizin_emulation.patch_rows(rizin_emulation.parse_cache(pipe.cmd("wcj")),
                                                       self._mine, True)
         self._mine_over = [row["over_run"] for row in rows if row["mine"]]
+        left = collections.Counter(confirmed) - collections.Counter(self._mine)
+        if left:
+            self._restore_saved_without(left)
         return rows if ordered else sorted(rows, key=lambda row: row["addr"])
 
     def _waiting_left(self, kept):

@@ -1215,3 +1215,28 @@ def test_run_covers_says_whether_a_write_that_is_not_ours_lies_under_any_byte_of
     assert not covers(rows, 0xFD, 3) and not covers(rows, 0x104, 5), "and one that ends or starts at its edge"
     assert not covers(rows, 0x200, 4), "a row of this session's own is no run"
     assert not covers([], 0x100, 1)
+
+
+def test_digest_ranges_are_the_ranges_run_digests_hashes_and_hash_nothing():
+    # an offer counts the ranges a record proves and does not need their SHA-256: the same spans, and none of the hashing
+    def row(addr, data, mine=False):
+        return {"addr": addr, "size": len(data), "before": "00" * len(data), "after": data.hex(), "mine": mine,
+                "over_run": False}
+
+    cases = [
+        [],
+        [row(0x100, b"ABCD")],
+        [row(0x100, b"ABCD"), row(0x102, b"\x90", mine=True)],  # a patch inside the run's bytes: one range of four
+        [row(0x100, b"AB"), row(0x200, b"CD"), row(0x201, b"\x90\x90", mine=True)],  # two runs, one patch over the edge
+        [row(0x100, b"AB", mine=True)],  # a patch and no run: nothing to prove
+    ]
+    for rows in cases:
+        ranges = rizin_emulation.run_only_ranges(rows)
+        assert rizin_emulation.digest_ranges(rows, ranges) == [
+            (d["start"], d["end"]) for d in rizin_emulation.run_digests(rows, ranges)], rows
+    assert [len(rizin_emulation.digest_ranges(rows, rizin_emulation.run_only_ranges(rows))) for rows in cases] == [0, 1, 1, 2, 0]
+    # what run_digests refuses (a row that holds fewer bytes than it says) is the save's to find, not the offer's
+    bad = [dict(row(0x100, b"AB"), size=4)]
+    with pytest.raises(ValueError):
+        rizin_emulation.run_digests(bad, rizin_emulation.run_only_ranges(bad))
+    assert len(rizin_emulation.digest_ranges(bad, rizin_emulation.run_only_ranges(bad))) == 1

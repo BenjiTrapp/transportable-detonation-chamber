@@ -775,6 +775,17 @@ def _common(first, second):
     return common
 
 
+def digest_ranges(rows, ranges):
+    """The ranges ``run_digests`` hashes, as (low, high) pairs lowest first -- and nothing of the bytes: how many
+    there are is what an offer of a restore says (``len``), and it has no use for the hashing of megabytes that
+    every ``GET /patches`` of a session with a timeline would pay (measured: 1.65 s for 2^20 one-byte rows of a
+    decryption loop, more than reading them). Same arguments as ``run_digests``, and the same spans, which is the
+    one thing the count may not differ in."""
+    owned = written_ranges([row for row in rows if not row.get("mine")])
+    return _merged(_common(owned, _merged(ranges)) + _common(owned, written_ranges(
+        [row for row in rows if row.get("mine")])))
+
+
 def run_digests(rows, ranges):
     """The SHA-256 of what a run left in each range: [{"start", "end", "sha256"}], lowest first, both ends
     in the range. It is what a replay has to give the same bytes for, and it is made while the cache is
@@ -799,9 +810,7 @@ def run_digests(rows, ranges):
     whatever was patched around them, and what a patch changes does not change the proof.
     """
     foreign = [row for row in rows if not row.get("mine")]
-    owned = written_ranges(foreign)
-    spans = _merged(_common(owned, _merged(ranges)) + _common(owned, written_ranges(
-        [row for row in rows if row.get("mine")])))
+    spans = digest_ranges(rows, ranges)
     held = [bytearray(high - low + 1) for low, high in spans]
     starts = [low for low, _ in spans]
     for row in foreign:  # in rizin's order: a later write over an earlier one is what the run left
