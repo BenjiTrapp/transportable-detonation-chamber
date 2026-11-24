@@ -27465,8 +27465,9 @@ function binaryGraphExploreStatus(st) {
                 + `${cut.tableEdges ? ' and the counts on its edges are at least what they say' : ''}`);
         }
         if (cut.importers) {
-            why.push(`who imports ${n(cut.importers, 'opened node', 'opened nodes')} may be incomplete: an import table of the graph was cut short when the graph was read, `
-                + 'and a binary whose table was cut may be one that imports it');
+            // a fact about the graph, not about this node: the sentence points at the figure that says how big it is
+            why.push(`who imports ${n(cut.importers, 'opened node', 'opened nodes')} may be incomplete: some import tables of the graph were cut short when the graph was read, `
+                + 'and a binary whose table was cut may be one that imports it; the figures say how many');
         }
         if (cut.dropped) why.push(`${n(cut.dropped, 'did', 'did')} not fit on this canvas, which holds at most ${escapeHtml(String(BINARY_GRAPH_EXPLORE.cap))} nodes`);
         html += `<strong class="binary-graph-cut">Not the whole neighbourhood${cut.hidden ? `: ${n(cut.hidden, 'neighbour is', 'neighbours are')} not shown, ` : ', '}`
@@ -27500,7 +27501,7 @@ function binaryGraphExploreInfo(st) {
     if (left) html += ` · ${escapeHtml(left.toLocaleString('en-US'))} of its neighbours are not shown`;
     if (lost) html += ` · ${escapeHtml(lost.toLocaleString('en-US'))} of its imported functions are not shown`;
     if (cut.ofTable.has(node.id)) html += ' · its import table was cut short when it was read: modules may be missing';
-    if (cut.ofImporters.has(node.id)) html += ' · the list of its importers may be incomplete: an import table was cut short when the graph was read';
+    if (cut.ofImporters.has(node.id)) html += ' · the list of its importers may be incomplete: some import tables were cut short when the graph was read (the figures say how many)';
     return html;
 }
 
@@ -27866,7 +27867,7 @@ function binaryGraphDraw() {
         if (cut.hidden) pieces.push(`${cut.hidden.toLocaleString('en-US')} not shown`);
         if (cut.functions) pieces.push(`${cut.functions.toLocaleString('en-US')} imported functions not shown`);
         if (cut.tables) pieces.push(`${cut.tables.toLocaleString('en-US')} import ${cut.tables === 1 ? 'table' : 'tables'} cut short`);
-        if (cut.importers) pieces.push('importers may be incomplete (a table was cut short)');
+        if (cut.importers) pieces.push('importers may be incomplete (some tables cut short, the figures say how many)');
         ctx.fillStyle = themeColor('--severity-medium');
         ctx.fillText(`Not the whole neighbourhood: ${pieces.join(', ')} (the canvas holds ${BINARY_GRAPH_EXPLORE.cap} nodes)`, 12, 10);
     }

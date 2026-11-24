@@ -566,7 +566,7 @@ def test_the_curated_edge_and_the_match_do_not_look_like_a_deviation():
 
 def test_the_assets_moved_on():
     html = _read(INDEX_HTML)
-    for asset, minimum in (("style.css", 89), ("theme-cyberpunk.css", 38), ("app.js", 146)):
+    for asset, minimum in (("style.css", 89), ("theme-cyberpunk.css", 38), ("app.js", 147)):
         version = int(re.search(rf"{re.escape(asset)}\?v=(\d+)", html).group(1))
         assert version >= minimum, f"{asset} was changed and kept its ?v="
 
@@ -1486,8 +1486,9 @@ def test_importers_that_may_be_missing_because_a_table_was_cut_are_said_so():
       })();""")
     assert r["whole"]["status"] == "" and not any("cut short" in t for t in r["whole"]["texts"])
     status = _plain(r["status"])
-    assert "who imports" in status and "import table" in status and "cut short when the graph was read" in status and "may be incomplete" in status, status
+    assert "who imports" in status and "may be incomplete" in status and "some import tables of the graph were cut short when the graph was read" in status, status
+    assert "the figures say how many" in status, "the sentence points at the count instead of standing alone"
     assert "does not mean" in status
-    assert "importers may be incomplete" in r["info"]
-    assert any("importers" in t and "cut short" in t for t in r["texts"])
+    assert "importers may be incomplete" in r["info"] and "some import tables" in r["info"] and "the figures say how many" in r["info"]
+    assert any("importers" in t and "cut short" in t and "figures" in t for t in r["texts"])
     assert r["ids"] == ["app.exe", "kernel32.dll", "kernelbase.dll", "ntdll.dll", "win32u.dll"], "the importers that are known are still drawn"
