@@ -25431,7 +25431,10 @@ function rizinEmuWaitingHtml(waiting, functions, options) {
             + (apply ? `<button type="button" class="rizin-tool" data-rizin-act="apply-waiting"${off(busy)} title="The server says a run's bytes lie under this patch again: write it into the cache now. `
                 + `It checks once more." aria-label="Apply the waiting patch at ${addr} now">Apply now</button>` : '<span></span>')
             + (addr ? `<button type="button" class="rizin-tool rizin-emu-del" data-rizin-act="drop-waiting"${off(busy)} title="Remove this patch from the project: it will not come back when the file is opened again" `
-                + `aria-label="Remove the waiting patch at ${addr} from the project">✕</button>` : '<span></span>')
+                + `aria-label="Remove the waiting patch at ${addr} from the project">✕</button>`
+                // nothing else reaches a waiting patch (it is in no cache): a row that cannot be named exactly says it has no exit
+                : `<button type="button" class="rizin-tool rizin-emu-del" data-rizin-act="drop-waiting" disabled title="This address cannot be sent exactly, so this patch cannot be removed from here" `
+                + `aria-label="The waiting patch at an address that cannot be shown exactly cannot be removed from here">✕</button>`)
             + `<span class="rizin-emu-note rizin-emu-wait-why">${escapeHtml(why)}</span></div>`;
     };
     const more = entries.length - RIZIN_EMU_PANE.rows;
@@ -25865,7 +25868,7 @@ async function rizinRestoreRun() {
             : `Not restored: ${r.error}`, 'error');
         rizinRenderRunStrip();
         if (r.state === 'busy') rizinPollSoon();
-        else if (r.state === 'refused') await rizinLoadEmuPane(true, 'patches');       // the offer that allowed it was out of date
+        else if (r.state === 'refused' || r.state === 'error') await rizinLoadEmuPane(true, 'patches');       // the offer that allowed it was out of date, or what broke left the pane's state unknown
         return false;
     }
     const d = r.data, words = rizinEmuRestoreWords(d);
