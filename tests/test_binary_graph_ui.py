@@ -566,7 +566,7 @@ def test_the_curated_edge_and_the_match_do_not_look_like_a_deviation():
 
 def test_the_assets_moved_on():
     html = _read(INDEX_HTML)
-    for asset, minimum in (("style.css", 89), ("theme-cyberpunk.css", 38), ("app.js", 145)):
+    for asset, minimum in (("style.css", 89), ("theme-cyberpunk.css", 38), ("app.js", 146)):
         version = int(re.search(rf"{re.escape(asset)}\?v=(\d+)", html).group(1))
         assert version >= minimum, f"{asset} was changed and kept its ?v="
 
@@ -643,11 +643,11 @@ const nodeRoute = (url) => {
   const g = GRAPH[name];
   if (!g) return { status: 404, body: { error: name + ' is neither a binary nor an api set in the binary graph of this system.', in_degree: 0 } };
   return { body: { name, is: g.is || 'binary', kind: g.is === 'api-set' ? 'api-set' : /[.]exe$/.test(name) ? 'exe' : 'dll', machine: g.machine || '',
-                   in_degree: g.in_degree, partial: g.partial === true, imports: g.imports || {}, exports: [], forwarders: {}, hosts: g.hosts || [] } };
+                   in_degree: g.in_degree, partial: false, imports: g.imports || {}, exports: [], forwarders: {}, hosts: g.hosts || [] } };
 };
 const modNode = name => { const g = GRAPH[name] || {}; return { id: name, label: name, kind: g.is === 'api-set' ? 'api-set' : /[.]exe$/.test(name) ? 'exe' : 'dll', in_degree: g.in_degree || 0, category: '' }; };
 const STAMP = { build: '26220.5770', arch: 'arm64', created: '' };
-const cutAnswer = (fixed, parts, note, what) => {
+const cutAnswer = (fixed, parts, note, what, partial = false) => {
   const nodes = new Map(), edges = new Map(), roots = [];
   const take = p => { for (const n of p.nodes) if (!nodes.has(n.id)) nodes.set(n.id, n);
                       for (const e of p.edges) edges.set([e.source, e.target, e.kind, e.label].join('|'), e);
@@ -656,9 +656,11 @@ const cutAnswer = (fixed, parts, note, what) => {
   for (const p of parts) { if (nodes.size + p.nodes.filter(n => !nodes.has(n.id)).length > 400) break; take(p); kept++; }
   const truncated = kept < parts.length;
   if (truncated) note += ' Only the first ' + kept + ' of ' + parts.length + ' ' + what + ' are drawn: an answer is cut at 400 nodes.';
-  return { nodes: [...nodes.values()], edges: [...edges.values()], truncated, note, roots, total: parts.length, ...STAMP };
+  return { nodes: [...nodes.values()], edges: [...edges.values()], truncated, note, roots, total: parts.length, partial, ...STAMP };
 };
-const none = note => ({ nodes: [], edges: [], truncated: false, note, roots: [], total: 0, ...STAMP });
+const none = (note, partial = false) => ({ nodes: [], edges: [], truncated: false, note, roots: [], total: 0, partial, ...STAMP });
+// as the backend: a table of the binary itself for its imports, any table the query read for who imports it
+const anyCut = () => Object.values(GRAPH).some(g => g.partial === true);
 const derived = (source, target, kind, label) => ({ source, target, kind, origin: 'derived', label });
 const importsOf = name => {
   const g = GRAPH[name];
@@ -668,9 +670,9 @@ const importsOf = name => {
     const id = imported + '!' + fn;
     parts.push({ nodes: [{ id, label: fn, kind: 'function', in_degree: 0, category: '' }], edges: [derived(name, id, 'imports', imported)], roots: [] });
   }
-  if (!parts.length) return none(name + ' imports nothing.');
+  if (!parts.length) return none(name + ' imports nothing.', g.partial === true);
   return cutAnswer({ nodes: [modNode(name)], edges: [], roots: [name] }, parts, name + ' imports ' + parts.length + ' functions.'
-    + (g.partial ? ' Its import table was cut short when it was read, so the list may be incomplete.' : ''), 'imported functions');
+    + (g.partial ? ' Its import table was cut short when it was read, so the list may be incomplete.' : ''), 'imported functions', g.partial === true);
 };
 const importersOf = (target, fn) => {
   const t = GRAPH[target];
@@ -691,8 +693,8 @@ const importersOf = (target, fn) => {
     }
     if (part.edges.length) parts.push(part);
   }
-  if (!parts.length) return none('No binary in the graph imports ' + (fn ? fn + ' from ' : '') + target + '.');
-  return cutAnswer({ nodes: [modNode(target)], edges: [], roots: [target] }, parts, parts.length + ' binaries import ' + target + '.', 'binaries that import it');
+  if (!parts.length) return none('No binary in the graph imports ' + (fn ? fn + ' from ' : '') + target + '.', anyCut());
+  return cutAnswer({ nodes: [modNode(target)], edges: [], roots: [target] }, parts, parts.length + ' binaries import ' + target + '.', 'binaries that import it', anyCut());
 };
 const queryRoute = url => {
   const q = new URL(url, 'http://x').searchParams, module = (q.get('module') || '').toLowerCase();
@@ -929,10 +931,12 @@ def test_a_deep_walk_stops_after_its_budget_of_requests_and_says_how_much_it_lef
         await binaryGraphExpand('pool.dll');
         out({ queries: queries(asked).length, requests: requests.length - asked, note: st.note, status: els['binary-explore-status'].innerHTML });
       })();""")
-    # two for the first hop, then three for each module of the second (its imports, its importers, and what its import table was)
-    assert r["requests"] == 59 and r["queries"] == 40, "the budget counts every request, the reads of a table too"
-    assert "after 59 requests" in r["note"] and "81 nodes" in r["note"] and "not opened" in r["note"], r["note"]
-    assert "81 nodes" in _plain(r["status"])
+    # the walk spends its budget on the modules it opens and no more: two requests for the first hop, then two for each module
+    # of the second, until the next one would not fit; the note says how many it left
+    opened = (r["requests"] - 2) // 2
+    assert r["requests"] == r["queries"] <= 60 < r["requests"] + 2, "every request is a query: nothing is read besides the answers"
+    assert 0 < opened < 100 and f"after {r['requests']} requests" in r["note"] and f"{100 - opened} nodes" in r["note"] and "not opened" in r["note"], r["note"]
+    assert f"{100 - opened} nodes" in _plain(r["status"])
 
 
 @needs_node
@@ -1371,9 +1375,9 @@ def test_a_cut_import_table_keeps_its_caveat_once_modules_are_drawn():
     r = _explore_flow(r"""
       (async () => {
         initSyscalls(); binaryGraphSetMode('explore');
-        GRAPH['cutbin.exe'] = { in_degree: 0, partial: true, imports: { 'kernel32.dll': ['A', 'B'], 'user32.dll': ['C'] } };
         await binaryGraphExploreStart('app.exe'); await binaryGraphExpand('app.exe');
         const whole = { status: els['binary-explore-status'].innerHTML, labels: st.edges.map(e => e.label), texts: frame().texts };
+        GRAPH['cutbin.exe'] = { in_degree: 0, partial: true, imports: { 'kernel32.dll': ['A', 'B'], 'user32.dll': ['C'] } };
         await binaryGraphExploreStart('cutbin.exe'); await binaryGraphExpand('cutbin.exe');
         const cut = { status: els['binary-explore-status'].innerHTML, edges: st.edges.map(e => [e.target, e.functions, e.label, e.partial]),
                       info: els['binary-explore-info'].innerHTML, texts: frame().texts };
@@ -1450,3 +1454,40 @@ def test_the_status_points_at_the_edge_of_the_cut_list_only_where_that_edge_is_d
     assert r["two"]["user32"] and "the count on that edge is at least what it says" in r["two"]["text"]
     assert not r["one"]["user32"] and "imported functions were cut by the server" in r["one"]["text"]
     assert "the count on that edge" not in r["one"]["text"], "the edge that the sentence points at is not drawn"
+
+
+@needs_node
+def test_the_cut_of_a_table_comes_with_the_answer_and_costs_no_read_of_the_module():
+    r = _explore_flow(r"""
+      (async () => {
+        initSyscalls(); binaryGraphSetMode('explore');
+        await binaryGraphExploreStart('ntdll.dll'); await binaryGraphExpand('ntdll.dll');
+        const asked = requests.length;
+        await binaryGraphExpand('kernel32.dll');
+        const sent = requests.slice(asked);
+        out({ reads: sent.filter(q => q.url.startsWith('/api/binary-graph/node')).map(q => new URL(q.url, 'http://x').searchParams.get('name')).sort(),
+              queries: queries(asked) });
+      })();""")
+    assert r["queries"] == [{"q": "imports", "module": "kernel32.dll"}, {"q": "importers", "module": "kernel32.dll"}]
+    assert r["reads"] == ["api-ms-win-core-handle-l1-1-0.dll"], "kernel32 itself was not read for its table: only the module it drew for the first time"
+
+
+@needs_node
+def test_importers_that_may_be_missing_because_a_table_was_cut_are_said_so():
+    r = _explore_flow(r"""
+      (async () => {
+        initSyscalls(); binaryGraphSetMode('explore');
+        await binaryGraphExploreStart('app.exe'); await binaryGraphExpand('app.exe');
+        const whole = { status: els['binary-explore-status'].innerHTML, texts: frame().texts };
+        GRAPH['odd.dll'] = { in_degree: 1, partial: true, imports: {} };
+        await binaryGraphExploreStart('ntdll.dll'); await binaryGraphExpand('ntdll.dll');
+        out({ whole, status: els['binary-explore-status'].innerHTML, info: els['binary-explore-info'].innerHTML, texts: frame().texts,
+              ids: drawnIds(), labels: st.edges.map(e => e.label) });
+      })();""")
+    assert r["whole"]["status"] == "" and not any("cut short" in t for t in r["whole"]["texts"])
+    status = _plain(r["status"])
+    assert "who imports" in status and "import table" in status and "cut short when the graph was read" in status and "may be incomplete" in status, status
+    assert "does not mean" in status
+    assert "importers may be incomplete" in r["info"]
+    assert any("importers" in t and "cut short" in t for t in r["texts"])
+    assert r["ids"] == ["app.exe", "kernel32.dll", "kernelbase.dll", "ntdll.dll", "win32u.dll"], "the importers that are known are still drawn"

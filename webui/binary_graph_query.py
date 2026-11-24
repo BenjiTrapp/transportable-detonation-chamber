@@ -53,6 +53,7 @@ class Answer:
     note: str                   # prose for the reader, English, whole sentences; not a token for code
     roots: tuple[str, ...]      # ids of the nodes the view starts from, always among `nodes`
     total: int                  # how many parts (importers, chains, ...) the answer had before the cut; 0 when empty
+    partial: bool = False       # a table the answer read was cut short when it was read: a negative or a count is not certain
 
 
 # function name -> its SUSPICIOUS_IMPORTS category; the web UI fills it (set_categories) so this module needs no app
@@ -132,14 +133,21 @@ class _Part:
     roots: list
 
 
-def _empty(note):
-    return Answer((), (), False, note, (), 0)
+def _empty(note, partial=False):
+    return Answer((), (), False, note, (), 0, partial)
 
 
-def _answer(fixed, parts, note, what):
+def _any_partial(graph):
+    """Whether any binary of the graph has a table that was cut short: what a query that reads every binary (to find who
+    imports a module, or who reaches a syscall) has read, so what it may be missing."""
+    return any(info.partial for info in graph.binaries.values())
+
+
+def _answer(fixed, parts, note, what, partial=False):
     """The answer of `fixed` (always kept: the start the view needs) and `parts` in their order, as many as fit in
     MAX_NODES. The first part that does not fit ends it, so what is shown is the first k of them and the note can say
-    so; `what` names the parts in the plural ("binaries that import it")."""
+    so; `what` names the parts in the plural ("binaries that import it"). `partial` is the caveat of every table the
+    answer read, as `BinaryInfo.partial` and `Resolution.partial` mean it: the same word and meaning at each level."""
     nodes, edges, roots = {}, {}, []
 
     def take(part):
@@ -163,7 +171,7 @@ def _answer(fixed, parts, note, what):
     if truncated:
         note += (f" Only the first {kept} of {len(parts)} {what} are drawn: an answer is cut at {MAX_NODES} "
                  f"nodes.")
-    return Answer(tuple(nodes.values()), tuple(edges.values()), truncated, note, tuple(roots), len(parts))
+    return Answer(tuple(nodes.values()), tuple(edges.values()), truncated, note, tuple(roots), len(parts), partial)
 
 
 def _plural(count, one, many):
@@ -190,6 +198,8 @@ def importers_of(graph, module: str, function: str | None = None) -> Answer:
                       f"imports it.")
     label = function or ""
     known = {}
+    # every binary's table is read to find the importers, so a cut one anywhere may be hiding one
+    partial = _any_partial(graph)
 
     def node(name):
         if name not in known:
@@ -224,10 +234,10 @@ def importers_of(graph, module: str, function: str | None = None) -> Answer:
         if part.edges:
             parts.append(part)
     if not parts:
-        return _empty(f"No binary in the graph imports {what}.")
+        return _empty(f"No binary in the graph imports {what}.", partial)
     fixed = _Part([node(target)], [], [target])
     note = f"{_plural(len(parts), 'binary imports', 'binaries import')} {what}, directly or through an api set."
-    return _answer(fixed, parts, note, "binaries that import it")
+    return _answer(fixed, parts, note, "binaries that import it", partial)
 
 
 def imports_of(graph, module: str) -> Answer:
@@ -243,10 +253,10 @@ def imports_of(graph, module: str) -> Answer:
                    [_edge(name, _function_id(imported, function), "imports", imported)], [])
              for imported, functions in info.imports.items() for function in functions]
     if not parts:
-        return _empty(f"{name} imports nothing.{caveat}")
+        return _empty(f"{name} imports nothing.{caveat}", info.partial)
     note = (f"{name} imports {_plural(len(parts), 'function', 'functions')} from "
             f"{_plural(len(info.imports), 'module', 'modules')}.{caveat}")
-    return _answer(_Part([_module_node(graph, name)], [], [name]), parts, note, "imported functions")
+    return _answer(_Part([_module_node(graph, name)], [], [name]), parts, note, "imported functions", info.partial)
 
 
 def _chain(start, resolution):
@@ -285,7 +295,7 @@ def callers_of_syscall(graph, nt_name: str) -> Answer:
     exported = set(ntdll.exports)
     names = [name for name in (nt, "Zw" + nt[2:]) if name in exported]
     if not names:
-        return _empty(f"ntdll.dll in the binary graph of this system does not export {nt}.")
+        return _empty(f"ntdll.dll in the binary graph of this system does not export {nt}.", ntdll.partial)
     targets = {("ntdll.dll", name) for name in names}
     # a function name an import must carry to reach the stub: a forwarder keeps the name it was imported by, an api
     # set keeps the name it was asked for, so the name is either the stub's or that of a forwarder ending there
@@ -313,13 +323,13 @@ def callers_of_syscall(graph, nt_name: str) -> Answer:
                 parts.append(_chain_part(_chain(key, resolution), resolution,
                                          head=_module_node(graph, importer)))
     if not parts:
-        return _empty(f"No binary in the graph reaches {nt} through an import, a forwarder or an api set.")
+        return _empty(f"No binary in the graph reaches {nt} through an import, a forwarder or an api set.", _any_partial(graph))
     note = (f"{_plural(len(callers), 'binary reaches', 'binaries reach')} {nt} in ntdll.dll through an import, a "
             f"forwarder or an api set. A Win32 function that calls it in its own code is not such a chain and is not "
             f"counted here.")
     if cut_short:
         note += " A table on one of these chains was cut short when it was read, so the list may be incomplete."
-    return _answer(fixed, parts, note, "import chains")
+    return _answer(fixed, parts, note, "import chains", cut_short or _any_partial(graph))
 
 
 # --- the descent from an import to a syscall number --------------------------------------------------------------
@@ -404,16 +414,18 @@ def path_to_syscall(graph, table, baseline, module: str, function: str) -> Answe
         # a binary the graph holds that has no such function in its tables: there is nothing to draw, not a function
         # node for something that exists nowhere
         return _empty(f"{name} neither imports nor exports {function} in the binary graph."
-                      + (_CUT_SHORT_NEGATIVE if resolution.partial else ""))
+                      + (_CUT_SHORT_NEGATIVE if resolution.partial else ""), resolution.partial or info.partial)
     pairs = _chain(start, resolution)
     part = _chain_part(pairs, resolution, head=head, label=label,
                        roots=[head.id if head else _function_id(*pairs[0])])
+    # a table on the chain, and the importer's own, which the first edge reads
+    partial = resolution.partial or bool(imported and info.partial)
 
     def ended(note, caveat=_CUT_SHORT_REACHED):
         note += extra
         if resolution.partial:
             note += caveat
-        return _answer(_Part([], [], []), [part], note, "paths")
+        return _answer(_Part([], [], []), [part], note, "paths", partial)
 
     end_module, end_function = pairs[-1]
     end = _function_id(end_module, end_function)
@@ -501,7 +513,7 @@ def forwarder_chains(graph, module: str) -> Answer:
     if info is None:
         return _empty(f"{name or 'That name'} is not in the binary graph of this system.")
     if not info.forwarders:
-        return _empty(f"{name} forwards none of its exports.")
+        return _empty(f"{name} forwards none of its exports.", info.partial)
     parts, outcomes, cut_short = [], {}, 0
     for export in info.forwarders:
         resolution = graph.resolved.get((name, export))
@@ -517,7 +529,7 @@ def forwarder_chains(graph, module: str) -> Answer:
     if cut_short:
         note += (f" On {cut_short} of them a table was cut short when it was read, so where they end is not "
                  f"certain.")
-    return _answer(_Part([], [], []), parts, note, "forwarded exports")
+    return _answer(_Part([], [], []), parts, note, "forwarded exports", info.partial or cut_short > 0)
 
 
 def _reached(graph, info):
@@ -546,7 +558,8 @@ def shared_dependencies(graph, a: str, b: str) -> Answer:
     reached = {name: _reached(graph, graph.binaries[name]) for name in (first, second)}
     shared = sorted(module for module in reached[first] if module in reached[second])
     if not shared:
-        return _empty(f"{first} and {second} import no module in common, compared after api-set resolution.")
+        return _empty(f"{first} and {second} import no module in common, compared after api-set resolution.",
+                      graph.binaries[first].partial or graph.binaries[second].partial)
     fixed = _Part([_module_node(graph, first), _module_node(graph, second)], [], [first, second])
     parts = []
     for module in shared:
@@ -561,7 +574,7 @@ def shared_dependencies(graph, a: str, b: str) -> Answer:
         parts.append(part)
     note = (f"{first} and {second} both import {_plural(len(shared), 'module', 'modules')}, compared after api-set "
             f"resolution: an api set counts as its first host.")
-    return _answer(fixed, parts, note, "shared modules")
+    return _answer(fixed, parts, note, "shared modules", graph.binaries[first].partial or graph.binaries[second].partial)
 
 
 def node_detail(graph, name: str) -> dict:

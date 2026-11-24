@@ -1,5 +1,6 @@
 """The import graph of the system binaries, and the curated Win32 to Nt table under it."""
 
+import dataclasses
 import json
 import os
 import re
@@ -2888,6 +2889,7 @@ def test_the_query_route_answers_each_query_name_and_refuses_an_unknown_one(clie
         assert (body["build"], body["arch"], body["created"]) == ("26220.5770", "arm64", "2026-11-23T10:00:00Z")
         assert body["truncated"] is False
         assert body["total"] >= 1
+        assert body["partial"] is False
         assert set(body["nodes"][0]) == {"id", "label", "kind", "in_degree", "category"}
         assert set(body["edges"][0]) == {"source", "target", "kind", "origin", "label"}
     callers = client.get("/api/binary-graph/query?q=syscall-callers&syscall=NtClose").get_json()
@@ -3723,3 +3725,87 @@ def test_the_sentence_of_a_process_proof_changes_nothing_but_the_sentence(x64_ba
     (p,), (f,) = (memory_evidence.from_direct_stubs([h], "sample.exe") for h in (process, as_file))
     differ = {k for k in set(p) | set(f) if p.get(k) != f.get(k)}
     assert differ == {"detail", "address", "places"}
+
+
+# --- `partial` of an answer: a table behind it was cut short ----------------------------------------------------------
+
+def _cut_system(**partial):
+    """_system with the named binaries' tables marked cut short when they were read."""
+    infos = []
+    for info in _system().binaries.values():
+        infos.append(binary_graph.BinaryInfo(**{**info.__dict__, "partial": partial.get(info.name.replace(".", "_"), False)}))
+    return _query_graph(*infos, api_sets=dict(_system().api_sets))
+
+
+def test_every_answer_of_a_graph_with_no_cut_table_is_not_partial():
+    graph = _system()
+    answers = [binary_graph_query.importers_of(graph, "kernel32.dll"), binary_graph_query.importers_of(graph, "kernel32.dll", "CloseHandle"),
+               binary_graph_query.imports_of(graph, "d.exe"), binary_graph_query.callers_of_syscall(graph, "NtClose"),
+               binary_graph_query.forwarder_chains(graph, "kernel32.dll"), binary_graph_query.shared_dependencies(graph, "d.exe", "e.exe"),
+               binary_graph_query.imports_of(graph, "nothere.dll"), binary_graph_query.importers_of(graph, "nothere.dll"),
+               binary_graph_query.importers_of(graph, "ntdll.dll", "NoSuchFunction")]
+    assert len(answers) == 9 and all(a.partial is False for a in answers), [a.note for a in answers if a.partial]
+    assert binary_graph_query.answer_json(answers[0])["partial"] is False
+    assert dataclasses.fields(binary_graph_query.Answer)[-1].default is False, "the field is additive: the others set it or leave it"
+
+
+def test_the_imports_of_a_binary_whose_table_was_cut_are_partial_whether_or_not_it_imports_anything():
+    graph = _cut_system(d_exe=True)
+    assert binary_graph_query.imports_of(graph, "d.exe").partial is True
+    assert binary_graph_query.imports_of(graph, "e.exe").partial is False, "another binary's answer does not read d.exe"
+    bare = _query_graph(_q("bare.exe", "exe", partial=True))
+    got = binary_graph_query.imports_of(bare, "bare.exe")
+    assert got.nodes == () and got.partial is True, "'imports nothing' is a negative, and the table may have been cut"
+    assert binary_graph_query.answer_json(got)["partial"] is True
+
+
+def test_who_imports_this_is_partial_when_any_table_it_read_was_cut_even_one_of_an_importer_it_names_or_does_not():
+    # the answer reads every binary's table to find the importers: a cut table anywhere may hide one
+    for cut in ("a_exe", "ntdll_dll", "d_exe"):
+        graph = _cut_system(**{cut: True})
+        assert binary_graph_query.importers_of(graph, "kernel32.dll").partial is True, cut
+    assert binary_graph_query.importers_of(_cut_system(a_exe=True), "nobody.dll").partial is False, "a name the graph does not know reads no table"
+    none = binary_graph_query.importers_of(_cut_system(a_exe=True), "e.exe")
+    assert none.nodes == () and none.partial is True, "'nobody imports it' is a negative over tables that may be cut"
+
+
+def test_the_callers_of_a_syscall_are_partial_when_any_table_was_cut():
+    assert binary_graph_query.callers_of_syscall(_cut_system(d_exe=True), "NtClose").partial is True
+    assert binary_graph_query.callers_of_syscall(_system(), "NtClose").partial is False
+    assert binary_graph_query.callers_of_syscall(_cut_system(ntdll_dll=True), "NtNoSuchThing").partial is True, "ntdll's export table was read"
+    assert binary_graph_query.callers_of_syscall(_cut_system(d_exe=True), "Foo").partial is False, "not a syscall name: nothing was read"
+
+
+def test_the_forwarders_of_a_module_are_partial_when_its_own_table_or_a_table_on_a_chain_was_cut():
+    assert binary_graph_query.forwarder_chains(_cut_system(kernel32_dll=True), "kernel32.dll").partial is True
+    assert binary_graph_query.forwarder_chains(_cut_system(ntdll_dll=True), "kernel32.dll").partial is True, "a chain ends in the cut table"
+    assert binary_graph_query.forwarder_chains(_cut_system(d_exe=True), "kernel32.dll").partial is False, "a binary that is on no chain"
+    assert binary_graph_query.forwarder_chains(_cut_system(a_exe=True), "a.exe").partial is True, "it forwards none, and its table was cut"
+
+
+def test_the_shared_dependencies_are_partial_when_either_binary_was_cut():
+    assert binary_graph_query.shared_dependencies(_cut_system(e_exe=True), "d.exe", "e.exe").partial is True
+    assert binary_graph_query.shared_dependencies(_cut_system(d_exe=True), "d.exe", "e.exe").partial is True
+    assert binary_graph_query.shared_dependencies(_cut_system(a_exe=True), "d.exe", "e.exe").partial is False
+
+
+def test_the_path_to_a_syscall_is_partial_only_when_a_table_on_its_chain_was_cut(descent_baseline):
+    whole = _descend(_descent_system(), "kernel32.dll", "WriteProcessMemory", descent_baseline)
+    cut = _descend(_descent_system(cut_short=True), "kernel32.dll", "WriteProcessMemory", descent_baseline)
+    assert whole.partial is False and cut.partial is True
+    assert "cut short" in cut.note and "cut short" not in whole.note
+    start = _query_graph(*[binary_graph.BinaryInfo(**{**i.__dict__, "partial": i.name == "evil.exe"}) for i in _descent_system().binaries.values()],
+                         api_sets=dict(_descent_system().api_sets))
+    assert _descend(start, "evil.exe", "WriteProcessMemory", descent_baseline).partial is True, "the importer's own table is read too"
+    assert _descend(start, "kernel32.dll", "WriteProcessMemory", descent_baseline).partial is False, "a binary on no chain of this path"
+    assert _descend(_descent_system(cut_short=True), "kernelbase.dll", "NoSuchExport", descent_baseline).partial is True, "a negative over a cut table"
+
+
+def test_the_api_reference_and_the_help_both_name_partial_in_the_payload_of_the_query_route():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    reference = open(os.path.join(root, "docs", "api.md"), encoding="utf-8").read()
+    help_page = open(os.path.join(root, "webui", "templates", "index.html"), encoding="utf-8").read()
+    row = next(line for line in reference.splitlines() if line.startswith("| GET | `/api/binary-graph/query`"))
+    help_row = next(line for line in help_page.splitlines() if "<code>/api/binary-graph/query</code>" in line)
+    for where, text in (("docs/api.md", row), ("help-api", help_row)):
+        assert "partial" in text and "total" in text and "cut short" in text, where

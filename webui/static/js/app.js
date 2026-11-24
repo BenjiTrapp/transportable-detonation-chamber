@@ -27303,9 +27303,9 @@ function binaryGraphCombineOrigin(a, b) {
 // without adding to it. The origin of the edge is derived only if every edge it stands for is (binaryGraphCombineOrigin).
 // When the server cut the list, the last module's count is a lower bound and the modules after it are missing: the edge
 // says "at least", `functions` of the result says how many functions were cut and `last` which module is the lower bound.
-// When the opened module's own import table was cut short when the graph was built (`request.partial`, from its /node
-// answer: the query answer carries that only as a sentence in its note), every count of it is a lower bound and modules
-// may be missing: `tableCut`.
+// When a table the answer read was cut short when the graph was built (`partial` of the answer: for an `imports` answer the
+// module's own import table, for an `importers` answer any table of the graph, which it reads whole), every count of it is
+// a lower bound and modules may be missing: `tableCut`.
 function binaryGraphExploreParts(request, answer) {
     const a = answer && typeof answer === 'object' ? answer : {};
     const known = new Map((Array.isArray(a.nodes) ? a.nodes : []).filter(n => n && typeof n.id === 'string').map(n => [n.id, n]));
@@ -27326,12 +27326,12 @@ function binaryGraphExploreParts(request, answer) {
         }
         const last = cutShort && by.size ? [...by.keys()][by.size - 1] : '';
         const parts = [...by.keys()].sort().map(module => {
-            const n = by.get(module).functions.size, partial = module === last || request.partial === true;
+            const n = by.get(module).functions.size, partial = module === last || a.partial === true;
             const label = `${partial ? 'at least ' : ''}${n.toLocaleString('en-US')} function${n === 1 ? '' : 's'}`;
             return { head: module, nodes: [{ id: module, label: module, kind: binaryGraphGuessKind(module), in_degree: 0, category: '', guess: true }],
                      edges: [{ source: root, target: module, kind: 'imports', origin: by.get(module).origin, label, functions: n, partial }] };
         });
-        return { parts, server: 0, functions: cutShort ? Math.max(0, total - shown) : 0, last, tableCut: request.partial === true };
+        return { parts, server: 0, functions: cutShort ? Math.max(0, total - shown) : 0, last, tableCut: a.partial === true };
     }
     const end = e => (request.via && e.target === root ? { ...e, target: request.via } : e);
     const grouped = new Map();
@@ -27349,7 +27349,7 @@ function binaryGraphExploreParts(request, answer) {
     }
     const parts = [...grouped.values()].filter(p => known.has(p.head))
         .map(p => ({ head: p.head, nodes: [...p.ids].map(id => known.get(id)).filter(Boolean), edges: p.edges }));
-    return { parts, server: cutShort ? Math.max(0, total - parts.length) : 0, functions: 0, last: '', tableCut: request.dir === 'out' && request.partial === true };
+    return { parts, server: cutShort ? Math.max(0, total - parts.length) : 0, functions: 0, last: '', tableCut: a.partial === true };
 }
 
 // How many nodes of these parts are not drawn yet
@@ -27417,16 +27417,17 @@ function binaryGraphExploreMerge(st, parts, limit) {
 
 // What is cut now, per opened node and level: the parts the server dropped of its own answer, the imported functions it
 // dropped from a list grouped by module (and the module whose count is a lower bound), the nodes whose own import table was
-// cut short when the graph was read, and the heads of the parts that did not fit on the canvas (or whose drawn head lost
-// its edge) and are still not drawn. { hidden (neighbours known to be missing), server, functions, tables, dropped, any,
-// parents, of, ofFunctions, ofTable, lastDrawn, tableEdges }
+// cut short when the graph was read, the nodes whose importers were read over a cut table, and the heads of the parts that
+// did not fit on the canvas (or whose drawn head lost its edge) and are still not drawn. { hidden (neighbours known to be
+// missing), server, functions, tables, importers, dropped, any, parents, of, ofFunctions, ofTable, ofImporters, lastDrawn,
+// tableEdges }
 function binaryGraphExploreCut(st) {
-    const drawn = new Set(st.nodes.map(n => n.id)), heads = new Set(), of = new Map(), ofFunctions = new Map(), ofTable = new Set(), parents = new Set();
+    const drawn = new Set(st.nodes.map(n => n.id)), heads = new Set(), of = new Map(), ofFunctions = new Map(), ofTable = new Set(), ofImporters = new Set(), parents = new Set();
     let server = 0, functions = 0, lastDrawn = false, tableEdges = false;
     for (const record of st.cut.values()) {
         const left = [...record.dropped].filter(id => !drawn.has(id));
         const lost = [...record.edgeless];
-        if (!record.server && !record.functions && !record.table && !left.length && !lost.length) continue;
+        if (!record.server && !record.functions && !record.table && !record.tableIn && !left.length && !lost.length) continue;
         server += record.server;
         functions += record.functions;
         [...left, ...lost].forEach(id => heads.add(id));
@@ -27440,9 +27441,10 @@ function binaryGraphExploreCut(st) {
             ofTable.add(record.from);
             if (st.edges.some(e => e.source === record.from && e.partial)) tableEdges = true;
         }
+        if (record.tableIn) ofImporters.add(record.from);
     }
-    return { hidden: server + heads.size, server, functions, tables: ofTable.size, dropped: heads.size, any: parents.size > 0, parents: parents.size,
-             of, ofFunctions, ofTable, lastDrawn, tableEdges };
+    return { hidden: server + heads.size, server, functions, tables: ofTable.size, importers: ofImporters.size, dropped: heads.size, any: parents.size > 0,
+             parents: parents.size, of, ofFunctions, ofTable, ofImporters, lastDrawn, tableEdges };
 }
 
 // The line above the canvas: that the picture is cut, in words, and the note of the last step. { tone, html }
@@ -27461,6 +27463,10 @@ function binaryGraphExploreStatus(st) {
         if (cut.tables) {
             why.push(`${n(cut.tables, 'opened node has', 'opened nodes have')} an import table that was cut short when it was read, so modules may be missing`
                 + `${cut.tableEdges ? ' and the counts on its edges are at least what they say' : ''}`);
+        }
+        if (cut.importers) {
+            why.push(`who imports ${n(cut.importers, 'opened node', 'opened nodes')} may be incomplete: an import table of the graph was cut short when the graph was read, `
+                + 'and a binary whose table was cut may be one that imports it');
         }
         if (cut.dropped) why.push(`${n(cut.dropped, 'did', 'did')} not fit on this canvas, which holds at most ${escapeHtml(String(BINARY_GRAPH_EXPLORE.cap))} nodes`);
         html += `<strong class="binary-graph-cut">Not the whole neighbourhood${cut.hidden ? `: ${n(cut.hidden, 'neighbour is', 'neighbours are')} not shown, ` : ', '}`
@@ -27494,6 +27500,7 @@ function binaryGraphExploreInfo(st) {
     if (left) html += ` · ${escapeHtml(left.toLocaleString('en-US'))} of its neighbours are not shown`;
     if (lost) html += ` · ${escapeHtml(lost.toLocaleString('en-US'))} of its imported functions are not shown`;
     if (cut.ofTable.has(node.id)) html += ' · its import table was cut short when it was read: modules may be missing';
+    if (cut.ofImporters.has(node.id)) html += ' · the list of its importers may be incomplete: an import table was cut short when the graph was read';
     return html;
 }
 
@@ -27563,7 +27570,7 @@ async function binaryGraphExploreStart(name) {
     st.nodes = [node];
     st.edges = [];
     st.cut = new Map();
-    st.modules = new Map([[id, { kind: node.kind, in_degree: node.in_degree, machine: node.machine, partial: d.partial === true }]]);
+    st.modules = new Map([[id, { kind: node.kind, in_degree: node.in_degree, machine: node.machine }]]);
     st.selected = id;
     st.hovered = null;
     st.dragging = null;
@@ -27588,8 +27595,8 @@ async function binaryGraphExploreModules(st, names) {
         await Promise.all(todo.slice(i, i + BINARY_GRAPH_EXPLORE.batch).map(async name => {
             const r = await syscallApi(`/api/binary-graph/node?${new URLSearchParams({ name })}`);
             const d = r.data && typeof r.data === 'object' ? r.data : {};
-            if (r.ok) st.modules.set(name, { kind: binaryGraphDetailKind(d, name), in_degree: Math.max(0, Number(d.in_degree) || 0), machine: typeof d.machine === 'string' ? d.machine : '', partial: d.partial === true });
-            else if (r.status === 404) st.modules.set(name, { kind: binaryGraphGuessKind(name), in_degree: Math.max(0, Number(d.in_degree) || 0), machine: '', partial: false });
+            if (r.ok) st.modules.set(name, { kind: binaryGraphDetailKind(d, name), in_degree: Math.max(0, Number(d.in_degree) || 0), machine: typeof d.machine === 'string' ? d.machine : '' });
+            else if (r.status === 404) st.modules.set(name, { kind: binaryGraphGuessKind(name), in_degree: Math.max(0, Number(d.in_degree) || 0), machine: '' });
         }));
     }
     return todo.length;
@@ -27632,18 +27639,13 @@ async function binaryGraphExploreWalk(id, level) {
         for (let i = 0; i < current.length; i++) {
             const from = st.nodes.find(n => n.id === current[i]), requests = from ? binaryGraphExploreRequests(from, level) : [];
             if (!requests.length) continue;
-            // what its import table was when the graph was read (the query answer says it only in a sentence of its note)
-            const needsTable = requests.some(r => r.dir === 'out') && !st.modules.has(from.id);
-            if (hop > 0 && (st.nodes.length >= g.cap || reads + requests.length + (needsTable ? 1 : 0) > g.reads)) {
+            if (hop > 0 && (st.nodes.length >= g.cap || reads + requests.length > g.reads)) {
                 unopened = current.length - i;
                 break;
             }
             reads += requests.length;
-            const [answers, tableRead] = await Promise.all([Promise.all(requests.map(r => binaryGraphExploreAsk(r.params))),
-                                                            needsTable ? binaryGraphExploreModules(st, [from.id]) : 0]);
+            const answers = await Promise.all(requests.map(r => binaryGraphExploreAsk(r.params)));
             if (seq !== st.seq) return false;
-            reads += tableRead;
-            const tableCut = !!st.modules.get(from.id) && st.modules.get(from.id).partial === true;
             const results = [];
             answers.forEach((a, k) => {
                 if (!a.ok) {
@@ -27652,7 +27654,7 @@ async function binaryGraphExploreWalk(id, level) {
                     return;
                 }
                 if (hop === 0) opened = true;
-                const found = binaryGraphExploreParts({ ...requests[k], partial: tableCut }, a.answer);
+                const found = binaryGraphExploreParts(requests[k], a.answer);
                 results.push({ request: requests[k], found, note: typeof a.answer.note === 'string' ? a.answer.note : '' });
             });
             // the direction with fewer new nodes first, held to its share of the room
@@ -27674,7 +27676,7 @@ async function binaryGraphExploreWalk(id, level) {
                 const merged = binaryGraphExploreMerge(st, r.found.parts, limit);
                 const key = `${from.id}\n${r.request.dir}\n${r.request.level}`;
                 if (r.found.server || r.found.functions || r.found.tableCut || merged.dropped.length || merged.edgeless.length) {
-                    st.cut.set(key, { from: from.id, server: r.found.server, functions: r.found.functions, last: r.found.last, table: r.found.tableCut,
+                    st.cut.set(key, { from: from.id, server: r.found.server, functions: r.found.functions, last: r.found.last, table: r.found.tableCut && r.request.dir === 'out', tableIn: r.found.tableCut && r.request.dir === 'in',
                                       dropped: new Set(merged.dropped), edgeless: new Set(merged.edgeless) });
                 } else {
                     st.cut.delete(key);
@@ -27864,6 +27866,7 @@ function binaryGraphDraw() {
         if (cut.hidden) pieces.push(`${cut.hidden.toLocaleString('en-US')} not shown`);
         if (cut.functions) pieces.push(`${cut.functions.toLocaleString('en-US')} imported functions not shown`);
         if (cut.tables) pieces.push(`${cut.tables.toLocaleString('en-US')} import ${cut.tables === 1 ? 'table' : 'tables'} cut short`);
+        if (cut.importers) pieces.push('importers may be incomplete (a table was cut short)');
         ctx.fillStyle = themeColor('--severity-medium');
         ctx.fillText(`Not the whole neighbourhood: ${pieces.join(', ')} (the canvas holds ${BINARY_GRAPH_EXPLORE.cap} nodes)`, 12, 10);
     }
