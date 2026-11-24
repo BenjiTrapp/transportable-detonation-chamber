@@ -135,7 +135,7 @@ web UI's own Python (`binary_graph.py`) and its command line is `--out <director
 
 Two things that are not faults: an answer with **a table cut short**
 (`partial`) is a binary whose import, delay-load or export table the reader had
-to stop in, and the tab says every count it affects is a lower bound; and
+to stop in, and the exploration view and the figures say the counts it affects are lower bounds, where the other answers say they are not certain; and
 **files skipped** are PE files that could not be read, listed under the figure
 *skipped*.
 

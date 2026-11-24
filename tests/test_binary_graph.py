@@ -3885,6 +3885,7 @@ def test_the_api_reference_and_the_help_both_name_partial_in_the_payload_of_the_
     assert "the same word as `partial` of a binary and of a chain" in clause
     # the module's own table is an import table for `imports` and an export table for `forwarders`; the clause names neither as such
     assert "own import table" not in clause, clause
+    assert "read import tables" not in clause, "the `forwarders` list reads export tables: the lists read the tables of every binary"
     assert "(import, delay-load or export)" in clause, "the clause does not say which tables the flag covers"
 
 
@@ -4136,6 +4137,27 @@ def test_both_pages_name_the_figures_route_every_figure_and_the_curated_zw_edge(
     for page in (docs["/api/binary-graph/metrics"], helps["/api/binary-graph/metrics"]):
         assert "import, delay-load or export" in page, page
         assert "whose import table was cut short" not in page and "import tables cut short" not in page
+
+
+def test_every_page_that_says_which_edges_are_curated_names_the_zw_one_and_the_limit():
+    """The curated edge is the one thing the view must never pass off as read from a binary, and it has two kinds: the
+    last hop from a Win32 function to its Nt name, and a Zw name to its Nt name. A page that names only the first reads
+    as if the second were derived, so the five pages that say which edges are curated say the same four things. It cannot
+    tell whether the sentence around the words is right, only that none of them is left out or dropped later."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    read = lambda *parts: open(os.path.join(root, *parts), encoding="utf-8").read()
+    readme, memory, help_page = read("README.md"), read("docs", "memory.md"), read("webui", "templates", "index.html")
+    docs, helps = _api_rows()
+    row = next(line for line in readme.splitlines() if line.startswith("| **SYSCALLS** |"))
+    section = memory[memory.index("### The binary graph"):memory.index("## Before the first detonation")]
+    usage = help_page[help_page.index("<h4>SYSCALLS</h4>"):help_page.index("<h4>LitterBox</h4>")]
+    pages = {"README.md": row, "docs/memory.md": section, "#help-usage": usage,
+             "docs/api.md": docs["/api/binary-graph/query"], "#help-api": helps["/api/binary-graph/query"]}
+    for name, text in pages.items():
+        flat = " ".join(re.sub(r"<[^>]+>", " ", text).split())
+        for needle in ("curated", "Zw", "naming convention", "at most one per path"):
+            assert needle in flat, f"{name} does not say {needle!r} of the curated edge"
+        assert "except one kind" not in flat and "the one dashed edge" not in flat, name
 
 
 # --- Ruling 60: a list far above the cap is not built whole ---------------------------------------------------------------

@@ -747,7 +747,7 @@ def _cut_note(graph, effect):
 # Each list is `(parts, total, note, what, reads_tables, nothing)`: its parts as an iterator, built only as far as the cap
 # reaches (a real System32 has tens of thousands of edges, and a click on a number must not build them all), the `total`
 # it was counted to by the very function `metrics` counts it with, so that the two cannot be two numbers, the note of an
-# answer, the plural of its parts, whether it read import tables, and the note of an empty one.
+# answer, the plural of its parts, whether it read the tables of every binary, and the note of an empty one.
 
 def _members_binaries(graph, table):
     total = len(graph.binaries)

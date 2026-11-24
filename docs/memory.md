@@ -364,7 +364,7 @@ clean VM has been shown to sweep clean with it.
 ### The binary graph
 
 GRAPH beside MAP draws the **import graph of `C:\Windows\System32`** in the map's
-place: for every PE in that folder (about 4,000 binaries), which modules and which
+place: for every PE in that folder (expected to be about 4,000 binaries; not yet counted on a VM), which modules and which
 functions it imports, delay-loads included, what it exports, which exports are
 forwarders and where a forwarder ends, with api-set names resolved to the module
 that hosts them. It answers the question the baseline cannot: *by which door does
@@ -393,7 +393,7 @@ imported modules, skipped files, binaries with a cut table); a number opens the
 list behind it in the DETAIL panel and a row of that list starts an exploration.
 
 **What is read and what is written by hand.** Every edge is read from a binary
-except one kind. The last hop from a Win32 function to its Nt counterpart
+except the curated kind. The last hop from a Win32 function to its Nt counterpart
 (`WriteProcessMemory` to `NtWriteVirtualMemory`) is not in any file: it comes from
 the table `webui/win32_to_nt.json`, kept by hand. That edge is drawn **dashed and
 marked `curated`**, it is at most one per path and always the last, and the

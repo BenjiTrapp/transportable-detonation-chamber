@@ -48,10 +48,10 @@ configurable.
 **At provisioning**, `scripts/build-binary-graph.ps1` builds it (`make deploy`,
 `make.ps1 deploy` and `deploy-utm.py` copy it to `C:\tdc\scripts`, and setup runs it after
 `install-webui.ps1`). It reads the import, delay-load and export tables of every
-PE directly in `C:\Windows\System32`, about 4,000 files, with the VM's own Python
+PE directly in `C:\Windows\System32` (expected to be about 4,000 files; not yet counted on a VM), with the VM's own Python
 and `pefile`, follows every forwarded export through the api-set map to the
 module that defines it, and writes the result in one piece. Nothing is
-downloaded and nothing is asked of a service. A build takes a few minutes; the
+downloaded and nothing is asked of a service. A build is expected to take a few minutes (not yet timed on a VM); the
 script waits for it up to 30 minutes, and setup up to 40. A cache that is
 already there is kept only when it loads: one that is cut short or zero-filled
 (a power loss leaves such a file) is built again.
@@ -75,8 +75,8 @@ build-binary-graph.ps1` runs it on a VM.
 **On demand**, the web UI builds a missing cache or one that does not load by
 itself, in the background, the first time the GRAPH view or a figure asks for it. That build runs
 at below-normal priority, so that it does not take the CPU from a sample under
-observation, and reads the same 4,000 files, so expect a few minutes of disk
-and a Python process of a few hundred MB while it runs. It is not started while
+observation, and reads the same files, so it takes disk and CPU for as long as it
+runs. It is not started while
 tool updates run. A failed build is not tried again for ten minutes, and after
 **three failures in a row** not at all, until a usable cache appears: rebuild it by hand
 as above. What the tab says in each state, and what to do, is in
