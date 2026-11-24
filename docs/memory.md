@@ -439,6 +439,8 @@ dependency graph of System32 too, but it has no public API, this VM has no
 internet, and a foreign dataset would not be the one of this system; the tab only
 links to it, and nothing is queried or fetched from it.
 
+![The SYSCALLS tab in GRAPH view on build 26200.9974 arm64: the query path to syscall for kernel32.dll and WriteProcessMemory, the sentence that the last step is not read from any binary but comes from the curated Win32 to Nt table, the path drawn as WriteProcessMemory of kernel32.dll joined by a dashed edge labelled curated to NtWriteVirtualMemory of ntdll.dll at 0x3a, the legend naming derived, curated and origin-unknown edges, and the figures of the whole stock with 3,999 binaries, 107,715 import edges and 1,110 resolved api sets above the caveat that 7 binaries had a table cut short](../static/syscalls_graph.png)
+
 It has three parts. **PATH** asks one question and draws the answer from left to
 right, one layer per hop: *path to syscall* (an import such as `kernel32.dll` and
 `WriteProcessMemory`, followed over forwarders and api sets to the export that

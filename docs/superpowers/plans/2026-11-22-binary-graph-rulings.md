@@ -55,7 +55,7 @@ kamen drei erst ans Licht, nachdem ein Reviewer sie reproduziert hatte.
 
 ## Falsche Aussagen, korrigiert statt umgangen
 
-Vierzehn. Jede einzelne kam aus einem Review, keine aus einer Selbstmeldung.
+Fünfzehn. Jede einzelne kam aus einem Review, keine aus einer Selbstmeldung.
 
 1. Spec Ziel 7 erzählte von einer Kette „über kernel32 und kernelbase **zu ntdll**", während Ziel 6 selbst sagt, kernelbase **ruft** `NtWriteVirtualMemory` und leitet nicht weiter.
 2. „Der Loader probiert die Hosts der Reihe nach" — eine Behauptung über `ApiSetResolveToHost`, die keiner von uns geprüft hatte. Gestrichen, nicht umgedreht.
@@ -71,10 +71,11 @@ Vierzehn. Jede einzelne kam aus einem Review, keine aus einer Selbstmeldung.
 12. Entscheidung 66 stand an sechs Stellen als Behebung eines Fehlers, der nie gemessen war: 144 Einträge „mit leerem Host nach dem ersten", darunter Memory und Processthreads. Gemessen haben alle 144 einen einzigen Wert ohne Importeur und Host; die Regel für spätere Werte hat auf `26200.9974` keinen Fall (Entscheidung 75).
 13. Der Befundtext eines Stubs, von dessen Kopien nur einige Rumpf eines eigenen Exports sind, nannte alle Kopien „the module's own code" — die übrigen sind gerade mitgebrachte Stubs, und `docs/memory.md` nennt genau diesen Fall einen lauten Hinweis (Entscheidung 76).
 14. VM-Prüfung 5 erwartete für eine echte `ntdll.dll` in der x64-Sicht `True` auf jedem Treffer, was Entscheidung 70 verbietet (Entscheidung 77).
+15. Task 11 nannte den Screenshot `webui/static/syscalls-graph.png`. Beides falsch: die Screenshots des Repos liegen in `static/` an der Wurzel, und sie heißen mit Unterstrich (`theme_cyberpunk.png`). Dazu begrenzt das Design der README ihren Schaukasten auf 8 bis 11 Einträge, und er hielt bereits 11 — der Screenshot gehört also auf die Seite, die den Graphen erklärt (`docs/memory.md`), nicht in die README. Gefunden, weil der Test „jeder PNG in `static/` wird genannt" und der Test über den Schaukasten beide zusahen.
 
 Dazu zwei ungemessene Zahlen, die wie gemessene lasen: „a few hundred MB" (ohne jede
-Quelle, gestrichen) und „a build takes a few minutes über ~4.000 Dateien" (jetzt als
-Erwartung, bis die VM misst).
+Quelle, gestrichen) und „a build takes a few minutes über ~4.000 Dateien" (zuerst als
+Erwartung gekennzeichnet, dann auf der VM gemessen: 3.999 Dateien, 78 Sekunden, 28,2 MB).
 
 ## Ehrlichkeit als Regel, nicht als Stil
 
@@ -106,6 +107,7 @@ Erwartung, bis die VM misst).
 | **Die eigene Kamera der Erkundung ist angenommen**, statt sechs Funktionen des Prozessgraphen umzubauen. | Vierzig Zeilen Dopplung gegen das Risiko, einen funktionierenden Tab zu brechen. |
 | **`pefile` wird nicht gepinnt**, und sein Warntext wird nur für die benannten Notizen gelesen (Entscheidungen 65 und 67); jede andere Warnung zählt als Schnitt, ohne gelesen zu werden. | Eine abgeschnittene Datei läge als „importiert nichts" im Graphen. |
 | **Der Visited-Schlüssel ist `(module, function)`** und ist festgenagelt. | Nur am Modul geschlüsselt hätte eine legitime Kette `a!F → b!X → a!G` als Zyklus gegolten. |
+| **Jeder Abschnitt der GRAPH-Fläche behält seine Inhaltshöhe, und das Panel scrollt** (Entscheidung 78). Gemessen in echtem Chrome gegen die VM: die Pfadansicht durfte unter ihren Inhalt schrumpfen und malte Leinwand und Legende über die Zahlen — bei 1920 und 1280 px, in beiden Themes. Der erste Fix ließ dafür die Zahlen schrumpfen und machte aus 243 px Inhalt ein **30-px-Fenster ohne eine ganze Zeile**. Also: beide Ansichten auf `min-content`, die Zahlen schrumpfen nicht, ein Scrollbalken für das Panel. | Die Legende ist der einzige Ort, der eine kuratierte Kante von einer abgeleiteten trennt — unleserlich ist sie dort schlimmer als fehlend. |
 
 ## Vorgehen
 
