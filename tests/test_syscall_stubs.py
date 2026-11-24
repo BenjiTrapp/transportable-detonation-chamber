@@ -426,8 +426,20 @@ def test_a_stub_the_file_exports_under_its_own_name_says_so(x64_baseline):
                                  "code, not a stub carried past the documented path")
     (finding,) = memory_evidence.from_direct_stubs([_copy(0x8d0, True, True), _copy(0x900, False, False)], "s.dll")
     assert finding["import_present"] is True
-    assert finding["detail"] == ("NtWriteVirtualMemory stub the file exports under its own name (1 of 2 copies): "
-                                 "the module's own code, not a stub carried past the documented path")
+    # Ruling 76: only some copies are export bodies, so the sentence says that, and never calls the others the
+    # module's own code; it names what it counts (the copies in the file)
+    assert finding["detail"] == ("NtWriteVirtualMemory stub: 1 of the 2 copies in the file are the bodies of its own "
+                                 "export under that name and the others are not, so this is a hint rather than a "
+                                 "proof; a file that exports a syscall stub under an Nt name deserves a look")
+    assert "own code" not in finding["detail"]
+    # every file copy an export body, but a copy in process memory beside them (a detonation): no word for that one
+    process = dict(_copy(0, True), address=0x1F0000)
+    del process["offset"]
+    (finding,) = memory_evidence.from_direct_stubs([_copy(0x8d0, True, True), _copy(0x8e0, True, True), process],
+                                                   "s.exe")
+    assert finding["copies"] == 3
+    assert finding["detail"] == ("NtWriteVirtualMemory stub the file exports under its own name, in each of its 2 "
+                                 "copies in the file; a copy in process memory cannot be attributed to that export")
     # imported by the table, not exported: the old sentence
     (finding,) = memory_evidence.from_direct_stubs([_copy(0x8d0, True, False)], "s.dll")
     assert finding["detail"] == "NtWriteVirtualMemory stub carried by the sample, which imports it as well"

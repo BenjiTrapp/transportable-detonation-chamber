@@ -607,7 +607,7 @@ def from_direct_stubs(hits, process=""):
 
     Copies of one syscall are one finding, and it says the weakest claim among them (True over
     None over False), so a copy the file exports as its own code (``own_export``) is never
-    outvoted by one found before it; the detail then says the file exports the stub.
+    outvoted by one found before it; the detail then says which of its copies the file exports.
     """
     if not isinstance(hits, (list, tuple)):
         return []
@@ -653,10 +653,20 @@ def from_direct_stubs(hits, process=""):
         elif imported and in_process:
             detail = f"{name} stub in process memory; a module loaded in the process imports a door to it as well"
         elif imported and exported:
-            # Ruling 73: the rescue fired for these copies, a fact of each hit, not a judgment over the file
-            copies = f" ({exported} of {len(deciding)} copies)" if exported < len(deciding) else ""
-            detail = (f"{name} stub the file exports under its own name{copies}: the module's own code, not a stub "
-                      "carried past the documented path")
+            # Ruling 73: the rescue fired for these copies, a fact of each hit, not a judgment over the file.
+            # Ruling 76: the sentence speaks only for the copies it describes. It counts the copies in the file (the
+            # deciding ones), which `copies` does not: in a detonation that also counts the copies in process memory
+            in_file = len(deciding)
+            if exported == len(group):
+                detail = (f"{name} stub the file exports under its own name: the module's own code, not a stub "
+                          "carried past the documented path")
+            elif exported == in_file:
+                detail = (f"{name} stub the file exports under its own name, in each of its {in_file} copies in the "
+                          "file; a copy in process memory cannot be attributed to that export")
+            else:
+                detail = (f"{name} stub: {exported} of the {in_file} copies in the file are the bodies of its own "
+                          "export under that name and the others are not, so this is a hint rather than a proof; "
+                          "a file that exports a syscall stub under an Nt name deserves a look")
         elif imported:
             detail = f"{name} stub carried by the sample, which imports it as well"
         else:

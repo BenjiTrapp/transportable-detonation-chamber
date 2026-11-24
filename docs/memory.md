@@ -244,9 +244,18 @@ copies, those decide, since a process copy answers for every loaded module and n
 for the sample.
 
 A hit whose door is the file's own export of that stub carries `own_export`, and its
-finding and row say so: the file exports this stub under its own name, the module's
-own code rather than a stub carried past the documented path. That is a fact of each
-hit and needs no judgment over the file. Searching `ntdll.dll` itself in its own view
+row says so. The finding speaks only for the copies it describes: when every copy is
+an export body, it calls the stub the module's own code rather than a stub carried
+past the documented path; when only some of the copies in the file are, it says how
+many, that the others are not, and that the finding is therefore a hint rather than a
+proof and the file deserves a look. That is the loud indicator above: a decoy export
+under the Nt name buys a hint, never the words "own code". Counts in that sentence
+are of the copies in the file; the finding's `copies` also counts those in process
+memory. All of it is a fact of each hit and needs no judgment over the file. A
+cheaply declared decoy export over one copy turns the finding of its syscall into a
+hint whatever the other copies are, now whatever their order: that escape existed
+under the old first-copy rule as well, it fails toward a hint, the sentence names it,
+and it is accepted as such. Searching `ntdll.dll` itself in its own view
 is a category error rather than a bypass: nearly every stub reads that way, and the
 verdict is still SUSPICIOUS on several hundred hints alone, as its reasons name the
 kind and not the detail.

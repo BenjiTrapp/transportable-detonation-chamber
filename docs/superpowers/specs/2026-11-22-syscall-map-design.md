@@ -647,9 +647,19 @@ mitgebrachten Stub daher nie sähe.
   diese; eine Kopie im Prozessspeicher spricht für jedes geladene Modul, nie für das
   Sample, und ließe sonst jeden Datei-Beleg einer Detonation fallen.
 - **Ein Treffer, dessen Tür der eigene Export der Datei ist, sagt das** (Entscheidung
-  73, `own_export`): Die Datei exportiert diesen Stub unter seinem eigenen Namen, er
-  ist eigener Code des Moduls, kein am dokumentierten Weg vorbei mitgebrachter Stub.
-  Das ist eine Tatsache je Treffer und braucht keine Schwelle über die Datei.
+  73, `own_export`), und der Befund spricht nur für die Kopien, die er beschreibt
+  (Entscheidung 76). Ist jede Kopie Rumpf eines eigenen Exports, nennt er den Stub
+  eigenen Code des Moduls, keinen am dokumentierten Weg vorbei mitgebrachten. Sind es
+  nur einige der Kopien in der Datei, sagt er, wie viele, dass die übrigen es nicht
+  sind und der Befund darum ein Hinweis statt eines Belegs ist und die Datei einen
+  Blick verdient — der laute Hinweis von oben: ein Köder-Export unter dem Nt-Namen
+  kauft einen Hinweis, nie die Worte „eigener Code". Gezählt werden darin die Kopien
+  in der Datei; `copies` zählt in einer Detonation auch die im Prozessspeicher. Das
+  ist eine Tatsache je Treffer und braucht keine Schwelle über die Datei. Ein
+  billig erklärter Köder-Export über einer Kopie macht den Befund seines Syscalls zum
+  Hinweis, gleich was die übrigen Kopien sind und nun auch gleich in welcher
+  Reihenfolge: dieses Schlupfloch gab es unter der Regel der ersten Kopie schon, es
+  fällt zum Hinweis, der Satz benennt es, und es wird so hingenommen.
   Ntdll selbst zu durchsuchen ist ein Kategorienfehler, keine Umgehung: fast jeder
   Stub liest dann so, und das Urteil lautet trotzdem SUSPICIOUS aus mehreren hundert
   Hinweisen allein, weil seine Gründe die Art nennen, nicht das Detail.

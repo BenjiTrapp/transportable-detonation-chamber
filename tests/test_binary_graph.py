@@ -420,7 +420,8 @@ def test_an_unexported_copy_before_the_exported_one_does_not_make_the_finding_a_
         (0x3C0, False, False), (0x3E0, True, True)]
     [finding] = [f for f in body["evidence"]["findings"] if f["kind"] == "direct_syscall_stub"]
     assert finding["import_present"] is True and finding["needs_corroboration"] is True
-    assert "exports under its own name (1 of 2 copies)" in finding["detail"]
+    assert "1 of the 2 copies in the file are the bodies of its own export" in finding["detail"]
+    assert "own code" not in finding["detail"] and "deserves a look" in finding["detail"]
     assert body["evidence"]["label"] != "MALICIOUS"
 
 
