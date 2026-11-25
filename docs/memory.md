@@ -198,8 +198,8 @@ stage ran and its history entry was written; a stage that skipped itself, or a
 run older than this feature, has none). Choosing one measures nothing.
 
 A past measurement may never read as a scan of now. A banner over the map says
-PAST MEASUREMENT, the process and PID, when it was measured (the VM's clock, as
-the history wrote it), its build and view and that it is not a scan of now, with
+PAST MEASUREMENT, the process and PID, when it was measured (by the chamber's clock, as
+the history wrote it, with no time zone), its build and view and that it is not a scan of now, with
 BACK TO LIVE at its end. While it is shown, SCAN and STUBS are off, because a map
 half of then and half of now would read as one measurement; the live scan and
 stub search are put away when it comes, recording its hooks as known is not

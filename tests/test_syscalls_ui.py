@@ -3106,7 +3106,7 @@ def test_the_map_opens_a_measurement_the_list_did_not_hold_yet():
 
 def test_app_js_moved_on_with_the_past_measurement():
     html = _read(INDEX_HTML)
-    assert 'app.js?v=162"' not in html, "app.js changed, its version did not"
+    assert all(f'app.js?v={v}"' not in html for v in (162, 163)), "app.js changed, its version did not"
 
 
 def test_the_banner_of_a_past_measurement_is_a_notice_of_the_warning_tone_and_hides_when_it_is_put_away():
@@ -3117,3 +3117,119 @@ def test_the_banner_of_a_past_measurement_is_a_notice_of_the_warning_tone_and_hi
     assert "--severity-medium" in rules[".syscall-notice-warn"] and "--severity-critical" in rules[".syscall-notice-error"]
     from test_theme import _cyberpunk_values
     assert "cp-amber" in _cyberpunk_values()["--severity-medium"], "which is the --cp-amber family in Cyberpunk"
+
+
+# --- review of the past measurement: what the page says while one is shown --------------------------------
+
+@needs_node
+def test_under_a_refusal_the_catalog_rows_say_measured_and_not_placed_and_not_that_they_were_not_scanned():
+    """Ruling 1: a refusal draws no state, and a row with no state said "not scanned" - of a syscall the measurement
+    did scan. A module it did not scan (win32u, left out unless asked for) is still not scanned, and says so."""
+    r = _past(r"""
+      (async () => {
+        await shown();
+        const live = els['syscall-rows'].innerHTML;
+        routes['/api/syscalls/measurement'] = { body: pastBody({ states: null, problem: 'this system has no syscall baseline for build 26100.1, view arm64' }) };
+        await choosePast('a1b2c3d4e5f6');
+        const refused = els['syscall-rows'].innerHTML;
+        syscallState.module = 'win32u.dll'; syscallApplyFilter();
+        out({ live, refused, win32u: els['syscall-rows'].innerHTML });
+      })();""")
+    assert 'aria-label="Nt0, not scanned"' in r["live"], "before a scan of now, not scanned is true"
+    assert "not scanned" not in r["refused"]
+    assert re.search(r'aria-label="Nt0, measured, [^"]*not placed[^"]*"', r["refused"]), r["refused"][:400]
+    assert re.search(r'title="measured, [^"]*not placed[^"]*"', r["refused"])
+    assert 'aria-label="NtUser0, not scanned"' in r["win32u"], "a module the measurement did not cover"
+
+
+@needs_node
+def test_the_graph_legend_and_the_number_flag_speak_of_the_measurement_on_the_map_and_not_of_now():
+    """Ruling 2: "the last scan" and "the live bytes" are false of a past measurement while a newer scan exists."""
+    r = _past(r"""
+      (async () => {
+        els['binary-graph-legend'] = new Node('div');
+        await shown();
+        const live = els['binary-graph-legend'].innerHTML;
+        routes['/api/syscalls/measurement'] = { body: pastBody({ deviations: [{ ...PAST_DEVS[0], number_matches: false, live_number: 9 }] }) };
+        await choosePast('a1b2c3d4e5f6');
+        out({ live, past: els['binary-graph-legend'].innerHTML, list: els['syscall-deviations'].innerHTML,
+              fold: els['syscall-lower-fold'].title, back: (syscallBackToLive(), els['binary-graph-legend'].innerHTML),
+              liveFold: els['syscall-lower-fold'].title });
+      })();""")
+    assert "the last scan" in r["live"] and r["back"] == r["live"]
+    assert "last scan" not in r["past"] and "past measurement" in r["past"]
+    assert "PID 4242" in r["past"] and "2026-11-20 09:15:42" in r["past"]
+    assert "number differs" in r["list"] and "live bytes" not in r["list"] and "bytes read then" in r["list"]
+    # the fold over DEVIATIONS speaks of the measurement on the map too
+    assert "last scan" not in r["fold"] and "past measurement" in r["fold"], r["fold"]
+    assert "last scan" in r["liveFold"]
+
+
+@needs_node
+def test_a_refused_measurement_stays_when_the_baseline_changes_and_a_placed_one_is_put_away_in_a_whole_sentence():
+    """Ruling 3: a refused measurement draws no cell on any baseline, so a baseline change changes nothing about it.
+    One that is placed and loses its view is put away, and the note has no hole where a view should be."""
+    r = _past(r"""
+      (async () => {
+        await shown(); chooseTarget(4242);
+        routes['/api/syscalls/measurement'] = { body: pastBody({ view: '', build: '', states: null,
+            problem: 'the measurement names no usable build and view (build ?, view ?)' }) };
+        await choosePast('a1b2c3d4e5f6');
+        await syscallRefresh(true); await settle();
+        const refused = { past: !!syscallState.past, banner: banner(), note: els['syscall-scan-result'].hidden, scan: els['syscall-scan'].disabled };
+        syscallBackToLive();
+        routes['/api/syscalls/measurement'] = { body: pastBody({ view: 'x64' }) };
+        await choosePast('a1b2c3d4e5f6');
+        await syscallRefresh(true); await settle();
+        const placed = els['syscall-scan-result'].textContent;
+        // a placed one that names no view at all (it cannot be drawn, so the state is put by hand)
+        await choosePast('a1b2c3d4e5f6');
+        syscallState.scan = { ...syscallState.scan, view: '' }; syscallState.past.data = syscallState.scan;
+        await syscallRefresh(true); await settle();
+        out({ refused, placed, noView: els['syscall-scan-result'].textContent });
+      })();""")
+    assert r["refused"]["past"] is True and r["refused"]["banner"]["hidden"] is False and r["refused"]["note"] is True
+    assert r["refused"]["scan"] is True, "still the one measurement on the map"
+    assert "PID 4242 measured the x64 view" in r["placed"] and "the arm64 baseline the map now shows" in r["placed"]
+    assert "put away" in r["placed"]
+    for note in (r["placed"], r["noView"]):
+        assert "  " not in note and "the  view" not in note, note
+    assert "PID 4242 names no view" in r["noView"] and "arm64 baseline" in r["noView"], r["noView"]
+
+
+@needs_node
+def test_the_banner_says_whose_clock_the_time_is_and_the_list_and_the_label_keep_the_bare_time():
+    """Ruling 4: the history writes the chamber's datetime.now() with no zone; the banner says so, once."""
+    r = _past(r"""
+      (async () => {
+        await shown(); await choosePast('a1b2c3d4e5f6');
+        out({ banner: banner().html, list: els['syscall-past'].innerHTML, head: els['syscall-deviations-head'].textContent });
+      })();""")
+    from html import unescape
+    assert "2026-11-20 09:15:42" in r["banner"] and "chamber's clock" in unescape(r["banner"])
+    assert r["banner"].count("clock") == 1
+    assert "clock" not in r["list"] and "clock" not in r["head"]
+
+
+@needs_node
+def test_a_past_measurement_is_not_chosen_while_hooks_are_recorded_and_record_says_what_is_in_the_way():
+    """Ruling 5: recording measures the process again, now, as SCAN does; and under a past measurement the RECORD
+    button does not tell the reader to scan, which they cannot."""
+    r = _past(r"""
+      (async () => {
+        await shown(); chooseTarget(4242);
+        syscallState.hooks.busy = true; renderSyscallHooks();
+        const disabled = els['syscall-past'].disabled;
+        const before = requests.length;
+        const opened = await syscallOpenMeasurement('a1b2c3d4e5f6');
+        const asked = requests.length - before;
+        syscallState.hooks.busy = false; renderSyscallHooks();
+        const after = els['syscall-past'].disabled;
+        await choosePast('a1b2c3d4e5f6');
+        out({ disabled, opened, asked, after, note: els['syscall-scan-result'].textContent, hooks: els['syscall-hooks'].innerHTML });
+      })();""")
+    assert r["disabled"] is True and r["after"] is False
+    assert r["opened"] is False and r["asked"] == 0
+    record = re.search(r'<button[^>]*syscallCaptureHooks\(\)[^>]*>', r["hooks"]).group(0)
+    assert "disabled" in record and "Scan a process first" not in record
+    assert "past measurement" in record.lower() and "back to live" in record.lower(), record

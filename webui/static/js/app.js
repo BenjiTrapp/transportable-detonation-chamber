@@ -25084,15 +25084,18 @@ function syscallMapLegendHtml(counts, unscanned) {
 }
 
 // One row of the catalog under the map: the dot of its state, its name, its module and its number. `state` is
-// the measured state, absent without a scan; `selected` marks the chosen syscall.
+// the measured state, absent without a scan; `selected` marks the chosen syscall. `unplaced`: the past measurement on
+// the map did measure it, but its cells cannot be placed on this baseline, so it has no state here and is no
+// syscall that was not scanned.
 function syscallRowHtml(entry) {
     const name = String(entry.name === null || entry.name === undefined ? '' : entry.name);
     const state = entry.state ? String(entry.state) : '';
     const module = String(entry.module || '').replace(/\.dll$/i, '');
+    const none = entry.unplaced ? 'measured, its cell not placed on this baseline' : 'not scanned';
     return `<button type="button" class="syscall-row${entry.selected ? ' selected' : ''}"${entry.selected ? ' aria-current="true"' : ''} ` +
            `data-name="${escapeHtml(name)}" ` +
-           `aria-label="${escapeHtml(`${name}, ${state || 'not scanned'}`)}" onclick="syscallSelect(${jsArg(name)})">` +
-           `<span class="syscall-row-dot syscall-state-${cssToken(state || 'baseline')}" title="${escapeHtml(state || 'not scanned')}"></span>` +
+           `aria-label="${escapeHtml(`${name}, ${state || none}`)}" onclick="syscallSelect(${jsArg(name)})">` +
+           `<span class="syscall-row-dot syscall-state-${cssToken(state || 'baseline')}" title="${escapeHtml(state || none)}"></span>` +
            `<span class="syscall-row-name">${escapeHtml(name)}</span>` +
            `<span class="syscall-row-module">${escapeHtml(module)}</span>` +
            `<span class="syscall-row-num" title="${escapeHtml(entry.number)}">${escapeHtml(syscallHex(entry.number))}</span>` +
@@ -25274,7 +25277,9 @@ function syscallPastBannerHtml(past) {
     if (past.loading) return { tone: 'warn', html: tag + text(`Loading the measurement ${past.id}… It is not a scan of now.`) + back };
     if (!past.data) return { tone: 'error', html: tag + text(`The measurement ${past.id} could not be loaded: ${past.error}`) + back };
     const d = past.data;
-    let html = tag + text(`Measured ${syscallWhen(d.measured_at)}, not a scan of now: the process may have changed since, or be gone. ` +
+    // the history writes the chamber's datetime.now() and no zone: the time is said to be the chamber's, once, here
+    let html = tag + text(`Measured ${syscallWhen(d.measured_at)} by the chamber's clock (no time zone recorded), not a scan of now: ` +
+                          'the process may have changed since, or be gone. ' +
                           syscallScanSummary(d));
     if (past.refusal) html += `<span class="syscall-notice-text syscall-past-refusal">No map: ${escapeHtml(past.refusal)}. ` +
                               'Its figures and its deviations are its own and are shown.</span>';
@@ -25459,7 +25464,8 @@ function renderSyscallDetail(sc) {
 
 // The deviations of a scan as a table, the loudest first. `list` is what /scan holds under `deviations`: every state
 // but intact, unreadable and diverged included, so a row is not always a finding. options: scanned (false: no scan
-// yet), selected (a name), scores (name → what the stub added to the evidence score). A hook the allowlist knows
+// yet), selected (a name), scores (name → what the stub added to the evidence score), past (the list is of a past
+// measurement, whose bytes were read then). A hook the allowlist knows
 // stays in the list, with its owner, and says that it does not score: an EDR that hooks ntdll in this process is
 // something to see, even though it is not evidence.
 function renderSyscallDeviations(list, options) {
@@ -25489,7 +25495,7 @@ function renderSyscallDeviations(list, options) {
             ? `<code class="syscall-bytes view-table-clip" title="${escapeHtml(own)}">${syscallBytesHtml(own, other)}</code>` : '<span class="syscall-muted">–</span>');
         return `<tr${name === opts.selected ? ' class="selected"' : ''}>` +
             `<td data-sort-value="${escapeHtml(name)}"><button type="button" class="syscall-link" onclick="syscallSelect(${jsArg(name)})">${escapeHtml(name)}</button>` +
-            (d.number_matches === false ? ' <span class="syscall-flag" title="The live bytes carry another syscall number than the baseline">number differs</span>' : '') + '</td>' +
+            (d.number_matches === false ? ` <span class="syscall-flag" title="${opts.past ? 'The bytes read then carry' : 'The live bytes carry'} another syscall number than the baseline">number differs</span>` : '') + '</td>' +
             `<td class="view-table-num" data-sort-value="${escapeHtml(d.number)}">${escapeHtml(syscallHex(d.number))}</td>` +
             `<td data-sort-value="${rank(d)}"><span class="syscall-row-dot syscall-state-${cssToken(state)}"></span> ${escapeHtml(state)}</td>` +
             `<td>${bytes(d.expected, d.actual)}</td><td>${bytes(d.actual, d.expected)}</td>` +
@@ -25639,6 +25645,7 @@ function renderHookAllowlist(state) {
     const hookable = scan ? Number(scan.hookable) || 0 : 0;
     const record = !scan || hookable === 0 || st.busy === true || st.loaded !== true;
     const recordTitle = st.loaded !== true ? 'The known hooks have not been read yet: recording waits for them'
+        : st.past === true ? 'A past measurement is on the map: go back to live and scan, the hooks of a run of now are what gets recorded'
         : !scan ? 'Scan a process first: the hooks of that run are what gets recorded'
         : hookable === 0 ? 'The last scan found no hook that is not known already' : 'Record the hooks of the last scan as known (asks first)';
     const forgetThis = !st.scope || !entries.length || st.busy === true;
@@ -25813,6 +25820,8 @@ async function syscallLoadBaseline(view) {
 function syscallDropForeignScan() {
     const scan = syscallState.scan, baseline = syscallState.baseline;
     if (!scan || (baseline && baseline.view === scan.view)) return;
+    // a refused past measurement draws no cell on any baseline: another one changes nothing about it
+    if (syscallPastRefusal()) return;
     const past = scan.live === false;
     syscallState.scan = null;
     syscallState.states = null;
@@ -25823,9 +25832,10 @@ function syscallDropForeignScan() {
     syscallState.note = {
         tone: 'warn',
         text: past
-            ? `The past measurement of PID ${scan.pid} measured the ${scan.view} view, but the map shows ` +
-              `${baseline ? `the ${baseline.view} baseline` : 'no baseline'}: it is put away. Choose it again to see it.`
-            : `The scan of PID ${scan.pid} measured the ${scan.view} view, but the map shows ` +
+            ? `The past measurement of PID ${scan.pid} ${scan.view ? `measured the ${scan.view} view` : 'names no view'}, so it cannot be placed ` +
+              `${baseline ? `on the ${baseline.view} baseline the map now shows` : 'while the map shows no baseline'}: it is put away. ` +
+              'Choose it again to see its figures and deviations.'
+            : `The scan of PID ${scan.pid} ${scan.view ? `measured the ${scan.view} view` : 'names no view'}, but the map shows ` +
               `${baseline ? `the ${baseline.view} baseline` : 'no baseline'}: its measurement is cleared.`,
     };
 }
@@ -26016,6 +26026,10 @@ function renderSyscallRows() {
     const match = syscallState.match;
     const matching = match ? items.filter(item => match.has(item.name)) : items;
     const shown = matching.slice(0, SYSCALL_ROWS_MAX);
+    // under a refusal: the modules the measurement covered, whose rows have no state only because none is drawn
+    const unplaced = syscallPastRefusal() && syscallState.scan
+        ? new Set((Array.isArray(syscallState.scan.modules) ? syscallState.scan.modules : ['ntdll.dll']).map(m => String(m).toLowerCase()))
+        : null;
     if (head) {
         head.textContent = `Catalog · ${matching.length.toLocaleString('en-US')} of ${items.length.toLocaleString('en-US')} syscalls` +
             (matching.length > shown.length ? ` · the first ${shown.length} listed, narrow the filter for the rest` : '');
@@ -26025,6 +26039,7 @@ function renderSyscallRows() {
     host.innerHTML = shown.length
         ? shown.map(item => syscallRowHtml({
             ...item, state: syscallState.states ? syscallState.states.get(item.name) : '', selected: item.name === syscallState.selected,
+            unplaced: !!unplaced && unplaced.has(item.module),
         })).join('')
         : (items.length ? '<div class="syscall-empty">No syscall matches the filter.</div>' : '');
     host.scrollTop = top;
@@ -26062,7 +26077,7 @@ function renderSyscallToolbar() {
     }
     const choice = document.getElementById('syscall-past');
     if (choice) {
-        const busy = syscallState.scanning || syscallState.stubs.running;
+        const busy = syscallState.scanning || syscallState.stubs.running || syscallState.hooks.busy;
         choice.disabled = busy;
         choice.title = busy ? 'A measurement of now is under way: a past one can be chosen when it is done'
             : 'Look at a measurement the scan history kept, a detonation\'s among them: it is drawn as it was measured then, nothing is measured again';
@@ -26170,7 +26185,8 @@ function syscallApplyLower() {
     const button = document.getElementById('syscall-lower-fold');
     if (button) {
         button.setAttribute('aria-expanded', String(!folded));
-        button.title = folded ? 'Show the panels of the last scan' : 'Fold the panels of the last scan away';
+        const whose = syscallState.scan && syscallState.scan.live === false ? 'the past measurement on the map' : 'the last scan';
+        button.title = folded ? `Show the panels of ${whose}` : `Fold the panels of ${whose} away`;
         button.setAttribute('aria-label', button.title);
     }
     const note = document.getElementById('syscall-lower-note');
@@ -26402,7 +26418,7 @@ function syscallOnPast() {
 async function syscallOpenMeasurement(id) {
     const wanted = String(id ?? '');
     if (!wanted) return syscallBackToLive();
-    if (syscallState.scanning || syscallState.stubs.running) {
+    if (syscallState.scanning || syscallState.stubs.running || syscallState.hooks.busy) {
         syscallSetScanNote('warn', 'A measurement of now is under way: choose the past one when it is done.');
         renderSyscallPastList();
         return false;
@@ -26613,7 +26629,8 @@ function renderSyscallDeviationPanel() {
     }
     if (!host) return;
     const top = host.scrollTop;
-    host.innerHTML = renderSyscallDeviations(list, { scanned: !!scan, selected: syscallState.selected, scores: syscallScores(scan) });
+    host.innerHTML = renderSyscallDeviations(list, { scanned: !!scan, selected: syscallState.selected, scores: syscallScores(scan),
+                                                     past: !!scan && scan.live === false });
     host.scrollTop = top;
 }
 
@@ -26833,6 +26850,7 @@ function syscallHooksModel() {
     const h = syscallState.hooks, baseline = syscallState.baseline, scan = syscallState.scan;
     const model = {
         entries: h.entries, loaded: h.loaded, problem: h.problem, error: h.error, note: h.note, busy: h.busy, scan: null,
+        past: !!scan && scan.live === false,
         scope: baseline && baseline.build && baseline.view ? { build: String(baseline.build), view: String(baseline.view) } : null,
     };
     // recording measures the process again, now: a past measurement is not what it would be checked against
@@ -26857,6 +26875,8 @@ function renderSyscallHooks() {
     host.innerHTML = renderHookAllowlist(syscallHooksModel());
     host.scrollTop = top;
     syscallApplyLower();
+    // recording measures now: the choice of a past measurement waits for it
+    renderSyscallToolbar();
 }
 
 async function syscallLoadHooks() {
@@ -27308,7 +27328,7 @@ function binaryGraphSvg(layout, model) {
 // deviation and a filter match. It names only what the drawing in front of the reader can show: the explore view
 // (mode 'explore', with the edges it draws) has no syscall, deviation or filter match, and a curated or unknown edge
 // only where one is drawn.
-function binaryGraphLegend(mode, edges) {
+function binaryGraphLegend(mode, edges, past) {
     const explore = mode === 'explore';
     const drawn = new Set((Array.isArray(edges) ? edges : []).map(e => binaryGraphOrigin(e)));
     const item = (key, mark, text, help) =>
@@ -27331,9 +27351,12 @@ function binaryGraphLegend(mode, edges) {
             'An edge whose answer names neither origin. It is not claimed to be read from a binary.'));
     }
     if (explore) return parts.join('');
+    // the deviations are those of the measurement on the map: a past one is named as such, never as the last scan
+    const whose = past && typeof past === 'object'
+        ? `the past measurement on the map (PID ${past.pid}, measured ${syscallWhen(past.measured_at)})` : '';
     parts.push(item('deviation', box(themeColor(SYSCALL_STATE_COLORS.patched), themeColor(SYSCALL_STATE_COLORS.patched, 0.18)),
-        'deviated in the last scan, and the path to it, in the colour of its state on the map',
-        'A syscall whose stub the last scan of this view did not find intact, coloured as on the map, and every edge on a path into it.'));
+        `deviated in ${whose ? 'the past measurement on the map' : 'the last scan'}, and the path to it, in the colour of its state on the map`,
+        `A syscall whose stub ${whose || 'the last scan of this view'} did not find intact, coloured as on the map, and every edge on a path into it.`));
     parts.push(item('match', box(themeColor('--text-muted'), themeColor('--bg-secondary'),
         `<rect x="0.5" y="0.5" width="17" height="11" rx="3" fill="none" stroke="${themeColor('--graph-match')}" stroke-width="1"></rect>`),
         'filter match', 'A node the filter of the tab matches: its name, or for a syscall its name or number as on the map.'));
@@ -27388,7 +27411,8 @@ function renderBinaryGraph() {
         status.hidden = !s.html;
     }
     const legend = document.getElementById('binary-graph-legend');
-    if (legend) legend.innerHTML = binaryGraphLegend();
+    const scan = syscallState.scan;
+    if (legend) legend.innerHTML = binaryGraphLegend('path', [], scan && scan.live === false ? scan : null);
     const host = document.getElementById('binary-graph-canvas');
     if (!host) return;
     if (st.loading || !st.nodes.length) {
