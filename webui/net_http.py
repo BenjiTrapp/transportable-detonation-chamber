@@ -98,7 +98,10 @@ Only the ``Upgrade``/``101`` exchange is a WebSocket; ``permessage-deflate``
 frames are not inflated, so such a message has ``text`` None.
 
 ``dest`` is the Host header's name (lower case, no port) and falls back to the
-server address; ``port`` is the TCP port. ``content_type`` and
+server address; ``port`` is the TCP port. ``dest`` and ``url`` keep the bytes of
+the request (ASCII, any other byte as a ``surrogateescape`` code point), not a
+guess at their character set: ``net_analyze`` renders every name of every
+protocol from its bytes, so one name has one spelling. ``content_type`` and
 ``content_encoding`` are the response's (the response decides whether a
 download happened); the request's are ``headers["content-type"]`` and
 ``request_encoding``.
@@ -162,6 +165,13 @@ def _decode(raw):
         return raw.decode("latin-1")
 
 
+def _name_text(raw):
+    """A name's bytes as text from which they can be recovered exactly (ASCII,
+    every other byte a ``surrogateescape`` code point), for ``net_analyze`` to
+    render the way DNS names are rendered."""
+    return raw.decode("ascii", "surrogateescape")
+
+
 def _first_line(stream):
     head = bytes(stream[:4096]).split(b"\n", 1)[0].rstrip(b"\r")
     return head.decode("latin-1")
@@ -200,6 +210,7 @@ class _Message:
         self.target = ""
         self.status = None
         self.headers = []           # [(name, value)] in order, original case
+        self.host_raw = None        # the bytes of the first Host header
         self.body = b""
         self.truncated = False
 
@@ -238,6 +249,8 @@ def _read_head(stream, pos, request):
         name = name.strip()
         if sep and name:
             msg.headers.append((_decode(name), _decode(value).strip()))
+            if msg.host_raw is None and name.lower() == b"host":
+                msg.host_raw = value.strip()
     msg.end = body_start
     msg.truncated = not complete
     return msg
@@ -732,7 +745,11 @@ class _Origin:
         self.headers, self.order = _headers_of(req.headers if req else ())
         target = req.target if req else ""
         self.path, self.query, absolute = _split_target(target) if req else ("", "", False)
-        authority = self.headers.get("host", "").lower()
+        # dest and url keep the bytes of the name (see _name_text); the request
+        # line was read as Latin-1, which gives them back byte for byte
+        raw_host = req.host_raw if req is not None else None
+        authority = _name_text(raw_host).lower() if raw_host is not None else ""
+        target = _name_text(target.encode("latin-1"))
         name = _host_of(authority) if authority else ""
         if not name and absolute:
             try:

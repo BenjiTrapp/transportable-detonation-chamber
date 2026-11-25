@@ -79,6 +79,9 @@ Not read: the FTP data connections (the file contents are on another flow),
 SMTP ``BDAT`` chunks (read as lines) and anything past STARTTLS. Bytes from a
 capture are never executed or opened as a file.
 
+``user``, ``mail_from`` and ``rcpt_to`` keep their bytes (ASCII, any other byte
+as a ``surrogateescape`` code point) rather than a guess at their character set,
+so that ``net_analyze`` gives a name one spelling whichever protocol carried it.
 ``dest`` is the server address and ``port`` its TCP port; ``ts`` is that of the
 client's first byte (the ``MAIL FROM`` line for an ``smtp`` event).
 """
@@ -212,6 +215,13 @@ def _text(raw):
         return raw.decode("utf-8")
     except UnicodeDecodeError:
         return raw.decode("latin-1")
+
+
+def _name(raw):
+    """A name's bytes as text from which they can be recovered exactly (ASCII,
+    every other byte a ``surrogateescape`` code point); ``net_analyze`` renders
+    it as DNS names are rendered."""
+    return raw.decode("ascii", "surrogateescape")
 
 
 def _clip(text):
@@ -380,7 +390,7 @@ def _read_ftp(side):
             s.attempts += 1
         _keep(s.capped, "commands", s.commands, _clip(shown))
         if verb == "USER":
-            s.user = arg
+            s.user = _name(raw.lstrip()).partition(" ")[2].strip()
         elif verb == "RETR" or verb in _FTP_STORE:
             if arg:
                 _keep(s.capped, "files", s.files, _clip(arg), unique=True)
@@ -518,7 +528,7 @@ def _credentials(s, expect, line):
     raw = _b64(line)
     text = _text(raw) if raw is not None else ""
     if expect == "login_user":
-        s.user = text
+        s.user = _name(raw) if raw is not None else ""
         return "login_pass"
     if expect == "login_pass":
         s.password = text
@@ -526,7 +536,7 @@ def _credentials(s, expect, line):
         return None
     parts = (raw or b"").split(b"\x00")
     if len(parts) >= 2:
-        s.user, s.password = _text(parts[-2]), _text(parts[-1])
+        s.user, s.password = _name(parts[-2]), _text(parts[-1])
         s.attempts += 1
     return None
 
@@ -572,13 +582,13 @@ def _read_smtp(side):
             expect = None
         verb = line.partition(" ")[0].upper()
         if verb == "MAIL":
-            found = _MAIL_FROM.match(line)
+            found = _MAIL_FROM.match(_name(raw).lstrip())
             if found:
                 if mail is not None:
                     s.mails.append(mail)
                 mail = _Mail(side.at(start), _clip(found.group(1)))
         elif verb == "RCPT":
-            found = _RCPT_TO.match(line)
+            found = _RCPT_TO.match(_name(raw).lstrip())
             if found and mail is not None:
                 _keep(mail.capped, "rcpt_to", mail.rcpt_to, _clip(found.group(1)))
         elif verb == "DATA" and mail is not None:

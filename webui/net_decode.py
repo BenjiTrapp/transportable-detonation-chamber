@@ -651,6 +651,12 @@ def _mask_parts(text):
     return boundary.join(pieces)
 
 
+def is_secret_name(name):
+    """Does a name (a form key, a header, a JSON key) say it holds a secret?
+    The test ``credential`` applies to the name a value was found under."""
+    return isinstance(name, str) and bool(_SECRET_NAME.search(name))
+
+
 def mask_credentials(text, lines=False):
     """``text`` with every credential value the ``credential`` flag would name
     replaced by ``***``, and everything else kept.

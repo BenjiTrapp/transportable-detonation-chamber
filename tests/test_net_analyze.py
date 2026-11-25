@@ -22,6 +22,16 @@ Regressions covered:
     SMTP login, or showed the password, or the text and base64 of a decoded
     credential, or a password sent in plain text (a login form, a query
     string, URL userinfo, a ``name: value`` upload)
+  * a password in a URL reached the report through a finding built from the
+    raw event; a WebSocket message, a cookie, an API-key header and a
+    response echoing the password were not masked either. One masking pass now
+    covers the whole report, whatever key a value sits under
+  * one name had two spellings: DNS and TLS rendered it byte by byte, HTTP and
+    SMTP after a UTF-8-or-Latin-1 guess, so a name with a byte above 0x7F gave
+    two IOCs; URLs and user names kept raw control bytes
+  * every server address of the idle machine came back as an IOC through the
+    connection events, although the name it served was ``known_good``
+  * an error line copied a raw NUL out of an exception text
   * one parser that raised took the whole analysis down
   * an empty capture looked the same as a capture in which nothing was found
 """
@@ -40,6 +50,7 @@ import net_baseline
 import net_events
 import net_rules
 import net_tls
+import test_net_http
 
 from test_net_default_rules import (CLIENT, RESOLVER, Capture, _benign_capture, _ok, _pe,
                                     _tcp_frame, _udp_frame)
@@ -564,3 +575,116 @@ def test_a_broken_step_after_the_parsers_is_an_error_too(tmp_path, monkeypatch):
     r = net_analyze.analyze_pcap(_pcap_with_http_c2(tmp_path))
     assert any("net_behavior" in e for e in r["errors"]) and r["behavior"] == []
     assert r["event_summary"]["http"] >= 1
+
+
+# --- review round 1 ----------------------------------------------------------------------
+
+_ODD = b"ev\x1bil\x00x.t\xe9p"
+_ODD_TEXT = "ev\\027il\\000x.t\\233p"
+
+
+def test_a_password_on_an_event_that_makes_a_finding_is_masked_there_too(tmp_path):
+    cap = Capture()
+    cap.get(5.0, "stage.top", "/a.exe?user=x&password=Find-Pw-1", _pe(),
+            "application/octet-stream")
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap), process="a.exe")
+    staging = [f for f in r["evidence_findings"] if f["kind"] == "payload_staging"]
+    assert staging and staging[0]["url"] == "http://stage.top/a.exe?user=x&password=***"
+    assert "Find-Pw-1" not in json.dumps(r)
+
+
+def test_messages_cookies_key_headers_and_replies_are_masked(tmp_path):
+    cap = Capture()
+    request = (b"GET /ws HTTP/1.1\r\nHost: c2.top\r\nUpgrade: websocket\r\n"
+               b"Cookie: session=Cookie-Tok-88; pass=Cookie-Pw-88\r\nX-Api-Key: Hdr-Key-99\r\n\r\n"
+               + test_net_http._ws_frame(b"login user=eve&pass=Ws-Pw-15", masked=True))
+    cap.web(5.0, "c2.top", request, b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
+    cap.post(9.0, "shop.top", "/login", b"user=bob&pass=Echo-Pw-44",
+             reply=b'{"ok": true, "password": "Echo-Pw-44"}', reply_type="application/json")
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    text = json.dumps(r)
+    for secret in ("Ws-Pw-15", "Cookie-Tok-88", "Cookie-Pw-88", "Hdr-Key-99", "Echo-Pw-44"):
+        assert secret not in text, secret
+    assert r["event_summary"]["websocket"] == 1
+
+
+def test_one_masking_pass_covers_any_key_of_the_report():
+    report = {"future": [{"url": "http://h.top/?pass=Fut-Pw-1", "deep": {"note": "token=Fut-2"}}],
+              "events": [{"headers": {"cookie": "a=b", "x-auth-token": "t", "accept": "*/*"}}]}
+    out = net_analyze.mask_report(report)
+    assert "Fut-Pw-1" not in json.dumps(out) and "Fut-2" not in json.dumps(out)
+    assert out["events"][0]["headers"] == {"cookie": "***", "x-auth-token": "***",
+                                           "accept": "*/*"}
+
+
+def test_one_name_has_one_spelling_whichever_protocol_carried_it(tmp_path):
+    cap = Capture()
+    cap.packets.append(_dns_query(4.0, 50000, _ODD.split(b".")))
+    cap.tcp(5.0, C2, 443, [("c", _client_hello_bytes(_ODD)), ("s", b"")])
+    cap.web(6.0, "x", b"GET / HTTP/1.1\r\nHost: " + _ODD + b"\r\n\r\n", _ok(b"hi"), lookup=False)
+    cap.tcp(7.0, C2, 25, [("c", b"EHLO x\r\nMAIL FROM:<a@" + _ODD + b">\r\nQUIT\r\n"),
+                          ("s", b"220 smtp\r\n250 ok\r\n250 ok\r\n")])
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    dests = {e["type"]: e["dest"] for e in r["events"] if e["type"] in ("dns", "tls", "http")}
+    assert dests == {"dns": _ODD_TEXT, "tls": _ODD_TEXT, "http": _ODD_TEXT}
+    smtp = [e for e in r["events"] if e["type"] == "smtp"][0]
+    assert smtp["mail_from"] == "a@" + _ODD_TEXT
+    domains = [i for i in r["iocs"] if i["type"] == "domain"]
+    assert [d["value"] for d in domains] == [_ODD_TEXT]
+    assert sorted(domains[0]["sources"]) == ["dns", "http", "tls"]
+    assert "a@" + _ODD_TEXT in [i["value"] for i in r["iocs"] if i["type"] == "email"]
+
+
+def test_urls_and_user_names_carry_no_raw_control_byte(tmp_path):
+    cap = Capture()
+    cap.web(6.0, "x", b"GET /p HTTP/1.1\r\nHost: " + _ODD + b"\r\n\r\n", _ok(b"hi"), lookup=False)
+    cap.tcp(9.0, C2, 21, [("c", b"USER b\x1bot\r\nPASS x\r\n"), ("s", b"220 ftp\r\n230 ok\r\n")])
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    http = [e for e in r["events"] if e["type"] == "http"][0]
+    ftp = [e for e in r["events"] if e["type"] == "ftp"][0]
+    assert http["url"] == "http://" + _ODD_TEXT + "/p" and ftp["user"] == "b\\027ot"
+    assert "http://" + _ODD_TEXT + "/p" in [i["value"] for i in r["iocs"] if i["type"] == "url"]
+    assert "ftp://b\\027ot@" + C2 in [i["value"] for i in r["iocs"]]
+    for ioc in r["iocs"]:
+        assert all(c.isprintable() for c in ioc["value"]), ioc
+
+
+def test_the_servers_of_known_good_names_are_not_iocs(tmp_path, monkeypatch):
+    monkeypatch.setattr(Capture, "read", lambda self: self)
+    cap = _benign_capture()
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    rules = net_rules.load_rules([net_analyze.DEFAULT_RULES])
+    kg = net_rules.KnownGood(rules.lists["known_good"])
+    ips = {i["value"] for i in r["iocs"] if i["type"] == "ip"}
+    known = {address for name, address in cap._servers.items() if kg.hides({"dest": name})}
+    assert known and not ips & known
+    assert cap.server("www.example.com") in ips
+
+
+def test_a_known_good_name_on_a_foreign_address_keeps_the_address(tmp_path):
+    cap = Capture()
+    cap.tcp(5.0, C2, 80, [("c", b"POST / HTTP/1.1\r\nHost: ocsp.digicert.com\r\n"
+                                b"Content-Length: 900\r\n\r\n" + b"\x30" * 900),
+                          ("s", _ok(b"ok"))])
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    assert C2 in [i["value"] for i in r["iocs"] if i["type"] == "ip"]
+
+
+def test_an_error_line_carries_no_raw_control_byte(tmp_path, monkeypatch):
+    def broken(flow):
+        raise RuntimeError("bo\x00om\nnext")
+
+    monkeypatch.setattr(net_tls, "events_from_flow", broken)
+    cap = Capture()
+    cap.tls(5.0, "x.top")
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    line = [e for e in r["errors"] if "net_tls" in e][0]
+    assert "bo\\000om\\010next" in line and line.isprintable()
+
+
+def test_a_baseline_without_a_key_version_is_ignored(tmp_path):
+    path = tmp_path / "bl.json"
+    path.write_text(json.dumps({"keys": {net_baseline.event_key(
+        net_events.NetEvent("dns", 1.0, dest="a.top")): {"type": "dns"}}, "dests": {"a.top": 1}}))
+    bl = net_baseline.NetBaseline(str(path))
+    assert bl.count == 0 and not bl.knows_dest("a.top")

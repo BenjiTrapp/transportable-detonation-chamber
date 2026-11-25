@@ -23,14 +23,19 @@ module is that order, in ``analyze_pcap``. The false assumptions it avoids:
     connection that carried something unknown is still in the report. A flow
     captured from its middle with nothing from the server is a ``conn``: the
     capture cannot say the attempt failed.
-  * A name from a capture is text. A TLS server name, a Host header or a mail
-    address may hold NUL, newline or any byte. Every name field (``dest``,
-    ``sni``, ``mail_from``, ``rcpt_to``) of every parser's event is rendered
-    once, here, with ``net_events.render_bytes``, exactly as ``net_dns``
-    renders the labels of a DNS name (which are therefore left as they are): a
-    printable ASCII byte stands for itself, a backslash is ``\\\\``, any other
-    byte ``\\DDD``. One spelling for one name, whichever protocol carried it,
-    and no raw control byte reaches a rule, a log or the report.
+  * A name from a capture is text. A TLS server name, a Host header, a URL, a
+    user name or a mail address may hold NUL, newline or any byte, in no
+    particular character set. The parsers keep a name's bytes (ASCII, every
+    other byte a ``surrogateescape`` code point) instead of guessing, and
+    every name field (``dest``, ``sni``, ``url``, ``user``, ``mail_from``,
+    ``rcpt_to``) of every parser's event is rendered once, here, with
+    ``net_events.render_bytes``, exactly as ``net_dns`` renders the labels of
+    a DNS name (which are therefore left as they are): a printable ASCII byte
+    stands for itself, a backslash is ``\\\\``, any other byte ``\\DDD``. One
+    spelling for one name, whichever protocol carried it (one IOC, not two),
+    and no raw control byte reaches a rule, a log or the report. Error lines
+    are free text and keep their spaces, but their unprintable characters are
+    written the same way (``safe_text``).
   * One download is the unit of cost. A capture of many small decompression
     bombs would be inflated into the hash a thousand times over, so one
     ``net_http.HashBudget`` of ``CAPTURE_HASH_BUDGET`` bytes is shared by every
@@ -50,17 +55,24 @@ module is that order, in ``analyze_pcap``. The false assumptions it avoids:
     a beacon whose requests the baseline knows is still measured, and is
     suppressed only when the baseline knows that rhythm too.
   * An event may be serialized as it is. ``ftp`` and ``smtp`` events hold a
-    ``net_mail_ftp.Secret`` that refuses JSON on purpose; the report holds
-    ``net_mail_ftp.masked`` copies only. A decoded credential carries the
-    plain text and its encoded form (``text``, ``encoded``): both are ``***``
-    in the report, and so are the encoded value where it sat in the request
-    and every ``Authorization`` header. A password sent in plain text (a
-    login form, a query string, URL userinfo, a ``name: value`` line in a
-    request body) is masked in the report's ``url``, ``query`` and
-    ``body_text`` by ``net_decode.mask_credentials``, the detection behind the
-    ``credential`` flag. Rules and findings ran on the plain events before,
-    so masking changes no verdict. Nothing secret is written to the baseline
-    either.
+    ``net_mail_ftp.Secret`` that refuses JSON on purpose, a decoded credential
+    carries the plain text and its encoded form (``text``, ``encoded``), and a
+    password also travels in plain text: a login form, a query string, URL
+    userinfo, a cookie, an API-key header, a WebSocket message, a reply that
+    echoes it, and from there into a finding's URL. Masking per key misses the
+    next key, so the whole report goes through one pass at the end
+    (``mask_report``): ``net_mail_ftp.masked`` for every ``Secret``, and
+    ``net_decode.mask_credentials``, the detection behind the ``credential``
+    flag, for every string (bodies, replies and messages line by line);
+    credential, cookie and secret-named header values are ``***``. A decoded
+    credential is also masked in its own event and where its encoded value
+    sat. Rules and findings ran on the plain events before, so masking changes
+    no verdict. Nothing secret is written to the baseline either.
+  * Every address is an indicator. The servers of ``known_good`` names are
+    the idle machine's: an address that only known-good lookups answered, and
+    the address of a connection that carried nothing but events to known-good
+    names, are not listed. A transfer's address is, unless a known-good lookup
+    returned it, so a claimed name on a foreign address keeps the address.
   * A step that fails ends the analysis. A capture is hostile input: a parser
     that raises on one flow is an entry in ``errors`` and the next parser (at
     the end ``net_raw``) is tried; the decoder, the behaviour analysis, the
@@ -94,7 +106,7 @@ CAPTURE_HASH_BUDGET = 256 * 1024 * 1024         # bytes streamed into file hashe
 MAX_IOCS = 5000
 
 BEHAVIOR_TYPES = ("beacon", "retry", "fanout")
-NAME_FIELDS = ("dest", "sni", "mail_from")
+NAME_FIELDS = ("dest", "sni", "mail_from", "user", "url")
 NAME_LIST_FIELDS = ("rcpt_to",)
 EXECUTABLES = net_evidence.EXECUTABLES
 
@@ -162,8 +174,27 @@ def _describe(flow):
     return "%s %s:%s -> %s:%s" % (flow.proto, flow.src, flow.sport, flow.dst, flow.dport)
 
 
+def safe_text(text):
+    """Free text (an error, a reason) with every byte that is not printable
+    written as ``render_bytes`` writes it (``\\DDD``), and a backslash as
+    ``\\\\``; spaces and other printable characters stay as they are."""
+    out = []
+    for c in str(text):
+        if c == "\\":
+            out.append("\\\\")
+        elif c.isprintable():
+            out.append(c)
+        else:
+            try:
+                raw = c.encode("utf-8", "surrogateescape")
+            except UnicodeEncodeError:
+                raw = c.encode("utf-8", "surrogatepass")
+            out.append(net_events.render_bytes(raw))
+    return "".join(out)
+
+
 def _failure(where, exc):
-    return "%s: %s: %s" % (where, type(exc).__name__, exc)
+    return safe_text("%s: %s: %s" % (where, type(exc).__name__, exc))
 
 
 def _run_parser(name, flow, budget, errors):
@@ -208,7 +239,7 @@ def connection_event(flow, app=""):
         stream_gaps=list(flow.gaps), **common)
 
 
-def _flow_events(flow, budget, errors):
+def _flow_events(flow, budget, errors, claimed=None):
     if flow.proto == "udp":
         if net_dns.is_dns(flow):
             found = _run_parser("dns", flow, budget, errors)
@@ -227,7 +258,10 @@ def _flow_events(flow, budget, errors):
     if not found and _has_payload(flow):
         found = _run_parser("raw", flow, budget, errors)
         app = "raw" if found else ""
-    return [connection_event(flow, app)] + found
+    conn = connection_event(flow, app)
+    if claimed is not None:
+        claimed[id(conn)] = found
+    return [conn] + found
 
 
 # --- names -----------------------------------------------------------------------------------
@@ -261,24 +295,35 @@ def _render_names(event):
 def collect_events(path, hash_budget=None):
     """``(events, errors, pcap_result)``: the parsers' and connection events of a
     capture, names rendered, in time order. No decoding or behaviour yet."""
+    return _collect(path, hash_budget)[:3]
+
+
+def _collect(path, hash_budget=None):
+    """``collect_events`` plus ``claimed``: id of a ``conn`` event -> the
+    parser events of its flow."""
     if hash_budget is None:
         hash_budget = net_http.HashBudget(CAPTURE_HASH_BUDGET)
     result = net_flows.read_pcap(path)
-    errors, events = [], []
+    errors, events, claimed = [], [], {}
     for flow in result.flows:
         try:
-            events += _flow_events(flow, hash_budget, errors)
+            events += _flow_events(flow, hash_budget, errors, claimed)
         except Exception as exc:    # e.g. a flow attribute a parser left odd
             errors.append(_failure("net_analyze on %s" % _describe(flow), exc))
-    return net_events.sort_events(_render_names(e) for e in events), errors, result
+    events = net_events.sort_events(_render_names(e) for e in events)
+    return events, errors, result, claimed
 
 
 # --- the report: masking ------------------------------------------------------------------------
 
-_CREDENTIAL_HEADERS = ("authorization", "proxy-authorization")
 _SCRUBBED_TEXT = ("query", "url", "body_text", "resp_text")
-# events whose url, query or request body may carry a password in plain text
-_PLAIN_TEXT_CREDENTIALS = ("http", "websocket", "download", "upload")
+# Header values masked whole: the credential headers, the cookies, and any
+# header whose name says secret (X-Api-Key, X-Auth-Token...), as the decoder's
+# credential flag reads names.
+_SECRET_HEADERS = frozenset(("authorization", "proxy-authorization", "cookie", "set-cookie"))
+_HEADER_FIELDS = frozenset(("headers", "resp_headers"))
+# Fields of free text read line by line ("name: value" lines, dump records).
+_LINE_FIELDS = frozenset(("body_text", "resp_text", "text"))
 
 
 def _scrub_text(text, prefix, length):
@@ -308,30 +353,43 @@ def _scrub_source(source, prefix, length):
                 message["text"] = _scrub_text(message.get("text"), prefix, length)
 
 
-def _mask_headers(event):
-    for field in ("headers", "resp_headers"):
-        headers = event.get(field)
-        if not isinstance(headers, dict):
-            continue
-        for name in _CREDENTIAL_HEADERS:
-            value = headers.get(name)
-            if isinstance(value, str) and value.strip():
-                scheme = value.strip().split(None, 1)[0]
-                headers[name] = scheme + " ***" if " " in value.strip() else "***"
+def _mask_header(name, value):
+    if not isinstance(value, str):
+        return mask_report(value)
+    lname = name.lower() if isinstance(name, str) else ""
+    if lname in _SECRET_HEADERS or net_decode.is_secret_name(lname):
+        value = value.strip()
+        if lname in ("authorization", "proxy-authorization") and " " in value:
+            return value.split(None, 1)[0] + " ***"
+        return "***" if value else value
+    return net_decode.mask_credentials(value)
 
 
-def _mask_report_events(events, copies, source_of):
-    """Mask what ``net_mail_ftp.masked`` cannot know is secret, in the copies."""
+def mask_report(value, key=None):
+    """A copy of any report structure with every credential masked.
+
+    One pass over everything, so that no key (an event field, a finding, a rule
+    hit, an IOC, a key added later) can carry a password past it: every string
+    goes through ``net_decode.mask_credentials`` (bodies, replies and messages
+    line by line), and header values whose name says secret, cookies and
+    credentials are ``***``. ``net_mail_ftp.masked`` is applied too, so a
+    ``Secret`` anywhere is masked as well. Applying it twice changes nothing.
+    """
+    value = net_mail_ftp.masked(value) if key is None else value
+    if isinstance(value, dict):
+        if key in _HEADER_FIELDS:
+            return {k: _mask_header(k, v) for k, v in value.items()}
+        return {k: mask_report(v, k if isinstance(k, str) else "") for k, v in value.items()}
+    if isinstance(value, list):
+        return [mask_report(v, key or "") for v in value]
+    if isinstance(value, str):
+        return net_decode.mask_credentials(value, lines=key in _LINE_FIELDS)
+    return value
+
+
+def _mask_decoded(events, copies, source_of):
+    """A decoded credential and the encoded value it came from, masked in the copies."""
     position = {id(e): i for i, e in enumerate(events)}
-    for event, copy in zip(events, copies):
-        if event.get("type") in ("http", "websocket"):
-            _mask_headers(copy)
-        if event.get("type") in _PLAIN_TEXT_CREDENTIALS:
-            for field in ("url", "query"):
-                if field in copy:
-                    copy[field] = net_decode.mask_credentials(copy[field])
-            if "body_text" in copy:
-                copy["body_text"] = net_decode.mask_credentials(copy["body_text"], lines=True)
     for event, copy in zip(events, copies):
         if event.get("type") != "decoded" or not event.get("credential"):
             continue
@@ -420,18 +478,54 @@ class _Indicators:
 _IOC_ORDER = ("domain", "ip", "url", "sha256", "email", "account")
 
 
-def _iocs(copies, known_good):
+def _quiet_addresses(events, claimed, known_good):
+    """``(addresses, positions)`` that are a known-good server, not an indicator.
+
+    ``addresses`` were answered by the capture's lookups for known-good names
+    only; ``positions`` are the ``conn`` events whose flow carried nothing but
+    events to known-good names (whose name is as trusted as the rest of
+    ``known_good``: the sample's own header or server name). An upload or
+    download keeps its address unless a known-good lookup returned it, so a
+    claimed name on a foreign address still leaves the address in the list.
+    """
+    names = {}
+    for e in events:
+        if e.get("type") != "dns" or e.get("query_type") not in ("A", "AAAA"):
+            continue
+        hidden = known_good.hides({"dest": e.get("dest")})
+        for answer in e.get("answers") or ():
+            ip = _ip(answer)
+            if ip is not None:
+                names.setdefault(str(ip), []).append(hidden)
+    addresses = {ip for ip, hidden in names.items() if all(hidden)}
+    positions = set()
+    for i, e in enumerate(events):
+        found = claimed.get(id(e)) if e.get("type") == "conn" else None
+        if found and all(isinstance(f.get("dest"), str) and known_good.hides({"dest": f["dest"]})
+                         for f in found):
+            positions.add(i)
+    return addresses, positions
+
+
+def _iocs(copies, known_good, quiet=(set(), set())):
     out = _Indicators()
-    for e in copies:
+    addresses, positions = quiet
+
+    def foreign(text):
+        ip = _ip(text)
+        return ip is None or str(ip) not in addresses
+
+    for i, e in enumerate(copies):
         etype = e.get("type")
         if e.get("baseline") == "known" or etype in BEHAVIOR_TYPES:
             continue
         dest = e.get("dest")
         name_known = isinstance(dest, str) and known_good.hides({"dest": dest})
-        if etype != "decoded":
+        if etype != "decoded" and i not in positions and foreign(dest):
             out.name(dest, e, known_good)
         for address in e.get("addresses") or ():
-            out.ip(address, e)
+            if foreign(address):
+                out.ip(address, e)
         if (etype == "dns" and e.get("query_type") in ("A", "AAAA") and not name_known
                 and isinstance(dest, str) and dest and not net_behavior.is_housekeeping(dest)):
             for answer in e.get("answers") or ():
@@ -451,7 +545,7 @@ def _iocs(copies, known_good):
         user = e.get("user")
         if etype in ("ftp", "smtp") and isinstance(user, str) and user and not (
                 etype == "ftp" and user.lower() in _ANONYMOUS):
-            out.add("account", "%s://%s@%s" % (etype, render_name(user), dest), e,
+            out.add("account", "%s://%s@%s" % (etype, user, dest), e,
                     password_captured=bool(e.get("password_captured")))
     items = sorted(out.found.values(),
                    key=lambda i: (_IOC_ORDER.index(i["type"]), i["first_ts"] or 0, i["value"]))
@@ -532,10 +626,10 @@ def analyze_pcap(path, rules=None, baseline=None, process="", mode="online"):
         raise ValueError("mode must be one of %s, not %r" % (", ".join(MODES), mode))
     errors = []
     ruleset = _ruleset(rules)
-    errors += ["rules: %s" % e for e in ruleset.errors]
+    errors += ["rules: %s" % safe_text(e) for e in ruleset.errors]
     known_good = net_rules.KnownGood(ruleset.lists.get(net_rules.KNOWN_GOOD, ()))
     budget = net_http.HashBudget(CAPTURE_HASH_BUDGET)
-    base, parse_errors, result = collect_events(path, budget)
+    base, parse_errors, result, claimed = _collect(path, budget)
     errors += parse_errors
 
     decoded, source_of = [], {}
@@ -586,13 +680,15 @@ def analyze_pcap(path, rules=None, baseline=None, process="", mode="online"):
         findings = []
 
     copies = net_mail_ftp.masked(events)
-    _mask_report_events(events, copies, source_of)
+    _mask_decoded(events, copies, source_of)
+    copies = mask_report(copies)
     for event, copy, is_known in zip(events, copies, known):
         copy["known_good"] = (event["type"] not in net_rules.ALWAYS_VISIBLE
                               and known_good.hides(event))
         if is_known:
             copy["baseline"] = "known"
-    iocs, iocs_capped = _iocs(copies, known_good)
+    iocs, iocs_capped = _iocs(copies, known_good,
+                              _quiet_addresses(events, claimed, known_good))
 
     note = result.note
     if not events:
@@ -602,12 +698,12 @@ def analyze_pcap(path, rules=None, baseline=None, process="", mode="online"):
         "events": copies,
         "event_summary": net_events.event_summary(events),
         "behavior": [c for c in copies if c["type"] in BEHAVIOR_TYPES],
-        "rule_hits": net_mail_ftp.masked(_remap(hits, positions)),
+        "rule_hits": _remap(hits, positions),
         "rule_unevaluated": list(getattr(hits, "unevaluated", [])),
         "rule_budget_spent": bool(getattr(hits, "budget_spent", False)),
         "rule_engine": getattr(hits, "regex_engine", ruleset.regex_engine),
         "rule_notes": list(ruleset.notes),
-        "evidence_findings": net_mail_ftp.masked(findings),
+        "evidence_findings": findings,
         "iocs": iocs,
         "iocs_capped": iocs_capped,
         "files": _files(copies),
@@ -623,4 +719,5 @@ def analyze_pcap(path, rules=None, baseline=None, process="", mode="online"):
         "suppressed_count": sum(known),
         "hash_budget_spent": any(e.get("hash_budget_spent") for e in events),
     }
-    return _jsonable(report)
+    # The one masking pass over everything serialized (see mask_report).
+    return mask_report(_jsonable(net_mail_ftp.masked(report)))

@@ -36,6 +36,9 @@ Regressions covered:
   * a capture that starts mid-session made the server the client
   * a flow that is not FTP or SMTP (HTTP on port 25, TLS on 465, UDP) produced
     an event
+  * a user name or mail address was decoded as UTF-8 or else Latin-1, so one
+    name got two spellings in the report; names keep their bytes
+    (``surrogateescape``) for ``net_analyze`` to render as DNS names are
 """
 
 import base64
@@ -524,7 +527,7 @@ def test_an_unfinished_data_line_still_counts_toward_the_body():
 
 def test_non_ascii_bytes_do_not_raise():
     e = _one(21, b"USER b\xe4\xf6t\r\nSTOR \xff\xfe.txt\r\n")
-    assert e["user"] == "b\xe4\xf6t"
+    assert e["user"].encode("ascii", "surrogateescape") == b"b\xe4\xf6t"
     assert len(e["files"]) == 1
 
 
@@ -550,3 +553,25 @@ def test_attachments_before_the_part_limit_are_still_found():
         "Subject: s", "", "--B", 'Content-Disposition: attachment; filename="a.zip"', "",
         "data", "--B--"), _OK_SERVER)
     assert e["attachments"] == ["a.zip"] and e["capped"] == []
+
+
+# --- names keep their bytes -----------------------------------------------------------------
+
+def _wire(text):
+    return text.encode("ascii", "surrogateescape")
+
+
+def test_mail_addresses_keep_their_bytes():
+    e = _one(25, b"EHLO x\r\nMAIL FROM:<a@T\xe9p\x1b.top>\r\nRCPT TO:<b@d\xc3\xa9.top>\r\n"
+                 b"QUIT\r\n", b"220 smtp\r\n250 ok\r\n250 ok\r\n250 ok\r\n")
+    assert _wire(e["mail_from"]) == b"a@T\xe9p\x1b.top"
+    assert [_wire(r) for r in e["rcpt_to"]] == [b"b@d\xc3\xa9.top"]
+
+
+def test_user_names_keep_their_bytes():
+    ftp = _one(21, b"USER b\x1bot\xe9\r\nPASS x\r\n", b"220 ftp\r\n331 ok\r\n230 ok\r\n")
+    assert _wire(ftp["user"]) == b"b\x1bot\xe9"
+    user = base64.b64encode(b"m\xc3\xa4il\x1b@e.top")
+    smtp = _one(25, b"EHLO x\r\nAUTH LOGIN\r\n" + user + b"\r\n" + base64.b64encode(b"pw")
+                + b"\r\nQUIT\r\n", b"220 smtp\r\n250 ok\r\n334 x\r\n334 y\r\n235 ok\r\n")
+    assert _wire(smtp["user"]) == b"m\xc3\xa4il\x1b@e.top"

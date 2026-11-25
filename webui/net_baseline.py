@@ -171,7 +171,8 @@ class NetBaseline:
                 "dests": {}}
 
     def _stale(self):
-        return self._data.get("key_version", 1) != KEY_VERSION
+        # a file without a version was not written by this module's scheme
+        return self._data.get("key_version") != KEY_VERSION
 
     def load(self):
         if not os.path.isfile(self.path):
@@ -186,7 +187,7 @@ class NetBaseline:
             if self._stale():
                 print("[net_baseline] %s uses key scheme v%s, current is v%d: ignored until "
                       "the baseline is captured again"
-                      % (self.path, data.get("key_version", 1), KEY_VERSION))
+                      % (self.path, data.get("key_version"), KEY_VERSION))
         except (ValueError, OSError) as e:
             print("[net_baseline] unreadable baseline %s: %s" % (self.path, e))
             try:
@@ -263,7 +264,7 @@ class NetBaseline:
             keys = dict(self._data.get("keys") or {})
             created, updated = self._data.get("created"), self._data.get("updated")
             stale = self._stale()
-            stored_version = self._data.get("key_version", 1)
+            stored_version = self._data.get("key_version")
         by_type = {}
         for entry in keys.values():
             by_type[entry.get("type", "?")] = by_type.get(entry.get("type", "?"), 0) + 1

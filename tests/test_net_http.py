@@ -56,6 +56,10 @@ Regressions covered:
     the bytes the capture retained; a ``HashBudget`` passed in by the caller
     bounds the total over every flow it is given to, and a download past it
     says so (``hash_budget_spent``) instead of carrying a hash
+  * a Host header was decoded as UTF-8 or else Latin-1, so the same name
+    reached ``net_analyze`` as different characters depending on its other
+    bytes and got another spelling than in DNS and TLS; ``dest`` and ``url``
+    keep the bytes (``surrogateescape``) for the central rendering
 """
 
 import gzip
@@ -68,6 +72,7 @@ import tracemalloc
 import zlib
 
 import dpkt
+import pytest
 
 import net_events
 import net_flows
@@ -1289,3 +1294,21 @@ def test_the_budget_covers_small_bombs_hashed_from_memory_too(monkeypatch):
     assert budget.spent <= _MIB and _CountingSha.total <= _MIB + 20 * wire
     assert sum(1 for d in downloads if d["sha256"]) == _MIB // len(payload) == 5
     assert all(d["hash_budget_spent"] and d["kind"] == "pe" for d in downloads[5:])
+
+
+# --- names keep their bytes ---------------------------------------------------------------
+
+def _wire(text):
+    return text.encode("ascii", "surrogateescape")
+
+
+@pytest.mark.parametrize("raw", [b"Ev\x1bil\x00x.T\xe9p", b"caf\xc3\xa9.top"])
+def test_the_host_keeps_its_bytes_for_the_caller_to_render(raw):
+    e = _events(_get(host=raw), b"")[0]
+    assert _wire(e["dest"]) == raw.lower()
+    assert _wire(e["url"]) == b"http://" + raw.lower() + b"/"
+
+
+def test_an_absolute_target_keeps_its_bytes_too():
+    e = _events(b"GET http://a\xe9\x01.top/x HTTP/1.1\r\n\r\n", b"")[0]
+    assert _wire(e["dest"]) == b"a\xe9\x01.top" and _wire(e["url"]) == b"http://a\xe9\x01.top/x"
