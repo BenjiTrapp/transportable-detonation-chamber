@@ -16,6 +16,9 @@ Regressions covered:
     or had no owner to be given was not "assumed" and was corroborated through
     the process about any endpoint (7.0 MALICIOUS from 4.6); only a pid keeps
     a finding from being assumed (final review I1)
+  * without dpkt, PyYAML or cryptography (a deploy to an existing VM runs no
+    pip) the whole web UI failed to import; now the capture routes are a 503
+    naming the fix and everything else works (final review I3)
 """
 
 import base64
@@ -795,3 +798,60 @@ def test_the_owner_is_never_a_child_seen_on_the_named_pipes(tdc):
     got = [f for f in results["memory_evidence"]["findings"] + results["memory_evidence"]["suppressed"]
            if f["kind"] == "c2_checkin"][0]
     assert got["process"] == "" and got["attribution"] == "assumed"
+
+
+# --- the web UI without the network packages (final review I3) -----------------------------------
+
+_WITHOUT_PACKAGES = r'''
+import io, json, os, sys, tempfile
+root = sys.argv[1]
+sys.path[:0] = [os.path.join(root, "webui"), os.path.join(root, "tests")]
+os.environ["TDC_NO_BACKGROUND"] = "1"
+os.environ["TDC_LOG_DIR"] = tempfile.mkdtemp(prefix="tdc-test-logs-")
+os.environ.pop("TDC_VM_WEBUI", None)
+for name in sys.argv[2:]:
+    sys.modules[name] = None                 # "import dpkt" raises ImportError
+import app as tdc
+from _pytest.monkeypatch import MonkeyPatch
+from test_api_payloads import _results_without_the_vm
+mp = MonkeyPatch()
+tmp = tempfile.mkdtemp()
+mp.setattr(tdc, "_net_reports", tdc._ResultStore(os.path.join(tmp, "net_results")))
+mp.setattr(tdc, "_net_baseline", tdc.net_baseline.NetBaseline(os.path.join(tmp, "bl.json")))
+mp.setattr(tdc, "_load_submissions", lambda: [])
+mp.setattr(tdc, "SUBMISSIONS_FILE", os.path.join(tmp, "submissions.json"))
+mp.setattr(tdc, "VM_WEBUI_URL", "")
+_results_without_the_vm(tdc, mp)
+client = tdc.app.test_client()
+out = {"net_analyze": tdc.net_analyze is None}
+for url in ("/api/network/import", "/api/network/baseline/capture"):
+    r = client.post(url, data={"file": (io.BytesIO(b"x"), "c.pcap")}, content_type="multipart/form-data")
+    out[url] = [r.status_code, r.get_json().get("error", "")]
+for url in ("/api/network/reports", "/api/network/baseline", "/api/detonation/results?sha256=" + "a1" * 32, "/"):
+    out[url] = client.get(url).status_code
+print(json.dumps(out))
+'''
+
+
+@pytest.mark.parametrize("blocked", [("dpkt",), ("yaml",), ("cryptography",)])
+def test_without_the_network_packages_the_web_ui_still_runs(blocked, tmp_path):
+    """Regressions covered (final review I3): app.py imported net_analyze (dpkt,
+    PyYAML, cryptography) at the top, and no deploy to an existing VM runs pip:
+    the whole web UI failed to start. Now only the routes that analyze a capture
+    answer, with a 503 that names the fix."""
+    import subprocess
+    import sys
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    script = tmp_path / "without.py"
+    script.write_text(_WITHOUT_PACKAGES)
+    run = subprocess.run([sys.executable, str(script), root] + list(blocked),
+                         capture_output=True, text=True, timeout=300)
+    assert run.returncode == 0, run.stderr[-2000:]
+    out = json.loads(run.stdout.strip().splitlines()[-1])
+    assert out["net_analyze"] is True
+    for url in ("/api/network/import", "/api/network/baseline/capture"):
+        status, error = out[url]
+        assert status == 503 and "pip install -r webui/requirements.txt" in error, url
+    assert out["/api/network/reports"] == 200 and out["/api/network/baseline"] == 200
+    assert out["/api/detonation/results?sha256=" + "a1" * 32] == 200
+    assert out["/"] == 200

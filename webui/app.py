@@ -50,8 +50,19 @@ import tool_updates
 import log_search
 import log_store
 # NETWORK analysis: a pcap to a report, and the baseline of the clean VM.
-import net_analyze
+# net_analyze needs dpkt, PyYAML and cryptography, and a deploy to an existing
+# VM does not run pip: without them the rest of the UI must still start, and
+# the routes that analyze a capture say what is missing (503).
 import net_baseline
+try:
+    import net_analyze
+    NET_ANALYZE_ERROR = None
+except ImportError as _net_import_error:
+    net_analyze = None
+    NET_ANALYZE_ERROR = ("network analysis is not available (%s); install its packages with "
+                         "pip install -r webui/requirements.txt and restart the web UI"
+                         % _net_import_error)
+    print("[network] " + NET_ANALYZE_ERROR)
 
 app = Flask(__name__)
 
@@ -7806,11 +7817,16 @@ def _net_analyze_upload(baseline, with_sample=False):
     capture belongs to) is checked before anything is stored and kept as
     `sample_sha256` (lower case, or None).
 
+    Without net_analyze (its packages missing, see NET_ANALYZE_ERROR) the
+    error is a 503 that names the fix.
+
     The size is settled before the body is parsed: reading request.form parses
     (and spools) the whole multipart body, so a Content-Length over the limit is
     refused first, and a body without one (chunked) is bounded by the request's
     max_content_length, which Werkzeug enforces while it reads.
     """
+    if net_analyze is None:
+        return None, (jsonify({"error": NET_ANALYZE_ERROR}), 503)
     limit = NET_UPLOAD_MAX + _NET_FORM_ALLOWANCE
     if (request.content_length or 0) > limit:
         return None, _net_too_large()
