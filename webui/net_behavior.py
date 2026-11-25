@@ -109,7 +109,13 @@ Several assumptions would make the result wrong:
     A lookup in the middle of a capture splits one host into two groups: the
     connections before it stay on the address, the ones after it join the name.
     Those two beacons (``dest`` an address, ``dest`` a name whose ``addresses``
-    holds it) can be the same host.
+    holds it) can be the same host. So can a beacon to an address no lookup
+    named and the HTTP check-ins to its Host name: an ``http`` event carries
+    the address its connection went to (``net_http``), and a name's beacon
+    lists the addresses of its events, so ``net_evidence`` can see the two
+    are one loop. The address is still never *renamed* by a Host header: a
+    sample writes that header, and ``Host: www.msftconnecttest.com`` would
+    then hide its beacon as known-good.
   * The port is part of the identity of a connection. It is deliberately not
     part of the grouping key, unlike ``memory_evidence``'s ``(ip, port)``: one
     host that beacons on two ports is one beacon, not two half-strength ones.
@@ -499,6 +505,11 @@ class _Group:
         self.times.append(ts)
         if address:
             self.addresses.add(address)
+        # the address an HTTP exchange went to (net_http), whatever its Host says
+        for other in event.get("addresses") or ():
+            canonical = _address(other) if isinstance(other, str) else None
+            if canonical:
+                self.addresses.add(canonical)
         self.types.add(event["type"])
         self.pids.add(event.get("pid"))
         if not self.process:

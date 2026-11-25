@@ -339,6 +339,13 @@ ATTRIBUTION_ASSUMED = "assumed"
 VERDICT_MALICIOUS = 6.0
 VERDICT_SUSPICIOUS = 2.0
 
+# The source of a capture's findings (net_evidence.SOURCE), and what its
+# uncorroborated findings of one process may add up to across kinds: enough
+# for SUSPICIOUS, never MALICIOUS without a second, independent signal.
+NETWORK_SOURCE = "network"
+NETWORK_UNCORROBORATED_CAP = 4.0
+assert VERDICT_SUSPICIOUS <= NETWORK_UNCORROBORATED_CAP < VERDICT_MALICIOUS
+
 
 # Version of the finding-key scheme. Baselines record it; a baseline built
 # with another version is ignored until it is captured again, because its
@@ -1096,8 +1103,14 @@ def score(findings, baseline=None):
     # process, nor does it vouch for one.
     # A finding whose process is only assumed (attribution "assumed": a
     # capture's finding given to the sample) neither gets nor gives a second
-    # opinion through the process: only through a shared endpoint, with a
-    # finding of any process and any other source.
+    # opinion through the process, only through a shared endpoint. The two
+    # directions differ on purpose: it *gets* one from a finding of any
+    # process and any other source that names its endpoint (the capture
+    # cannot say which process made the connection, so Sysmon's beacon to
+    # that address in another process still vouches for it), but it *gives*
+    # one only to a finding of the same process that names its endpoint (a
+    # capture's check-in must not make an unrelated process's finding count
+    # in full).
     def assumed(f):
         return f.get("attribution") == ATTRIBUTION_ASSUMED
 
@@ -1223,6 +1236,29 @@ def score(findings, baseline=None):
                 "group_cap": round(allowance, 2),
             }
 
+    # A capture's findings that needed a second opinion and got none: every
+    # periodic service and telemetry POST of the machine is "the sample's" in
+    # a pcap, so together, across kinds, they may make a process SUSPICIOUS
+    # but never MALICIOUS on their own (a poller and two telemetry POSTs were
+    # 6.4). Only source "network" findings take part, so a set without them
+    # scores exactly as before.
+    pools = {}
+    for item in scored:
+        if (item.get("source") == NETWORK_SOURCE
+                and item["factors"].get("corroboration") == UNCORROBORATED and item["score"] > 0):
+            pools.setdefault(proc_key(item), []).append(item)
+    for proc, items in pools.items():
+        if sum(item["score"] for item in items) <= NETWORK_UNCORROBORATED_CAP:
+            continue
+        items.sort(key=lambda x: (-x["score"], x.get("key") or ""))
+        running = 0.0
+        for item in items:
+            capped = min(item["score"], max(0.0, NETWORK_UNCORROBORATED_CAP - running))
+            running += capped
+            item["network_cap"] = {"before": item["score"], "cap": NETWORK_UNCORROBORATED_CAP,
+                                   "group_size": len(items)}
+            item["score"] = round(capped, 3)
+
     total = round(sum(item["score"] for item in scored), 2)
 
     scored.sort(key=lambda x: (-x["score"], EVIDENCE_RANK.get(x["evidence"], 9)))
@@ -1251,6 +1287,8 @@ def score(findings, baseline=None):
         sat = item.get("saturation")
         if sat and sat["group_size"] > 1:
             bits.append(f"{sat['rank']} of {sat['group_size']} of this kind")
+        if item.get("network_cap"):
+            bits.append(f"uncorroborated capture findings capped at {NETWORK_UNCORROBORATED_CAP:g}")
         for other in item.get("absorbed") or ():
             bits.append(f"absorbs {other['kind']} from {other['source']}")
         reasons.append(f"{reason} ({'; '.join(bits)})")
@@ -1284,8 +1322,13 @@ def collect(results, process="", network_process=None):
     and marked ``attribution: "assumed"``. Supersede matches by process:
     without this a capture's check-in and Sysmon's beaconing of the same loop
     never met and counted twice. Corroboration of such a finding goes only
-    through a shared endpoint (see score). A finding that already names a
-    process, or one with a pid, keeps what it has.
+    through a shared endpoint (see score). Every finding of the report without
+    a pid is assumed, also one that names a process (the import's ``process``
+    field writes it into every finding; the name is kept) and also when there
+    is no owner (its process stays ""): a name typed at import time, or none,
+    is not an attribution, and through it a check-in to one address was
+    corroborated by Sysmon's beacon to another. Only a pid keeps a finding
+    out of this.
     """
     findings = []
     aether = results.get("aether") or {}
@@ -1326,8 +1369,11 @@ def collect(results, process="", network_process=None):
         for f in report["evidence_findings"]:
             if not isinstance(f, dict) or f.get("baseline"):
                 continue
-            if owner and not f.get("process") and f.get("pid") in (None, ""):
-                f = dict(f, process=owner, attribution=ATTRIBUTION_ASSUMED)
+            # A capture knows no process, whatever the report or the import
+            # named: every finding of it without a pid is the sample's by
+            # assumption, with or without an owner (Ruling 69).
+            if f.get("pid") in (None, ""):
+                f = dict(f, process=f.get("process") or owner, attribution=ATTRIBUTION_ASSUMED)
             findings.append(dict(f))
 
     dyn = results.get("litterbox_dynamic") or {}

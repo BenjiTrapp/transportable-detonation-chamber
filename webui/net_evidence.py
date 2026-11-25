@@ -62,7 +62,11 @@ the findings wrong:
     it carries its full weight, however tight the rhythm. This is the honest
     position for a pcap; the next phase, which attributes connections to
     processes, can let an attributed finding stand alone again (an event with
-    a ``pid`` already does). ``credential_in_transit``, ``payload_staging`` and
+    a ``pid`` already does). What such findings of one process add up to
+    across kinds is capped below MALICIOUS (``memory_evidence``'s
+    ``NETWORK_UNCORROBORATED_CAP``): a poller and two telemetry POSTs were
+    6.4, each kind saturating on its own, and "cannot add up to a verdict"
+    has to hold across kinds, not only within one. ``credential_in_transit``, ``payload_staging`` and
     ``dga_pattern`` still stand alone: a named-account login in clear text, an
     executable over plain HTTP and ten invented names failing in a minute are
     not what an idle machine does.
@@ -73,6 +77,15 @@ the findings wrong:
     Every finding on a name also carries what the capture's DNS answers gave
     for that name: an HTTP check-in is named by its Host header, Sysmon's by
     the address, and only the answers tie the two together.
+  * A name and an address are two loops. Without a lookup in the capture the
+    HTTP check-ins of one loop are named by their Host header and its
+    connections by the address: two ``c2_checkin`` findings that saturation
+    let count 3.2, where the same capture with the lookup is 1.6. An ``http``
+    event carries the address its connection went to, so the name's finding
+    lists it, and a finding on an address goes into the finding of the same
+    kind and process on the one name that lists it (``folded``). Not into a
+    ``known_good`` one, and not when two names list it (a shared host): a
+    Host header is the sample's to write.
 """
 
 import ipaddress
@@ -83,7 +96,7 @@ import memory_evidence
 import net_behavior
 import net_rules
 
-SOURCE = "network"
+SOURCE = memory_evidence.NETWORK_SOURCE
 NETWORK_KINDS = memory_evidence.NETWORK_KINDS
 
 # Share of an attempt that the isolated mode lets us see: an attempt counts
@@ -456,7 +469,54 @@ def findings_from(events, hits, process="", observed_fully=True, *, known_good):
         if resolved:
             addresses = list(finding.get("addresses") or [])
             finding["addresses"] = addresses + [a for a in resolved if a not in addresses]
-    return list(c.by_key.values())
+    return _fold_addresses(list(c.by_key.values()))
+
+
+def _ip_key(value):
+    try:
+        return str(ipaddress.ip_address(value))
+    except (ValueError, TypeError):
+        return None
+
+
+def _fold_addresses(findings):
+    """One finding per loop: a finding on an address goes into the finding of
+    the same kind and process on the one name that lists that address.
+
+    Without a lookup in the capture the HTTP check-ins of a loop are named by
+    their Host header and its connections by the address, two findings that
+    saturation lets count twice (3.2 for one loop, 1.6 with the lookup). The
+    address finding is kept when no name, or more than one name, lists the
+    address (a shared host), and when either side is marked ``known_good``:
+    a claimed known-good name must not absorb the address finding that keeps
+    the loop visible (a spoofed Host header).
+    """
+    by_name = {}
+    for f in findings:
+        if _ip_key(f.get("dest")) is None and not f.get("known_good"):
+            for address in f.get("addresses") or ():
+                key = (f["kind"], f["process"].lower(), _ip_key(address))
+                by_name.setdefault(key, []).append(f)
+    out = []
+    for f in findings:
+        address = _ip_key(f.get("dest"))
+        names = by_name.get((f["kind"], f["process"].lower(), address)) if address else None
+        if not names or len(names) > 1 or f.get("known_good"):
+            out.append(f)
+            continue
+        into = names[0]
+        for rule in f.get("rules") or ():
+            if rule not in into["rules"]:
+                into["rules"].append(rule)
+        if address not in into["addresses"]:
+            into["addresses"].append(address)
+        into["count"] = (into.get("count") or 1) + (f.get("count") or 1)
+        into["base_weight"] = max(into["base_weight"], f["base_weight"])
+        into["needs_corroboration"] = bool(into["needs_corroboration"] or f["needs_corroboration"])
+        if f.get("pid") is None:
+            into["pid"] = None
+        into.setdefault("folded", []).append(f["dest"])
+    return out
 
 
 def _answers(events):

@@ -12,6 +12,10 @@ Regressions covered:
     body of the import, the stored report, the list or the baseline
   * the baseline is captured from an analysis without the baseline, so the
     capture of the clean VM is learned whole, and a later import suppresses it
+  * a capture's finding that named a process (the import's ``process`` field)
+    or had no owner to be given was not "assumed" and was corroborated through
+    the process about any endpoint (7.0 MALICIOUS from 4.6); only a pid keeps
+    a finding from being assumed (final review I1)
 """
 
 import base64
@@ -672,11 +676,13 @@ def test_without_a_host_side_signal_the_check_in_still_needs_one(client, tdc, tm
 
 
 def test_a_finding_that_names_its_process_keeps_it(tdc):
+    """The name is kept, but it is no attribution: without a pid it is assumed."""
     results = {"network": {"evidence_findings": [
         {"source": "network", "kind": "dga_pattern", "key": "k", "process": "other.exe"},
         {"source": "network", "kind": "dga_pattern", "key": "k2", "process": ""}]}}
     got = tdc.memory_evidence.collect(results, process="", network_process="evil.exe")
     assert [f["process"] for f in got] == ["other.exe", "evil.exe"]
+    assert [f["attribution"] for f in got] == ["assumed", "assumed"]
     assert [f["process"] for f in tdc.memory_evidence.collect(results, process="Evil.exe")] == ["other.exe", "Evil.exe"]
 
 
@@ -732,15 +738,50 @@ def test_a_reflective_pe_of_the_sample_does_not_vouch_for_the_check_in(tdc):
     assert checkin["corroborated_by"] == ["sysmon-network"]
 
 
-def test_a_finding_with_a_process_or_a_pid_is_not_assumed(tdc):
+def test_only_a_pid_keeps_a_finding_from_being_assumed(tdc):
+    """Regressions covered (final review I1): a finding that named a process, or
+    one without an owner to give it, was not marked assumed and so was
+    corroborated through the process about any endpoint."""
     results = {"network": {"evidence_findings": [
         {"source": "network", "kind": "dga_pattern", "key": "a", "process": "x.exe"},
         {"source": "network", "kind": "dga_pattern", "key": "b", "process": "", "pid": 77},
         {"source": "network", "kind": "dga_pattern", "key": "c", "process": ""}]}}
     got = tdc.memory_evidence.collect(results, network_process="evil.exe")
     assert [(f["process"], f.get("attribution")) for f in got] == [
-        ("x.exe", None), ("", None), ("evil.exe", "assumed")]
-    assert [f.get("attribution") for f in tdc.memory_evidence.collect(results)] == [None, None, None]
+        ("x.exe", "assumed"), ("", None), ("evil.exe", "assumed")]
+    assert [(f["process"], f.get("attribution")) for f in tdc.memory_evidence.collect(results)] == [
+        ("x.exe", "assumed"), ("", None), ("", "assumed")]
+
+
+def test_an_import_that_names_the_process_does_not_vouch_for_its_check_in(client, tdc, tmp_path, monkeypatch):
+    """Regressions covered (final review I1): the import's ``process`` field
+    writes the name into every finding, which then was not "assumed": a
+    Sysmon beacon of evil.exe to a different address (203.0.113.9)
+    corroborated the check-in to evil.top, 7.0 MALICIOUS. Now as without the
+    field: 4.6 SUSPICIOUS."""
+    for proc in ("", "evil.exe"):
+        tdc._net_reports = tdc._ResultStore(str(tmp_path / ("nr" + proc)))
+        assert _upload(client, _pcap_with_http_c2(tmp_path), sha256=SAMPLE, process=proc).status_code == 200
+        d = _verdict_with_sysmon_beacon(client, tdc, monkeypatch, ip="203.0.113.9")
+        ev = d["memory_evidence"]
+        checkin = [f for f in ev["findings"] if f["kind"] == "c2_checkin"][0]
+        assert checkin["attribution"] == "assumed" and not checkin.get("corroborated_by"), proc
+        assert ev["score"] == 4.6 and d["verdict"]["label"] == "SUSPICIOUS", proc
+
+
+def test_without_an_owner_a_host_finding_does_not_vouch_for_the_check_in(tdc):
+    """Regressions covered (final review I1): with no process known, the
+    check-in (process "") and a pe-sieve finding (process "") shared the key ""
+    and the PE corroborated the check-in: 7.0 MALICIOUS."""
+    checkin = dict(_checkin(tdc), needs_corroboration=True, base_weight=4.0)
+    pe = dict(tdc.memory_evidence.MemoryFinding(source="pe-sieve", kind="reflective_pe", process="",
+                                                identity=("r",)))
+    results = {"aether": {"evidence_findings": [pe]}, "network": {"evidence_findings": [checkin]}}
+    verdict = tdc._compute_verdict(results, [])
+    ev = results["memory_evidence"]
+    got = [f for f in ev["findings"] if f["kind"] == "c2_checkin"][0]
+    assert got["process"] == "" and got["attribution"] == "assumed" and not got.get("corroborated_by")
+    assert ev["score"] == 4.6 and verdict["label"] == "SUSPICIOUS"
 
 
 def test_the_owner_is_never_a_child_seen_on_the_named_pipes(tdc):
@@ -753,4 +794,4 @@ def test_the_owner_is_never_a_child_seen_on_the_named_pipes(tdc):
     tdc._compute_verdict(results, [])
     got = [f for f in results["memory_evidence"]["findings"] + results["memory_evidence"]["suppressed"]
            if f["kind"] == "c2_checkin"][0]
-    assert got["process"] == "" and "attribution" not in got
+    assert got["process"] == "" and got["attribution"] == "assumed"

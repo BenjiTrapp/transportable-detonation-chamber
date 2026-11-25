@@ -967,7 +967,8 @@ def _exchange_events(ctx, req, resp):
         content_encoding=response_encoding,
         request_truncated=bool(req and req.truncated),
         response_truncated=bool(resp and resp.truncated),
-        stream_gaps=list(ctx.gaps), stream_capped=ctx.capped, **spent)
+        stream_gaps=list(ctx.gaps), stream_capped=ctx.capped, addresses=_connected(ctx),
+        **spent)
     events = [http]
     if len(body) > UPLOAD_MIN:
         events.append(NetEvent(
@@ -991,12 +992,15 @@ def _exchange_events(ctx, req, resp):
 
 
 def _connected(ctx):
-    """The address a transfer really went to, whatever its Host header says.
+    """The address an exchange really went to, whatever its Host header says.
 
     ``dest`` is the Host header, which the sample writes: an upload to a C2
     address with ``Host: ocsp.digicert.com`` names a known-good host. The
     connection's address is what a host-side finding (Sysmon's connection
-    log) names, so it is the endpoint they can be matched on.
+    log) names, so it is the endpoint they can be matched on. Every ``http``
+    event carries it too: a check-in named by its Host header and the
+    connections to its address are one loop, also when no lookup in the
+    capture ties the two.
     """
     return [ctx.server] if ctx.server else []
 

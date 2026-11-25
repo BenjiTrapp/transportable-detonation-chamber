@@ -16,6 +16,14 @@ Regressions covered:
   * an OCSP POST of the idle machine, visible as an upload, was corroborated by
     an unrelated reflective PE in the same process: 3.0 SUSPICIOUS became 7.0
     MALICIOUS
+  * one loop counted twice when its name was not looked up in the capture: the
+    HTTP check-ins (by Host header) and the connections (by address) were two
+    c2_checkin findings, 3.2 SUSPICIOUS against 1.6 with the lookup; http
+    events carry their connection's address and the address finding folds into
+    the one name that lists it (never into a known-good one) (final review C2)
+  * uncorroborated, pid-less capture findings added up to MALICIOUS: a vendor
+    poller and two telemetry POSTs were 6.4, each kind saturating on its own;
+    across kinds they are capped per process below MALICIOUS (final review C2)
 """
 
 import json
@@ -582,3 +590,112 @@ def test_the_addresses_of_every_transfer_behind_one_finding_are_kept():
     by_kind = {f["kind"]: f for f in out}
     assert by_kind["exfil_upload"]["addresses"] == ["192.0.2.80", "203.0.113.7"]
     assert by_kind["payload_staging"]["addresses"] == ["198.51.100.1", "198.51.100.2"]
+
+
+# --- one loop, one finding; a capture alone is never MALICIOUS (final review C2) ----------------
+
+def _gate_loop(host, address="203.0.113.66", lookup=False):
+    cap = Capture()
+    for i in range(10):
+        req = ("POST /gate.php HTTP/1.1\r\nHost: %s\r\nUser-Agent: x\r\nContent-Length: 11\r\n\r\n"
+               "id=42&st=ok" % host).encode()
+        if lookup:
+            cap.post(100 + 60 * i, host, "/gate.php", b"id=42&st=ok")
+        else:
+            cap.tcp(100 + 60 * i, address, 80,
+                    [("c", req), ("s", b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")])
+    return cap
+
+
+def _report(tmp_path, cap, name="c.pcap"):
+    import net_analyze
+    import test_net_analyze
+    return net_analyze.analyze_pcap(test_net_analyze._write(tmp_path, cap, name))
+
+
+def test_an_http_event_and_its_name_s_beacon_carry_the_address_they_went_to(tmp_path):
+    events = _report(tmp_path, _gate_loop("evil.top"))["events"]
+    assert {tuple(e["addresses"]) for e in events if e["type"] == "http"} == {("203.0.113.66",)}
+    beacons = {b["dest"]: b for b in events if b["type"] == "beacon"}
+    assert beacons["evil.top"]["addresses"] == ["203.0.113.66"]
+    assert "203.0.113.66" in beacons       # the address is never renamed by a Host header
+
+
+def test_one_loop_is_one_finding_with_or_without_the_lookup(tmp_path):
+    """Regressions covered: without a lookup in the capture the HTTP check-ins
+    (named by the Host header) and the connections (by the address) were two
+    c2_checkin findings, 3.2 SUSPICIOUS by saturation, 1.6 CLEAN with the lookup."""
+    without = _report(tmp_path, _gate_loop("evil.top"), "a.pcap")["evidence_findings"]
+    assert [(f["kind"], f["dest"]) for f in without] == [("c2_checkin", "evil.top")]
+    assert without[0]["folded"] == ["203.0.113.66"] and "203.0.113.66" in without[0]["addresses"]
+    assert "net.periodic_checkin" in without[0]["rules"]
+    with_dns = _report(tmp_path, _gate_loop("evil.top", lookup=True), "b.pcap")["evidence_findings"]
+    assert memory_evidence.score(without)["score"] == memory_evidence.score(with_dns)["score"] == 1.6
+
+
+def test_a_spoofed_known_good_host_does_not_absorb_the_address_finding(tmp_path):
+    out = _report(tmp_path, _gate_loop("www.msftconnecttest.com"))["evidence_findings"]
+    assert [(f["kind"], f["dest"]) for f in out] == [("c2_checkin", "203.0.113.66")]
+
+
+def test_an_address_two_names_share_stays_its_own_finding():
+    findings = net_evidence.findings_from(
+        [_beacon("198.51.100.5", process=""), _beacon("a.top", process="", addresses=["198.51.100.5"]),
+         _beacon("b.top", process="", addresses=["198.51.100.5"])], [], known_good=())
+    assert sorted(f["dest"] for f in findings) == ["198.51.100.5", "a.top", "b.top"]
+    assert not any(f.get("folded") for f in findings)
+
+
+def _vendor_hour():
+    import os
+    cap = Capture()
+    for i in range(12):
+        req = (b"GET /api/v2/check?ver=4.1 HTTP/1.1\r\nHost: updates.example-vendor.com\r\n"
+               b"User-Agent: VendorUpdater/4.1\r\n\r\n")
+        cap.tcp(100 + 300 * i, "192.0.2.10", 80, [("c", req), ("s", b"HTTP/1.1 204 No Content\r\n\r\n")])
+    cap.post(500, "telemetry.example-app.com", "/v1/events", os.urandom(2048), "application/octet-stream")
+    cap.post(900, "crash.example-tool.net", "/report", os.urandom(2048), "application/octet-stream")
+    cap.post(950, "metrics.example-sdk.io", "/m", os.urandom(2048), "application/octet-stream")
+    cap.get(1000, "cdn.example-vendor.com", "/x", b"ok")
+    return cap
+
+
+def test_uncorroborated_capture_findings_reach_suspicious_never_malicious(tmp_path):
+    """Regressions covered: a vendor updater polling every 300 s (no lookup in
+    the capture) and two telemetry POSTs scored 6.4 MALICIOUS, every finding
+    uncorroborated, each kind saturating to 3.2 on its own. The poller is one
+    finding now, and what uncorroborated capture findings of one process add
+    up to across kinds is capped below MALICIOUS."""
+    findings = _report(tmp_path, _vendor_hour())["evidence_findings"]
+    assert all(f["needs_corroboration"] for f in findings)
+    out = memory_evidence.score(findings)
+    assert out["label"] == "SUSPICIOUS"
+    assert out["score"] == memory_evidence.NETWORK_UNCORROBORATED_CAP
+    assert any(f.get("network_cap") for f in out["findings"])
+    assert any("capped at 4" in r for r in out["reasons"])
+    # many more of every kind cannot pass it either
+    many = [dict(f, key="%s-%d" % (f["key"], i), dest="%d.%s" % (i, f["dest"]))
+            for i in range(10) for f in findings]
+    assert memory_evidence.score(many)["score"] == memory_evidence.NETWORK_UNCORROBORATED_CAP
+
+
+def test_the_cap_is_per_process_and_leaves_corroborated_and_standalone_findings_alone(tmp_path):
+    # as collect() hands them over: assumed, so the PE does not vouch for them
+    findings = [dict(f, attribution="assumed")
+                for f in _report(tmp_path, _vendor_hour())["evidence_findings"]]
+    pe = dict(memory_evidence.MemoryFinding("aether", "reflective_pe", "", identity=("r",)))
+    staging = net_evidence.findings_from(
+        [net_events.NetEvent("download", 1.0, dest="stage.top", kind="pe", sha256="0" * 64)], [],
+        known_good=())
+    out = memory_evidence.score(findings + [pe] + staging)
+    # the PE (3.0) and the staging (4.0, needs no second opinion) count in full beside the cap
+    assert out["score"] == memory_evidence.NETWORK_UNCORROBORATED_CAP + 3.0 + 4.0
+    other = [dict(f, process="other.exe") for f in findings]
+    assert memory_evidence.score(findings + other)["score"] == 2 * memory_evidence.NETWORK_UNCORROBORATED_CAP
+
+
+def test_a_set_without_capture_findings_carries_no_cap():
+    hsb = [dict(memory_evidence.MemoryFinding("hsb", "sleeping_beacon", "a.exe", identity=(str(i),),
+                                              weight=3.0)) for i in range(5)]
+    out = memory_evidence.score(hsb)
+    assert not any("network_cap" in f for f in out["findings"])

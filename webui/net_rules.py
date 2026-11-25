@@ -166,7 +166,7 @@ FIELDS = {
                       "form_names", "status", "resp_text", "resp_bytes", "resp_capped",
                       "resp_decode_failed", "content_type", "content_encoding",
                       "request_truncated", "response_truncated", "stream_capped",
-                      "text_budget_spent"},
+                      "text_budget_spent", "addresses"},
     "raw": COMMON | {"proto", "direction", "framing", "delimiter", "message_sizes",
                      "message_count", "entropy", "printable_ratio", "heartbeat", "interval",
                      "stream_bytes", "stream_capped", "client_guessed"},
