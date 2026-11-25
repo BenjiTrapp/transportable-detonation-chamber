@@ -898,6 +898,10 @@ def test_deeply_nested_blocks_are_refused():
     r"(?:\d+)?(?:\d+)?(?:\d+)?(?:\d+)?x",
     r"()?(?(1)(a+)+$|b)",
     r"(a)?(?(1)(?:b+)+$|c)",
+    # found by re-review: alternatives that start alike hid their own cost
+    r"^(?:\w*\w*\w*\w*\w*\w*b|\w)",
+    r"^(?:\w*\w*\w*\w*\w*b|\w)",
+    r"^(?:.*=.*&.*=.*&.*=.*x|/)",
     # found while fuzzing: an optional part that can match what the next round starts with
     r"^(?:(?:(?:a|b)[a-z]?)*/+(?:\.){2})/+x",
     r"(?:[ab][a-z]?)*c",
@@ -982,7 +986,7 @@ def test_no_regex_that_is_accepted_is_slow_on_a_field_made_to_hurt_it():
             out[-1] += rng.choice(quants)
         return "".join(out)
 
-    n = net_rules.MAX_SUBJECT
+    n = net_rules.PRICE_LEN
     subjects = ["a" * n, "a" * n + "!", "1" * n, "a1" * (n // 2), "a." * (n // 2) + "!",
                 "ab" * (n // 2) + "!", "a/" * (n // 2), " " * n, "a b " * (n // 4) + "!",
                 "x-" * (n // 2) + "."]
@@ -1007,7 +1011,7 @@ def test_no_regex_that_is_accepted_is_slow_on_a_field_made_to_hurt_it():
 
 def test_a_regex_sees_only_the_start_of_a_field_and_not_a_cut_end():
     rs = _rules("rules:\n  - {id: h, name: h, event: http, match: {\"path|re\": 'x$'}}")
-    cut = net_rules.MAX_SUBJECT
+    cut = net_rules.subject_limit()
     assert rs.evaluate([_http(path="a" * (cut - 1) + "x")]) != []
     assert rs.evaluate([_http(path="a" * (cut - 1) + "x" + "b" * 50)]) == []
     assert rs.evaluate([_http(path="a" * (cut + 100) + "x")]) == []
@@ -1021,31 +1025,112 @@ def test_linear_operators_see_the_whole_field():
     assert rs.evaluate([_http(body_text="a" * 500000 + "needle")]) != []
 
 
-def test_the_regex_budget_stops_regexes_and_says_so(monkeypatch):
+_BUDGET_SPENT = [{"rule_id": "r", "events": 50, "reasons": ["budget"]}]
+
+
+def test_a_spent_budget_makes_the_rule_unevaluated_not_false(monkeypatch):
     rs = _rules("rules:\n  - {id: r, name: r, event: http, match: {path|re: 'a'}}")
     evs = [_http(float(i), path="a") for i in range(50)]
     hits = rs.evaluate(evs)
-    assert hits[0]["count"] == 50 and hits.regex_budget_exceeded is False
+    assert hits[0]["count"] == 50 and hits.unevaluated == [] and hits.budget_spent is False
     monkeypatch.setattr(net_rules, "REGEX_BUDGET_S", 0.0)
     spent = rs.evaluate(evs)
-    assert spent == [] and spent.regex_budget_exceeded is True
-    assert isinstance(spent, list)
+    assert spent == [] and isinstance(spent, list)
+    assert spent.unevaluated == _BUDGET_SPENT and spent.budget_spent is True
+
+
+def test_a_negated_regex_does_not_fire_when_the_budget_is_spent(monkeypatch):
+    """The review's attack: spend the budget, and every ``not: {regex}`` rule
+    fires on everything after it."""
+    rs = _rules("rules:\n  - {id: r, name: r, event: http, match: {not: {path|re: '^/benign'}}}")
+    evs = [_http(float(i), path="/benign") for i in range(10)]
+    assert rs.evaluate(evs) == []
+    monkeypatch.setattr(net_rules, "REGEX_BUDGET_S", 0.0)
+    spent = rs.evaluate(evs)
+    assert spent == [] and spent.unevaluated[0]["rule_id"] == "r"
+    assert spent.unevaluated[0]["events"] == 10
+
+
+def test_a_not_around_a_block_with_an_unknown_stays_unknown(monkeypatch):
+    rs = _rules("""
+rules:
+  - {id: a, name: a, event: http, match: {not: {any: [{path|re: x}, {method: POST}]}}}
+  - {id: b, name: b, event: http, match: {not: [{path|re: x}, {method: POST}]}}
+  - {id: c, name: c, event: http, match: {not: {all: [{path|re: x}, {method: POST}]}}}
+""")
+    monkeypatch.setattr(net_rules, "REGEX_BUDGET_S", 0.0)
+    got = rs.evaluate([_http(method="GET", path="/x")])
+    # c: the all is false whatever the regex says (GET is not POST), so its not is true
+    assert _ids(got) == ["c"]
+    assert [u["rule_id"] for u in got.unevaluated] == ["a", "b"]
+
+
+def test_an_any_is_true_and_an_all_is_false_whatever_an_unknown_member_would_say(monkeypatch):
+    rs = _rules("""
+rules:
+  - {id: any_true, name: a, event: http, match: {any: [{path|re: x}, {method: GET}]}}
+  - {id: any_none, name: a, event: http, match: {any: [{path|re: x}, {method: PUT}]}}
+  - {id: all_false, name: a, event: http, match: {all: [{path|re: x}, {method: PUT}]}}
+  - {id: all_none, name: a, event: http, match: {all: [{path|re: x}, {method: GET}]}}
+""")
+    monkeypatch.setattr(net_rules, "REGEX_BUDGET_S", 0.0)
+    got = rs.evaluate([_http(method="GET", path="x")])
+    assert _ids(got) == ["any_true"]
+    assert [u["rule_id"] for u in got.unevaluated] == ["all_none", "any_none"]
+
+
+def test_a_rule_unknown_for_some_events_keeps_the_hits_it_could_decide(monkeypatch):
+    rs = _rules("rules:\n  - {id: r, name: r, event: http, match: {path|re: x}}")
+    monkeypatch.setattr(net_rules, "REGEX_BUDGET_S", 0.0)
+    assert rs.evaluate([_http(path="x")]) == []
+    monkeypatch.setattr(net_rules, "REGEX_BUDGET_S", 20.0)
+    assert len(rs.evaluate([_http(path="x")])) == 1
+
+
+def test_a_spent_budget_is_reported_even_when_nothing_was_skipped(monkeypatch):
+    rs = _rules("rules:\n  - {id: r, name: r, event: http, match: {path|re: 'a'}}")
+    monkeypatch.setattr(net_rules, "REGEX_BUDGET_S", 1e-12)
+    hits = rs.evaluate([_http(path="a")])
+    assert len(hits) == 1 and hits.unevaluated == [] and hits.budget_spent is True
 
 
 def test_the_regex_budget_is_spent_by_regex_time_only(monkeypatch):
     rs = _rules("rules:\n  - {id: r, name: r, event: http, match: {method: GET}}")
     monkeypatch.setattr(net_rules, "REGEX_BUDGET_S", 0.0)
     hits = rs.evaluate([_http(method="GET")])
-    assert len(hits) == 1 and hits.regex_budget_exceeded is False
+    assert len(hits) == 1 and hits.budget_spent is False and hits.unevaluated == []
 
 
 def test_the_regex_budget_does_not_leak_into_the_next_call(monkeypatch):
     rs = _rules("rules:\n  - {id: r, name: r, event: http, match: {path|re: 'a'}}")
     monkeypatch.setattr(net_rules, "REGEX_BUDGET_S", 0.0)
-    assert rs.evaluate([_http(path="a")]).regex_budget_exceeded is True
+    assert rs.evaluate([_http(path="a")]).budget_spent is True
     monkeypatch.setattr(net_rules, "REGEX_BUDGET_S", 20.0)
-    assert len(rs.evaluate([_http(path="a")])) == 1
-    assert len(rs.rules[0]._match(_http(path="a")) and [1]) == 1       # outside evaluate: no budget
+    again = rs.evaluate([_http(path="a")])
+    assert len(again) == 1 and again.budget_spent is False
+    assert rs.rules[0]._match(_http(path="a")) is True          # outside evaluate: no budget
+
+
+def test_an_unknown_in_a_list_field_is_unknown_unless_another_element_matches(monkeypatch):
+    rs = _rules("rules:\n  - {id: r, name: r, event: smtp, match: {rcpt_to|re: 'd.top'}}")
+    event = net_events.NetEvent("smtp", 1.0, rcpt_to=["a@d.top", "b@d.top"])
+    monkeypatch.setattr(net_rules, "REGEX_BUDGET_S", 0.0)
+    got = rs.evaluate([event])
+    assert got == [] and got.unevaluated[0]["reasons"] == ["budget"]
+
+
+def test_a_correlation_that_could_not_fire_because_a_member_is_unknown_is_listed(monkeypatch):
+    rs = _rules("""
+rules:
+  - {id: a, name: a, event: http, match: {path|re: x}}
+  - {id: b, name: b, event: dns, match: {}}
+  - {id: chain, name: c, requires: [[a], [b]]}
+""")
+    monkeypatch.setattr(net_rules, "REGEX_BUDGET_S", 0.0)
+    got = rs.evaluate([_http(path="x"), net_events.NetEvent("dns", 2.0)])
+    assert _ids(got) == ["b"]
+    assert [(u["rule_id"], u["reasons"]) for u in got.unevaluated] == [
+        ("a", ["budget"]), ("chain", ["requires a"])]
 
 
 def test_a_regex_looks_only_at_the_first_elements_of_a_list_field():
@@ -1062,17 +1147,98 @@ def test_other_operators_look_at_every_element_of_a_list_field():
     assert len(rs.evaluate([far])) == 1
 
 
-def test_the_cost_of_one_evaluate_of_hostile_events_is_bounded(monkeypatch):
-    """The point of the budget: a capture of many fields made to hurt the
-    most expensive regex that is accepted costs a budget, not hours."""
-    rs = _rules("rules:\n  - {id: r, name: r, event: http, "
-                "match: {path|re: '\\S*?(?:a|bc)+?\\.php'}}")
-    monkeypatch.setattr(net_rules, "REGEX_BUDGET_S", 0.3)
-    evs = [_http(float(i), path="a" * 5000) for i in range(2000)]
+def _without_the_load_time_check(monkeypatch):
+    """Load ``(a|aa)+$`` and its kind, which the load-time check would refuse, to
+    see what the timeout does when the check lets one through."""
+    monkeypatch.setattr(net_rules._Risk, "work", lambda self, items, inside=False: 0)
+
+
+needs_regex = pytest.mark.skipif(net_rules._regex_module is None,
+                                 reason="no timeout without the regex module")
+
+
+@needs_regex
+def test_a_regex_that_runs_away_times_out_and_the_rule_is_unevaluated(monkeypatch):
+    _without_the_load_time_check(monkeypatch)
+    rs = _rules("rules:\n  - {id: r, name: r, event: http, match: {path|re: '(a|aa)+$'}}")
+    assert rs.errors == []
+    evil = _http(1.0, path="a" * 80 + "!")
     start = time.time()
-    hits = rs.evaluate(evs)
-    assert time.time() - start < 1.5
-    assert hits.regex_budget_exceeded is True
+    got = rs.evaluate([evil, _http(2.0, path="aa")])
+    assert time.time() - start < 1.0
+    assert [h["events"][0]["index"] for h in got] == [1]            # the ordinary event still matches
+    assert got.unevaluated == [{"rule_id": "r", "events": 1, "reasons": ["timeout"]}]
+
+
+@needs_regex
+def test_a_timed_out_regex_is_neither_false_nor_true_inside_not(monkeypatch):
+    _without_the_load_time_check(monkeypatch)
+    rs = _rules("rules:\n  - {id: r, name: r, event: http, match: {not: {path|re: '(a|aa)+$'}}}")
+    got = rs.evaluate([_http(1.0, path="a" * 80 + "!")])
+    assert got == [] and got.unevaluated[0]["reasons"] == ["timeout"]
+
+
+@needs_regex
+def test_a_regex_that_cannot_be_stopped_by_the_checker_still_costs_one_timeout_per_call(monkeypatch):
+    """What the budget is for: many events made to hurt one pattern."""
+    _without_the_load_time_check(monkeypatch)
+    rs = _rules("rules:\n  - {id: r, name: r, event: http, match: {path|re: '(a|aa)+$'}}")
+    monkeypatch.setattr(net_rules, "REGEX_BUDGET_S", 0.3)
+    evs = [_http(float(i), path="a" * 80 + "!") for i in range(2000)]
+    start = time.time()
+    got = rs.evaluate(evs)
+    took = time.time() - start
+    assert took < 0.3 + 5 * net_rules.REGEX_TIMEOUT_S + 0.2
+    assert got.budget_spent is True
+    reasons = got.unevaluated[0]["reasons"]
+    assert got.unevaluated[0]["events"] == 2000 and "budget" in reasons
+
+
+@needs_regex
+@pytest.mark.parametrize("pattern", [
+    r"^(?:\w*\w*\w*\w*\w*\w*b|\w)",
+    r"^(?:a(?=\w*\w*\w*\w*\w*\w*!))+",
+    r"^(?:\w*\w*\w*\w*\w*b|\w)",
+    r"^(?:.*=.*&.*=.*&.*=.*x|/)",
+    r"(a+)+$",
+    r"^/(\w+/?){1,5}\.php$",
+])
+def test_the_patterns_that_got_past_the_checker_are_harmless_with_the_timeout(pattern, monkeypatch):
+    """Judged by what happens, whatever the load-time check says: either refused,
+    or one event with a 256-character field is decided or timed out in well under a second."""
+    _without_the_load_time_check(monkeypatch)
+    rs = _rules("rules:\n  - {id: h, name: h, event: http, match: {\"path|re\": '%s'}}" % pattern)
+    assert rs.errors == []
+    start = time.time()
+    for subject in ("a" * 256, "a=" * 128, "/" + "a/" * 128, "a" * 255 + "!"):
+        rs.evaluate([_http(path=subject)])
+    assert time.time() - start < 1.0
+
+
+def test_without_the_regex_module_the_checker_is_the_guard_and_the_cut_is_short(monkeypatch):
+    monkeypatch.setattr(net_rules, "_regex_module", None)
+    assert net_rules.subject_limit() == net_rules.MAX_SUBJECT_UNGUARDED
+    rs = _rules("rules:\n  - {id: r, name: r, event: http, match: {path|re: 'x$'}}\n"
+                "  - {id: bad, name: b, event: http, match: {path|re: '(a+)+$'}}")
+    assert [r["id"] for r in rs.rules] == ["r"] and len(rs.errors) == 1
+    assert not rs.rules[0]["match"] == {} and net_rules._compile_regex("a")._pattern.__class__.__module__ == "re"
+    cut = net_rules.MAX_SUBJECT_UNGUARDED
+    assert len(rs.evaluate([_http(path="a" * (cut - 1) + "x")])) == 1
+    assert rs.evaluate([_http(path="a" * cut + "x")]) == []
+
+
+def test_with_the_regex_module_the_cut_is_longer_and_calls_are_guarded():
+    if net_rules._regex_module is None:
+        pytest.skip("no regex module")
+    assert net_rules.subject_limit() == net_rules.MAX_SUBJECT > net_rules.MAX_SUBJECT_UNGUARDED
+    assert net_rules._compile_regex("a").guarded is True
+
+
+def test_a_regex_sees_further_into_a_field_with_the_timeout_than_without(monkeypatch):
+    rs = _rules("rules:\n  - {id: h, name: h, event: http, match: {\"path|re\": 'late'}}")
+    mid = net_rules.MAX_SUBJECT_UNGUARDED + 100
+    assert (len(rs.evaluate([_http(path="a" * mid + "late")])) == 1) == (
+        net_rules._regex_module is not None)
 
 
 # --- cost -----------------------------------------------------------------------

@@ -23,19 +23,35 @@ not learn a second notation. Several things are easy to get wrong:
     would make the engine the first thing that does.
   * A regex is harmless. ``(a+)+$`` against forty characters runs for hours, and
     ``^/(\\w+/?){1,5}\\.php$`` against two hundred for longer than anyone waits,
-    in one event of a capture the malware chose. ``re`` cannot be interrupted, so
-    there are three lines of defence. At load time a regex is read as a parse
-    tree: shapes that are exponential (a repeat that holds a repeat or an
-    optional part it cannot tell from what follows, alternatives that start
-    alike inside a repeat, conditional groups) are refused, and for the rest the
-    steps a worst-case field would cost are estimated (each repeat that can
-    swallow what follows it multiplies the work after it) and a regex over
-    ``MAX_REGEX_STEPS`` is refused. A regex is shown only the first
-    ``MAX_SUBJECT`` characters of a field, and of a list field only the first
-    ``MAX_REGEX_ELEMENTS`` elements. And one ``evaluate`` may spend only
-    ``REGEX_BUDGET_S`` seconds in regexes, after which they stop matching and
-    the result says so (``regex_budget_exceeded``). The other string operators are
-    linear and see the whole field.
+    in one event of a capture the malware chose, and the standard ``re`` cannot be
+    interrupted. So rule patterns run on the ``regex`` module with a timeout on
+    every call (``REGEX_TIMEOUT_S``), which holds whatever the pattern is. A
+    pattern that times out is not "no match": see the next point. If ``regex``
+    cannot be imported, ``re`` is used and nothing bounds a call except the
+    checks below, so the subject is then cut to ``MAX_SUBJECT_UNGUARDED``
+    characters instead of ``MAX_SUBJECT``; the guest always has ``regex``
+    (``requirements.txt``).
+    Independent of the engine, a pattern is checked when the rule loads, as an
+    early warning with a reason and not as the guarantee: shapes that are
+    exponential (a repeat that holds a repeat or an optional part it cannot tell
+    from what follows, alternatives that start alike inside a repeat,
+    conditional groups) are refused, and a worst-case step estimate on
+    ``PRICE_LEN`` characters over ``MAX_REGEX_STEPS`` is refused. The estimate has
+    known gaps (the cost of a lookahead inside a repeat's body is not priced) and
+    is not the thing to rely on. A list field is shown to a regex only up to its
+    first ``MAX_REGEX_ELEMENTS`` elements, and one ``evaluate`` may spend only
+    ``REGEX_BUDGET_S`` seconds in regexes. The other string operators are linear
+    and see the whole field.
+  * A regex that was not run is "could not tell", not "no". A timeout, or a spent
+    budget, makes the condition unknown. Unknown is never true and never false:
+    ``not: {path|re: ...}`` over an unknown is unknown, so an attacker who exhausts
+    the budget does not make every negated rule fire. An ``all`` is false if any
+    member is false, an ``any`` true if any member is true, and unknown
+    otherwise. A rule that is unknown for an event is skipped for that event and
+    named in ``Hits.unevaluated``; its hits from the events it could decide are
+    real, and for a rule listed there the absence of a hit is not an answer. A
+    correlation whose required rules are unevaluated and which did not fire is
+    listed too.
   * Every rule against every event. Rules are filed under the event types they
     name, and a rule whose match has a plain equality or ``in`` condition is
     additionally filed under that field's values, so an event is tried on the
@@ -76,6 +92,11 @@ import time
 
 import yaml
 
+try:
+    import regex as _regex_module
+except ImportError:                      # re is used, see the docstring
+    _regex_module = None
+
 import net_events
 
 try:                                     # Python 3.11 and later
@@ -85,8 +106,10 @@ except ImportError:                      # 3.9, 3.10
     import sre_constants
     import sre_parse
 
-MAX_SUBJECT = 256           # characters of a field that a regex is shown (a path, a user
-#                             agent, a server name, a header value all fit)
+MAX_SUBJECT = 2048          # characters of a field that a regex is shown, with a timeout
+MAX_SUBJECT_UNGUARDED = 256 # the same with plain ``re``, which cannot be interrupted
+PRICE_LEN = 256             # the length the load-time cost estimate is made for
+REGEX_TIMEOUT_S = 0.02      # one regex call on one field; a normal one takes microseconds
 MAX_PATTERN = 500           # characters of a regex
 MAX_FILE_BYTES = 4 * 1024 * 1024
 MAX_DEPTH = 6               # any / all / not inside each other
@@ -95,7 +118,7 @@ MAX_HIT_EVENTS = 20         # events named by one hit; ``count`` is exact
 MAX_REGEX_ELEMENTS = 16     # elements of a list field a regex is tried on
 REGEX_BUDGET_S = 20.0       # seconds of regex matching one ``evaluate`` may spend
 ALWAYS_VISIBLE = frozenset(("download", "upload", "decoded"))   # never hidden by known_good
-MAX_REGEX_STEPS = 20000000  # estimated worst case of one regex on one field
+MAX_REGEX_STEPS = 20000000  # estimated worst case of one regex on PRICE_LEN characters
 
 SEVERITIES = ("info", "low", "medium", "high", "critical")
 KNOWN_GOOD = "known_good"
@@ -159,6 +182,21 @@ _TEXT_KEYS = ("description", "role", "behavior", "family", "kind")
 _run = threading.local()        # the regex budget of the evaluate() running in this thread
 
 
+def subject_limit():
+    """How many characters of a field a regex is shown, with the engine in use."""
+    return MAX_SUBJECT if _regex_module is not None else MAX_SUBJECT_UNGUARDED
+
+
+class _Unknown(Exception):
+    """A condition that could not be decided (a regex timed out or the budget is
+    spent). Raised out of the condition, and handled by ``all``/``any``/``not``,
+    which never turn it into true or false."""
+
+    def __init__(self, *reasons):
+        super().__init__(", ".join(reasons))
+        self.reasons = frozenset(reasons)
+
+
 class RuleError(ValueError):
     """A rule that cannot be used; the message is the reason shown to the analyst."""
 
@@ -209,8 +247,8 @@ def _plain(value):
 # --- regex safety -------------------------------------------------------------------
 # ``re`` backtracks and cannot be interrupted. What blows up is ambiguity: more than one
 # way to divide a string among repeats. This reads the parsed pattern and refuses the
-# shapes that are ambiguous; ``MAX_SUBJECT`` and the budget in ``evaluate`` are the
-# backstops for the ones it misses.
+# shapes that are ambiguous. It is an early warning with a reason; the guarantee is the
+# timeout on every call (``_Compiled``).
 
 _OPEN = 16          # a repeat that can run more often than this is open-ended
 
@@ -405,7 +443,7 @@ def _sequence(items):
 
 class _Risk:
     """Walks a parsed pattern, refuses the shapes that are exponential, and estimates
-    the work of the rest as a number of steps on a ``MAX_SUBJECT`` field.
+    the work of the rest as a number of steps on a ``PRICE_LEN`` field.
 
     A repeat is *ambiguous* when it can swallow a character that may follow it, so
     that where it ends is a choice; each choice multiplies the work of everything
@@ -444,7 +482,7 @@ class _Risk:
             if hi > 1 and _has_repeat(body):
                 self.delimited(body)
             self.work(body, inside or hi > 1)
-            run = MAX_SUBJECT if _is_open(av) else hi
+            run = PRICE_LEN if _is_open(av) else hi
             if (hi > 1 or lo == 0 or optional) and (
                     _chars(body, self.fold) & self.follow(flat, i)):
                 return (run if hi > 1 else 2) * (1 + rest)
@@ -458,7 +496,7 @@ class _Risk:
             starts = [_first(alt, self.fold)[0] for alt in av[1]]
             overlapping = sum(len(x) for x in starts) > len(frozenset().union(*starts))
             if overlapping:
-                return len(av[1]) * (1 + rest)
+                return len(av[1]) * (1 + max(works) + rest)
             return max(works) + rest
         if op == _CONDITIONAL:
             raise RuleError("a conditional group (?(1)..|..) is not supported")
@@ -505,7 +543,7 @@ class _Risk:
 
 
 def _starts(parsed, fold):
-    """How many positions of a ``MAX_SUBJECT`` field a search can start a real attempt at.
+    """How many positions of a ``PRICE_LEN`` field a search can start a real attempt at.
 
     One when the pattern is anchored. When it opens with literal characters, an
     attempt needs those, and the most starts they allow is the length divided by
@@ -521,7 +559,7 @@ def _starts(parsed, fold):
             break
         prefix.append(chr(av).lower() if fold else chr(av))
     if not prefix:
-        return MAX_SUBJECT
+        return PRICE_LEN
     border = [0] * len(prefix)             # longest proper prefix that is also a suffix
     for i in range(1, len(prefix)):
         k = border[i - 1]
@@ -529,7 +567,7 @@ def _starts(parsed, fold):
             k = border[k - 1]
         border[i] = k + (prefix[i] == prefix[k])
     period = len(prefix) - border[-1]
-    return -(-MAX_SUBJECT // period)
+    return -(-PRICE_LEN // period)
 
 
 def _compile_regex(pattern):
@@ -545,12 +583,29 @@ def _compile_regex(pattern):
         if steps > MAX_REGEX_STEPS:
             raise RuleError("its worst case on a %d-character field is about %d steps "
                             "(limit %d): too many repeats that can swallow what follows "
-                            "them" % (MAX_SUBJECT, steps, MAX_REGEX_STEPS))
+                            "them" % (PRICE_LEN, steps, MAX_REGEX_STEPS))
     except RuleError as exc:
         raise RuleError("regex %r refused: %s" % (pattern, exc))
     except (re.error, RecursionError, OverflowError) as exc:
         raise RuleError("invalid regex %r: %s" % (pattern, exc))
-    return compiled
+    return _Compiled(pattern)
+
+
+class _Compiled:
+    """A rule regex on the engine in use; ``search`` raises ``_Unknown`` on a timeout."""
+
+    def __init__(self, pattern):
+        self.guarded = _regex_module is not None
+        self.limit = subject_limit()
+        self._pattern = (_regex_module or re).compile(pattern)
+
+    def search(self, text):
+        if not self.guarded:
+            return self._pattern.search(text)
+        try:
+            return self._pattern.search(text, timeout=REGEX_TIMEOUT_S)
+        except TimeoutError:
+            raise _Unknown("timeout")
 
 
 # --- compiling a rule ---------------------------------------------------------------
@@ -563,6 +618,46 @@ _WHOLE_OPS = ("count_gte", "has_all")
 
 def _names(allowed):
     return ", ".join(sorted(allowed))
+
+
+def _merge(unknown, new):
+    return new if unknown is None else _Unknown(*(unknown.reasons | new.reasons))
+
+
+def _all(tests):
+    """False if any member is false, unknown if none is false and one is unknown."""
+    def run(event):
+        unknown = None
+        for test in tests:
+            try:
+                if not test(event):
+                    return False
+            except _Unknown as exc:
+                unknown = _merge(unknown, exc)
+        if unknown is not None:
+            raise unknown
+        return True
+    return run
+
+
+def _any(tests):
+    """True if any member is true, unknown if none is true and one is unknown."""
+    def run(event):
+        unknown = None
+        for test in tests:
+            try:
+                if test(event):
+                    return True
+            except _Unknown as exc:
+                unknown = _merge(unknown, exc)
+        if unknown is not None:
+            raise unknown
+        return False
+    return run
+
+
+def _not(test):
+    return lambda event: not test(event)          # an unknown passes through unchanged
 
 
 class _Compiler:
@@ -643,24 +738,21 @@ class _Compiler:
         tests = [t for _cost, t in self.mapping(node, depth)[0]]
         if not tests:
             return lambda event: True
-        if len(tests) == 1:
-            return tests[0]
-        return lambda event: all(t(event) for t in tests)
+        return tests[0] if len(tests) == 1 else _all(tests)
 
     def block(self, name, value, depth):
         if depth + 1 > MAX_DEPTH:
             raise RuleError("blocks nested more than %d deep" % MAX_DEPTH)
         if name == "not" and isinstance(value, dict):
-            inner = self.conjunction(value, depth + 1)
-            return 3, lambda event: not inner(event)
+            return 3, _not(self.conjunction(value, depth + 1))
         if not isinstance(value, list) or not value:
             raise RuleError("%r needs a non-empty list of mappings" % name)
         members = [self.conjunction(v, depth + 1) for v in value]
         if name == "all":
-            return 3, lambda event: all(m(event) for m in members)
+            return 3, _all(members)
         if name == "any":
-            return 3, lambda event: any(m(event) for m in members)
-        return 3, lambda event: not any(m(event) for m in members)
+            return 3, _any(members)
+        return 3, _not(_any(members))
 
     def condition(self, key, value):
         field, _bar, op = key.partition("|")
@@ -733,22 +825,31 @@ class _Compiler:
                     return False
                 left = getattr(_run, "left", None)
                 if left is not None and left <= 0:
-                    _run.exceeded = True
-                    return False
-                head = item[:MAX_SUBJECT]
-                cut = len(item) > MAX_SUBJECT
+                    _run.spent = True
+                    raise _Unknown("budget")
                 started = time.perf_counter()
-                found = False
-                for pattern in patterns:
-                    m = pattern.search(head)
-                    # a match that reaches the cut might have been anchored there or
-                    # have run on, so it counts for nothing
-                    if m and not (cut and m.end() == len(head)):
-                        found = True
-                        break
-                if left is not None:
-                    _run.left = left - (time.perf_counter() - started)
-                return found
+                unknown = None
+                try:
+                    for pattern in patterns:
+                        head = item[:pattern.limit]
+                        cut = len(item) > pattern.limit
+                        try:
+                            m = pattern.search(head)
+                        except _Unknown as exc:
+                            unknown = _merge(unknown, exc)
+                            continue
+                        # a match that reaches the cut might have been anchored there
+                        # or have run on, so it counts for nothing
+                        if m and not (cut and m.end() == len(head)):
+                            return True
+                finally:
+                    if left is not None:
+                        _run.left = left - (time.perf_counter() - started)
+                        if _run.left <= 0:
+                            _run.spent = True
+                if unknown is not None:
+                    raise unknown
+                return False
         else:
             number = _number(self.resolve(value))
             if number is None:
@@ -760,14 +861,29 @@ class _Compiler:
                 n = _number(item)
                 return n is not None and compare(n, number)
 
-        elements = MAX_REGEX_ELEMENTS if op == "re" else None
+        if op != "re":
+            def test(event):
+                found = event.get(field)
+                if isinstance(found, (list, tuple)):
+                    return any(check(item) for item in found)
+                return check(found)
+            return cost, test, keys
 
-        def test(event):
+        def test_regex(event):
             found = event.get(field)
-            if isinstance(found, (list, tuple)):
-                return any(check(item) for item in found[:elements])
-            return check(found)
-        return cost, test, keys
+            if not isinstance(found, (list, tuple)):
+                return check(found)
+            unknown = None
+            for item in found[:MAX_REGEX_ELEMENTS]:
+                try:
+                    if check(item):
+                        return True
+                except _Unknown as exc:
+                    unknown = _merge(unknown, exc)
+            if unknown is not None:
+                raise unknown
+            return False
+        return cost, test_regex, keys
 
 
 # --- the rule and the hit -------------------------------------------------------------
@@ -809,11 +925,25 @@ def _reference(index, event):
 
 
 class Hits(list):
-    """The result of ``evaluate``: a list of ``RuleHit``. ``regex_budget_exceeded`` is
-    True when the regex time of the call ran out and later regex conditions were
-    treated as not matching, so the hits may be incomplete."""
+    """The result of ``evaluate``: a list of ``RuleHit``, plus what it could not decide.
 
-    regex_budget_exceeded = False
+    ``unevaluated`` lists the rules that could not be decided for some events,
+    because a regex timed out or the regex time budget was spent: each entry is
+    ``{"rule_id", "events", "reasons"}`` (``events`` is how many events were
+    skipped; ``reasons`` are ``timeout``, ``budget`` or ``requires <id>``).
+
+    For a rule that is not listed, no hit means no match. For a rule that is
+    listed, its hits come from the events it could decide and are real, but the
+    absence of a hit is not an answer: it may be "could not tell". A condition that
+    could not be decided never counts as true or as false, in a ``not`` either.
+    ``budget_spent`` is True when the regex time ran out during the call, whether
+    or not a later condition was then skipped.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.unevaluated = []
+        self.budget_spent = False
 
 
 class _KnownGood:
@@ -893,10 +1023,11 @@ class RuleSet:
         loaded, then the correlations. The events are not changed."""
         seen = {}               # rule position -> process -> [count, event references]
         hidden = self._known.hides if self._known else None
-        _run.left, _run.exceeded = REGEX_BUDGET_S, False
+        unknown = {}            # rule position -> [events skipped, reasons]
+        _run.left, _run.spent = REGEX_BUDGET_S, False
         try:
-            self._scan_events(events, seen, hidden)
-            exceeded = _run.exceeded
+            self._scan_events(events, seen, hidden, unknown)
+            spent = _run.spent
         finally:
             _run.left = None
         hits, by_rule = Hits(), {}
@@ -908,10 +1039,21 @@ class RuleSet:
                     hits.append(hit)
                     by_rule.setdefault(rule["id"], {})[process] = hit
         hits.extend(self._correlate(by_rule))
-        hits.regex_budget_exceeded = exceeded
+        hits.budget_spent = spent
+        hits.unevaluated = self._unevaluated(unknown, by_rule, hits)
         return hits
 
-    def _scan_events(self, events, seen, hidden):
+    def _unevaluated(self, unknown, by_rule, hits):
+        out = {self.rules[p]["id"]: [n, set(reasons)] for p, (n, reasons) in unknown.items()}
+        fired = {h["rule_id"] for h in hits}
+        for rule in self._chains:
+            missing = [i for group in rule["requires"] for i in group if i in out]
+            if missing and rule["id"] not in fired:
+                out[rule["id"]] = [0, {"requires " + i for i in sorted(set(missing))}]
+        return [{"rule_id": rid, "events": n, "reasons": sorted(reasons)}
+                for rid, (n, reasons) in sorted(out.items())]
+
+    def _scan_events(self, events, seen, hidden, unknown):
         for index, event in enumerate(events):
             if not isinstance(event, dict):
                 continue
@@ -923,7 +1065,14 @@ class RuleSet:
             for rule in self._candidates(event, etype):
                 if invisible and not rule._sees_known:
                     continue
-                if rule._match(event):
+                try:
+                    matched = rule._match(event)
+                except _Unknown as exc:
+                    skipped = unknown.setdefault(rule._position, [0, set()])
+                    skipped[0] += 1
+                    skipped[1] |= exc.reasons
+                    continue
+                if matched:
                     process = event.get("process")
                     entry = seen.setdefault(rule._position, {}).setdefault(
                         process if isinstance(process, str) else "", [0, []])
@@ -1064,12 +1213,7 @@ def _event_rule(spec, lists):
     compiler = _Compiler(lists, types)
     tests, index = compiler.mapping(spec.get("match", {}), 0, top=True)
     parts = [t for _cost, t in tests]
-
-    def match(event):
-        for part in parts:
-            if not part(event):
-                return False
-        return True
+    match = _all(parts) if parts else (lambda event: True)
     count = spec.get("count_gte", 1)
     if isinstance(count, bool) or not isinstance(count, int) or count < 1:
         raise RuleError("'count_gte' must be a whole number of at least 1")
