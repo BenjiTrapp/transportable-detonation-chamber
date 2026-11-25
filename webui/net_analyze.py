@@ -69,10 +69,11 @@ module is that order, in ``analyze_pcap``. The false assumptions it avoids:
     sat. Rules and findings ran on the plain events before, so masking changes
     no verdict. Nothing secret is written to the baseline either.
   * Every address is an indicator. The servers of ``known_good`` names are
-    the idle machine's: an address that only known-good lookups answered, and
-    the address of a connection that carried nothing but events to known-good
-    names, are not listed. A transfer's address is, unless a known-good lookup
-    returned it, so a claimed name on a foreign address keeps the address.
+    the idle machine's and are not listed, but only where a DNS answer in the
+    capture says so: an address that known-good lookups (and no other) returned,
+    and to which no connection claimed a name that answer does not cover. A
+    claimed name is not corroboration: a known-good Host header sent to an
+    address no known-good lookup returned keeps the address in the list.
   * A step that fails ends the analysis. A capture is hostile input: a parser
     that raises on one flow is an entry in ``errors`` and the next parser (at
     the end ``net_raw``) is tried; the decoder, the behaviour analysis, the
@@ -478,50 +479,60 @@ class _Indicators:
 _IOC_ORDER = ("domain", "ip", "url", "sha256", "email", "account")
 
 
-def _quiet_addresses(events, claimed, known_good):
-    """``(addresses, positions)`` that are a known-good server, not an indicator.
+def _norm(name):
+    return name.lower().rstrip(".") if isinstance(name, str) else ""
 
-    ``addresses`` were answered by the capture's lookups for known-good names
-    only; ``positions`` are the ``conn`` events whose flow carried nothing but
-    events to known-good names (whose name is as trusted as the rest of
-    ``known_good``: the sample's own header or server name). An upload or
-    download keeps its address unless a known-good lookup returned it, so a
-    claimed name on a foreign address still leaves the address in the list.
+
+def _quiet_addresses(events, claimed, known_good):
+    """Addresses that are a known-good server, not an indicator.
+
+    A claimed name (a Host header, a server name) is not corroboration: the
+    sample writes it. An address is quiet only when a DNS answer in this
+    capture mapped a known-good name to it, no answer mapped another name to
+    it, and no connection to it claimed a name that such an answer does not
+    cover (a name that is not known-good, or a known-good name that was
+    resolved elsewhere or not at all). A known-good Host header sent to an
+    address no known-good lookup returned keeps that address as an IOC.
     """
     names = {}
     for e in events:
         if e.get("type") != "dns" or e.get("query_type") not in ("A", "AAAA"):
             continue
-        hidden = known_good.hides({"dest": e.get("dest")})
         for answer in e.get("answers") or ():
             ip = _ip(answer)
             if ip is not None:
-                names.setdefault(str(ip), []).append(hidden)
-    addresses = {ip for ip, hidden in names.items() if all(hidden)}
-    positions = set()
-    for i, e in enumerate(events):
-        found = claimed.get(id(e)) if e.get("type") == "conn" else None
-        if found and all(isinstance(f.get("dest"), str) and known_good.hides({"dest": f["dest"]})
-                         for f in found):
-            positions.add(i)
-    return addresses, positions
+                names.setdefault(str(ip), set()).add(_norm(e.get("dest")))
+    quiet = {ip for ip, found in names.items()
+             if found and all(known_good.hides({"dest": n}) for n in found)}
+    for e in events:
+        ip = _ip(e.get("dest")) if e.get("type") == "conn" else None
+        if ip is None or str(ip) not in quiet:
+            continue
+        for f in claimed.get(id(e)) or ():
+            name = f.get("dest")
+            if not isinstance(name, str) or not name or _ip(name) is not None:
+                continue            # a profile of bytes claims no name
+            if _norm(name) not in names[str(ip)]:
+                quiet.discard(str(ip))
+                break
+    return quiet
 
 
-def _iocs(copies, known_good, quiet=(set(), set())):
+def _iocs(copies, known_good, quiet=frozenset()):
     out = _Indicators()
-    addresses, positions = quiet
+    addresses = quiet
 
     def foreign(text):
         ip = _ip(text)
         return ip is None or str(ip) not in addresses
 
-    for i, e in enumerate(copies):
+    for e in copies:
         etype = e.get("type")
         if e.get("baseline") == "known" or etype in BEHAVIOR_TYPES:
             continue
         dest = e.get("dest")
         name_known = isinstance(dest, str) and known_good.hides({"dest": dest})
-        if etype != "decoded" and i not in positions and foreign(dest):
+        if etype != "decoded" and foreign(dest):
             out.name(dest, e, known_good)
         for address in e.get("addresses") or ():
             if foreign(address):

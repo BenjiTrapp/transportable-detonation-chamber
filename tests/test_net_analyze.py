@@ -688,3 +688,26 @@ def test_a_baseline_without_a_key_version_is_ignored(tmp_path):
         net_events.NetEvent("dns", 1.0, dest="a.top")): {"type": "dns"}}, "dests": {"a.top": 1}}))
     bl = net_baseline.NetBaseline(str(path))
     assert bl.count == 0 and not bl.knows_dest("a.top")
+
+
+def test_a_known_good_host_header_on_an_unresolved_address_keeps_the_address(tmp_path):
+    cap = Capture()
+    cap.tcp(5.0, "203.0.113.50", 80, [("c", b"GET /connecttest.txt HTTP/1.1\r\n"
+                                           b"Host: www.msftconnecttest.com\r\n\r\n"),
+                                      ("s", _ok(b"Microsoft Connect Test"))])
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    assert "203.0.113.50" in [i["value"] for i in r["iocs"] if i["type"] == "ip"]
+
+
+def test_an_address_that_also_served_another_name_stays_an_ioc(tmp_path):
+    cap = Capture()
+    address = cap.server("www.msftconnecttest.com")
+    cap.get(5.0, "www.msftconnecttest.com", "/connecttest.txt", b"Microsoft Connect Test")
+    cap.tcp(9.0, address, 80, [("c", b"GET /gate HTTP/1.1\r\nHost: evil.top\r\n\r\n"),
+                               ("s", _ok(b"ok"))])
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    assert address in [i["value"] for i in r["iocs"] if i["type"] == "ip"]
+    only = Capture()
+    only.get(5.0, "www.msftconnecttest.com", "/connecttest.txt", b"Microsoft Connect Test")
+    r = net_analyze.analyze_pcap(_write(tmp_path, only, "only.pcap"))
+    assert address not in [i["value"] for i in r["iocs"] if i["type"] == "ip"]
