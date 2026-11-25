@@ -48,6 +48,22 @@ intervals (``ts`` of each request), rules (``method``, ``path``, ``body_text``,
     two directions interleave in time, so messages are listed by when they
     began. A request that asks for an upgrade and was answered with anything
     but 101 is only an HTTP event.
+  * A body is what is on the wire. ``Content-Encoding`` gzip, x-gzip and
+    deflate (and stacks of them) are undone before the text is decided, with
+    the framings servers mislabel (gzip, zlib-wrapped and raw deflate) all
+    accepted. A compressed body is a decompression bomb waiting for a tool
+    that opens untrusted captures, so inflating stops at ``MAX_INFLATED``, set
+    to the text cap because nothing past it would be kept; the decompressor
+    itself refuses to produce more, so the output is never allocated, and
+    ``body_capped`` / ``resp_capped`` say it was cut. Corrupt or cut
+    compressed data is normal in a pcap: the event is kept, the text is
+    whatever inflated before the break (None if nothing did),
+    ``body_bytes`` / ``resp_bytes`` stay the bytes on the wire, and
+    ``body_decode_failed`` / ``resp_decode_failed`` are True. An encoding that
+    is not understood (br, zstd) leaves the body as it is; the encoding
+    applied or seen is in ``content_encoding`` (response) and
+    ``request_encoding``. ``download`` and ``upload`` still describe the wire
+    bytes: size and hash are those of what was transferred.
   * Bytes from a capture are inert. Nothing is executed or opened as a file;
     a download is hashed and its first bytes name its kind.
 
@@ -55,21 +71,24 @@ Only the ``Upgrade``/``101`` exchange is a WebSocket; ``permessage-deflate``
 frames are not inflated, so such a message has ``text`` None.
 
 ``dest`` is the Host header's name (lower case, no port) and falls back to the
-server address; ``port`` is the TCP port. ``content_type`` is the response's;
-the request's is ``headers["content-type"]``. Compressed bodies are not
-inflated.
+server address; ``port`` is the TCP port. ``content_type`` and
+``content_encoding`` are the response's (the response decides whether a
+download happened); the request's are ``headers["content-type"]`` and
+``request_encoding``.
 """
 
 import codecs
 import hashlib
 import heapq
 import re
+import zlib
 from bisect import bisect_right
 from urllib.parse import parse_qsl, urlsplit
 
 from net_events import NetEvent
 
 MAX_BODY_TEXT = 256 * 1024       # text kept per body or message; the size is still exact
+MAX_INFLATED = MAX_BODY_TEXT     # output of one inflate step; nothing past it is kept anyway
 MAX_HEAD = 256 * 1024            # a header section longer than this is not read
 UPLOAD_MIN = 512                 # a request body above this many bytes is an upload
 MAX_WS_FRAMES = 20000            # frames read per direction
@@ -88,6 +107,8 @@ _DIGITS = re.compile(rb"[0-9]{1,18}$")
 _CONTROL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
 _BOUNDARY = re.compile(r'boundary="?([^";]+)"?', re.I)
 _PART_NAME = re.compile(rb'(?:^|[;\s])name="([^"]*)"', re.I)
+
+_CODINGS = frozenset(("gzip", "x-gzip", "deflate", "identity"))
 
 _WS_DATA = (0, 1, 2)
 _WS_CONTROL = (8, 9, 10)
@@ -357,6 +378,83 @@ def _text(body):
     return text, capped
 
 
+def _inflate_stream(data, wbits, limit):
+    """``(output, capped, failed)`` for one attempt at one framing of ``data``.
+
+    The output ceiling is enforced by the decompressor itself (``max_length``),
+    so a bomb never allocates more than ``limit`` + 1 bytes. A stream that ends
+    before its end marker, or breaks, is ``failed`` and keeps what it produced.
+    """
+    out = []
+    total = 0
+    members = 0
+    while data:
+        decoder = zlib.decompressobj(wbits)
+        try:
+            chunk = decoder.decompress(data, limit + 1 - total)
+        except zlib.error:
+            # garbage after a complete member (padding) is not a failure
+            return b"".join(out), False, members == 0
+        out.append(chunk)
+        total += len(chunk)
+        if total > limit:
+            return b"".join(out)[:limit], True, False
+        if not decoder.eof:
+            return b"".join(out), False, True
+        members += 1
+        data = decoder.unused_data if wbits > 0 else b""
+    return b"".join(out), False, False
+
+
+def _inflate(data, limit):
+    """Undo one gzip or deflate layer: ``(output, capped, failed)``.
+
+    Servers label gzip, zlib-wrapped deflate and raw deflate with each other's
+    names, so the zlib/gzip header is detected, and raw deflate is tried when
+    that yields nothing.
+    """
+    if not data:
+        return b"", False, False
+    out, capped, failed = _inflate_stream(data, zlib.MAX_WBITS | 32, limit)
+    if failed and not out:
+        out, capped, failed = _inflate_stream(data, -zlib.MAX_WBITS, limit)
+    return out, capped, failed
+
+
+def _decoded(body, encoding):
+    """``(data, capped, failed)``: the body with its content encoding undone.
+
+    ``capped`` means more output existed than ``MAX_INFLATED``; ``failed`` that
+    a supported encoding could not be undone completely, in which case ``data``
+    is what came out before it broke. An encoding that is not understood leaves
+    the body as it is.
+    """
+    codings = [c.strip() for c in encoding.split(",") if c.strip()]
+    if not body or not codings or any(c not in _CODINGS for c in codings):
+        return body, False, False
+    data, capped, failed = body, False, False
+    for coding in reversed(codings):
+        if coding == "identity":
+            continue
+        data, capped, failed = _inflate(data, MAX_INFLATED)
+        if capped or failed:
+            break
+    return data, capped, failed
+
+
+def _body_text(body, encoding):
+    """``(text or None, capped, decode_failed, data)`` of a message body.
+
+    ``data`` is the body with its encoding undone. A body that could not be
+    decoded at all has no text, however empty its remains are.
+    """
+    data, inflate_capped, failed = _decoded(body, encoding)
+    text, capped = _text(data)
+    if failed and not data:
+        text = None
+    return text, capped or inflate_capped, failed, data
+
+
 def _kind(body):
     if body[:2] == b"MZ":
         return "pe"
@@ -597,18 +695,22 @@ def _exchange_events(ctx, req, resp):
     body = req.body if req else b""
     reply = resp.body if resp else b""
     ctype = resp_headers.get("content-type", "")
-    body_text, body_capped = _text(body)
-    resp_text, resp_capped = _text(reply)
+    request_encoding = origin.headers.get("content-encoding", "").strip().lower()
+    response_encoding = resp_headers.get("content-encoding", "").strip().lower()
+    body_text, body_capped, body_failed, data = _body_text(body, request_encoding)
+    resp_text, resp_capped, resp_failed, _data = _body_text(reply, response_encoding)
     http = NetEvent(
         "http", ts, dest=origin.dest, port=origin.port,
         method=origin.method, url=origin.url, path=origin.path, query=origin.query,
         ua=origin.headers.get("user-agent", ""), headers=origin.headers,
         header_order=origin.order,
         body_text=body_text, body_bytes=len(body), body_capped=body_capped,
-        form_names=_form_names(origin.headers.get("content-type", ""), body) if req else [],
+        body_decode_failed=body_failed, request_encoding=request_encoding,
+        form_names=_form_names(origin.headers.get("content-type", ""), data) if req else [],
         status=resp.status if resp else None,
         resp_text=resp_text, resp_bytes=len(reply), resp_capped=resp_capped,
-        content_type=ctype,
+        resp_decode_failed=resp_failed, content_type=ctype,
+        content_encoding=response_encoding,
         request_truncated=bool(req and req.truncated),
         response_truncated=bool(resp and resp.truncated),
         stream_gaps=list(ctx.gaps), stream_capped=ctx.capped)

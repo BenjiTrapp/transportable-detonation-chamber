@@ -33,13 +33,27 @@ Regressions covered:
     instead of in the order they happened
   * a download hash was taken over a body that the stream cap had cut and
     looked like the hash of the real file
+  * a gzip or deflate body (most of the real web, and malware too) had no
+    text, so what the C2 sent back stayed unreadable; the raw-deflate and
+    zlib-wrapped forms servers mislabel in both directions are read as well
+  * a decompression bomb (a few hundred bytes that expand to gigabytes) was
+    allowed to allocate its output; inflating stops at ``MAX_INFLATED`` and
+    the body says it was cut
+  * a compressed body cut by the capture, or corrupt, took the event down or
+    passed for an empty one; the event is kept with the raw size and
+    ``body_decode_failed`` / ``resp_decode_failed``
+  * an encoding the module cannot undo (br, zstd) was treated as if it had
+    been undone, or the body was dropped, instead of being left as it was
 """
 
+import gzip
 import hashlib
 import os
 import random
 import socket
 import tempfile
+import tracemalloc
+import zlib
 
 import dpkt
 
@@ -754,3 +768,141 @@ def test_ws_frames_stops_at_a_reserved_opcode_and_at_nonsense():
     assert [f["payload"] for f in net_http.ws_frames(good + b"\x85\x00" + good)] == [b"ok"]
     assert net_http.ws_frames(b"") == [] and net_http.ws_frames(b"\x81") == []
     assert net_http.ws_frames(b"\x81\x7f" + b"\xff" * 8 + b"x") == []
+
+
+# --- content encoding ---------------------------------------------------------
+
+_TEXT = b'{"cmd": "sleep", "arg": 30, "pad": "' + b"abcdefgh" * 40 + b'"}'
+
+
+def _raw_deflate(data):
+    c = zlib.compressobj(9, zlib.DEFLATED, -zlib.MAX_WBITS)
+    return c.compress(data) + c.flush()
+
+
+def _encoded(body, coding):
+    return _ok(body, b"Content-Encoding: " + coding + b"\r\n")
+
+
+def test_a_gzipped_response_is_read_as_text():
+    wire = gzip.compress(_TEXT)
+    for coding in (b"gzip", b"x-gzip", b"GZIP"):
+        e = _events(_get(), _encoded(wire, coding))[0]
+        assert e["resp_text"] == _TEXT.decode(), coding
+        assert e["resp_bytes"] == len(wire) and e["resp_capped"] is False
+        assert e["resp_decode_failed"] is False and e["content_encoding"] == coding.decode().lower()
+
+
+def test_a_zlib_wrapped_deflate_response_is_read_as_text():
+    e = _events(_get(), _encoded(zlib.compress(_TEXT), b"deflate"))[0]
+    assert e["resp_text"] == _TEXT.decode() and e["resp_decode_failed"] is False
+
+
+def test_a_raw_deflate_response_without_the_zlib_header_is_read_as_text():
+    e = _events(_get(), _encoded(_raw_deflate(_TEXT), b"deflate"))[0]
+    assert e["resp_text"] == _TEXT.decode() and e["resp_decode_failed"] is False
+
+
+def test_a_mislabelled_encoding_is_still_read():
+    assert _events(_get(), _encoded(zlib.compress(_TEXT), b"gzip"))[0]["resp_text"] == _TEXT.decode()
+    assert _events(_get(), _encoded(_raw_deflate(_TEXT), b"gzip"))[0]["resp_text"] == _TEXT.decode()
+    assert _events(_get(), _encoded(gzip.compress(_TEXT), b"deflate"))[0]["resp_text"] == _TEXT.decode()
+
+
+def test_a_gzipped_request_body_is_read_for_text_and_form_names():
+    wire = gzip.compress(b"hwid=A1&os=win")
+    e = _events(b"POST /f HTTP/1.1\r\nHost: x.top\r\nContent-Encoding: gzip\r\n"
+                b"Content-Type: application/x-www-form-urlencoded\r\nContent-Length: %d\r\n\r\n"
+                % len(wire) + wire, b"")[0]
+    assert e["body_text"] == "hwid=A1&os=win" and e["form_names"] == ["hwid", "os"]
+    assert e["body_bytes"] == len(wire) and e["request_encoding"] == "gzip"
+    assert e["body_decode_failed"] is False and e["content_encoding"] == ""
+
+
+def test_stacked_encodings_are_undone_in_reverse_order():
+    wire = gzip.compress(zlib.compress(_TEXT))
+    e = _events(_get(), _encoded(wire, b"deflate, gzip"))[0]
+    assert e["resp_text"] == _TEXT.decode() and e["content_encoding"] == "deflate, gzip"
+
+
+def test_a_gzip_stream_of_several_members_and_trailing_padding_is_one_body():
+    wire = gzip.compress(b"first ") + gzip.compress(b"second") + b"\x00" * 8
+    e = _events(_get(), _encoded(wire, b"gzip"))[0]
+    assert e["resp_text"] == "first second" and e["resp_decode_failed"] is False
+
+
+def test_a_decompression_bomb_stops_at_the_ceiling_and_never_allocates_the_output():
+    bomb = gzip.compress(b"\x00" * (64 * 1024 * 1024), 9)
+    assert len(bomb) < 100000
+    flow = _http_flow(_get(), _encoded(bomb, b"gzip"))
+    tracemalloc.start()
+    try:
+        e = net_http.events_from_flow(flow)[0]
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 8 * 1024 * 1024
+    assert e["resp_capped"] is True and e["resp_decode_failed"] is False
+    assert e["resp_bytes"] == len(bomb)
+    text = _events(_get(), _encoded(gzip.compress(b"t" * (net_http.MAX_INFLATED + 10)), b"gzip"))[0]
+    assert len(text["resp_text"]) == net_http.MAX_INFLATED and text["resp_capped"] is True
+
+
+def test_a_bomb_in_a_request_body_is_stopped_too():
+    bomb = zlib.compress(b"\x00" * (32 * 1024 * 1024), 9)
+    e = _events(b"POST /b HTTP/1.1\r\nHost: x.top\r\nContent-Encoding: deflate\r\n"
+                b"Content-Length: %d\r\n\r\n" % len(bomb) + bomb, b"")[0]
+    assert e["body_capped"] is True and e["body_bytes"] == len(bomb)
+
+
+def test_a_body_below_the_ceiling_that_inflates_completely_is_not_flagged():
+    text = b"y" * (net_http.MAX_INFLATED)
+    e = _events(_get(), _encoded(gzip.compress(text), b"gzip"))[0]
+    assert e["resp_capped"] is False and len(e["resp_text"]) == len(text)
+
+
+def test_a_truncated_gzip_body_keeps_the_event_and_marks_decoding_failed():
+    original = b"".join(b"record %d: value %d\n" % (i, i * i) for i in range(400))
+    wire = gzip.compress(original)[:120]
+    e = _events(_get(), _encoded(wire, b"gzip"))[0]
+    assert e["status"] == 200 and e["resp_bytes"] == 120
+    assert e["resp_decode_failed"] is True and e["response_truncated"] is False
+    assert e["resp_text"] and original.decode().startswith(e["resp_text"])
+
+
+def test_corrupt_compressed_data_gives_no_text_and_marks_decoding_failed():
+    wire = b"\x1f\x8b\x08\x00\x00\x00\x00\x00\x00\x03" + bytes(range(7, 200))
+    e = _events(_get(), _encoded(wire, b"gzip"))[0]
+    assert e["resp_decode_failed"] is True and e["resp_text"] is None
+    assert e["resp_bytes"] == len(wire)
+    e = _events(_get(), _encoded(b"this is not deflate at all", b"deflate"))[0]
+    assert e["resp_decode_failed"] is True and e["resp_text"] is None
+
+
+def test_a_wire_cut_compressed_body_is_flagged_on_both_counts():
+    wire = gzip.compress(b"z" * 5000 + b"tail")
+    e = _events(_get(), b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: %d\r\n\r\n"
+                % len(wire) + wire[:30])[0]
+    assert e["response_truncated"] is True and e["resp_decode_failed"] is True
+    assert e["resp_bytes"] == 30
+
+
+def test_an_unknown_content_encoding_leaves_the_body_as_it_is():
+    e = _events(_get(), _encoded(b"plain words", b"br"))[0]
+    assert e["resp_text"] == "plain words" and e["resp_decode_failed"] is False
+    assert e["content_encoding"] == "br"
+    e = _events(_get(), _encoded(gzip.compress(_TEXT), b"gzip, br"))[0]
+    assert e["resp_text"] is None and e["resp_decode_failed"] is False
+
+
+def test_identity_and_missing_encodings_change_nothing():
+    for extra in (b"Content-Encoding: identity\r\n", b""):
+        e = _events(_get(), _ok(b"hello", extra))[0]
+        assert e["resp_text"] == "hello" and e["resp_decode_failed"] is False
+    assert e["content_encoding"] == "" and e["request_encoding"] == ""
+
+
+def test_an_empty_body_with_an_encoding_is_empty_not_failed():
+    e = _events(b"HEAD /h HTTP/1.1\r\nHost: x.top\r\n\r\n",
+                b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 40\r\n\r\n")[0]
+    assert e["resp_text"] == "" and e["resp_decode_failed"] is False and e["content_encoding"] == "gzip"
