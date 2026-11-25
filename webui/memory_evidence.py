@@ -330,6 +330,11 @@ SATURATION_CAP = 2.0
 CORROBORATION_MIN_WEIGHT = 1.0
 # corroboration_scope of a finding that is about one destination only.
 CORROBORATION_SCOPE_ENDPOINT = "endpoint"
+# attribution of a capture finding whose process is the sample's by
+# assumption (a capture knows no process): it counts with that process for
+# grouping and supersede, but gets and gives a second opinion only through a
+# shared endpoint (Ruling 69)
+ATTRIBUTION_ASSUMED = "assumed"
 
 VERDICT_MALICIOUS = 6.0
 VERDICT_SUSPICIOUS = 2.0
@@ -1089,6 +1094,13 @@ def score(findings, baseline=None):
     # opinion except with a finding that names the same endpoint. An OCSP
     # request is not made suspicious by a reflective PE elsewhere in the
     # process, nor does it vouch for one.
+    # A finding whose process is only assumed (attribution "assumed": a
+    # capture's finding given to the sample) neither gets nor gives a second
+    # opinion through the process: only through a shared endpoint, with a
+    # finding of any process and any other source.
+    def assumed(f):
+        return f.get("attribution") == ATTRIBUTION_ASSUMED
+
     sources_by_process = {}
     scoped = []
     for f in findings:
@@ -1096,7 +1108,7 @@ def score(findings, baseline=None):
             continue
         if known(f):
             continue
-        if f.get("corroboration_scope") == CORROBORATION_SCOPE_ENDPOINT:
+        if f.get("corroboration_scope") == CORROBORATION_SCOPE_ENDPOINT or assumed(f):
             scoped.append(f)
             continue
         sources_by_process.setdefault(proc_key(f), set()).add(f["source"])
@@ -1104,6 +1116,9 @@ def score(findings, baseline=None):
                 if f.get("base_weight", 0) >= CORROBORATION_MIN_WEIGHT and not known(f)]
 
     def corroborators(f):
+        if assumed(f):
+            mine = _endpoints(f)
+            return {g["source"] for g in eligible if g is not f and mine & _endpoints(g)} - {f["source"]}
         if f.get("corroboration_scope") == CORROBORATION_SCOPE_ENDPOINT:
             pool = [g for g in eligible if g is not f]
         elif scoped:
@@ -1265,10 +1280,12 @@ def collect(results, process="", network_process=None):
 
     A capture knows no process, so the findings of the network report come
     without one; they are the sample's traffic (the report was imported for
-    it), so they are attributed to ``network_process`` (default ``process``).
-    Supersede and corroboration match by process: without this a capture's
-    check-in and Sysmon's beaconing of the same loop never met and counted
-    twice. A finding that already names a process keeps it.
+    it), so they are attributed to ``network_process`` (default ``process``)
+    and marked ``attribution: "assumed"``. Supersede matches by process:
+    without this a capture's check-in and Sysmon's beaconing of the same loop
+    never met and counted twice. Corroboration of such a finding goes only
+    through a shared endpoint (see score). A finding that already names a
+    process, or one with a pid, keeps what it has.
     """
     findings = []
     aether = results.get("aether") or {}
@@ -1306,8 +1323,12 @@ def collect(results, process="", network_process=None):
     report = results.get("network") or {}
     if isinstance(report, dict) and isinstance(report.get("evidence_findings"), list):
         owner = _process_identity(process if network_process is None else network_process)[0]
-        findings += [dict(f, process=f.get("process") or owner) for f in report["evidence_findings"]
-                     if isinstance(f, dict) and not f.get("baseline")]
+        for f in report["evidence_findings"]:
+            if not isinstance(f, dict) or f.get("baseline"):
+                continue
+            if owner and not f.get("process") and f.get("pid") in (None, ""):
+                f = dict(f, process=owner, attribution=ATTRIBUTION_ASSUMED)
+            findings.append(dict(f))
 
     dyn = results.get("litterbox_dynamic") or {}
     if isinstance(dyn, dict):

@@ -678,3 +678,79 @@ def test_a_finding_that_names_its_process_keeps_it(tdc):
     got = tdc.memory_evidence.collect(results, process="", network_process="evil.exe")
     assert [f["process"] for f in got] == ["other.exe", "evil.exe"]
     assert [f["process"] for f in tdc.memory_evidence.collect(results, process="Evil.exe")] == ["other.exe", "Evil.exe"]
+
+
+# --- Ruling 69: an assumed process corroborates only through a shared endpoint --------------
+
+def _reflective_pe(tdc, process):
+    return dict(tdc.memory_evidence.MemoryFinding(source="aether", kind="reflective_pe", process=process,
+                                                  identity=("r",)))
+
+
+def _checkin(tdc):
+    """A capture's check-in as net_evidence makes it: no process, no pid."""
+    return dict(tdc.memory_evidence.MemoryFinding(
+        source="network", kind="c2_checkin", process="", identity=("evil.top",),
+        extra={"dest": "evil.top", "addresses": ["198.51.100.100"], "pid": None}))
+
+
+def test_a_beacon_to_another_address_does_not_vouch_for_the_check_in(client, tdc, tmp_path, monkeypatch):
+    """Regressions covered (Ruling 69): once the capture's findings were given the
+    sample's process, any substantial host finding of the sample corroborated
+    them, about any endpoint: a check-in to evil.top and a Sysmon beacon of
+    evil.exe to 203.0.113.9 went from 4.6 SUSPICIOUS to 7.0 MALICIOUS. The
+    attributed check-in is marked "assumed" and is corroborated only through a
+    shared endpoint; the two are two findings, neither superseded."""
+    assert _upload(client, _pcap_with_http_c2(tmp_path), sha256=SAMPLE).status_code == 200
+    d = _verdict_with_sysmon_beacon(client, tdc, monkeypatch, ip="203.0.113.9")
+    ev = d["memory_evidence"]
+    by_kind = {f["kind"]: f for f in ev["findings"]}
+    assert set(by_kind) == {"c2_beaconing", "c2_checkin"} and ev["suppressed"] == []
+    assert by_kind["c2_checkin"]["attribution"] == "assumed" and by_kind["c2_checkin"]["process"] == "evil.exe"
+    assert not by_kind["c2_checkin"].get("corroborated_by")
+    assert ev["score"] == 4.6 and d["verdict"]["label"] == "SUSPICIOUS"
+
+
+def test_a_reflective_pe_of_the_sample_does_not_vouch_for_the_check_in(tdc):
+    """Regressions covered (Ruling 69): a check-in attributed to evil.exe (the
+    agent names the process) and a reflective PE in evil.exe: 4.6 -> 7.0 after
+    the attribution, back to 4.6 - a reflective PE says nothing about evil.top."""
+    results = {"agent": {"execution": {"process_name": "evil.exe"}},
+               "aether": {"evidence_findings": [_reflective_pe(tdc, "evil.exe")]},
+               "network": {"evidence_findings": [_checkin(tdc)]}}
+    verdict = tdc._compute_verdict(results, [])
+    ev = results["memory_evidence"]
+    checkin = [f for f in ev["findings"] if f["kind"] == "c2_checkin"][0]
+    assert checkin["attribution"] == "assumed" and not checkin.get("corroborated_by")
+    assert ev["score"] == 4.6 and verdict["label"] == "SUSPICIOUS"
+    # a finding of the same endpoint, of any process, still vouches for it
+    results.pop("memory_evidence")
+    results["network_beaconing"] = {"evidence_findings": tdc.memory_evidence.beaconing_from_connections(
+        [(1000.0 + 60 * i, "198.51.100.100", 80) for i in range(8)], process="other.exe")}
+    tdc._compute_verdict(results, [])
+    checkin = [f for f in results["memory_evidence"]["findings"] if f["kind"] == "c2_checkin"][0]
+    assert checkin["corroborated_by"] == ["sysmon-network"]
+
+
+def test_a_finding_with_a_process_or_a_pid_is_not_assumed(tdc):
+    results = {"network": {"evidence_findings": [
+        {"source": "network", "kind": "dga_pattern", "key": "a", "process": "x.exe"},
+        {"source": "network", "kind": "dga_pattern", "key": "b", "process": "", "pid": 77},
+        {"source": "network", "kind": "dga_pattern", "key": "c", "process": ""}]}}
+    got = tdc.memory_evidence.collect(results, network_process="evil.exe")
+    assert [(f["process"], f.get("attribution")) for f in got] == [
+        ("x.exe", None), ("", None), ("evil.exe", "assumed")]
+    assert [f.get("attribution") for f in tdc.memory_evidence.collect(results)] == [None, None, None]
+
+
+def test_the_owner_is_never_a_child_seen_on_the_named_pipes(tdc):
+    """Regressions covered: the named pipes cover the sample's whole process
+    subtree, so the owner taken from them could be a child. Only the root
+    PID's own image (its Sysmon connections) or the named process counts."""
+    pipe = dict(tdc.memory_evidence.MemoryFinding(source="sysmon-pipes", kind="pipe_c2_default",
+                                                  process="child.exe", identity=("p",)))
+    results = {"named_pipes": {"evidence_findings": [pipe]}, "network": {"evidence_findings": [_checkin(tdc)]}}
+    tdc._compute_verdict(results, [])
+    got = [f for f in results["memory_evidence"]["findings"] + results["memory_evidence"]["suppressed"]
+           if f["kind"] == "c2_checkin"][0]
+    assert got["process"] == "" and "attribution" not in got
