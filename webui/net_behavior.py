@@ -141,7 +141,7 @@ ON_RHYTHM_MIN_SHARE = 0.5
 
 # One time scale (see _single_scale). An interval is "off" when it is
 # SCALE_BAND times the median or more, or the median divided by SCALE_BAND or
-# less: an exact doubling is a second scale. It is "far" when it is off by
+# less: an exact halving is a second scale. It is "far" when it is off by
 # SCALE_FAR times. A rhythm tolerates a fifth of its intervals off (stalls, a
 # re-register), 5% far (an outage is an event; two in a thousand check-ins are
 # noise, two in eight are a second scale; follow-ups that _follow_ups_joined
@@ -156,6 +156,21 @@ SCALE_MAX_OFF_SHARE = 0.2
 SCALE_MAX_FAR_SHARE = 0.05
 SCALE_MIN_FAR = 1
 SCALE_MAX_RUN = 2
+# A long interval within MISSED_TOLERANCE of the median of a whole multiple k
+# of the median (2 <= k < SCALE_FAR) is k - 1 missed check-ins of the same
+# rhythm, not a second time scale: the rhythm is what put it on the multiple.
+# The same insight as the follow-up, one step further: a short interval is
+# part of the check-in before it, a long one on the beat is a missed round,
+# and only a long one off the beat is a pause. See _missed_rounds. Missed
+# rounds fall where they fall; when the intervals on a multiple come on a beat
+# of their own (every second interval, every third: at evenly spaced
+# positions, MISSED_PATTERN_MIN of them or more), the multiple is a second
+# scale after all. A GET with its POST 20 s later every 60 s is 20, 40, 20,
+# 40: the 40s sit at every second position. They also never make up half of
+# the intervals (MISSED_MAX_SHARE): at half, the median itself is a multiple.
+MISSED_TOLERANCE = 0.1
+MISSED_MAX_SHARE = 0.5
+MISSED_PATTERN_MIN = 4
 
 # Intervals taken into the measurement of one group. A beacon is established
 # long before this; the cap keeps the cost of one huge group bounded.
@@ -256,6 +271,29 @@ def _follow_ups_come_after(clusters, limit):
     return balance > 0
 
 
+def _missed_rounds(x, median):
+    """Is a long interval ``x`` one or more missed check-ins of the rhythm?"""
+    k = round(x / median)
+    return 2 <= k < SCALE_FAR and abs(x - k * median) <= MISSED_TOLERANCE * median
+
+
+def _forgiven(intervals, median):
+    """Positions of the intervals that are missed rounds, or an empty set.
+
+    Empty when they are too many (``MISSED_MAX_SHARE``) or come on a beat of
+    their own (evenly spaced, ``MISSED_PATTERN_MIN`` or more): that is a
+    second rhythm, not check-ins that happened not to happen.
+    """
+    positions = [i for i, x in enumerate(intervals)
+                 if x >= SCALE_BAND * median and _missed_rounds(x, median)]
+    if len(positions) >= MISSED_MAX_SHARE * len(intervals):
+        return set()
+    steps = {b - a for a, b in zip(positions, positions[1:])}
+    if len(positions) >= MISSED_PATTERN_MIN and len(steps) == 1:
+        return set()
+    return set(positions)
+
+
 def _single_scale(intervals, median):
     """Do the intervals lie on one time scale?
 
@@ -265,14 +303,22 @@ def _single_scale(intervals, median):
     more than ``SCALE_MAX_OFF_SHARE`` of the intervals are off the median by
     ``SCALE_BAND``, more than ``SCALE_MAX_FAR_SHARE`` of them (and more than
     ``SCALE_MIN_FAR``) are off by ``SCALE_FAR``, or more than
-    ``SCALE_MAX_RUN`` off intervals follow each other. GET plus POST
-    (1 s, 59 s alternating), several requests per check-in, a duty cycle and a
-    change of rhythm all fail one of the three; a jittered beacon, a missed
-    check-in, an outage and a periodic re-register pass.
+    ``SCALE_MAX_RUN`` off intervals follow each other. An interval on a whole
+    multiple of the median (``_missed_rounds``) is not off: it is the same
+    rhythm with check-ins missing, and a beacon that misses one in five rounds
+    (or reuses a connection, which Sysmon logs once) is still that beacon,
+    unless the multiples come on a beat of their own (``_forgiven``). Known
+    limitation: fewer than ``MISSED_PATTERN_MIN`` evenly spaced multiples
+    are not recognised as a beat, so 60, 60, 120, 60, 60, 120, 60 measures
+    60 s; a longer series of that shape is refused.
+    GET plus POST (1 s, 59 s alternating), several requests per check-in, a
+    duty cycle and a change of rhythm all fail one of the three; a jittered
+    beacon, missed check-ins, an outage and a periodic re-register pass.
     """
     off = far = run = longest = 0
-    for x in intervals:
-        if x >= SCALE_BAND * median or x <= median / SCALE_BAND:
+    forgiven = _forgiven(intervals, median)
+    for i, x in enumerate(intervals):
+        if x <= median / SCALE_BAND or (x >= SCALE_BAND * median and i not in forgiven):
             off += 1
             run += 1
             longest = max(longest, run)

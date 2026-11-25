@@ -49,6 +49,9 @@ Regressions covered:
     contact, because a series that short tolerates no odd interval at all
   * the noise ceiling sat exactly on the count of the one seed it was run
     with; other seeds exceeded it about every other time
+  * a beacon with no jitter that missed a check-in now and then (a gap of
+    exactly two or three periods) was refused as two time scales: about one
+    in twenty such series lost its tight Sysmon finding
 """
 
 import json
@@ -866,6 +869,33 @@ def test_a_steady_beacon_with_one_outage_keeps_its_interval():
     ts = [t * 60.0 for t in range(10)] + [540.0 + 3600.0 + t * 60.0 for t in range(1, 10)]
     p = net_behavior.periodicity(ts)
     assert p["periodic"] is True and p["interval"] == 60.0
+
+
+def test_an_exact_beacon_that_misses_check_ins_keeps_its_interval():
+    # Zero jitter is a common default, and a reused connection is one Sysmon
+    # EID 3: gaps of exactly two and three periods are missed rounds.
+    ts = [0.0, 60.0, 180.0, 240.0, 300.0, 480.0, 540.0, 600.0, 720.0, 780.0]
+    p = net_behavior.periodicity(ts)
+    assert p["periodic"] is True and p["single_scale"] is True and p["interval"] == 60.0
+
+
+def test_a_gap_on_the_beat_is_a_missed_round_and_one_off_the_beat_is_a_pause():
+    on_beat = [0.0, 60.0, 120.0, 240.0, 300.0]       # 120 = 2 x 60
+    off_beat = [0.0, 60.0, 120.0, 270.0, 330.0]      # 150 = 2.5 x 60
+    assert net_behavior.periodicity(on_beat)["periodic"] is True
+    assert net_behavior.periodicity(off_beat)["single_scale"] is False
+
+
+def test_doubled_intervals_on_a_beat_of_their_own_are_a_second_scale():
+    # 60, 60, 120, 60, 60, 120, ...: every third interval doubled is a rhythm
+    # of 240 s with three check-ins, not a 60 s beacon that keeps missing the
+    # same round.
+    ts, t = [0.0], 0.0
+    for k in range(12):
+        t += 120.0 if k % 3 == 2 else 60.0
+        ts.append(t)
+    p = net_behavior.periodicity(ts)
+    assert p["single_scale"] is False and p["interval"] is None
 
 
 def test_a_single_request_per_check_in_is_unchanged():
