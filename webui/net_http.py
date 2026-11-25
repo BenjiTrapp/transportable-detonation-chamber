@@ -67,10 +67,14 @@ intervals (``ts`` of each request), rules (``method``, ``path``, ``body_text``,
     ``sha256`` and ``size`` are those of the inflated bytes and the wire
     bytes' are ``wire_sha256`` / ``wire_size`` (present only when they
     differ); if inflating failed, or no encoding applies, the wire bytes are
-    the payload. When inflating stopped at the ceiling only a prefix exists
-    and a hash of a prefix identifies nothing, so ``sha256`` and ``size`` are
-    None and ``inflate_capped`` is True. An ``upload`` still describes the
-    wire bytes.
+    the payload. The text ceiling is far too small for a real file, so a
+    download that outgrows it is inflated again into the hash alone: each
+    piece is hashed and discarded, which costs time and no memory, and
+    ``MAX_HASHED`` bounds the time. Only a payload beyond that has no hash
+    (``sha256`` and ``size`` None, ``inflate_capped`` True), because the hash
+    of part of a file identifies nothing. Two ceilings, two purposes: the
+    text a body keeps is still capped at ``MAX_INFLATED``. An ``upload`` still
+    describes the wire bytes.
   * Bytes from a capture are inert. Nothing is executed or opened as a file;
     a download is hashed and its first bytes name its kind.
 
@@ -95,12 +99,14 @@ from urllib.parse import parse_qsl, urlsplit
 from net_events import NetEvent
 
 MAX_BODY_TEXT = 256 * 1024       # text kept per body or message; the size is still exact
-MAX_INFLATED = MAX_BODY_TEXT     # output of one inflate step; nothing past it is kept anyway
+MAX_INFLATED = MAX_BODY_TEXT     # output of one inflate step kept for text; nothing past it is kept anyway
+MAX_HASHED = 64 * 1024 * 1024    # decoded bytes hashed and sized for a download; bounds time, not memory
 MAX_HEAD = 256 * 1024            # a header section longer than this is not read
 UPLOAD_MIN = 512                 # a request body above this many bytes is an upload
 MAX_WS_FRAMES = 20000            # frames read per direction
 MAX_WS_MESSAGES = 5000           # messages kept per event
 
+_CHUNK = 64 * 1024               # decompressor output taken at a time
 _MATCH_BUDGET = 256              # searches allowed to place out-of-order segments
 
 _METHODS = frozenset(
@@ -385,69 +391,127 @@ def _text(body):
     return text, capped
 
 
-def _inflate_stream(data, wbits, limit):
-    """``(output, capped, failed)`` for one attempt at one framing of ``data``.
+class _Run:
+    """How one pass of ``_chunks`` ended."""
 
-    The output ceiling is enforced by the decompressor itself (``max_length``),
-    so a bomb never allocates more than ``limit`` + 1 bytes. A stream that ends
-    before its end marker, or breaks, is ``failed`` and keeps what it produced.
+    failed = False
+
+
+def _chunks(data, wbits, run):
+    """Yield the output of ``data`` in pieces of at most ``_CHUNK`` bytes.
+
+    The decompressor is asked for one piece at a time (``max_length``), so a
+    bomb costs time, never memory, and a consumer that stops reading stops the
+    work. ``run.failed`` is set when the stream breaks or ends before its end
+    marker; what was yielded before that is still good. Several gzip members
+    in a row are one stream, and garbage after a complete member is ignored.
     """
-    out = []
-    total = 0
     members = 0
     while data:
         decoder = zlib.decompressobj(wbits)
-        try:
-            chunk = decoder.decompress(data, limit + 1 - total)
-        except zlib.error:
-            # garbage after a complete member (padding) is not a failure
-            return b"".join(out), False, members == 0
-        out.append(chunk)
-        total += len(chunk)
-        if total > limit:
-            return b"".join(out)[:limit], True, False
-        if not decoder.eof:
-            return b"".join(out), False, True
+        rest = data
+        while True:
+            try:
+                out = decoder.decompress(rest, _CHUNK)
+            except zlib.error:
+                run.failed = members == 0
+                return
+            if out:
+                yield out
+            if decoder.eof:
+                break
+            rest = decoder.unconsumed_tail
+            if len(out) < _CHUNK and not rest:
+                run.failed = True       # the input ended before the end marker
+                return
         members += 1
         data = decoder.unused_data if wbits > 0 else b""
-    return b"".join(out), False, False
+
+
+# Servers label gzip, zlib-wrapped deflate and raw deflate with each other's
+# names: the zlib/gzip header is detected, and raw deflate is the fallback
+# when that yields nothing.
+_FRAMINGS = (zlib.MAX_WBITS | 32, -zlib.MAX_WBITS)
 
 
 def _inflate(data, limit):
-    """Undo one gzip or deflate layer: ``(output, capped, failed)``.
+    """Undo one gzip or deflate layer, keeping at most ``limit`` bytes.
 
-    Servers label gzip, zlib-wrapped deflate and raw deflate with each other's
-    names, so the zlib/gzip header is detected, and raw deflate is tried when
-    that yields nothing.
+    Returns ``(output, capped, failed)``.
     """
     if not data:
         return b"", False, False
-    out, capped, failed = _inflate_stream(data, zlib.MAX_WBITS | 32, limit)
-    if failed and not out:
-        out, capped, failed = _inflate_stream(data, -zlib.MAX_WBITS, limit)
-    return out, capped, failed
+    for wbits in _FRAMINGS:
+        run = _Run()
+        out = []
+        total = 0
+        capped = False
+        for chunk in _chunks(data, wbits, run):
+            out.append(chunk)
+            total += len(chunk)
+            if total > limit:
+                capped = True
+                break
+        joined = b"".join(out)[:limit]
+        if capped:
+            return joined, True, False
+        if run.failed and not joined and wbits > 0:
+            continue
+        return joined, False, run.failed
+    return b"", False, True
+
+
+def _digest(data, ceiling):
+    """``(sha256, size, status)`` of the last layer of ``data``, kept by nothing.
+
+    The output is hashed piece by piece and discarded, so the only bound that
+    matters is time, and ``ceiling`` bounds that. ``status`` is "ok",
+    "capped" (the payload is larger than ``ceiling``; a hash of part of a file
+    identifies nothing, so there is none) or "failed".
+    """
+    for wbits in _FRAMINGS:
+        run = _Run()
+        digest = hashlib.sha256()
+        size = 0
+        for chunk in _chunks(data, wbits, run):
+            size += len(chunk)
+            if size > ceiling:
+                return None, None, "capped"
+            digest.update(chunk)
+        if run.failed and not size and wbits > 0:
+            continue
+        if run.failed:
+            break
+        return digest.hexdigest(), size, "ok"
+    return None, None, "failed"
+
+
+def _layers(encoding):
+    """The coding names to undo, outermost first; None if any is not understood."""
+    codings = [c.strip() for c in encoding.split(",") if c.strip()]
+    if not codings or any(c not in _CODINGS for c in codings):
+        return None
+    return [c for c in reversed(codings) if c != "identity"]
 
 
 def _decoded(body, encoding):
     """``(data, capped, failed, applied)``: the body with its content encoding undone.
 
-    ``applied`` is True when an inflate was attempted. ``capped`` means more output existed than ``MAX_INFLATED``; ``failed`` that
-    a supported encoding could not be undone completely, in which case ``data``
-    is what came out before it broke. An encoding that is not understood leaves
-    the body as it is.
+    ``applied`` is True when an inflate was attempted. ``capped`` means more
+    output existed than ``MAX_INFLATED``; ``failed`` that a supported encoding
+    could not be undone completely, in which case ``data`` is what came out
+    before it broke. An encoding that is not understood leaves the body as it
+    is.
     """
-    codings = [c.strip() for c in encoding.split(",") if c.strip()]
-    if not body or not codings or any(c not in _CODINGS for c in codings):
+    layers = _layers(encoding)
+    if not body or not layers:
         return body, False, False, False
-    data, capped, failed, applied = body, False, False, False
-    for coding in reversed(codings):
-        if coding == "identity":
-            continue
-        applied = True
+    data, capped, failed = body, False, False
+    for _coding in layers:
         data, capped, failed = _inflate(data, MAX_INFLATED)
         if capped or failed:
             break
-    return data, capped, failed, applied
+    return data, capped, failed, True
 
 
 def _body_text(body, encoding):
@@ -464,29 +528,57 @@ def _body_text(body, encoding):
     return text, capped or inflate_capped, failed, decoded
 
 
-def _payload(wire, decoded):
+def _file_digest(wire, encoding):
+    """``(sha256, size, status)`` of the whole payload behind ``wire``.
+
+    A stack of encodings is undone layer by layer; all but the last layer are
+    held in memory up to ``MAX_INFLATED``, the last one is streamed through
+    the hash up to ``MAX_HASHED``. A stack whose inner layers are larger than
+    the text ceiling is reported "capped".
+    """
+    data = wire
+    for _coding in _layers(encoding)[:-1]:
+        data, capped, failed = _inflate(data, MAX_INFLATED)
+        if capped or failed:
+            return None, None, "capped" if capped else "failed"
+    return _digest(data, MAX_HASHED)
+
+
+def _payload(wire, decoded, encoding):
     """``(kind, fields)`` of a downloaded body, as the receiving application sees it.
 
-    When an encoding was undone completely the file is the inflated bytes, and
-    the wire bytes' hash and size are added beside it. When inflating stopped
-    at the ceiling only a prefix of the file exists, and a hash of a prefix
+    When an encoding was undone completely the file is the inflated bytes: the
+    kind is read from them, ``sha256`` and ``size`` describe them, and the
+    wire bytes' hash and size are added beside as ``wire_sha256`` /
+    ``wire_size`` when they differ. The inflated bytes kept for text stop at
+    ``MAX_INFLATED``, which a real file usually exceeds, so then the payload is
+    inflated a second time into the hash alone, up to ``MAX_HASHED``. Beyond
+    that only a prefix of the file could be hashed, and the hash of a prefix
     identifies nothing, so ``sha256`` and ``size`` are None (the kind, read
     from the start, is still known) and ``inflate_capped`` says why. When
     inflating failed, or no encoding applies, the wire bytes are the payload.
     """
     data, capped, failed, applied = decoded
     wire_sha = hashlib.sha256(wire).hexdigest()
+    wire_only = {"sha256": wire_sha, "size": len(wire), "inflate_capped": False}
     if not applied or failed:
-        return _kind(wire), {"sha256": wire_sha, "size": len(wire), "inflate_capped": False}
+        return _kind(wire), wire_only
     kind = _kind(data)
+    if not kind:
+        return "", {}
     if capped:
-        return kind, {"sha256": None, "size": None, "inflate_capped": True,
-                      "wire_sha256": wire_sha, "wire_size": len(wire)}
-    fields = {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data),
-              "inflate_capped": False}
-    if fields["sha256"] != wire_sha:
+        sha, size, status = _file_digest(wire, encoding)
+        if status == "failed":              # broke after the text ceiling
+            return _kind(wire), wire_only
+        if status == "capped":
+            return kind, {"sha256": None, "size": None, "inflate_capped": True,
+                          "wire_sha256": wire_sha, "wire_size": len(wire)}
+    else:
+        sha, size = hashlib.sha256(data).hexdigest(), len(data)
+    fields = {"sha256": sha, "size": size, "inflate_capped": False}
+    if sha != wire_sha:
         fields["wire_sha256"] = wire_sha
-    if fields["size"] != len(wire):
+    if size != len(wire):
         fields["wire_size"] = len(wire)
     return kind, fields
 
@@ -759,7 +851,7 @@ def _exchange_events(ctx, req, resp):
             sha256=hashlib.sha256(body).hexdigest(), kind=_kind(body),
             content_type=origin.headers.get("content-type", ""), truncated=req.truncated))
     if reply:
-        kind, identity = _payload(reply, resp_decoded)
+        kind, identity = _payload(reply, resp_decoded, response_encoding)
         if kind:
             events.append(NetEvent(
                 "download", resp_ts, dest=origin.dest, port=origin.port, url=origin.url,

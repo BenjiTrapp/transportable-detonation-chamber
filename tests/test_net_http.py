@@ -942,14 +942,59 @@ def test_an_uncompressed_download_has_no_wire_fields():
     assert d["inflate_capped"] is False and d["content_encoding"] == ""
 
 
-def test_a_body_stopped_by_the_inflate_ceiling_is_marked_and_has_no_file_hash():
-    big = b"MZ" + b"\x00" * (net_http.MAX_INFLATED + 5000)
+_MIB = 1024 * 1024
+
+
+def test_a_gzipped_payload_above_the_text_ceiling_still_gets_its_file_hash():
+    big = b"MZ" + b"\x00" * (4 * _MIB)
+    wire = gzip.compress(big)
+    d = _events(_get(), _encoded(wire, b"gzip"), kind="download")[0]
+    assert d["kind"] == "pe" and d["sha256"] == _sha(big) and d["size"] == len(big)
+    assert d["inflate_capped"] is False
+    assert d["wire_sha256"] == _sha(wire) and d["wire_size"] == len(wire)
+
+
+def test_the_retained_text_keeps_its_own_smaller_cap_beside_the_big_hash():
+    big = b"%PDF-1.4\n" + b"a" * (3 * _MIB)
+    wire = gzip.compress(big)
+    evs = net_http.events_from_flow(_http_flow(_get(), _encoded(wire, b"gzip")))
+    http = [e for e in evs if e["type"] == "http"][0]
+    d = [e for e in evs if e["type"] == "download"][0]
+    assert len(http["resp_text"]) == net_http.MAX_BODY_TEXT and http["resp_capped"] is True
+    assert http["resp_bytes"] == len(wire) and http["resp_decode_failed"] is False
+    assert d["kind"] == "pdf" and d["sha256"] == _sha(big) and d["size"] == len(big)
+
+
+def test_a_stacked_encoding_hashes_the_whole_file_too():
+    big = b"MZ" + b"\x00" * (3 * _MIB)
+    d = _events(_get(), _encoded(gzip.compress(zlib.compress(big)), b"deflate, gzip"),
+                kind="download")[0]
+    assert d["sha256"] == _sha(big) and d["size"] == len(big)
+
+
+def test_a_payload_above_the_hashing_ceiling_has_no_hash_and_says_so(monkeypatch):
+    monkeypatch.setattr(net_http, "MAX_HASHED", 2 * _MIB)
+    big = b"MZ" + b"\x00" * (3 * _MIB)
     wire = gzip.compress(big)
     d = _events(_get(), _encoded(wire, b"gzip"), kind="download")[0]
     assert d["kind"] == "pe" and d["inflate_capped"] is True
     assert d["sha256"] is None and d["size"] is None
     assert d["wire_sha256"] == _sha(wire) and d["wire_size"] == len(wire)
-    assert d["sha256"] != _sha(big[:net_http.MAX_INFLATED])
+    just_fits = b"MZ" + b"\x00" * (2 * _MIB - 2)
+    d = _events(_get(), _encoded(gzip.compress(just_fits), b"gzip"), kind="download")[0]
+    assert d["sha256"] == _sha(just_fits) and d["size"] == 2 * _MIB
+
+
+def test_the_hashing_ceiling_is_in_the_tens_of_megabytes_and_above_the_text_ceiling():
+    assert 16 * _MIB <= net_http.MAX_HASHED <= 256 * _MIB
+    assert net_http.MAX_HASHED > 8 * net_http.MAX_INFLATED
+
+
+def test_a_big_gzipped_pe_that_breaks_after_the_text_ceiling_falls_back_to_the_wire():
+    wire = gzip.compress(b"MZ" + b"\x00" * (3 * _MIB))
+    cut = wire[:len(wire) // 2]
+    evs = net_http.events_from_flow(_http_flow(_get(), _encoded(cut, b"gzip")))
+    assert [e["type"] for e in evs] == ["http"]
 
 
 def test_a_failed_inflate_falls_back_to_the_wire_bytes_for_kind_and_hash():
