@@ -44,7 +44,11 @@ intervals (``ts`` of each request), rules (``method``, ``path``, ``body_text``,
     ``body_capped`` / ``resp_capped`` say when more existed. The sizes are
     always the real ones. Working memory is bounded by the stream cap of
     ``net_flows`` (4 MiB per direction); a download larger than that is
-    reported with ``truncated`` and the hash of what was kept.
+    reported with ``truncated`` and the hash of what was kept. Per message is
+    not the bound that matters either: two hundred pipelined 290-byte gzip
+    bombs are 51 MiB of text from a 77 KB capture, so a caller that reads a
+    whole capture passes one ``TextBudget`` to every flow, and a text past it
+    is cut (``text_budget_spent``).
   * An upgrade is a request. After ``101`` both directions carry WebSocket
     frames, not HTTP. Client frames are masked, lengths may use 16 or 64 bits,
     a message may be fragmented with control frames between its parts, and the
@@ -326,17 +330,18 @@ def _read_body(stream, pos, msg, no_body, until_close, cut):
     return b"", pos, False
 
 
-def _read_messages(stream, request, cut, methods=()):
+def _read_messages(stream, request, cut, methods=(), limit=None):
     """The messages of one direction, in order, up to the first unreadable byte.
 
     ``methods`` are the methods of the requests, for a response stream: a
     response to HEAD has no body whatever its headers say. ``cut`` is True when
     the stream itself ended early, so a body that runs to its end is cut too.
+    ``limit`` (None: no limit) stops after that many messages.
     """
     messages = []
     pos = 0
     final = 0
-    while True:
+    while limit is None or len(messages) < limit:
         while stream[pos:pos + 1] in (b"\r", b"\n"):
             pos += 1
         if pos >= len(stream):
@@ -479,6 +484,27 @@ class HashBudget:
         return max(0, self.limit - self.spent)
 
 
+class TextBudget(HashBudget):
+    """Characters of body text all messages of a capture may still keep
+    (``body_text`` and ``resp_text``, inflated or plain), shared like
+    ``HashBudget``. A text that would go past it is cut to what is left, and
+    once it is gone a body keeps "" ; ``body_capped`` / ``resp_capped`` say so
+    and the event carries ``text_budget_spent``."""
+
+
+def _charge_text(text, budget):
+    """``(text, cut)``: ``text`` as far as ``budget`` still allows, charged to it."""
+    if budget is None or not text:
+        return text, False
+    left = budget.left
+    if len(text) > left:
+        text = text[:left]
+        budget.spent += left
+        return text, True
+    budget.spent += len(text)
+    return text, False
+
+
 def _digest(data, ceiling, budget=None):
     """``(sha256, size, status)`` of the last layer of ``data``, kept by nothing.
 
@@ -539,18 +565,21 @@ def _decoded(body, encoding):
     return data, capped, failed, True
 
 
-def _body_text(body, encoding):
-    """``(text or None, capped, decode_failed, decoded)`` of a message body.
+def _body_text(body, encoding, budget=None):
+    """``(text or None, capped, decode_failed, decoded, budget_spent)`` of a
+    message body.
 
     ``decoded`` is what ``_decoded`` returned. A body that could not be decoded
-    at all has no text, however empty its remains are.
+    at all has no text, however empty its remains are. ``budget`` is the
+    capture's ``TextBudget``; ``budget_spent`` is True when it cut the text.
     """
     decoded = _decoded(body, encoding)
     data, inflate_capped, failed, _applied = decoded
     text, capped = _text(data, cut=inflate_capped or failed)
     if failed and not data:
         text = None
-    return text, capped or inflate_capped, failed, decoded
+    text, spent = _charge_text(text, budget)
+    return text, capped or inflate_capped or spent, failed, decoded, spent
 
 
 def _file_digest(wire, encoding, budget=None):
@@ -725,8 +754,9 @@ def _split_target(target):
 class _Context:
     """What is known about the flow as a whole, in client/server terms."""
 
-    def __init__(self, flow, swapped, hash_budget=None):
+    def __init__(self, flow, swapped, hash_budget=None, text_budget=None):
         self.hash_budget = hash_budget
+        self.text_budget = text_budget
         if swapped:
             self.server, self.port = flow.src, flow.sport
             self.client_dir, self.server_dir = "s", "c"
@@ -917,9 +947,12 @@ def _exchange_events(ctx, req, resp):
     ctype = resp_headers.get("content-type", "")
     request_encoding = origin.headers.get("content-encoding", "").strip().lower()
     response_encoding = resp_headers.get("content-encoding", "").strip().lower()
-    body_text, body_capped, body_failed, decoded = _body_text(body, request_encoding)
+    body_text, body_capped, body_failed, decoded, body_spent = _body_text(
+        body, request_encoding, ctx.text_budget)
     data = decoded[0]
-    resp_text, resp_capped, resp_failed, resp_decoded = _body_text(reply, response_encoding)
+    resp_text, resp_capped, resp_failed, resp_decoded, resp_spent = _body_text(
+        reply, response_encoding, ctx.text_budget)
+    spent = {"text_budget_spent": True} if body_spent or resp_spent else {}
     http = NetEvent(
         "http", ts, dest=origin.dest, port=origin.port, hosts=origin.hosts,
         method=origin.method, url=origin.url, path=origin.path, query=origin.query,
@@ -934,7 +967,7 @@ def _exchange_events(ctx, req, resp):
         content_encoding=response_encoding,
         request_truncated=bool(req and req.truncated),
         response_truncated=bool(resp and resp.truncated),
-        stream_gaps=list(ctx.gaps), stream_capped=ctx.capped)
+        stream_gaps=list(ctx.gaps), stream_capped=ctx.capped, **spent)
     events = [http]
     if len(body) > UPLOAD_MIN:
         events.append(NetEvent(
@@ -973,22 +1006,26 @@ def _reversed(client, server):
     return not _is_request(client) and (_is_response(client) or _is_request(server))
 
 
-def events_from_flow(flow, hash_budget=None):
+def events_from_flow(flow, hash_budget=None, text_budget=None, max_messages=None):
     """``http`` events of a TCP flow, with ``download``, ``upload`` and
     ``websocket`` events beside the exchange they belong to. A flow that does
     not carry HTTP gives an empty list.
 
     ``hash_budget`` is a ``HashBudget`` shared by the flows of one capture;
-    without one each download is bounded by ``MAX_HASHED`` alone."""
+    without one each download is bounded by ``MAX_HASHED`` alone.
+    ``text_budget`` is a ``TextBudget`` shared the same way. ``max_messages``
+    bounds the messages read per direction (a capture's event cap; four
+    megabytes of pipelined one-line GETs are a hundred thousand requests)."""
     if flow.proto != "tcp":
         return []
     client, server = flow.client_stream(), flow.server_stream()
     if not looks_like_http(client) and not looks_like_http(server):
         return []
-    ctx = _Context(flow, bool(flow.client_guessed) and _reversed(client, server), hash_budget)
-    requests = _read_messages(ctx.client_stream, True, ctx.client_cut)
+    ctx = _Context(flow, bool(flow.client_guessed) and _reversed(client, server), hash_budget,
+                   text_budget)
+    requests = _read_messages(ctx.client_stream, True, ctx.client_cut, limit=max_messages)
     responses = _read_messages(ctx.server_stream, False, ctx.server_cut,
-                               [r.method for r in requests])
+                               [r.method for r in requests], limit=max_messages)
     events = []
     for i in range(max(len(requests), len(responses))):
         req = requests[i] if i < len(requests) else None

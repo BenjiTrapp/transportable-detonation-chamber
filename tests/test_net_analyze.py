@@ -14,6 +14,11 @@ Regressions covered:
     rendered ``\\DDD``; every name field is now rendered once, like DNS
   * many small decompression bombs made the HTTP parser hash about a thousand
     times the bytes the capture retained; one budget bounds the capture
+  * the text was not bounded per capture: 200 pipelined 290-byte gzip POSTs
+    (77 KB) became 52.6 MB of JSON in 65 s, and 4 MB of one-line GETs 150,001
+    events and 1.7 GB of memory; a text budget (``text_budget_spent``) and an
+    event cap (``events_capped``, the parser stops reading) bound both, and
+    the report's event copies are masked once, not twice
   * the baseline could not absorb what the clean machine does (a Defender
     update ``.exe`` fires ``net.exe_download``; a poller not in ``known_good``
     is a ``c2_checkin``), or absorbed a sample that only borrowed the name of
@@ -408,6 +413,69 @@ def test_one_hashing_budget_bounds_the_whole_capture(tmp_path, monkeypatch):
     assert sum(1 for d in downloads if d["sha256"]) == 2
     assert sum(1 for d in downloads if d.get("hash_budget_spent")) == 4
     assert r["hash_budget_spent"] is True
+
+
+# --- an output budget for the whole capture (final review C1) ---------------------------------------
+
+def _gzip_posts(count, body):
+    import gzip
+    bomb = gzip.compress(body, 9)
+    req = (b"POST /x HTTP/1.1\r\nHost: a.top\r\nContent-Encoding: gzip\r\nContent-Type: text/plain"
+           b"\r\nContent-Length: %d\r\n\r\n" % len(bomb)) + bomb
+    cap = Capture()
+    cap.tcp(10.0, C2, 80, [("c", req * count)])
+    return cap
+
+
+def test_one_text_budget_bounds_the_body_text_of_the_whole_capture(tmp_path, monkeypatch):
+    # 290 bytes of gzip are 256 KiB of text each; two hundred of them were 52.6 MB of JSON
+    monkeypatch.setattr(net_analyze, "CAPTURE_TEXT_BUDGET", 1024 * 1024)
+    r = net_analyze.analyze_pcap(_write(tmp_path, _gzip_posts(12, b"A" * (256 * 1024))))
+    http = [e for e in r["events"] if e["type"] == "http"]
+    assert len(http) == 12
+    kept = sum(len(e["body_text"] or "") for e in http)
+    assert kept == 1024 * 1024
+    assert sum(1 for e in http if e.get("text_budget_spent")) == 8
+    assert all(e["body_capped"] for e in http[4:]) and http[-1]["body_text"] == ""
+    assert all(e["body_bytes"] < 1000 for e in http)          # the size on the wire stays exact
+    assert r["text_budget_spent"] is True
+    assert len(json.dumps(r)) < 2 * 1024 * 1024
+
+
+def test_the_default_text_budget_keeps_a_bomb_capture_small(tmp_path):
+    # the reviewer's probe: 77 KB of capture, 51 MiB of text, 52.6 MB of JSON before
+    r = net_analyze.analyze_pcap(_write(tmp_path, _gzip_posts(200, b"A" * (256 * 1024))))
+    assert r["text_budget_spent"] is True
+    assert net_analyze.CAPTURE_TEXT_BUDGET <= 32 * 1024 * 1024
+    assert len(json.dumps(r)) < 2 * net_analyze.CAPTURE_TEXT_BUDGET
+
+
+def test_a_capture_past_the_event_cap_is_cut_and_says_so(tmp_path, monkeypatch):
+    monkeypatch.setattr(net_analyze, "MAX_EVENTS", 50)
+    req = b"GET / HTTP/1.1\r\nHost: a\r\n\r\n"
+    cap = Capture()
+    cap.tcp(10.0, C2, 80, [("c", req * 5000)])
+    for i in range(5):
+        cap.tcp(20.0 + i, "203.0.113.%d" % (20 + i), 80, [("c", req)])
+    calls = []
+    real = net_analyze.net_http._read_messages
+
+    def counted(stream, request, cut, methods=(), limit=None):
+        out = real(stream, request, cut, methods, limit)
+        calls.append(len(out))
+        return out
+    monkeypatch.setattr(net_analyze.net_http, "_read_messages", counted)
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    parsed = [e for e in r["events"] if e["type"] not in net_analyze.BEHAVIOR_TYPES]
+    assert len(parsed) == 50
+    assert r["events_capped"] is True and r["max_events"] == 50
+    assert max(calls) <= 50                 # the parser stopped reading, not only the report
+    assert not any(e.get("dest", "").startswith("203.0.113.2") for e in r["events"])
+
+
+def test_a_capture_under_the_event_cap_is_not_marked_cut(tmp_path):
+    r = net_analyze.analyze_pcap(_pcap_with_http_c2(tmp_path))
+    assert r["events_capped"] is False and r["text_budget_spent"] is False
 
 
 # --- the baseline ----------------------------------------------------------------------------------

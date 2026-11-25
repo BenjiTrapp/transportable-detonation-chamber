@@ -6,8 +6,9 @@ Regressions covered:
   * a value of a capture (name, URL, process, rule name, finding, indicator, file name, error)
     reaching the markup unescaped; a header read under its capitalised name (the masked report
     has lower-case keys); a file offered as a link
-  * "could not decide" shown as "nothing found": a rule left undecided, a spent regex or hash
-    budget, a cut capture and a failed step each need their own say in OVERVIEW; a capture without
+  * "could not decide" shown as "nothing found": a rule left undecided, a spent regex, hash or
+    text budget, a capture past its event cap (events_capped), a cut capture and a failed step
+    each need their own say in OVERVIEW; a capture without
     traffic is "not observed" with its note, never "nothing found"
   * a finding another finding absorbed (superseded_by) listed under "suppressed by the baseline",
     here and in the memory evidence block; baseline events and findings not marked
@@ -278,6 +279,8 @@ UNDECIDED = {
                     ["net.body_regex", "3 event(s)", "timeout, cut"]),
     "regex budget": ({"rule_budget_spent": True}, ["regex time budget"]),
     "hash budget": ({"hash_budget_spent": True}, ["hash budget"]),
+    "events capped": ({"events_capped": True, "max_events": 20000}, ["more than 20000 events", "report is cut"]),
+    "text budget": ({"text_budget_spent": True}, ["text budget"]),
     "truncated": ({"truncated": True}, ["capture was cut"]),
     "errors": ({"errors": ["net_decode on a http event to a.example: ValueError"]}, ["net_decode on a http event"]),
 }

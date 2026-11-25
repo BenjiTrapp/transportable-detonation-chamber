@@ -229,7 +229,8 @@ MAX_BOMB = 6
 
 
 # set by a parser in some cases only; a single sample cannot show them
-SOMETIMES = {"download": {"wire_sha256", "wire_size", "hash_budget_spent"}}
+SOMETIMES = {"download": {"wire_sha256", "wire_size", "hash_budget_spent"},
+             "http": {"text_budget_spent"}}
 
 
 def _fields_of(events):

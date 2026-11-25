@@ -73,6 +73,11 @@ Regressions covered:
     rewrote free text (a rule's ``token_exfil: auth: bearer``, a User-Agent
     ending ``key:val``); a key now starts at a boundary, and outside bodies only
     ``=`` (or a quoted JSON pair) separates it from its value
+  * the colon-pair finder (``finditer``) read up to 64 characters from every
+    position of a line, 8 of 10 seconds of masking a bomb capture; it now
+    looks only in the 64 characters before each colon, with the same matches
+    (held against ``finditer`` on generated lines), and a pattern whose
+    separator is not in the text is not run
 """
 
 import base64
@@ -1068,6 +1073,65 @@ def test_masking_a_long_hostile_body_takes_linear_time():
     for body in ("pass=" * 50000, "p:" * 100000, "a|" * 100000 + "http://x", '"pass":"' * 40000):
         net_decode.mask_credentials(body, lines=True)
     assert time.time() - started < 10
+
+
+class _Counted:
+    """A compiled pattern whose ``search`` and ``match`` calls are recorded."""
+
+    def __init__(self, pattern, log):
+        self.pattern, self.log = pattern, log
+
+    def search(self, text, pos=0, endpos=None):
+        endpos = len(text) if endpos is None else endpos
+        self.log.append(("search", endpos - pos))
+        return self.pattern.search(text, pos, endpos)
+
+    def match(self, text, pos=0):
+        self.log.append(("match", 0))
+        return self.pattern.match(text, pos)
+
+    def finditer(self, *args):
+        raise AssertionError("finditer reads 64 characters from every position")
+
+
+def test_a_colon_pair_is_looked_for_only_before_each_colon(monkeypatch):
+    # finditer read 64 characters from every position: masking 51 MiB of "A" took 8 s
+    log = []
+    monkeypatch.setattr(net_decode, "_COLON_PAIR", _Counted(net_decode._COLON_PAIR, log))
+    monkeypatch.setattr(net_decode, "_COLON_LEFT", _Counted(net_decode._COLON_LEFT, log))
+    assert net_decode._colon_pair_match("A" * 262144) is None
+    assert log == []
+    line = ("B" * 99 + ":") * 2000                   # a run past 64: the pair starts 64 back
+    assert net_decode._colon_pair_match(line).group(1) == "B" * 64
+    del log[:]
+    line = ("B" * 99 + " ") * 2000 + "8:30"          # many runs, one clock time, no pair
+    assert net_decode._colon_pair_match(line) is None
+    assert len(log) <= 2 and all(width <= 65 for kind, width in log if kind == "search")
+    line = "1:2 " * 20000                           # 20,000 colons, none a pair
+    del log[:]
+    assert net_decode._colon_pair_match(line) is None
+    assert len(log) <= 2 * 20000 and all(width <= 65 for kind, width in log if kind == "search")
+    assert net_decode._colon_pair_match("x " * 100 + "user:Pw-1").group(1) == "user"
+    assert net_decode._colon_pair_match("A" * 70 + ":v").group(1) == "A" * 64
+
+
+def test_the_colon_pair_finder_agrees_with_finditer():
+    """The colon-driven search finds exactly the first match ``finditer`` would count."""
+    import random
+    rng = random.Random(7)
+    pieces = ["A" * 3, "A" * 63, "A" * 64, "A" * 65, "A" * 140, " ", "\t", ":", "//", "1", "12:30",
+              "1.2.3.4:80", "c:\\x", "bob:", "x", ".", "@", "-"]
+
+    def old(line):
+        for match in net_decode._COLON_PAIR.finditer(line):
+            if net_decode._counts_as_pair(match):
+                return match
+        return None
+    for _ in range(20000):
+        line = "".join(rng.choice(pieces) for _ in range(rng.randint(0, 8)))
+        a, b = old(line), net_decode._colon_pair_match(line)
+        assert (a is None) == (b is None), line
+        assert a is None or (a.span(), a.groups()) == (b.span(), b.groups()), line
 
 
 @pytest.mark.parametrize("text", [

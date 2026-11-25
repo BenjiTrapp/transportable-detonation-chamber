@@ -118,6 +118,7 @@ _SECRET_PAIR = re.compile(
 _URL_SCHEME = r"[A-Za-z][A-Za-z0-9+.-]{0,20}://"
 _URL_USERINFO = re.compile(_URL_SCHEME + r"[^/\s:@]{1,64}:[^/\s@]{1,128}@")
 _COLON_PAIR = re.compile(r"([^\s:]{1,64}):[ \t]*(?=(\S{0,8}))")
+_COLON_LEFT = re.compile(r"[^\s:]{1,64}:")    # searched with endpos just past one colon
 _URL_FIELD = re.compile("(?:" + _URL_SCHEME + r"|www\.)\S+")
 _RECORD_DELIMITERS = ("|", "\t", ";", ",")
 
@@ -557,25 +558,47 @@ def _colon_pair(line):
 
 
 def _colon_pair_match(line):
-    """The first ``_COLON_PAIR`` match that ``_colon_pair`` counts, or None."""
-    for match in _COLON_PAIR.finditer(line):
-        left, head = match.groups()
-        if not head or head.startswith("//") or left.startswith("//"):
+    """The first ``_COLON_PAIR`` match that ``_colon_pair`` counts, or None.
+
+    The same matches as ``_COLON_PAIR.finditer(line)``, found from the colons:
+    ``finditer`` tries every start position and reads up to 64 characters from
+    each, so a quarter-megabyte line without a colon cost 16 million steps.
+    A match ends at a colon, so for the next colon only the 64 characters
+    before it can start one, and the leftmost of them that does is where
+    ``finditer`` would have found it.
+    """
+    pos = 0
+    while True:
+        colon = line.find(":", pos)
+        if colon < 0:
+            return None
+        left = _COLON_LEFT.search(line, max(pos, colon - 64), colon + 1)
+        if left is None:
+            pos = colon + 1
             continue
-        if not (left[-1].isalnum() or left[-1] in "._-@!$#"):
-            continue
-        if head.startswith(("\\", "/")) and len(left) == 1:
-            continue
-        if left.isdigit() and len(left) <= 2 and head[:2].isdigit():
-            continue
-        if head.isdigit() and len(head) <= 5:
-            try:
-                ipaddress.ip_address(left)
-                continue
-            except ValueError:
-                pass
-        return match
-    return None
+        match = _COLON_PAIR.match(line, left.start())
+        pos = match.end()
+        if _counts_as_pair(match):
+            return match
+
+
+def _counts_as_pair(match):
+    left, head = match.groups()
+    if not head or head.startswith("//") or left.startswith("//"):
+        return False
+    if not (left[-1].isalnum() or left[-1] in "._-@!$#"):
+        return False
+    if head.startswith(("\\", "/")) and len(left) == 1:
+        return False
+    if left.isdigit() and len(left) <= 2 and head[:2].isdigit():
+        return False
+    if head.isdigit() and len(head) <= 5:
+        try:
+            ipaddress.ip_address(left)
+            return False
+        except ValueError:
+            pass
+    return True
 
 
 def _credential_record(line):
@@ -705,15 +728,21 @@ def mask_credentials(text, lines=False, colons=None):
         return text
     if text.startswith("--"):
         text = _mask_parts(text)
-    text = _USERINFO_PASSWORD.sub(lambda m: m.group(1) + MASK + m.group(3), text)
+    # Each pattern needs its separator; a body without one is not read again
+    # (a capture's text budget is tens of megabytes).
+    if "://" in text:
+        text = _USERINFO_PASSWORD.sub(lambda m: m.group(1) + MASK + m.group(3), text)
     if colons is None:
         colons = lines
     quoted = lambda m: m.group(1) + m.group(2) + MASK + m.group(2)   # noqa: E731
-    text = _SECRET_QUOTED.sub(quoted, text)
-    text = _SECRET_QUOTED_COLON.sub(quoted, text)
-    text = _SECRET_BARE.sub(lambda m: m.group(1) + (m.group(2) if m.group(2) == MASK else MASK),
-                            text)
-    if colons:
+    if "=" in text:
+        text = _SECRET_QUOTED.sub(quoted, text)
+    if ":" in text:
+        text = _SECRET_QUOTED_COLON.sub(quoted, text)
+    if "=" in text:
+        text = _SECRET_BARE.sub(
+            lambda m: m.group(1) + (m.group(2) if m.group(2) == MASK else MASK), text)
+    if colons and ":" in text:
         text = _SECRET_BARE_COLON.sub(_bare_colon, text)
     if lines:
         out = []

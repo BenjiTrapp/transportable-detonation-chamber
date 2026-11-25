@@ -39,7 +39,15 @@ module is that order, in ``analyze_pcap``. The false assumptions it avoids:
   * One download is the unit of cost. A capture of many small decompression
     bombs would be inflated into the hash a thousand times over, so one
     ``net_http.HashBudget`` of ``CAPTURE_HASH_BUDGET`` bytes is shared by every
-    flow of a capture.
+    flow of a capture. One message is not the unit either: two hundred
+    pipelined 290-byte gzip bombs (77 KB of capture) are 51 MiB of body text
+    and took a minute to mask, so the text all bodies keep shares one
+    ``net_http.TextBudget`` of ``CAPTURE_TEXT_BUDGET`` characters
+    (``text_budget_spent``), and four megabytes of pipelined one-line GETs are
+    150,000 events and 1.7 GB of memory, so a capture keeps at most
+    ``MAX_EVENTS`` parser and connection events: what comes after is not
+    parsed, and ``events_capped`` says the report is cut (the UI says so). A
+    DNS answer that points back into itself many times is bounded the same way.
   * "No finding" is an answer. A rule the regex time budget could not decide
     is listed (``rule_unevaluated``, ``rule_budget_spent``), an empty capture
     is ``observed`` False with a ``note`` and differs from a capture in which
@@ -104,6 +112,8 @@ DEFAULT_RULES = os.path.join(ROOT, "rules", "network", "default.yaml")
 
 MODES = {"online": True, "isolated": False}     # mode -> observed_fully
 CAPTURE_HASH_BUDGET = 256 * 1024 * 1024         # bytes streamed into file hashes per capture
+CAPTURE_TEXT_BUDGET = 8 * 1024 * 1024           # characters of body text kept per capture
+MAX_EVENTS = 20000                              # parser and connection events kept per capture
 MAX_IOCS = 5000
 
 BEHAVIOR_TYPES = ("beacon", "retry", "fanout")
@@ -157,12 +167,26 @@ def _candidates(flow):
     return ordered + [name for name in _ORDER if name in fits and name != hint]
 
 
+class _Limits:
+    """What one capture may still cost: the shared hash and text budgets and
+    the events left under ``MAX_EVENTS`` (see the module docstring)."""
+
+    def __init__(self, hash_budget=None, text_budget=None, max_events=None):
+        self.hash = hash_budget if hash_budget is not None else net_http.HashBudget(
+            CAPTURE_HASH_BUDGET)
+        self.text = text_budget if text_budget is not None else net_http.TextBudget(
+            CAPTURE_TEXT_BUDGET)
+        self.events_left = MAX_EVENTS if max_events is None else max_events
+        self.events_capped = False
+
+
 def _parse(name, flow, budget):
     # Looked up on the module at call time, so one parser can be replaced (a test).
     if name == "tls":
         return net_tls.events_from_flow(flow)
     if name == "http":
-        return net_http.events_from_flow(flow, hash_budget=budget)
+        return net_http.events_from_flow(flow, hash_budget=budget.hash, text_budget=budget.text,
+                                         max_messages=max(1, budget.events_left))
     if name == "mail":
         return net_mail_ftp.events_from_flow(flow)
     if name == "dns":
@@ -309,21 +333,33 @@ def _render_names(event):
 def collect_events(path, hash_budget=None):
     """``(events, errors, pcap_result)``: the parsers' and connection events of a
     capture, names rendered, in time order. No decoding or behaviour yet."""
-    return _collect(path, hash_budget)[:3]
+    return _collect(path, _Limits(hash_budget))[:3]
 
 
-def _collect(path, hash_budget=None):
+def _collect(path, limits=None):
     """``collect_events`` plus ``claimed``: id of a ``conn`` event -> the
-    parser events of its flow."""
-    if hash_budget is None:
-        hash_budget = net_http.HashBudget(CAPTURE_HASH_BUDGET)
+    parser events of its flow. ``limits`` (a ``_Limits``) says when to stop:
+    flows past ``MAX_EVENTS`` events are not parsed, and ``events_capped``
+    is set on it."""
+    if limits is None:
+        limits = _Limits()
     result = net_flows.read_pcap(path)
     errors, events, claimed = [], [], {}
     for flow in result.flows:
+        if limits.events_left <= 0:
+            limits.events_capped = True
+            break
         try:
-            events += _flow_events(flow, hash_budget, errors, claimed)
+            found = _flow_events(flow, limits, errors, claimed)
         except Exception as exc:    # e.g. a flow attribute a parser left odd
             errors.append(_failure("net_analyze on %s" % _describe(flow), exc))
+            continue
+        if len(found) > limits.events_left:
+            # the connection event comes first and stays; its claim keeps what was kept
+            found = found[:limits.events_left]
+            limits.events_capped = True
+        limits.events_left -= len(found)
+        events += found
     events = net_events.sort_events(_render_names(e) for e in events)
     return events, errors, result, claimed
 
@@ -663,8 +699,8 @@ def analyze_pcap(path, rules=None, baseline=None, process="", mode="online"):
     ruleset = _ruleset(rules)
     errors += ["rules: %s" % safe_text(e) for e in ruleset.errors]
     known_good = net_rules.KnownGood(ruleset.lists.get(net_rules.KNOWN_GOOD, ()))
-    budget = net_http.HashBudget(CAPTURE_HASH_BUDGET)
-    base, parse_errors, result, claimed = _collect(path, budget)
+    limits = _Limits()
+    base, parse_errors, result, claimed = _collect(path, limits)
     errors += parse_errors
 
     decoded, source_of = [], {}
@@ -716,7 +752,7 @@ def analyze_pcap(path, rules=None, baseline=None, process="", mode="online"):
 
     copies = net_mail_ftp.masked(events)
     _mask_decoded(events, copies, source_of)
-    copies = mask_report(copies)
+    copies = mask_report(_jsonable(copies))
     for event, copy, is_known in zip(events, copies, known):
         copy["known_good"] = (event["type"] not in net_rules.ALWAYS_VISIBLE
                               and known_good.hides(event))
@@ -753,6 +789,14 @@ def analyze_pcap(path, rules=None, baseline=None, process="", mode="online"):
         "errors": errors,
         "suppressed_count": sum(known),
         "hash_budget_spent": any(e.get("hash_budget_spent") for e in events),
+        "text_budget_spent": any(e.get("text_budget_spent") for e in events),
+        "events_capped": limits.events_capped,
+        "max_events": MAX_EVENTS,
     }
-    # The one masking pass over everything serialized (see mask_report).
-    return mask_report(_jsonable(net_mail_ftp.masked(report)))
+    # The one masking pass over everything serialized (see mask_report). The
+    # event copies went through it above; a second pass over them changes
+    # nothing and doubled the time of a capture full of text.
+    done = {key: report[key] for key in ("events", "behavior")}
+    rest = mask_report(_jsonable(net_mail_ftp.masked(
+        {k: v for k, v in report.items() if k not in done})))
+    return {k: done[k] if k in done else rest[k] for k in report}

@@ -13353,6 +13353,8 @@ function networkUndecided(report) {
     });
     if (report.rule_budget_spent) out.push('The regex time budget was spent: the rules with a regex were left undecided from then on.');
     if (report.hash_budget_spent) out.push('The hash budget was spent: some files have no full hash.');
+    if (report.events_capped) out.push(`The capture held more than ${networkText(report.max_events)} events: the flows after that were not parsed, so the report is cut.`);
+    if (report.text_budget_spent) out.push('The text budget was spent: some bodies keep only part of their text, or none.');
     const errors = Array.isArray(report.errors) ? report.errors : [];
     errors.slice(0, NETWORK_ERRORS_SHOWN).forEach(err => out.push(`A step failed: ${networkText(err)}`));
     if (errors.length > NETWORK_ERRORS_SHOWN) out.push(`${errors.length - NETWORK_ERRORS_SHOWN} more failed step(s) are not listed.`);
