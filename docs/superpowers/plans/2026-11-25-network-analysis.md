@@ -134,7 +134,9 @@ git commit -m "feat(net): event schema for network analysis"
 
 **Interfaces:**
 - Consumes: Task 1
-- Produces: `read_pcap(path) -> PcapResult`, `PcapResult` mit `.flows` (list of `Flow`), `.truncated` (bool), `.note` (str), `.packet_count` (int); `Flow` mit `.proto`, `.src`, `.sport`, `.dst`, `.dport`, `.first_ts`, `.last_ts`, `.client_bytes`, `.server_bytes`, `.gaps` (list of int), `.client_stream()`, `.server_stream()`
+- Produces: `read_pcap(path) -> PcapResult`, `PcapResult` mit `.flows` (list of `Flow`), `.truncated` (bool), `.note` (str), `.packet_count` (int); `Flow` mit `.proto`, `.src`, `.sport`, `.dst`, `.dport`, `.first_ts`, `.last_ts`, `.client_bytes`, `.server_bytes`, `.gaps` (list of int), `.packets` (list of `(ts, direction, payload)`, `direction` ist `"c"` oder `"s"`), `.client_stream()`, `.server_stream()`
+
+`.packets` trägt die Zeitstempel je Nachricht — Task 7 misst daraus Heartbeat-Abstände, was mit `first_ts`/`last_ts` allein nicht geht.
 
 Deckt Review Focus 1 und 2.
 
@@ -182,6 +184,12 @@ def test_a_file_that_is_not_a_pcap_is_refused_with_a_reason(tmp_path):
 def test_udp_packets_become_flows_too(tmp_path):
     p = _pcap(tmp_path, _udp_packet(53, b"\x00\x01"))
     assert net_flows.read_pcap(p).flows[0].proto == "udp"
+
+def test_each_message_keeps_its_timestamp_and_direction(tmp_path):
+    p = _pcap(tmp_path, _tcp_exchange(b"ping", b"pong", client_ts=10.0, server_ts=11.5))
+    pk = net_flows.read_pcap(p).flows[0].packets
+    assert [(d, bytes(pl)) for _, d, pl in pk] == [("c", b"ping"), ("s", b"pong")]
+    assert [ts for ts, _, _ in pk] == [10.0, 11.5]
 ```
 
 - [ ] **Step 2: Run tests to verify they fail**
@@ -731,9 +739,11 @@ git commit -m "feat(net): beaconing, retries and fanout over time"
 
 **Interfaces:**
 - Consumes: Task 1
-- Produces: `load_rules(paths) -> RuleSet`, `RuleSet` mit `.rules`, `.errors` (list of str), `.lists`; `RuleSet.evaluate(events) -> list` (von `RuleHit`); `RuleHit` mit `.rule_id`, `.name`, `.severity`, `.role`, `.attack`, `.family`, `.behavior`, `.kind` (or None), `.events` (list), `.process`
+- Produces: `load_rules(paths) -> RuleSet`, `RuleSet` mit `.rules` (list of `Rule`), `.errors` (list of str), `.lists`; `RuleSet.evaluate(events) -> list` (von `RuleHit`). `Rule` und `RuleHit` erben beide von `dict`, wie `MemoryFinding` (`webui/memory_evidence.py:238`), damit Report und Regelübersicht direkt nach JSON serialisieren. `Rule` trägt die Schlüssel der YAML-Regel (`id`, `name`, `severity`, `role`, `behavior`, `attack`, `family`, `kind`); `RuleHit` zusätzlich `rule_id`, `events` (list), `process`
 
 Operatoren: Gleichheit (Wert oder Liste), `|re`, `|contains`, `|startswith`, `|endswith`, `|in`, `|gte`, `|lte`, `|gt`, `|lt`, `|count_gte`, `|has_all`; Blöcke `any`, `all`, `not`; Listen über `$name`; Korrelation über `requires: [[a, b], [c]]` — aus jeder Gruppe muss eine Regel für denselben Prozess getroffen haben.
+
+Die Liste `known_good` ist vordefiniert: Events, deren Ziel darin steht, sind für jede Regel unsichtbar, solange die Regel nicht `include_known_good: true` setzt. Ohne das kann Task 11 nicht verlangen, dass gewöhnlicher Windows-Verkehr nichts auslöst, und die Spec nennt die Unterdrückung bekannter Infrastruktur ausdrücklich.
 
 Ein optionales `kind:` ordnet den Treffer einer Evidence-Art zu; die Art bestimmt das Gewicht, nicht die Regel (Spec, *Analyse, Events und Regeln*). Deckt Review Focus 4.
 
@@ -751,7 +761,12 @@ rules:
 """)
     hits = rs.evaluate([net_events.NetEvent("http", 1.0, dest="e.top",
                                             method="POST", path="/gate7.php")])
-    assert [h.rule_id for h in hits] == ["gate"]
+    assert [h["rule_id"] for h in hits] == ["gate"]
+
+def test_a_hit_serializes_to_json():
+    rs = _rules("rules:\n  - {id: g, name: g, event: http, match: {method: GET}}")
+    hit = rs.evaluate([net_events.NetEvent("http", 1.0, method="GET")])[0]
+    assert json.loads(json.dumps(hit))["rule_id"] == "g"
 
 def test_a_rule_that_does_not_match_produces_nothing():
     rs = _rules("rules:\n  - {id: x, name: x, event: http, match: {method: PUT}}")
@@ -765,6 +780,25 @@ rules:
   - {id: l, name: l, event: dns, match: {dest|in: $bad}}
 """)
     assert len(rs.evaluate([net_events.NetEvent("dns", 1.0, dest="worse.top")])) == 1
+
+def test_known_good_destinations_are_invisible_to_rules():
+    rs = _rules("""
+lists:
+  known_good: [www.msftconnecttest.com]
+rules:
+  - {id: any_dns, name: any, event: dns, match: {}}
+""")
+    assert rs.evaluate([net_events.NetEvent("dns", 1.0, dest="www.msftconnecttest.com")]) == []
+    assert len(rs.evaluate([net_events.NetEvent("dns", 1.0, dest="evil.top")])) == 1
+
+def test_a_rule_may_opt_into_known_good():
+    rs = _rules("""
+lists:
+  known_good: [www.msftconnecttest.com]
+rules:
+  - {id: ncsi, name: ncsi, event: dns, match: {}, include_known_good: true}
+""")
+    assert len(rs.evaluate([net_events.NetEvent("dns", 1.0, dest="www.msftconnecttest.com")])) == 1
 
 def test_any_all_and_not_blocks_compose():
     rs = _rules("""
@@ -796,12 +830,12 @@ rules:
 """)
     only_dl = [net_events.NetEvent("download", 1.0, process="a.exe", kind="pe")]
     both = only_dl + [net_events.NetEvent("beacon", 2.0, process="a.exe")]
-    assert "chain" not in [h.rule_id for h in rs.evaluate(only_dl)]
-    assert "chain" in [h.rule_id for h in rs.evaluate(both)]
+    assert "chain" not in [h["rule_id"] for h in rs.evaluate(only_dl)]
+    assert "chain" in [h["rule_id"] for h in rs.evaluate(both)]
 
 def test_a_rule_may_name_an_evidence_kind():
     rs = _rules("rules:\n  - {id: k, name: k, event: upload, match: {}, kind: exfil_upload}")
-    assert rs.evaluate([net_events.NetEvent("upload", 1.0)])[0].kind == "exfil_upload"
+    assert rs.evaluate([net_events.NetEvent("upload", 1.0)])[0]["kind"] == "exfil_upload"
 
 def test_an_invalid_regex_is_reported_and_the_other_rules_still_run():
     rs = _rules("""
@@ -810,7 +844,7 @@ rules:
   - {id: fine, name: f, event: http, match: {method: GET}}
 """)
     assert any("broken" in e for e in rs.errors)
-    assert [h.rule_id for h in rs.evaluate([net_events.NetEvent("http", 1.0, method="GET")])] == ["fine"]
+    assert [h["rule_id"] for h in rs.evaluate([net_events.NetEvent("http", 1.0, method="GET")])] == ["fine"]
 
 def test_an_unknown_operator_is_reported():
     rs = _rules("rules:\n  - {id: u, name: u, event: http, match: {path|sideways: x}}")
@@ -873,14 +907,14 @@ def test_the_default_rules_load_without_errors():
 
 def test_every_rule_has_a_name_a_severity_and_a_behaviour_line():
     for r in net_rules.load_rules([DEFAULT_RULES]).rules:
-        assert r.name and r.severity in ("info", "low", "medium", "high", "critical")
-        assert r.behavior
+        assert r["name"] and r["severity"] in ("info", "low", "medium", "high", "critical")
+        assert r["behavior"]
 
 def test_a_pe_download_followed_by_beaconing_fires_the_chain_rule():
     rs = net_rules.load_rules([DEFAULT_RULES])
     evs = [net_events.NetEvent("download", 1.0, process="l.exe", dest="e.top", kind="pe"),
            net_events.NetEvent("beacon", 60.0, process="l.exe", dest="c2.top", interval=60.0)]
-    assert any(h.severity == "critical" for h in rs.evaluate(evs))
+    assert any(h["severity"] == "critical" for h in rs.evaluate(evs))
 
 def test_ordinary_windows_traffic_fires_nothing():
     rs = net_rules.load_rules([DEFAULT_RULES])
