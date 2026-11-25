@@ -32,14 +32,19 @@ Several assumptions would make the result wrong:
     shapes, turned a duty-cycled beacon into one of 3600 s and, because any
     break leaving four starts was accepted and four to six points pass the
     regularity gate by chance, produced more beacons from random traffic than
-    before. Instead a series is refused when its intervals show more than one
-    scale: see ``_single_scale``. Refusing costs beacons (a burst of GET plus
-    five or more follow-ups looks like a rhythm with stalls, and a beacon
-    with two or more outages of ten times its interval is not measured), but
-    a wrong interval stored as a fingerprint feature spreads. Requests of
-    different kinds (type, method, path) whose own rhythm differs from the
-    group's are refused too (``_interleaved``): a GET every 60 s with its POST
-    30 s later is evenly spaced at 30 s and only the kinds give it away.
+    before. Instead a series whose intervals show more than one scale (see
+    ``_single_scale``) is reported without a measurement: the beacon event
+    keeps the host, the number of check-ins and the span, ``interval``,
+    ``jitter``, ``cov`` and ``on_rhythm`` are None and ``unmeasured`` says why.
+    Repeated contact is a fact worth keeping; a number that may be the spacing
+    inside a burst is not, because a later run is compared against it. Only a
+    series that would otherwise have passed the regularity gate is reported
+    this way, or every host contacted four times at random would be.
+  * Request kinds (method, path) say something about the rhythm. They do not:
+    beacons rotate paths, pick URIs at random, mix GET and POST and add a
+    favicon, and all of them are one rhythm. Known limitation: a GET every
+    60 s with its POST exactly half a period later is evenly spaced at 30 s,
+    only the kinds could tell it from a 30 s beacon, and it is reported as one.
   * A DNS lookup is a check-in. It is not: it happens seconds before the
     connection it serves, again whenever a TTL expires, and a resolver asks for
     names such as wpad.lan on a timer with no sample involved. Its time would
@@ -98,21 +103,21 @@ BEACON_MIN_INTERVAL_S = 0.5
 ON_RHYTHM_TOLERANCE = 0.25
 ON_RHYTHM_MIN_SHARE = 0.5
 
-# One time scale (see _single_scale). An interval is "off" when it is more than
-# SCALE_BAND times or less than 1/SCALE_BAND of the median: one missed check-in
-# (twice the interval) is still on the scale. It is "far" when it is off by
+# One time scale (see _single_scale). An interval is "off" when it is
+# SCALE_BAND times the median or more, or the median divided by SCALE_BAND or
+# less: an exact doubling is a second scale. It is "far" when it is off by
 # SCALE_FAR times. A rhythm tolerates a fifth of its intervals off (stalls, a
-# re-register), one interval far (an outage is an event, two are a second
-# scale) and no run of more than SCALE_MAX_RUN consecutive off intervals (a run
-# is a second rhythm, a stall is one interval).
+# re-register), 5% far (an outage is an event; two in a thousand check-ins are
+# noise, two in eight are a second scale) but never fewer than SCALE_MIN_FAR so
+# that a short series is not judged by a percentage of three, and no run of
+# more than SCALE_MAX_RUN consecutive off intervals (a run is a second rhythm,
+# a stall is one interval).
 SCALE_BAND = 2.0
 SCALE_FAR = 10.0
 SCALE_MAX_OFF_SHARE = 0.2
-SCALE_MAX_FAR = 1
+SCALE_MAX_FAR_SHARE = 0.05
+SCALE_MIN_FAR = 1
 SCALE_MAX_RUN = 2
-
-# A request kind that repeats on its own must repeat at the group's interval.
-KIND_INTERVAL_TOLERANCE = 0.25
 
 # Intervals taken into the measurement of one group. A beacon is established
 # long before this; the cap keeps the cost of one huge group bounded.
@@ -164,24 +169,26 @@ def _single_scale(intervals, median):
     median of 60 s a series is one rhythm if almost all intervals are near 60 s,
     and two rhythms if a sizeable share is not. Refused are series in which
     more than ``SCALE_MAX_OFF_SHARE`` of the intervals are off the median by
-    ``SCALE_BAND``, more than ``SCALE_MAX_FAR`` is off by ``SCALE_FAR``, or more
-    than ``SCALE_MAX_RUN`` off intervals follow each other. GET plus POST
+    ``SCALE_BAND``, more than ``SCALE_MAX_FAR_SHARE`` of them (and more than
+    ``SCALE_MIN_FAR``) are off by ``SCALE_FAR``, or more than
+    ``SCALE_MAX_RUN`` off intervals follow each other. GET plus POST
     (1 s, 59 s alternating), several requests per check-in, a duty cycle and a
     change of rhythm all fail one of the three; a jittered beacon, a missed
     check-in, an outage and a periodic re-register pass.
     """
     off = far = run = longest = 0
     for x in intervals:
-        if x > SCALE_BAND * median or x < median / SCALE_BAND:
+        if x >= SCALE_BAND * median or x <= median / SCALE_BAND:
             off += 1
             run += 1
             longest = max(longest, run)
-            if x > SCALE_FAR * median or x < median / SCALE_FAR:
+            if x >= SCALE_FAR * median or x <= median / SCALE_FAR:
                 far += 1
         else:
             run = 0
     return (off <= SCALE_MAX_OFF_SHARE * len(intervals)
-            and far <= SCALE_MAX_FAR and longest <= SCALE_MAX_RUN)
+            and far <= max(SCALE_MIN_FAR, SCALE_MAX_FAR_SHARE * len(intervals))
+            and longest <= SCALE_MAX_RUN)
 
 
 def periodicity(timestamps):
@@ -191,36 +198,39 @@ def periodicity(timestamps):
     coefficient of variation: 1.4826 * MAD / median), ``jitter`` (the same
     value, as the fraction of the interval the timing wanders by),
     ``connections`` (check-ins seen), ``on_rhythm`` (share of intervals within
-    25% of the median), ``single_scale`` and ``periodic``. Fewer than
+    25% of the median), ``single_scale``, ``regular`` (the intervals pass the
+    cov and on_rhythm gate, whatever their scale) and ``periodic``. Fewer than
     ``BEACON_MIN_CONNECTIONS`` check-ins measure nothing: interval, cov,
-    jitter, on_rhythm and single_scale are None. A series whose intervals lie
-    on more than one time scale (``single_scale`` False, see ``_single_scale``)
-    has no rhythm to report either: the median of two scales is a number that
-    belongs to neither, so interval, cov, jitter and on_rhythm are None there
-    too. A series on one scale that is merely irregular keeps its numbers and
+    jitter, on_rhythm, single_scale and regular are None. A series whose
+    intervals lie on more than one time scale (``single_scale`` False, see
+    ``_single_scale``) has no rhythm to report either: the median of two
+    scales is a number that belongs to neither, so interval, cov, jitter and
+    on_rhythm are None there too; ``regular`` still says whether it would have
+    been taken for a beacon. A series on one scale that is merely irregular keeps its numbers and
     has ``periodic`` False. ``connections`` counts check-ins: requests closer
     than ``BEACON_MIN_INTERVAL_S`` are one.
     """
     # sorted() on input that is already in order is a single pass.
     starts = _check_ins(sorted(t for t in timestamps if _usable(t)))
     result = {"interval": None, "jitter": None, "cov": None, "on_rhythm": None,
-              "connections": len(starts), "single_scale": None, "periodic": False}
+              "connections": len(starts), "single_scale": None, "regular": None,
+              "periodic": False}
     if len(starts) < BEACON_MIN_CONNECTIONS:
         return result
     window = starts[:MAX_INTERVALS + 1]
     intervals = [b - a for a, b in zip(window, window[1:])]
     median = statistics.median(intervals)
-    result["single_scale"] = _single_scale(intervals, median)
-    if not result["single_scale"]:
-        return result
     mad = statistics.median(abs(x - median) for x in intervals)
     cov = 1.4826 * mad / median
     on_rhythm = sum(1 for x in intervals
                     if abs(x - median) <= ON_RHYTHM_TOLERANCE * median) / len(intervals)
-    result.update(
-        interval=round(median, 2), cov=round(cov, 3), jitter=round(cov, 3),
-        on_rhythm=round(on_rhythm, 2),
-        periodic=cov <= BEACON_MAX_COV and on_rhythm >= ON_RHYTHM_MIN_SHARE)
+    regular = cov <= BEACON_MAX_COV and on_rhythm >= ON_RHYTHM_MIN_SHARE
+    single = _single_scale(intervals, median)
+    result.update(single_scale=single, regular=regular)
+    if single:
+        result.update(
+            interval=round(median, 2), cov=round(cov, 3), jitter=round(cov, 3),
+            on_rhythm=round(on_rhythm, 2), periodic=regular)
     return result
 
 
@@ -265,11 +275,10 @@ def _resolutions(events):
 class _Group:
     """What one destination (or path) did: times, event types, a process name."""
 
-    __slots__ = ("times", "kinds", "types", "process", "pids", "addresses")
+    __slots__ = ("times", "types", "process", "pids", "addresses")
 
     def __init__(self):
         self.times = []
-        self.kinds = {}
         self.types = set()
         self.process = ""
         self.pids = set()
@@ -277,8 +286,6 @@ class _Group:
 
     def add(self, event, ts, address=None):
         self.times.append(ts)
-        kind = (event["type"], event.get("method") or "", event.get("path") or "")
-        self.kinds.setdefault(kind, []).append(ts)
         if address:
             self.addresses.add(address)
         self.types.add(event["type"])
@@ -287,35 +294,29 @@ class _Group:
             self.process = event.get("process") or ""
 
 
-def _interleaved(group, interval):
-    """Does a kind of request repeat at a different rhythm than the group?
-
-    The group is evenly spaced at 30 s when a GET comes every 60 s and its
-    POST 30 s later, and only the kinds show that each repeats every 60 s. A
-    kind with at least ``BEACON_MIN_CONNECTIONS`` check-ins of its own must
-    repeat at the group's interval; otherwise the group's interval is the
-    spacing of different requests, not a rhythm of the sample.
-    """
-    for times in group.kinds.values():
-        if len(times) < BEACON_MIN_CONNECTIONS:
-            continue
-        own = periodicity(times)
-        if own["connections"] < BEACON_MIN_CONNECTIONS:
-            continue
-        if (own["interval"] is None
-                or abs(own["interval"] - interval) > KIND_INTERVAL_TOLERANCE * interval):
-            return True
-    return False
+UNMEASURED_SCALES = "more than one time scale"
 
 
 def _beacon(pid, dest, group):
+    """The beacon of a group, measured; or repeated contact without a number.
+
+    A series that would pass the regularity gate except that its intervals lie
+    on more than one scale is still repeated contact with this host, so the
+    event is kept, with every measurement None and the reason in ``unmeasured``.
+    Anything else that is not periodic is not reported.
+    """
     p = periodicity(group.times)
-    if not p["periodic"] or _interleaved(group, p["interval"]):
+    if p["periodic"]:
+        measured, unmeasured = True, None
+    elif p["single_scale"] is False and p["regular"]:
+        measured, unmeasured = False, UNMEASURED_SCALES
+    else:
         return None
     return net_events.NetEvent(
         "beacon", min(group.times), process=group.process, pid=pid, dest=dest,
         interval=p["interval"], jitter=p["jitter"], cov=p["cov"],
-        on_rhythm=p["on_rhythm"], connections=p["connections"],
+        on_rhythm=p["on_rhythm"], periodic=measured, unmeasured=unmeasured,
+        connections=p["connections"],
         first_ts=min(group.times), last_ts=max(group.times),
         via=sorted(group.types), addresses=sorted(group.addresses))
 

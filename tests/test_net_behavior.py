@@ -152,10 +152,10 @@ def test_a_slow_first_connect_does_not_move_the_interval():
 
 
 def test_periodicity_reports_the_measurement_of_an_irregular_series():
-    # Every interval is within a factor of two of the median, so there is one
+    # Every interval is within (not at) a factor of two of the median, so there is one
     # scale and the numbers are meaningful: they say how irregular it is.
-    p = net_behavior.periodicity([0.0, 30.0, 90.0, 210.0, 240.0, 360.0])
-    assert p["periodic"] is False and p["single_scale"] is True
+    p = net_behavior.periodicity([0.0, 35.0, 95.0, 210.0, 245.0, 355.0])
+    assert p["periodic"] is False and p["single_scale"] is True and p["regular"] is False
     assert p["interval"] == 60.0 and p["cov"] > net_behavior.BEACON_MAX_COV
 
 
@@ -379,8 +379,13 @@ def test_failed_lookups_on_a_timer_are_a_retry_not_a_beacon():
 #
 # A timestamp list cannot say whether a short interval is the inside of a
 # check-in or the rhythm itself, so a series whose intervals fall on more than
-# one scale is not measured. Every row here is either refused or measured
-# correctly; none may come out as a confident wrong interval.
+# one scale is reported as repeated contact without a measurement: the beacon
+# event keeps the host, the count and the span, and interval, jitter, cov and
+# on_rhythm are None. None is the point: a number that is not a measurement
+# would be compared against later runs.
+
+SCALES = "more than one time scale"
+
 
 def requests(offsets, count=8, step=60.0, start=0.0, methods=None):
     """``count`` check-ins ``step`` apart, one HTTP request at each offset."""
@@ -401,88 +406,119 @@ def stamps(events):
     return sorted(e["ts"] for e in events)
 
 
-def refused_or(beacons, interval):
-    """No beacon, or only beacons that report ``interval``."""
-    return all(b["interval"] == interval for b in beacons)
+def as_events(timestamps, dest="c2.top"):
+    return [ev("http", t, dest=dest) for t in timestamps]
 
 
-def test_a_get_and_a_post_one_second_apart_are_refused():
+def assert_unmeasured(beacons, minimum_connections=4):
+    """One beacon event that states the contact and withholds the measurement."""
+    assert len(beacons) == 1, beacons
+    b = beacons[0]
+    for field in ("interval", "jitter", "cov", "on_rhythm"):
+        assert field in b and b[field] is None, (field, b[field])
+    assert b["periodic"] is False and b["unmeasured"] == SCALES
+    assert b["dest"] == "c2.top" and b["connections"] >= minimum_connections
+    assert b["first_ts"] < b["last_ts"] and b["ts"] == b["first_ts"]
+
+
+def test_a_get_and_a_post_one_second_apart_are_repeated_contact_without_an_interval():
     evs = requests((0.0, 1.0), methods=("GET", "POST"))
-    assert beacons_of(evs) == []
+    assert_unmeasured(beacons_of(evs), minimum_connections=8)
     p = net_behavior.periodicity(stamps(evs))
-    assert p["periodic"] is False
+    assert p["periodic"] is False and p["single_scale"] is False
     assert p["interval"] is None and p["jitter"] is None and p["cov"] is None
-    assert p["single_scale"] is False
 
 
-def test_two_pairs_per_check_in_are_refused():
+def test_the_missing_measurement_is_none_and_never_zero():
+    b = beacons_of(requests((0.0, 1.0), methods=("GET", "POST")))[0]
+    for field in ("interval", "jitter", "cov", "on_rhythm"):
+        assert b[field] is None and b[field] != 0 and not isinstance(b[field], (int, float))
+    json.dumps(b)
+    assert json.loads(json.dumps(b))["interval"] is None
+
+
+def test_a_measured_beacon_says_it_was_measured():
+    b = beacons_of([ev("http", k * 60.0, dest="c2.top") for k in range(6)])[0]
+    assert b["periodic"] is True and b["unmeasured"] is None and b["interval"] == 60.0
+
+
+def test_two_pairs_per_check_in_are_repeated_contact_without_an_interval():
     evs = requests((0.0, 1.0, 6.0, 7.0), methods=("GET", "POST", "GET", "POST"))
-    assert beacons_of(evs) == []
+    assert_unmeasured(beacons_of(evs), minimum_connections=8)
 
 
-def test_four_requests_with_uneven_offsets_are_refused():
-    assert beacons_of(requests((0.0, 0.5, 3.1, 3.6))) == []
+def test_four_requests_with_uneven_offsets_are_repeated_contact_without_an_interval():
+    assert_unmeasured(beacons_of(requests((0.0, 0.5, 3.1, 3.6))))
 
 
-def test_a_burst_with_uneven_spacing_is_refused():
-    assert beacons_of(requests((0.0, 0.8, 2.6, 3.4), step=120.0)) == []
+def test_a_burst_with_uneven_spacing_is_repeated_contact_without_an_interval():
+    assert_unmeasured(beacons_of(requests((0.0, 0.8, 2.6, 3.4), step=120.0)))
 
 
-def test_a_duty_cycled_beacon_is_refused_or_measured_correctly():
+def test_a_duty_cycled_beacon_is_repeated_contact_without_an_interval():
     ts = []
     for cycle in range(5):
         ts += [cycle * 3600.0 + k * 60.0 for k in range(10)]     # 10 min on, 50 min off
-    p = net_behavior.periodicity(ts)
-    assert not p["periodic"] or p["interval"] == 60.0
-    evs = [ev("http", t, dest="c2.top") for t in ts]
-    assert refused_or(beacons_of(evs), 60.0)
+    assert_unmeasured(beacons_of(as_events(ts)), minimum_connections=50)
+    assert net_behavior.periodicity(ts)["interval"] is None
 
 
-def test_a_fast_beacon_with_regular_pauses_is_refused_or_measured_correctly():
+def test_a_fast_beacon_with_regular_pauses_is_repeated_contact_without_an_interval():
     ts = []
-    for block in range(4):
-        ts += [block * 430.0 + k for k in range(30)]              # 30 s of 1 Hz, 400 s quiet
+    for block in range(7):
+        ts += [block * 405.0 + k for k in range(6)]               # 6 s of 1 Hz, 400 s quiet
+    assert_unmeasured(beacons_of(as_events(ts)), minimum_connections=42)
     p = net_behavior.periodicity(ts)
-    assert p["periodic"] is False or p["interval"] == 1.0
-    assert p["interval"] != 430.0
+    assert p["interval"] is None and p["interval"] != 405.0
 
 
-def test_a_phase_change_is_refused_rather_than_one_phase_reported():
+def test_a_phase_change_is_repeated_contact_without_an_interval():
     first = [k * 10.0 for k in range(15)]
     second = [140.0 + k * 60.0 for k in range(1, 46)]
-    p = net_behavior.periodicity(first + second)
-    assert p["periodic"] is False and p["interval"] is None
+    assert_unmeasured(beacons_of(as_events(first + second)), minimum_connections=60)
     # even when the first phase is short
     short = [k * 10.0 for k in range(6)] + [50.0 + k * 60.0 for k in range(1, 46)]
-    assert net_behavior.periodicity(short)["periodic"] is False
+    assert_unmeasured(beacons_of(as_events(short)), minimum_connections=51)
 
 
-def test_a_just_under_five_to_one_burst_is_refused():
+def test_a_just_under_five_to_one_burst_is_repeated_contact_without_an_interval():
     # 10.2 s and 49.8 s alternate: the ratio that slipped between two scales.
-    evs = requests((0.0, 10.2), methods=("GET", "POST"))
-    assert beacons_of(evs) == []
+    assert_unmeasured(beacons_of(requests((0.0, 10.2), methods=("GET", "POST"))), 8)
 
 
-@pytest.mark.parametrize("delay", [13.0, 20.0, 30.0])
-def test_a_post_that_follows_the_get_by_ten_seconds_or_more_is_refused(delay):
-    # The task runs for ``delay`` seconds, then its result is posted. At 30 s
-    # the merged series is evenly spaced and only the request kinds give it
-    # away: the GETs come every 60 s, the POSTs every 60 s.
-    evs = requests((0.0, delay), methods=("GET", "POST"))
-    assert beacons_of(evs) == []
+@pytest.mark.parametrize("delay", [13.0, 20.0])
+def test_a_post_that_follows_the_get_by_ten_seconds_or_more_has_no_interval(delay):
+    # The task runs for ``delay`` seconds, then its result is posted. 20 s is
+    # an exact doubling of 40 s: the intervals 20 and 40 are two scales.
+    assert_unmeasured(beacons_of(requests((0.0, delay), methods=("GET", "POST"))), 8)
 
 
-def test_requests_of_one_kind_that_alternate_with_another_are_not_a_beacon_of_their_own():
-    gets = [ev("http", k * 60.0, dest="c2.top", method="GET", path="/task") for k in range(8)]
-    posts = [ev("http", k * 60.0 + 30.0, dest="c2.top", method="POST", path="/result")
-             for k in range(8)]
-    assert beacons_of(gets + posts) == []
-    assert len(beacons_of(gets)) == 1
+def test_known_limitation_a_post_exactly_half_a_period_later_reads_as_a_beacon_of_half_the_period():
+    # The merged series is evenly spaced at 30 s. Only the request kinds could
+    # tell it from a 30 s beacon, and keying on kinds refused real beacons that
+    # rotate URLs, mix GET and POST, or pick URIs at random. Not detected.
+    b = beacons_of(requests((0.0, 30.0), methods=("GET", "POST")))
+    assert len(b) == 1 and b[0]["interval"] == 30.0
 
 
-def test_two_scales_less_than_ten_times_apart_are_refused_by_share():
-    # No request kinds to tell them apart, no run, no extreme interval: 13 s
-    # and 47 s alternate, and only the share of off-scale intervals shows it.
+def test_bursts_at_random_times_are_repeated_contact_without_an_interval():
+    starts = [0, 30, 400, 450, 1000, 1700, 1760, 2500]
+    evs = []
+    for t in starts:
+        evs += [ev("http", float(t), dest="c2.top"), ev("http", t + 1.0, dest="c2.top")]
+    assert_unmeasured(beacons_of(evs), minimum_connections=16)
+
+
+def test_two_alternating_scales_20_and_40_have_no_interval():
+    # 40 is exactly twice 20: an exact doubling is a second scale.
+    ts = []
+    for k in range(8):
+        ts += [k * 60.0, k * 60.0 + 20.0]
+    p = net_behavior.periodicity(ts)
+    assert p["interval"] is None and p["single_scale"] is False and p["periodic"] is False
+
+
+def test_two_scales_less_than_ten_times_apart_have_no_interval_by_share():
     ts = []
     for k in range(8):
         ts += [k * 60.0, k * 60.0 + 13.0]
@@ -490,28 +526,120 @@ def test_two_scales_less_than_ten_times_apart_are_refused_by_share():
     assert p["periodic"] is False and p["interval"] is None
 
 
-def test_two_outages_are_a_second_scale_and_one_is_not():
-    steady = [k * 60.0 for k in range(40)]
-    one = steady[:20] + [t + 3600.0 for t in steady[20:]]
-    two = steady[:13] + [t + 3600.0 for t in steady[13:27]] + [t + 7200.0 for t in steady[27:]]
+def test_two_outages_in_a_short_series_are_a_second_scale_and_one_is_not():
+    steady = [k * 60.0 for k in range(12)]
+    one = steady[:6] + [t + 3600.0 for t in steady[6:]]
+    two = steady[:4] + [t + 3600.0 for t in steady[4:8]] + [t + 7200.0 for t in steady[8:]]
     assert net_behavior.periodicity(one)["interval"] == 60.0
-    assert net_behavior.periodicity(two)["periodic"] is False
+    p = net_behavior.periodicity(two)
+    assert p["periodic"] is False and p["interval"] is None
 
 
-def test_bursts_at_random_times_are_refused():
-    starts = [0, 30, 400, 450, 1000, 1700, 1760, 2500]
-    evs = []
-    for t in starts:
-        evs += [ev("http", float(t), dest="c2.top"), ev("http", t + 1.0, dest="c2.top")]
-    assert beacons_of(evs) == []
-    assert net_behavior.periodicity(stamps(evs))["periodic"] is False
+def test_two_short_follow_ups_in_a_thousand_check_ins_do_not_disqualify_anything():
+    ts = [k * 60.0 for k in range(1000)]
+    ts += [100 * 60.0 + 1.0, 700 * 60.0 + 1.0]
+    p = net_behavior.periodicity(ts)
+    assert p["periodic"] is True and p["interval"] == 60.0 and p["single_scale"] is True
+
+
+def test_the_same_two_follow_ups_in_eight_check_ins_do_disqualify():
+    ts = [k * 60.0 for k in range(8)] + [2 * 60.0 + 1.0, 5 * 60.0 + 1.0]
+    p = net_behavior.periodicity(ts)
+    assert p["periodic"] is False and p["single_scale"] is False and p["interval"] is None
+
+
+def test_one_follow_up_in_a_short_series_is_tolerated():
+    ts = [k * 60.0 for k in range(8)] + [3 * 60.0 + 1.0]
+    p = net_behavior.periodicity(ts)
+    assert p["periodic"] is True and p["interval"] == 60.0
 
 
 def test_a_slow_response_in_the_middle_of_a_long_run_does_not_hide_the_interval():
-    # Three requests per check-in whose later ones are rare enough to be noise.
     evs = [ev("http", k * 60.0, dest="c2.top") for k in range(30)]
     evs.append(ev("http", 5 * 60.0 + 2.0, dest="c2.top"))
-    assert refused_or(beacons_of(evs), 60.0)
+    b = beacons_of(evs)
+    assert len(b) == 1 and b[0]["interval"] == 60.0
+
+
+# Beacons as they are: request kinds say nothing about the rhythm.
+
+def beacon_60(kinds, count=30, seed=None):
+    """One request per check-in, its (method, path) taken from ``kinds``."""
+    rng = random.Random(seed)
+    out = []
+    for k in range(count):
+        method, path = kinds(k, rng)
+        out.append(ev("http", k * 60.0, dest="c2.top", method=method, path=path))
+    return out
+
+
+def only_beacon(events):
+    b = beacons_of(events)
+    assert len(b) == 1, b
+    return b[0]
+
+
+def test_a_beacon_alternating_two_paths_is_measured():
+    b = only_beacon(beacon_60(lambda k, r: ("GET", ("/a", "/b")[k % 2])))
+    assert b["interval"] == 60.0 and b["unmeasured"] is None
+
+
+def test_a_beacon_cycling_three_paths_is_measured():
+    b = only_beacon(beacon_60(lambda k, r: ("GET", ("/a", "/b", "/c")[k % 3])))
+    assert b["interval"] == 60.0
+
+
+def test_a_beacon_picking_a_random_uri_is_measured():
+    uris = ["/jquery-3.3.1.min.js", "/s/ref=nb_sb_noss_1/167-3294888-0262949/field-keywords=books",
+            "/updates.rss", "/cm", "/pixel.gif"]
+    b = only_beacon(beacon_60(lambda k, r: ("GET", r.choice(uris)), seed=11))
+    assert b["interval"] == 60.0 and b["connections"] == 30
+
+
+def test_get_and_post_alternating_at_one_rhythm_is_measured():
+    b = only_beacon(beacon_60(lambda k, r: (("GET", "POST")[k % 2], "/gate")))
+    assert b["interval"] == 60.0
+
+
+def test_get_and_post_chosen_at_random_is_measured():
+    b = only_beacon(beacon_60(lambda k, r: (r.choice(("GET", "POST")), "/gate"), seed=5))
+    assert b["interval"] == 60.0
+
+
+def test_a_get_with_a_post_a_fifth_of_a_second_later_on_some_check_ins_is_measured():
+    evs = [ev("http", k * 60.0, dest="c2.top", method="GET", path="/task") for k in range(30)]
+    evs += [ev("http", k * 60.0 + 0.2, dest="c2.top", method="POST", path="/result")
+            for k in (3, 9, 14, 21, 27)]
+    b = only_beacon(evs)
+    assert b["interval"] == 60.0 and b["connections"] == 30
+
+
+def test_a_get_with_an_occasional_favicon_is_measured():
+    evs = [ev("http", k * 60.0, dest="c2.top", method="GET", path="/task") for k in range(30)]
+    evs += [ev("http", k * 60.0 + 0.3, dest="c2.top", method="GET", path="/favicon.ico")
+            for k in (2, 11, 17, 25)]
+    assert only_beacon(evs)["interval"] == 60.0
+
+
+def test_a_favicon_a_second_later_on_one_check_in_is_measured():
+    evs = [ev("http", k * 60.0, dest="c2.top", path="/task") for k in range(30)]
+    evs.append(ev("http", 12 * 60.0 + 1.0, dest="c2.top", path="/favicon.ico"))
+    assert only_beacon(evs)["interval"] == 60.0
+
+
+def test_a_connection_every_check_in_with_http_decoded_on_only_some_is_measured():
+    evs = [ev("conn", k * 60.0, dest="c2.top") for k in range(30)]
+    evs += [ev("http", k * 60.0 + 0.05, dest="c2.top", method="GET", path="/task")
+            for k in range(0, 30, 3)]
+    b = only_beacon(evs)
+    assert b["interval"] == 60.0 and b["connections"] == 30
+
+
+def test_a_beacon_whose_c2_was_briefly_down_is_measured():
+    evs = [ev("conn_failed" if k in (7, 8, 9, 20) else "conn", k * 60.0, dest="c2.top")
+           for k in range(30)]
+    b = only_beacon(evs)
+    assert b["interval"] == 60.0 and b["connections"] == 30
 
 
 # What must keep working.
@@ -624,6 +752,21 @@ def _false_periodic(generator):
     rng = random.Random(NOISE_SEED)
     return sum(1 for _ in range(NOISE_TRIALS)
                if net_behavior.periodicity(generator(rng))["periodic"])
+
+
+def _any_beacon_event(generator):
+    """Trials in which noise produced a beacon event, measured or not."""
+    rng = random.Random(NOISE_SEED)
+    return sum(1 for _ in range(NOISE_TRIALS)
+               if beacons_of(as_events(generator(rng))))
+
+
+def test_noise_rarely_becomes_repeated_contact_either():
+    # Reporting unmeasured repeated contact must not bring the noise back
+    # through the side door: measured and unmeasured beacons together stay at
+    # or below the false-periodic count of the version before the heuristic.
+    assert _any_beacon_event(_poisson_with_follow_ups) <= NOISE_CEILING_POISSON
+    assert _any_beacon_event(_uniform_times) <= NOISE_CEILING_UNIFORM
 
 
 def test_poisson_traffic_with_follow_up_requests_is_not_a_beacon():
