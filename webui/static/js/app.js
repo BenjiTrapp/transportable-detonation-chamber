@@ -441,6 +441,9 @@ function switchTab(tabName) {
     if (tabName === 'pipes') {
         openPipesTab();
     }
+    if (tabName === 'network') {
+        networkTabShown();
+    }
     if (tabName === 'submit') {
         refreshSubmissions();
     }
@@ -8637,6 +8640,13 @@ function renderDetonationPanels(data) {
         tabs.push({ id: 'det-tab-pipes', label: 'Named Pipes', count: np.available ? (np.pipes || []).length : undefined, body });
     }
 
+    // Network: the report of an imported or assigned capture, an evidence source of its own
+    const networkReport = data.network ? networkReportOf(data) : null;
+    if (networkReport) {
+        const events = Array.isArray(networkReport.events) ? networkReport.events.length : 0;
+        tabs.push({ id: 'det-tab-network', label: 'Network', count: events, body: renderNetworkPanel(data) });
+    }
+
     // Raw JSON tab (full response)
     tabs.push({ id: 'det-tab-raw', label: 'Raw JSON', body: `<pre class="det-raw det-raw-tall">${escapeHtml(JSON.stringify(data, null, 2))}</pre>` });
 
@@ -8745,11 +8755,12 @@ const VERDICT_FLOW_KINDS = [
     { key: 'exit', label: 'exit capture', color: 'var(--accent-blue)' },
     { key: 'network', label: 'network beaconing', color: 'var(--graph-network)' },
     { key: 'pipes', label: 'named pipes', color: 'var(--graph-pipe)' },
+    { key: 'capture', label: 'network capture', color: 'var(--net-http)' },
 ];
 // The LitterBox score (of 10) from which _compute_verdict adds points to the verdict
 const VERDICT_FLOW_LITTERBOX_MIN = 4;
 // The sources of the memory evidence that are a kind of their own; any other is live memory
-const VERDICT_FLOW_SOURCES = { 'exit-capture': 'exit', 'sysmon-network': 'network', 'sysmon-pipes': 'pipes' };
+const VERDICT_FLOW_SOURCES = { 'exit-capture': 'exit', 'sysmon-network': 'network', 'sysmon-pipes': 'pipes', 'network': 'capture' };
 // LINEAR of each view's flow, until the page is reloaded
 const verdictFlowView = { det: { linear: false }, detail: { linear: false } };
 // What the flow of each view was drawn from, for which width, and the card head that is watched for its width
@@ -12904,6 +12915,644 @@ function logsTabShown() {
     runLogsSearch({ silent: true });
 }
 
+// ===== NETWORK =====
+// The NETWORK tab: the report of a pcap (/api/network/*). networkTabShown()
+// loads the stored reports the first time the tab opens, renderNetworkReport()
+// draws every sub-tab pane of one report (the buttons only show one of them),
+// renderNetworkPanel() the compact panel of the Submit tab. The report is
+// masked on the server; its header dicts have lower-case keys. Files are
+// listed by their name only, never opened or run.
+// What a report can say, kept apart on purpose:
+//   NOTHING FOUND     every rule was decided and no rule hit or finding came out
+//   COULD NOT DECIDE  a rule timed out, the regex or hash budget was spent,
+//                     the capture was cut or a step failed (the absence of a
+//                     hit then is no answer)
+//   NOT OBSERVED      the capture held no traffic
+//   SUPERSEDED        a finding another finding of the evidence model absorbed
+//   BASELINE          what the clean machine does (suppressed_count, baseline
+//                     "known" on an event or finding)
+const NETWORK_SUBS = ['overview', 'connections', 'dns', 'http', 'tls', 'files', 'iocs'];
+const NETWORK_ROWS_MAX = 1000;
+const NETWORK_ERRORS_SHOWN = 10;
+const NETWORK_CONNECTION_TYPES = ['conn', 'conn_failed', 'udp', 'raw', 'ftp', 'smtp', 'websocket', 'beacon', 'retry', 'fanout'];
+const networkState = { loaded: false, reports: [], id: '', report: null, sub: 'overview', busy: false };
+
+// A value as the text of a cell: lists joined, objects as JSON, nothing as ''
+function networkText(value) {
+    if (value === null || value === undefined) return '';
+    if (Array.isArray(value)) return value.map(networkText).filter(Boolean).join(', ');
+    if (typeof value === 'object') return JSON.stringify(value);
+    return String(value);
+}
+
+// Unix seconds as HH:MM:SS.mmm (UTC); '' for anything else
+function networkTime(ts) {
+    const n = Number(ts);
+    if (ts === null || ts === undefined || ts === '' || !Number.isFinite(n)) return '';
+    try { return new Date(n * 1000).toISOString().slice(11, 23); } catch (e) { return ''; }
+}
+
+// A header of a dict with lower-case keys (headers, resp_headers)
+function networkHeader(headers, name) {
+    return headers && typeof headers === 'object' && !Array.isArray(headers) ? networkText(headers[name]) : '';
+}
+
+function networkTypeChip(type) {
+    return `<span class="net-type net-type-${cssToken(type)}">${escapeHtml(type)}</span>`;
+}
+
+// What an event is besides its columns: the baseline knows it, or the rule set's known-good list hides it
+function networkFlags(e) {
+    let html = '';
+    if (e && e.baseline === 'known') html += ' <span class="net-flag" title="The network baseline of this VM knows this event: it is kept here but hidden from the rules and the findings.">BASELINE</span>';
+    if (e && e.known_good) html += ' <span class="net-flag" title="The destination is on the known-good list of the rules.">KNOWN GOOD</span>';
+    return html;
+}
+
+function networkRowClass(e) {
+    return e && e.baseline === 'known' ? ' class="net-known"' : '';
+}
+
+function networkProcess(e) {
+    const name = networkText(e && e.process);
+    const pid = e && e.pid !== null && e.pid !== undefined && e.pid !== '' ? ` <span class="muted">(PID ${escapeHtml(networkText(e.pid))})</span>` : '';
+    return escapeHtml(name) + pid;
+}
+
+// The one line of detail of an event of the CONNECTIONS pane
+function networkDetail(e) {
+    const size = n => (Number.isFinite(Number(n)) && n !== null && n !== '' ? formatSize(Number(n)) : '?');
+    switch (e.type) {
+        case 'conn':
+            return `${networkText(e.proto || 'tcp')}${e.app ? ' ' + networkText(e.app) : ''} · out ${size(e.client_bytes)} · in ${size(e.server_bytes)}`
+                + (Number.isFinite(Number(e.duration)) ? ` · ${Number(e.duration)}s` : '');
+        case 'conn_failed':
+            return `${networkText(e.attempts)} attempt(s) · ${e.refused ? 'refused' : 'no answer'}`;
+        case 'udp':
+            return `out ${size(e.client_bytes)} · in ${size(e.server_bytes)} · ${e.answered ? 'answered' : 'no answer'}`;
+        case 'raw':
+            return `${networkText(e.direction)} · ${networkText(e.framing)} · ${networkText(e.message_count)} message(s) · entropy ${networkText(e.entropy)}`;
+        case 'ftp':
+            return `user ${networkText(e.user) || '?'} · ${(e.commands || []).length} command(s) · ${(e.files || []).length} file(s)`;
+        case 'smtp':
+            return `${networkText(e.mail_from)} → ${networkText(e.rcpt_to)}${e.subject ? ' · ' + networkText(e.subject) : ''}`;
+        case 'websocket':
+            return `${(e.messages || []).length} message(s)${e.messages_capped ? ' (capped)' : ''}`;
+        case 'beacon':
+            return `every ${networkText(e.interval)}s · jitter ${networkText(e.jitter)} · ${networkText(e.connections)} connection(s)`
+                + (e.periodic === false ? ' · rhythm not measured' : '');
+        case 'retry':
+            return `${networkText(e.attempts)} attempts`;
+        case 'fanout':
+            return `${networkText(e.hosts)} ${e.nxdomain ? 'names that do not exist' : 'hosts'}`;
+        default:
+            return '';
+    }
+}
+
+// Why a pane has no rows: nothing was observed, or the capture holds none of this kind
+function networkEmpty(report, what) {
+    if (report.observed === false) {
+        return `<div class="net-empty">Not observed: ${escapeHtml(report.note || 'the capture holds no traffic')}</div>`;
+    }
+    return `<div class="net-empty">No ${escapeHtml(what)} in this capture.</div>`;
+}
+
+// "first N of M" when a table is cut
+function networkCut(shown, total) {
+    return total > shown ? `<div class="net-note">The first ${shown} of ${total} rows are listed.</div>` : '';
+}
+
+function networkEventsOf(report, types) {
+    return (Array.isArray(report.events) ? report.events : []).filter(e => e && typeof e === 'object' && types.includes(e.type));
+}
+
+function networkConnectionsPane(report) {
+    const all = networkEventsOf(report, NETWORK_CONNECTION_TYPES);
+    if (!all.length) return networkEmpty(report, 'connections');
+    const rows = all.slice(0, NETWORK_ROWS_MAX);
+    let html = `<div class="net-table-wrap"><table class="net-table" data-sortable data-sort-id="net-connections"><thead><tr>
+        <th>Time</th><th>Type</th><th>Destination</th><th>Port</th><th>Process</th><th>Detail</th></tr></thead><tbody>`;
+    rows.forEach(e => {
+        html += `<tr${networkRowClass(e)}>
+            <td class="net-mono" data-sort-value="${sortNumberValue(e.ts)}">${escapeHtml(networkTime(e.ts))}</td>
+            <td>${networkTypeChip(e.type)}</td>
+            <td>${escapeHtml(networkText(e.dest))}${networkFlags(e)}</td>
+            <td data-sort-value="${sortNumberValue(e.port)}">${escapeHtml(networkText(e.port))}</td>
+            <td>${networkProcess(e)}</td>
+            <td>${escapeHtml(networkDetail(e))}</td></tr>`;
+    });
+    return html + `</tbody></table></div>` + networkCut(rows.length, all.length);
+}
+
+function networkDnsPane(report) {
+    const all = networkEventsOf(report, ['dns']);
+    if (!all.length) return networkEmpty(report, 'DNS lookups');
+    const rows = all.slice(0, NETWORK_ROWS_MAX);
+    let html = `<div class="net-table-wrap"><table class="net-table" data-sortable data-sort-id="net-dns"><thead><tr>
+        <th>Time</th><th>Name</th><th>Type</th><th>Answers</th><th>Result</th><th>Server</th><th>Process</th></tr></thead><tbody>`;
+    rows.forEach(e => {
+        const result = e.nxdomain ? 'NXDOMAIN' : (e.rcode || ((e.answers || []).length ? 'answered' : 'no answer seen'));
+        html += `<tr${networkRowClass(e)}>
+            <td class="net-mono" data-sort-value="${sortNumberValue(e.ts)}">${escapeHtml(networkTime(e.ts))}</td>
+            <td>${escapeHtml(networkText(e.dest))}${networkFlags(e)}</td>
+            <td>${escapeHtml(networkText(e.query_type))}</td>
+            <td>${escapeHtml(networkText(e.answers))}</td>
+            <td>${escapeHtml(networkText(result))}</td>
+            <td>${escapeHtml(networkText(e.server))}</td>
+            <td>${networkProcess(e)}</td></tr>`;
+    });
+    return html + `</tbody></table></div>` + networkCut(rows.length, all.length);
+}
+
+function networkHttpPane(report) {
+    const all = networkEventsOf(report, ['http']);
+    if (!all.length) return networkEmpty(report, 'HTTP requests');
+    const rows = all.slice(0, NETWORK_ROWS_MAX);
+    let html = `<div class="net-table-wrap"><table class="net-table" data-sortable data-sort-id="net-http"><thead><tr>
+        <th>Time</th><th>Method</th><th>Host</th><th>URL</th><th>Status</th><th>Sent</th><th>Received</th><th>Redirect</th><th>User agent</th><th>Process</th></tr></thead><tbody>`;
+    rows.forEach(e => {
+        const header = networkHeader(e.headers, 'host');
+        const hosts = Array.isArray(e.hosts) && e.hosts.length > 1 ? e.hosts : [];
+        const claimed = header && header !== networkText(e.dest) ? `<div class="muted">Host: ${escapeHtml(header)}</div>` : '';
+        const others = hosts.length ? `<div class="muted">names: ${escapeHtml(networkText(hosts))}</div>` : '';
+        html += `<tr${networkRowClass(e)}>
+            <td class="net-mono" data-sort-value="${sortNumberValue(e.ts)}">${escapeHtml(networkTime(e.ts))}</td>
+            <td>${escapeHtml(networkText(e.method))}</td>
+            <td>${escapeHtml(networkText(e.dest))}${e.port ? ':' + escapeHtml(networkText(e.port)) : ''}${networkFlags(e)}${claimed}${others}</td>
+            <td class="net-mono">${escapeHtml(networkText(e.url || e.path))}</td>
+            <td data-sort-value="${sortNumberValue(e.status)}">${escapeHtml(networkText(e.status))}</td>
+            <td data-sort-value="${sortNumberValue(e.body_bytes)}">${e.body_bytes ? escapeHtml(formatSize(e.body_bytes)) : ''}</td>
+            <td data-sort-value="${sortNumberValue(e.resp_bytes)}">${e.resp_bytes ? escapeHtml(formatSize(e.resp_bytes)) : ''}${e.content_type ? ' <span class="muted">' + escapeHtml(networkText(e.content_type)) + '</span>' : ''}</td>
+            <td class="net-mono">${escapeHtml(networkHeader(e.resp_headers, 'location'))}</td>
+            <td>${escapeHtml(networkText(e.ua))}</td>
+            <td>${networkProcess(e)}</td></tr>`;
+    });
+    return html + `</tbody></table></div>` + networkCut(rows.length, all.length);
+}
+
+function networkTlsPane(report) {
+    const all = networkEventsOf(report, ['tls']);
+    if (!all.length) return networkEmpty(report, 'TLS handshakes');
+    const rows = all.slice(0, NETWORK_ROWS_MAX);
+    let html = `<div class="net-table-wrap"><table class="net-table" data-sortable data-sort-id="net-tls"><thead><tr>
+        <th>Time</th><th>Server name</th><th>Port</th><th>Version</th><th>ALPN</th><th>JA3</th><th>JA4</th><th>Subject</th><th>Issuer</th><th>Expires</th><th>Self-signed</th></tr></thead><tbody>`;
+    rows.forEach(e => {
+        html += `<tr${networkRowClass(e)}>
+            <td class="net-mono" data-sort-value="${sortNumberValue(e.ts)}">${escapeHtml(networkTime(e.ts))}</td>
+            <td>${escapeHtml(networkText(e.sni || e.dest))}${networkFlags(e)}${e.hello_incomplete ? ' <span class="net-flag">HELLO CUT</span>' : ''}</td>
+            <td data-sort-value="${sortNumberValue(e.port)}">${escapeHtml(networkText(e.port))}</td>
+            <td>${escapeHtml(networkText(e.version))}</td>
+            <td>${escapeHtml(networkText(e.alpn))}</td>
+            <td class="net-mono">${escapeHtml(networkText(e.ja3_hash))}</td>
+            <td class="net-mono">${escapeHtml(networkText(e.ja4))}</td>
+            <td>${escapeHtml(networkText(e.cert_subject))}</td>
+            <td>${escapeHtml(networkText(e.cert_issuer))}</td>
+            <td>${escapeHtml(networkText(e.cert_not_after))}</td>
+            <td>${e.self_signed ? 'yes' : ''}</td></tr>`;
+    });
+    return html + `</tbody></table></div>` + networkCut(rows.length, all.length);
+}
+
+function networkFilesPane(report) {
+    const all = Array.isArray(report.files) ? report.files.filter(f => f && typeof f === 'object') : [];
+    if (!all.length) return networkEmpty(report, 'files');
+    const rows = all.slice(0, NETWORK_ROWS_MAX);
+    let html = `<div class="net-note">What crossed the wire, by hash and kind. These files are never written, opened or run here.</div>`;
+    html += `<div class="net-table-wrap"><table class="net-table" data-sortable data-sort-id="net-files"><thead><tr>
+        <th>Name</th><th>Kind</th><th>Size</th><th>Direction</th><th>From / to</th><th>Hash of</th><th>Count</th></tr></thead><tbody>`;
+    rows.forEach(f => {
+        html += `<tr${networkRowClass(f)}>
+            <td class="net-mono">${escapeHtml(networkText(f.name))}${networkFlags(f)}${f.truncated ? ' <span class="net-flag">CUT</span>' : ''}</td>
+            <td>${escapeHtml(networkText(f.kind))}</td>
+            <td data-sort-value="${sortNumberValue(f.size)}">${f.size === null || f.size === undefined ? '' : escapeHtml(formatSize(f.size))}</td>
+            <td>${escapeHtml(networkText(f.direction))}</td>
+            <td>${escapeHtml(networkText(f.url || (networkText(f.dest) + networkText(f.path))))}</td>
+            <td>${f.hashed === 'wire' ? 'the bytes on the wire' : 'the file'}</td>
+            <td data-sort-value="${sortNumberValue(f.count)}">${escapeHtml(networkText(f.count))}</td></tr>`;
+    });
+    return html + `</tbody></table></div>` + networkCut(rows.length, all.length);
+}
+
+function networkIocsPane(report) {
+    const all = Array.isArray(report.iocs) ? report.iocs.filter(i => i && typeof i === 'object') : [];
+    if (!all.length) return networkEmpty(report, 'indicators');
+    const rows = all.slice(0, NETWORK_ROWS_MAX);
+    let html = report.iocs_capped ? `<div class="net-note">The list of indicators was capped: more exist than are listed.</div>` : '';
+    html += `<div class="net-table-wrap"><table class="net-table" data-sortable data-sort-id="net-iocs"><thead><tr>
+        <th>Type</th><th>Value</th><th>Count</th><th>First seen</th><th>Seen in</th><th>Note</th></tr></thead><tbody>`;
+    rows.forEach(i => {
+        const notes = [];
+        if (i.type === 'ip' && i.public === true) notes.push('public address');
+        if (i.type === 'ip' && i.public === false) notes.push('not a public address');
+        if (i.password_captured) notes.push('password captured (masked)');
+        html += `<tr>
+            <td>${escapeHtml(networkText(i.type))}</td>
+            <td class="net-mono">${escapeHtml(networkText(i.value))}</td>
+            <td data-sort-value="${sortNumberValue(i.count)}">${escapeHtml(networkText(i.count))}</td>
+            <td class="net-mono" data-sort-value="${sortNumberValue(i.first_ts)}">${escapeHtml(networkTime(i.first_ts))}</td>
+            <td>${escapeHtml(networkText(i.sources))}</td>
+            <td>${escapeHtml(notes.join(', '))}</td></tr>`;
+    });
+    return html + `</tbody></table></div>` + networkCut(rows.length, all.length);
+}
+
+// What the capture could not settle: [text], empty when everything was decided
+function networkUndecided(report) {
+    const out = [];
+    if (report.truncated) out.push('The capture was cut (a size or packet limit): traffic after the cut is missing.');
+    (Array.isArray(report.rule_unevaluated) ? report.rule_unevaluated : []).forEach(u => {
+        if (!u || typeof u !== 'object') return;
+        out.push(`Rule ${networkText(u.rule_id)} could not be decided for ${networkText(u.events)} event(s): ${networkText(u.reasons) || 'unknown reason'}. No hit of this rule does not mean no match.`);
+    });
+    if (report.rule_budget_spent) out.push('The regex time budget was spent: the rules with a regex were left undecided from then on.');
+    if (report.hash_budget_spent) out.push('The hash budget was spent: some files have no full hash.');
+    const errors = Array.isArray(report.errors) ? report.errors : [];
+    errors.slice(0, NETWORK_ERRORS_SHOWN).forEach(err => out.push(`A step failed: ${networkText(err)}`));
+    if (errors.length > NETWORK_ERRORS_SHOWN) out.push(`${errors.length - NETWORK_ERRORS_SHOWN} more failed step(s) are not listed.`);
+    return out;
+}
+
+// The banner of OVERVIEW: not observed, could not decide, or nothing found
+function networkStatusHtml(report) {
+    const hits = Array.isArray(report.rule_hits) ? report.rule_hits.length : 0;
+    const findings = Array.isArray(report.evidence_findings) ? report.evidence_findings.length : 0;
+    const undecided = networkUndecided(report);
+    let html = '';
+    if (report.observed === false) {
+        html += `<div class="net-banner net-banner-unobserved"><span class="net-banner-title">NOT OBSERVED</span>
+            <div>${escapeHtml(report.note || 'The capture holds no traffic.')} This is not a clean result: nothing was seen.</div></div>`;
+    } else if (report.note) {
+        html += `<div class="net-banner"><div>${escapeHtml(report.note)}</div></div>`;
+    }
+    if (undecided.length) {
+        html += `<div class="net-banner net-banner-undecided"><span class="net-banner-title">COULD NOT DECIDE</span>
+            <ul>${undecided.map(text => `<li>${escapeHtml(text)}</li>`).join('')}</ul>`
+            + (report.observed !== false && !hits && !findings ? `<div>No rule hit and no finding came out, but that is not &ldquo;nothing found&rdquo;: see above.</div>` : '')
+            + `</div>`;
+    } else if (report.observed !== false && !hits && !findings) {
+        const count = Array.isArray(report.events) ? report.events.length : 0;
+        html += `<div class="net-banner net-banner-clear"><span class="net-banner-title">NOTHING FOUND</span>
+            <div>${count} event(s) were evaluated, every rule was decided, and no rule hit or finding came out.</div></div>`;
+    }
+    return html;
+}
+
+// Findings of the evidence model in three groups that must not be mixed up:
+// those that count, those another finding absorbed (superseded_by), and
+// those the baseline knows (baseline "known")
+function networkFindingGroups(findings) {
+    const groups = { active: [], superseded: [], baseline: [] };
+    (Array.isArray(findings) ? findings : []).forEach(f => {
+        if (!f || typeof f !== 'object') return;
+        if (f.superseded_by) groups.superseded.push(f);
+        else if (f.baseline === 'known') groups.baseline.push(f);
+        else groups.active.push(f);
+    });
+    return groups;
+}
+
+function networkFindingHtml(f) {
+    const why = [];
+    if (typeof f.confidence === 'number') why.push(`confidence ${f.confidence.toFixed(2)}`);
+    if (f.superseded_by) why.push(`superseded by ${networkText(f.superseded_by)}`);
+    if (typeof f.observation === 'number' && f.observation < 1) why.push('partly observed: our own server answered, so this is an attempt, not a delivery');
+    if (f.needs_corroboration) why.push('needs a second signal, none yet');
+    if (Array.isArray(f.corroborated_by) && f.corroborated_by.length) why.push('corroborated by ' + networkText(f.corroborated_by));
+    if (Array.isArray(f.rules) && f.rules.length) why.push('rules ' + networkText(f.rules));
+    if (f.count) why.push(`${networkText(f.count)} time(s)`);
+    return `<div class="mem-finding sev-${cssToken(f.severity || 'info')}"><div class="mem-finding-head">`
+        + (typeof f.score === 'number' ? `<span class="mem-score">${f.score.toFixed(2)}</span>` : '')
+        + `<span class="mem-type">${escapeHtml(networkText(f.label || f.kind))}</span>`
+        + `<span class="mem-chip">${escapeHtml(networkText(f.source || 'network'))}</span>`
+        + (f.evidence ? `<span class="mem-chip">${escapeHtml(evidenceClassLabel(f.evidence))}</span>` : '')
+        + (f.dest ? `<span class="mem-addr">${escapeHtml(networkText(f.dest))}${f.port ? ':' + escapeHtml(networkText(f.port)) : ''}</span>` : '')
+        + `</div>`
+        + (f.detail ? `<div class="mem-desc">${escapeHtml(networkText(f.detail))}</div>` : '')
+        + (f.process ? `<div class="mem-kv">process ${escapeHtml(networkText(f.process))}</div>` : '')
+        + (why.length ? `<div class="mem-kv">${escapeHtml(why.join('  ·  '))}</div>` : '')
+        + `</div>`;
+}
+
+function networkFindingsHtml(findings) {
+    const groups = networkFindingGroups(findings);
+    let html = '';
+    if (groups.active.length) {
+        html += `<div class="net-section-label">FINDINGS (${groups.active.length}) <span class="mem-chip">network</span></div>`;
+        html += groups.active.slice(0, 50).map(networkFindingHtml).join('');
+        if (groups.active.length > 50) html += `<div class="net-note">${groups.active.length - 50} more finding(s) are not listed.</div>`;
+    }
+    if (groups.superseded.length) {
+        html += `<details class="net-group"><summary>${groups.superseded.length} finding(s) superseded by another finding (absorbed into it)</summary>`
+            + groups.superseded.slice(0, 50).map(networkFindingHtml).join('') + `</details>`;
+    }
+    if (groups.baseline.length) {
+        html += `<details class="net-group"><summary>${groups.baseline.length} finding(s) suppressed by the baseline</summary>`
+            + groups.baseline.slice(0, 50).map(networkFindingHtml).join('') + `</details>`;
+    }
+    return html;
+}
+
+function networkRuleHitsHtml(report) {
+    const hits = Array.isArray(report.rule_hits) ? report.rule_hits.filter(h => h && typeof h === 'object') : [];
+    if (!hits.length) return '';
+    let html = `<div class="net-section-label">RULE HITS (${hits.length})</div>
+        <div class="net-table-wrap"><table class="net-table" data-sortable data-sort-id="net-rule-hits"><thead><tr>
+        <th>Rule</th><th>Name</th><th>Severity</th><th>Process</th><th>Count</th><th>ATT&amp;CK</th><th>Family</th></tr></thead><tbody>`;
+    hits.slice(0, NETWORK_ROWS_MAX).forEach(h => {
+        const sev = String(h.severity || 'info').toLowerCase();
+        html += `<tr>
+            <td class="net-mono">${escapeHtml(networkText(h.rule_id))}</td>
+            <td>${escapeHtml(networkText(h.name))}</td>
+            <td data-sort-value="${severitySortValue(sev)}"><span class="det-alert-sev sev-${cssToken(sev)}">${escapeHtml(sev.toUpperCase())}</span></td>
+            <td>${escapeHtml(networkText(h.process))}</td>
+            <td data-sort-value="${sortNumberValue(h.count)}">${escapeHtml(networkText(h.count))}</td>
+            <td>${escapeHtml(networkText(h.attack))}</td>
+            <td>${escapeHtml(networkText(h.family))}</td></tr>`;
+    });
+    return html + `</tbody></table></div>`;
+}
+
+// EVENTS BY TYPE: bars and the same numbers as a table (CHART / TABLE)
+function networkEventTypesCard(report) {
+    const summary = report.event_summary && typeof report.event_summary === 'object' ? report.event_summary : {};
+    const rows = Object.entries(summary).filter(([, n]) => Number.isFinite(Number(n))).map(([type, n]) => [type, Number(n)])
+        .sort((a, b) => (b[1] - a[1]) || (a[0] < b[0] ? -1 : 1));
+    if (!rows.length) return '';
+    const max = Math.max(...rows.map(r => r[1]), 1);
+    const total = rows.reduce((sum, r) => sum + r[1], 0) || 1;
+    const id = 'network-events';
+    let html = `<div class="chart-card net-chart-card" id="${id}-card"><div class="chart-card-head">
+        <h3 class="chart-card-title" data-info="The events of the report by type: connections, lookups, requests, handshakes, files that crossed the wire and the behaviour the analysis measured.">EVENTS BY TYPE</h3>
+        <span class="chart-card-tools">${viewToggleHtml(id)}</span></div>`;
+    html += `<div class="net-bars"${cardViewAttrs(id, 'chart')}>`;
+    rows.forEach(([type, n]) => {
+        html += `<div class="net-bar-row"><span>${networkTypeChip(type)}</span>
+            <span class="net-bar-track"><span class="net-bar-fill net-type-${cssToken(type)}" style="width:${Math.max(1, Math.round(n / max * 1000) / 10)}%"></span></span>
+            <span class="net-bar-count">${n}</span></div>`;
+    });
+    html += `</div><div${cardViewAttrs(id, 'table')}><div class="net-table-wrap"><table class="net-table" data-sortable data-sort-id="net-event-types"><thead><tr>
+        <th>Type</th><th>Events</th><th>Share</th></tr></thead><tbody>`;
+    rows.forEach(([type, n]) => {
+        html += `<tr><td>${networkTypeChip(type)}</td><td data-sort-value="${n}">${n}</td>
+            <td data-sort-value="${n / total}">${Math.round(n / total * 1000) / 10}%</td></tr>`;
+    });
+    return html + `</tbody></table></div></div></div>`;
+}
+
+function networkOverviewPane(report) {
+    const count = key => (Array.isArray(report[key]) ? report[key].length : 0);
+    const meta = [['Capture', report.filename], ['Mode', report.mode], ['Process', report.process], ['Format', report.format],
+        ['Packets', report.packet_count], ['Flows', report.flow_count], ['Imported', report.timestamp]]
+        .filter(([, v]) => v !== null && v !== undefined && v !== '');
+    let html = `<div class="net-meta">${meta.map(([k, v]) => `<span><b>${escapeHtml(k.toUpperCase())}</b> ${escapeHtml(networkText(v))}</span>`).join('')}</div>`;
+    html += networkStatusHtml(report);
+    html += `<div class="mem-chips">`
+        + `<span class="mem-chip"><span class="mem-chip-val">${count('events')}</span>events</span>`
+        + `<span class="mem-chip"><span class="mem-chip-val">${count('rule_hits')}</span>rule hits</span>`
+        + `<span class="mem-chip"><span class="mem-chip-val">${count('evidence_findings')}</span>findings</span>`
+        + `<span class="mem-chip"><span class="mem-chip-val">${count('iocs')}</span>indicators</span>`
+        + `<span class="mem-chip"><span class="mem-chip-val">${count('files')}</span>files</span>`
+        + (report.suppressed_count ? `<span class="mem-chip sev-info"><span class="mem-chip-val">${escapeHtml(networkText(report.suppressed_count))}</span>events known to the baseline</span>` : '')
+        + `</div>`;
+    if (report.suppressed_count) {
+        html += `<div class="net-note">The baseline knows ${escapeHtml(networkText(report.suppressed_count))} event(s): they are marked BASELINE in the tables and hidden from the rules and the findings.</div>`;
+    }
+    html += networkEventTypesCard(report);
+    html += networkRuleHitsHtml(report);
+    html += networkFindingsHtml(report.evidence_findings);
+    return html;
+}
+
+// Every pane of a report, the one of networkState.sub shown; also an empty
+// report ("not observed") draws all of them, so nothing is silently missing
+function renderNetworkReport(report) {
+    if (!report || typeof report !== 'object') return `<div class="net-empty">No report.</div>`;
+    const panes = {
+        overview: networkOverviewPane, connections: networkConnectionsPane, dns: networkDnsPane,
+        http: networkHttpPane, tls: networkTlsPane, files: networkFilesPane, iocs: networkIocsPane,
+    };
+    return NETWORK_SUBS.map(name => `<section class="net-pane" data-net-pane="${name}"${name === networkState.sub ? '' : ' hidden'}>${panes[name](report)}</section>`).join('');
+}
+
+// The network report of a detonation's results (data.network), or null
+function networkReportOf(results) {
+    const report = results && typeof results === 'object' ? results.network : null;
+    return report && typeof report === 'object' && !Array.isArray(report) && (Array.isArray(report.events) || typeof report.observed === 'boolean') ? report : null;
+}
+
+// The findings of the network source: the scored ones of the memory evidence
+// when it holds some (they carry the superseded and baseline marks), else
+// those of the report
+function networkEvidenceOf(results, report) {
+    const ev = results && typeof results === 'object' ? results.memory_evidence : null;
+    const scored = [];
+    if (ev && typeof ev === 'object') {
+        [...(Array.isArray(ev.findings) ? ev.findings : []), ...(Array.isArray(ev.suppressed) ? ev.suppressed : [])]
+            .forEach(f => { if (f && typeof f === 'object' && f.source === 'network') scored.push(f); });
+    }
+    return scored.length ? scored : (Array.isArray(report.evidence_findings) ? report.evidence_findings : []);
+}
+
+// The compact panel of the Submit tab: what the report of this run says, its
+// own evidence source (network), and a way into the NETWORK tab. '' when the
+// results hold no network report.
+function renderNetworkPanel(results) {
+    const report = networkReportOf(results);
+    if (!report) return '';
+    const findings = networkEvidenceOf(results, report);
+    const iocs = (Array.isArray(report.iocs) ? report.iocs : []).filter(i => i && typeof i === 'object');
+    const count = key => (Array.isArray(report[key]) ? report[key].length : 0);
+    let html = `<div class="det-sub-title" data-info="What the network report of this run holds. Network is an evidence source of its own, apart from live memory.">Network &mdash; report of the capture</div>`;
+    html += `<div class="mem-chips">`
+        + `<span class="mem-chip"><span class="mem-chip-val">${count('events')}</span>events</span>`
+        + `<span class="mem-chip"><span class="mem-chip-val">${count('rule_hits')}</span>rule hits</span>`
+        + `<span class="mem-chip"><span class="mem-chip-val">${findings.length}</span>findings</span>`
+        + `<span class="mem-chip"><span class="mem-chip-val">${iocs.length}</span>indicators</span>`
+        + `<span class="mem-chip"><span class="mem-chip-val">${count('files')}</span>files</span>`
+        + (report.suppressed_count ? `<span class="mem-chip sev-info"><span class="mem-chip-val">${escapeHtml(networkText(report.suppressed_count))}</span>known to the baseline</span>` : '')
+        + `</div>`;
+    html += networkStatusHtml(report);
+    html += networkFindingsHtml(findings);
+    if (iocs.length) {
+        html += `<div class="net-section-label">INDICATORS (${iocs.length})</div>
+            <div class="net-table-wrap"><table class="net-table" data-sortable data-sort-id="net-panel-iocs"><thead><tr>
+            <th>Type</th><th>Value</th><th>Count</th></tr></thead><tbody>`;
+        iocs.slice(0, 10).forEach(i => {
+            html += `<tr><td>${escapeHtml(networkText(i.type))}</td><td class="net-mono">${escapeHtml(networkText(i.value))}</td>
+                <td data-sort-value="${sortNumberValue(i.count)}">${escapeHtml(networkText(i.count))}</td></tr>`;
+        });
+        html += `</tbody></table></div>`;
+        if (iocs.length > 10) html += `<div class="net-note">${iocs.length - 10} more in the NETWORK tab.</div>`;
+    }
+    if (report.id) {
+        html += `<div class="net-panel-links"><button type="button" class="btn btn-sm" onclick="networkOpenReport(${jsArg(report.id)})">Open in the NETWORK tab</button></div>`;
+    }
+    return html;
+}
+
+function networkMessage(text, isError) {
+    const box = document.getElementById('net-message');
+    if (!box) return;
+    box.textContent = text || '';
+    box.hidden = !text;
+    box.classList.toggle('net-message-error', !!isError);
+}
+
+function networkSetSub(name) {
+    if (!NETWORK_SUBS.includes(name)) return;
+    networkState.sub = name;
+    document.querySelectorAll('#net-subtabs [data-net-sub]').forEach(b => {
+        b.setAttribute('aria-pressed', String(b.getAttribute('data-net-sub') === name));
+    });
+    document.querySelectorAll('#net-report [data-net-pane]').forEach(p => {
+        p.hidden = p.getAttribute('data-net-pane') !== name;
+    });
+}
+
+function networkShowReport(report) {
+    networkState.report = report;
+    networkState.id = report && report.id ? String(report.id) : '';
+    const target = document.getElementById('net-report');
+    if (target) target.innerHTML = renderNetworkReport(report);
+    const summary = document.getElementById('net-summary');
+    if (summary && report) {
+        const n = key => (Array.isArray(report[key]) ? report[key].length : 0);
+        summary.textContent = `${n('events')} events · ${n('rule_hits')} rule hits · ${n('evidence_findings')} findings · ${n('iocs')} indicators`;
+    }
+    networkSetSub(networkState.sub);
+    networkFillSelect();
+}
+
+function networkFillSelect() {
+    const select = document.getElementById('net-report-select');
+    if (!select) return;
+    if (!networkState.reports.length) {
+        select.innerHTML = `<option value="">No report yet</option>`;
+        return;
+    }
+    select.innerHTML = networkState.reports.map(r => {
+        const s = r && r.summary && typeof r.summary === 'object' ? r.summary : {};
+        const label = `${networkText(r.filename)} · ${networkText(r.timestamp)} · ${networkText(r.mode)} · ${networkText(s.events)} events`;
+        return `<option value="${escapeHtml(networkText(r.id))}"${networkText(r.id) === networkState.id ? ' selected' : ''}>${escapeHtml(label)}</option>`;
+    }).join('');
+}
+
+async function networkSelectReport(id) {
+    if (!id) return;
+    try {
+        const resp = await fetch('/api/network/report?id=' + encodeURIComponent(id));
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        networkMessage('');
+        networkShowReport(data);
+    } catch (e) {
+        networkMessage(`The report could not be loaded: ${e.message}`, true);
+    }
+}
+
+async function networkRefreshReports() {
+    try {
+        const resp = await fetch('/api/network/reports');
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        networkState.reports = Array.isArray(data.reports) ? data.reports : [];
+        networkFillSelect();
+        if (!networkState.report && networkState.reports.length) await networkSelectReport(networkState.reports[0].id);
+    } catch (e) {
+        networkMessage(`The reports could not be listed: ${e.message}`, true);
+    }
+}
+
+async function networkRefreshBaseline() {
+    const text = document.getElementById('net-baseline-text');
+    if (!text) return;
+    try {
+        const resp = await fetch('/api/network/baseline');
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        if (data.stale) {
+            text.textContent = `Baseline: ignored (${networkText(data.note) || 'built with an older key scheme'}).`;
+        } else {
+            const types = Object.entries(data.by_type || {}).map(([k, v]) => `${v} ${k}`).join(', ');
+            text.textContent = `Baseline: ${networkText(data.total)} entr${Number(data.total) === 1 ? 'y' : 'ies'}${types ? ' (' + types + ')' : ''}`
+                + (data.updated ? `, updated ${networkText(data.updated)}` : '') + '.';
+        }
+    } catch (e) {
+        text.textContent = `Baseline: not available (${e.message}).`;
+    }
+}
+
+async function networkImport() {
+    const input = document.getElementById('net-file');
+    const file = input && input.files && input.files[0];
+    if (!file) { networkMessage('Choose a pcap or pcapng file first.', true); return; }
+    if (networkState.busy) return;
+    networkState.busy = true;
+    const button = document.getElementById('net-import-btn');
+    if (button) button.disabled = true;
+    networkMessage(`Analyzing ${file.name}...`);
+    try {
+        const form = new FormData();
+        form.append('file', file);
+        form.append('mode', (document.getElementById('net-mode') || {}).value || 'online');
+        const resp = await fetch('/api/network/import', { method: 'POST', body: form });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        networkState.sub = 'overview';
+        networkShowReport(data);
+        networkMessage(`Analyzed ${data.filename || file.name}: ${(data.events || []).length} events.`);
+        input.value = '';
+        await networkRefreshReports();
+    } catch (e) {
+        networkMessage(`The capture could not be analyzed: ${e.message}`, true);
+    } finally {
+        networkState.busy = false;
+        if (button) button.disabled = false;
+    }
+}
+
+async function networkCaptureBaseline() {
+    const input = document.getElementById('net-baseline-file');
+    const file = input && input.files && input.files[0];
+    if (!file) { networkMessage('Choose the capture of a clean machine first.', true); return; }
+    if (!confirm('Record this capture as the network baseline?\n\n'
+        + 'Everything in it stops counting as evidence in later imports. '
+        + 'Only do this with a capture of a clean machine.')) return;
+    try {
+        const form = new FormData();
+        form.append('file', file);
+        const resp = await fetch('/api/network/baseline/capture', { method: 'POST', body: form });
+        const data = await resp.json();
+        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        const cut = [];
+        if (data.truncated) cut.push('the capture was cut, so part of it is not learned');
+        if (Array.isArray(data.errors) && data.errors.length) cut.push(`${data.errors.length} step(s) failed`);
+        if (data.note) cut.push(networkText(data.note));
+        networkMessage(`Baseline: ${networkText(data.added)} new entr${Number(data.added) === 1 ? 'y' : 'ies'} learned, ${networkText(data.count)} in all.`
+            + (cut.length ? ' ' + cut.join('; ') + '.' : ''), cut.length > 0);
+        input.value = '';
+        networkRefreshBaseline();
+    } catch (e) {
+        networkMessage(`The baseline could not be recorded: ${e.message}`, true);
+    }
+}
+
+// From the Submit panel: the NETWORK tab with this report
+function networkOpenReport(id) {
+    switchTab('network');
+    networkSelectReport(String(id || ''));
+}
+
+// The tab is opened: the first time the baseline is read too; the list of reports each time
+function networkTabShown() {
+    if (!networkState.loaded) {
+        networkState.loaded = true;
+        networkRefreshBaseline();
+    }
+    networkRefreshReports();
+}
+
 // --- LitterBox Integration ---
 let _lbData = null;
 let _lbHealth = null;
@@ -14877,14 +15526,25 @@ function renderMemoryEvidence(ev, meta) {
     // Baseline-suppressed findings stay visible but collapsed: they are the
     // host's own noise, and hiding them entirely would make the baseline
     // impossible to sanity-check.
+    // A finding another one absorbed (superseded_by) is no baseline noise and
+    // is listed on its own, never under the baseline.
+    const absorbed = (ev.suppressed || []).filter(f => f && f.superseded_by);
+    const known = (ev.suppressed || []).filter(f => f && !f.superseded_by);
+    const suppressedLine = f => {
+        let line = `<div class="mem-kv">${escapeHtml(f.label)}`;
+        if (f.detail) line += ` \u2014 ${escapeHtml(f.detail)}`;
+        return line + ` <span class="mem-foot-inline">${escapeHtml(f.source)}</span></div>`;
+    };
     if (ev.suppressed_count) {
         html += `<details class="mem-suppressed"><summary>`
             + `${ev.suppressed_count} finding(s) suppressed by the host baseline</summary>`;
-        (ev.suppressed || []).slice(0, 30).forEach(f => {
-            html += `<div class="mem-kv">${escapeHtml(f.label)}`;
-            if (f.detail) html += ` \u2014 ${escapeHtml(f.detail)}`;
-            html += ` <span class="mem-foot-inline">${escapeHtml(f.source)}</span></div>`;
-        });
+        known.slice(0, 30).forEach(f => { html += suppressedLine(f); });
+        html += `</details>`;
+    }
+    if (absorbed.length) {
+        html += `<details class="mem-suppressed"><summary>`
+            + `${absorbed.length} finding(s) superseded by another finding (absorbed into it)</summary>`;
+        absorbed.slice(0, 30).forEach(f => { html += suppressedLine(f); });
         html += `</details>`;
     }
     return html;

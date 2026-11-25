@@ -148,6 +148,14 @@
     --graph-pipe-rgb: 0, 229, 255;
     --graph-detonated: #d4ff00;
     --graph-detonated-rgb: 212, 255, 0;
+    /* The kinds of network event of the NETWORK tab (bars of EVENTS BY TYPE, type chips) */
+    --net-conn: #4d8dff;
+    --net-dns: #9b8cff;
+    --net-http: #34f5a0;
+    --net-tls: #00e5ff;
+    --net-file: #ff9a3c;
+    --net-behavior: #ff2bd6;
+    --net-other: #6c7399;
     --pe-code: #4d8dff;
     --pe-data: #34f5a0;
     --pe-readonly: #6c7399;
@@ -10965,4 +10973,289 @@ body.maintenance-active #app {
 /* Tab titles: the gradient (--cp-heading) with a cyan glow */
 :root[data-theme="classic"] .content-header h2 {
     filter: drop-shadow(0 0 22px rgba(var(--accent-cyan-rgb), .25));
+}
+
+/* --- NETWORK tab: the import bar, the sub-tabs and the panes of renderNetworkReport.
+   The colours are the variables of the theme (style.css :root, theme-cyberpunk.css); the kinds of event take --net-*. --- */
+#tab-network.active {
+    display: flex;
+    flex-direction: column;
+}
+.net-bar,
+.net-baseline {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: flex-end;
+    gap: 8px 12px;
+    padding: 8px 14px;
+}
+.net-baseline {
+    align-items: center;
+    padding-top: 0;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.net-field {
+    display: flex;
+    flex-direction: column;
+    gap: 3px;
+    font-size: 10px;
+    letter-spacing: .06em;
+    color: var(--text-muted);
+}
+.net-file {
+    max-width: 260px;
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+.net-message {
+    margin: 0 14px 6px;
+    padding: 6px 10px;
+    font-size: 11px;
+    color: var(--text-secondary);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-left: 3px solid var(--accent-cyan);
+    border-radius: var(--radius-lg);
+}
+.net-message.net-message-error {
+    border-left-color: var(--severity-critical);
+}
+.net-summary {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.net-subtabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    padding: 0 14px;
+    border-bottom: 1px solid var(--border-primary);
+}
+.net-subtab {
+    padding: 6px 12px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: .08em;
+    color: var(--text-muted);
+    background: transparent;
+    border: 1px solid transparent;
+    border-bottom: 0;
+    border-radius: var(--radius-lg) var(--radius-lg) 0 0;
+    cursor: pointer;
+}
+.net-subtab:hover {
+    color: var(--text-primary);
+}
+.net-subtab[aria-pressed="true"] {
+    color: var(--accent-cyan);
+    background: var(--bg-card);
+    border-color: var(--border-primary);
+}
+.net-report {
+    min-width: 0;
+    padding: 10px 14px 16px;
+    overflow: auto;
+}
+.net-pane[hidden] {
+    display: none;
+}
+.net-empty,
+.net-note {
+    padding: 10px 2px;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.net-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 18px;
+    margin-bottom: 8px;
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+.net-meta b {
+    color: var(--text-muted);
+    font-weight: 600;
+    letter-spacing: .06em;
+}
+.net-banner {
+    margin: 8px 0;
+    padding: 8px 12px;
+    font-size: 12px;
+    color: var(--text-primary);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-left: 4px solid var(--border-accent);
+    border-radius: var(--radius-lg);
+}
+.net-banner-title {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: .08em;
+}
+.net-banner ul {
+    margin: 4px 0 0 18px;
+    padding: 0;
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+.net-banner-undecided {
+    border-left-color: var(--severity-medium);
+}
+.net-banner-undecided .net-banner-title {
+    color: var(--severity-medium);
+}
+.net-banner-unobserved {
+    border-left-color: var(--severity-high);
+}
+.net-banner-unobserved .net-banner-title {
+    color: var(--severity-high);
+}
+.net-banner-clear {
+    border-left-color: var(--severity-low);
+}
+.net-banner-clear .net-banner-title {
+    color: var(--severity-low);
+}
+.net-section-label {
+    margin: 14px 0 6px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: .08em;
+    color: var(--accent-cyan);
+}
+.net-chart-card {
+    max-width: 640px;
+    margin: 10px 0;
+}
+.net-bars {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 6px 2px;
+}
+.net-bar-row {
+    display: grid;
+    grid-template-columns: 110px 1fr 56px;
+    align-items: center;
+    gap: 8px;
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+.net-bar-row .net-bar-count {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+.net-bar-track {
+    height: 8px;
+    background: var(--bg-counter);
+    border-radius: 2px;
+    overflow: hidden;
+}
+.net-bar-fill {
+    display: block;
+    height: 100%;
+    background: var(--net-other);
+}
+.net-type {
+    display: inline-block;
+    padding: 0 6px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 700;
+    color: var(--text-primary);
+    border: 1px solid var(--net-other);
+    border-radius: 3px;
+}
+.net-type-conn, .net-type-conn_failed, .net-type-udp,
+.net-type-raw { border-color: var(--net-conn); }
+.net-type-dns { border-color: var(--net-dns); }
+.net-type-http, .net-type-websocket, .net-type-ftp,
+.net-type-smtp { border-color: var(--net-http); }
+.net-type-tls { border-color: var(--net-tls); }
+.net-type-download, .net-type-upload,
+.net-type-decoded { border-color: var(--net-file); }
+.net-type-beacon, .net-type-retry,
+.net-type-fanout { border-color: var(--net-behavior); }
+.net-bar-fill.net-type-conn, .net-bar-fill.net-type-conn_failed,
+.net-bar-fill.net-type-udp, .net-bar-fill.net-type-raw { background: var(--net-conn); }
+.net-bar-fill.net-type-dns { background: var(--net-dns); }
+.net-bar-fill.net-type-http, .net-bar-fill.net-type-websocket,
+.net-bar-fill.net-type-ftp, .net-bar-fill.net-type-smtp { background: var(--net-http); }
+.net-bar-fill.net-type-tls { background: var(--net-tls); }
+.net-bar-fill.net-type-download, .net-bar-fill.net-type-upload,
+.net-bar-fill.net-type-decoded { background: var(--net-file); }
+.net-bar-fill.net-type-beacon, .net-bar-fill.net-type-retry,
+.net-bar-fill.net-type-fanout { background: var(--net-behavior); }
+.net-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 11px;
+}
+.net-table th {
+    padding: 4px 8px;
+    text-align: left;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: .08em;
+    color: var(--accent-cyan);
+    background: var(--bg-tertiary);
+    border-bottom: 1px solid var(--border-primary);
+}
+.net-table td {
+    padding: 4px 8px;
+    color: var(--text-secondary);
+    vertical-align: top;
+    overflow-wrap: anywhere;
+    border-bottom: 1px solid var(--border-primary);
+}
+.net-table tbody tr:hover td {
+    background: var(--bg-card-hover);
+}
+.net-table .net-known td {
+    color: var(--text-dim);
+}
+.net-mono {
+    font-family: var(--font-mono);
+}
+.net-flag {
+    display: inline-block;
+    margin-left: 4px;
+    padding: 0 5px;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: .06em;
+    color: var(--text-muted);
+    border: 1px solid var(--border-accent);
+    border-radius: 3px;
+}
+.net-group {
+    margin: 8px 0;
+}
+.net-group > summary {
+    cursor: pointer;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.net-panel-links {
+    margin-top: 6px;
+    font-size: 11px;
+}
+.net-table-wrap {
+    max-width: 100%;
+    overflow-x: auto;
+}
+.net-file::file-selector-button {
+    margin-right: 6px;
+    padding: 2px 8px;
+    font-size: 11px;
+    color: var(--text-primary);
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-accent);
+    border-radius: 3px;
+    cursor: pointer;
 }

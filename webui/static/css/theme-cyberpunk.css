@@ -202,6 +202,14 @@
     --graph-pipe-rgb: var(--cp-cyan-rgb);
     --graph-detonated: var(--cp-gold);
     --graph-detonated-rgb: var(--cp-gold-rgb);
+    /* The kinds of network event of the NETWORK tab */
+    --net-conn: var(--cp-blue);
+    --net-dns: var(--cp-violet);
+    --net-http: var(--cp-green);
+    --net-tls: var(--cp-cyan);
+    --net-file: var(--cp-orange);
+    --net-behavior: var(--cp-magenta);
+    --net-other: var(--cp-text-dim);
     --pe-code: var(--cp-blue);
     --pe-data: var(--cp-green);
     --pe-readonly: var(--cp-text-dim);
