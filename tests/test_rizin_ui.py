@@ -85,6 +85,9 @@ Regressions covered:
 import json
 import os
 import re
+import shutil
+
+import pytest
 
 from test_frontend import ROOT, SOURCE, _function_source, _run_node, needs_node
 from test_theme import (INDEX_HTML, LAYOUT_CSS, LITERAL_COLOR, SORT_DOM, STYLE_CSS, THEME_CSS, _const_source, _css_blocks,
@@ -7207,6 +7210,7 @@ def test_rizin_emulation_pane_styles_and_markup():
         "asset versions not raised for the waiting patches and the restore button"
     assert "app.js?v=133" not in html, "app.js changed again (Apply now is drawn from the server's flag), its version did not"
     assert "app.js?v=134" not in html, "app.js changed again (the exit of a waiting row, a restore that broke), its version did not"
+    assert "style.css?v=90" not in html, "style.css changed (the gutter's hit area), its version did not"
     assert "app.js?v=135" not in html, "the pane's words and the help changed (the ⚠ no longer says the run's byte is not the file's), its version did not"
 
 
@@ -8631,6 +8635,172 @@ def test_rizin_decompiler_gutter_looks_like_the_disassembly_gutter_in_both_theme
     html = _read(INDEX_HTML)
     assert "style.css?v=88" not in html and 'theme-layout.css?v=11"' not in html and "app.js?v=130" not in html, \
         "asset versions not raised for the gutter of DECOMPILER"
+
+
+# --- the gutter's hit area ---------------------------------------------------------------------------------------------
+#
+# The cell was 2ch (14 px) wide, between the row's 10 px of padding and the ≠ cell, and a click on either of those jumps
+# instead of toggling: a misclick of a few pixels scrolled the view. The cell now reaches back over the row's padding to
+# the row's edge (10 px + 2ch, ~24 px) and keeps its glyph where it was.
+#
+# The recipe `margin-left: -10px; padding-left: 10px` alone would not do: style.css gives every element
+# `box-sizing: border-box`, so with `width: 2ch` the padding eats the content box (14.4 - 10 = 4.4 px) and the
+# `text-align: center` ○ moves 5 px right. The cell is therefore `content-box`: its content stays 2ch wide and where it
+# was, the padding is added to it on the left, and the negative margin gives back exactly what the padding took, so the
+# margin box -- what the C or the ≠ cell is laid out after -- is still 2ch.
+
+def _px(value):
+    match = re.fullmatch(r"(-?\d+(?:\.\d+)?)px", (value or "").strip())
+    return float(match.group(1)) if match else None
+
+
+def _row_padding_left(rule):
+    """The left padding of `padding: 0 10px` (a two-value shorthand), in px."""
+    values = (_declared(rule, "padding") or "").split()
+    return _px(values[1] if len(values) == 2 else values[-1] if values else None)
+
+
+def test_the_gutters_hit_area_reaches_the_rows_edge_and_leaves_the_glyph_where_it_was():
+    # INTENT: both views' cell is ~24 px wide (the row's padding plus 2ch), and nothing of the layout moves: the cell is
+    # content-box (so `width: 2ch` still means the glyph's room), its padding is the row's padding and its margin is the
+    # same, negative (so the margin box is 2ch as before, and the cell stops at the row's edge and does not leave its
+    # container). A reviewer who drops box-sizing, makes the margin and padding differ, or leaves the pad cell and
+    # the gutter at different widths, fails here; so does one who puts any of it in the theme sheets, where the
+    # Classic or Cyberpunk look would differ from the other.
+    classic = _rules(STYLE_CSS)
+    for gutter, row in ((".rizin-gutter", ".rizin-op"), (".rizin-dec-gutter", ".rizin-dec-line")):
+        cell, line = classic[gutter], classic[row]
+        reach = _row_padding_left(line)
+        assert reach and reach >= 8, f"{row} has no left padding to take the hit area back over: {line!r}"
+        assert _declared(cell, "box-sizing") == "content-box", \
+            f"{gutter}: with the global border-box, the padding would eat the 2ch the glyph is centred in"
+        assert _declared(cell, "width") == "2ch", f"{gutter}: the glyph's room is 2ch"
+        assert _px(_declared(cell, "padding-left")) == reach, f"{gutter}: the hit area is not the row's padding plus 2ch"
+        assert _px(_declared(cell, "margin-left")) == -reach, \
+            f"{gutter}: the margin must give back what the padding took, or the C / the ≠ cell moves"
+        for prop in ("padding", "padding-right", "padding-top", "padding-bottom", "margin", "margin-right", "border",
+                     "position", "transform", "left"):
+            assert _declared(cell, prop) is None, f"{gutter} declares {prop}: the cell or what follows it could move"
+        assert _declared(classic[".rizin-dec-pad"], "width") == "2ch" and _declared(classic[".rizin-dec-pad"], "padding-left") is None, \
+            "the empty cell of a line with no address is as wide as the glyph's room, so the C starts on one column"
+    # a pure-geometry change renders in both themes: neither theme sheet may say anything about it, or the rule that wins
+    # (theme-layout.css applies in both themes) would be another cell
+    for path in (LAYOUT_CSS, THEME_CSS):
+        for selector, body in _rules(path).items():
+            if re.search(r"rizin-(dec-)?gutter(?![-\w])", selector):
+                for prop in ("width", "box-sizing", "padding", "padding-left", "margin", "margin-left", "display"):
+                    assert _declared(body, prop) is None, f"{os.path.basename(path)}: {selector} declares {prop}"
+    # the PC's ▶ lies over the first pixels of the row, which the cell now covers: a pseudo-element is hit-tested and a
+    # click on it lands on the row, so it takes no pointer, and the PC's line toggles as the others do
+    arrow = classic[".rizin-op.pc::before"]
+    assert _declared(arrow, "pointer-events") == "none", "the PC's ▶ catches the click meant for the gutter under it"
+    assert _declared(arrow, "left") == "1px" and _declared(arrow, "position") == "absolute", "the ▶ moved: it is a mark, not the subject here"
+
+
+def _chrome():
+    for name in ("google-chrome", "google-chrome-stable", "chromium", "chromium-browser", "chrome"):
+        found = shutil.which(name)
+        if found:
+            return found
+    for path in ("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome", "/Applications/Chromium.app/Contents/MacOS/Chromium",
+                 "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"):
+        if os.path.exists(path):
+            return path
+    return None
+
+
+CHROME = _chrome()
+
+# The two views' markup as rizinDisasmHtml and rizinDecompilerHtml write it (a breakpoint, the PC, a patched line; a line
+# of C with an address and one without), laid out by the real stylesheets of both themes in a real browser.
+GUTTER_PAGE = r"""<!DOCTYPE html><html><head><meta charset="utf-8">
+<script>document.documentElement.dataset.theme = location.hash.slice(1);</script>
+<link rel="stylesheet" href="file://STYLE"><link rel="stylesheet" href="file://LAYOUT"><link rel="stylesheet" href="file://THEME">
+</head><body style="margin:0;width:700px"><div class="rizin-view" style="height:420px"><div class="rizin-disasm" id="dis"></div>
+<div class="rizin-decompiler" id="dec" style="margin-top:6px"></div></div><pre id="out"></pre>
+<script>
+const cell = (cls, on, addr) => `<span class="${cls}${on ? ' on' : ''}" data-rizin-gutter="${addr}">${on ? '●' : ''}</span>`;
+let html = '';
+[['plain', 0, 0, 0], ['bp', 1, 0, 0], ['pc', 0, 1, 0], ['pc+bp', 1, 1, 0], ['patched', 0, 0, 1]].forEach(([name, on, pc, edited], i) => {
+  html += `<div class="rizin-op${pc ? ' pc' : ''}${on ? ' bp' : ''}${edited ? ' patched' : ''}" data-name="${name}">${cell('rizin-gutter', on, i)}`
+    + `<span class="rz-pm${edited ? ' on' : ''}">${edited ? '≠' : ''}</span><span class="rz-addr">0x${1000 + i}</span> <span class="rz-mnem">mov</span> eax, 1</div>`;
+});
+dis.innerHTML = html;
+html = '';
+[['pad', 0, 0], ['off', 1, 0], ['on', 1, 1]].forEach(([name, has, on], i) => {
+  html += `<div class="rizin-dec-line${has ? ' rizin-dec-jump' : ''}" data-name="${name}">`
+    + `${has ? cell('rizin-dec-gutter', on, i) : '<span class="rizin-dec-pad"></span>'}int x = f(${i});</div>`;
+});
+dec.innerHTML = html;
+window.addEventListener('load', () => {
+  const rows = [];
+  document.querySelectorAll('.rizin-op, .rizin-dec-line').forEach(row => {
+    const box = row.getBoundingClientRect(), first = row.firstElementChild, cs = getComputedStyle(first), r = first.getBoundingClientRect();
+    const o = { name: row.getAttribute('data-name'), view: row.classList.contains('rizin-op') ? 'dis' : 'dec', rowLeft: box.left, rowRight: box.right,
+                rowPad: parseFloat(getComputedStyle(row).paddingLeft), isGutter: first.hasAttribute('data-rizin-gutter'),
+                left: r.left, right: r.right, width: r.width, height: r.height, content: parseFloat(cs.width), padLeft: parseFloat(cs.paddingLeft) };
+    const text = document.createRange(); text.selectNodeContents(row.lastChild);
+    o.after = row.classList.contains('rizin-dec-line') ? text.getBoundingClientRect().left : row.querySelector('.rz-pm').getBoundingClientRect().left;
+    const y = r.top + r.height / 2, hits = [];
+    for (let x = box.left - 3; x < box.left + 60; x += 0.5) {
+      const el = document.elementFromPoint(x, y);
+      hits.push([x - box.left, !!(el && el.closest('[data-rizin-gutter]'))]);
+    }
+    const on = hits.filter(h => h[1]).map(h => h[0]);
+    o.hitFrom = on.length ? Math.min(...on) : null; o.hitTo = on.length ? Math.max(...on) + 0.5 : null;
+    o.holes = on.length ? hits.filter(h => h[0] >= o.hitFrom && h[0] < o.hitTo && !h[1]).map(h => h[0]) : [];
+    rows.push(o);
+  });
+  out.textContent = JSON.stringify({ rows, scrollW: document.documentElement.scrollWidth });
+});
+</script></body></html>
+"""
+
+
+def _measure_gutters(tmp_path, theme):
+    import html as htmllib
+    import subprocess
+    page = tmp_path / "gutter.html"
+    page.write_text(GUTTER_PAGE.replace("STYLE", STYLE_CSS).replace("LAYOUT", LAYOUT_CSS).replace("THEME", THEME_CSS))
+    done = subprocess.run([CHROME, "--headless=new", "--disable-gpu", "--no-first-run", f"--user-data-dir={tmp_path / 'profile'}",
+                           "--window-size=700,460", "--virtual-time-budget=3000", "--dump-dom", f"file://{page}#{theme}"],
+                          capture_output=True, text=True, timeout=60)
+    found = re.search(r'<pre id="out">(.*?)</pre>', done.stdout, re.S)
+    assert found, "the page did not report: " + done.stderr[-400:]
+    return json.loads(htmllib.unescape(found.group(1)))
+
+
+@pytest.mark.skipif(not CHROME, reason="no Chrome or Chromium to lay the gutter out")
+@pytest.mark.parametrize("theme", ["classic", "cyberpunk"])
+def test_the_gutters_hit_area_is_24px_in_both_views_and_both_themes_and_the_glyph_has_not_moved(tmp_path, theme):
+    # INTENT: laid out by a browser with both sheets and either data-theme (the boot script always sets one): a click from
+    # the row's left edge to ~24 px lands in the cell, in DISASSEMBLY and DECOMPILER, on every kind of line -- the PC's
+    # too, where a ▶ lies over the first pixels --, while the cell's content (the ○ is centred in it) starts where the
+    # 14 px cell started, the next cell and the C start where they did, and no row grows wider than its box.
+    measured = _measure_gutters(tmp_path, theme)
+    rows = measured["rows"]
+    assert [(r["view"], r["name"]) for r in rows] == [("dis", n) for n in ("plain", "bp", "pc", "pc+bp", "patched")] + \
+        [("dec", n) for n in ("pad", "off", "on")]
+    assert measured["scrollW"] <= 700, "the cell pushed the page wide: " + str(measured["scrollW"])
+    for r in rows:
+        if not r["isGutter"]:
+            assert r["width"] > 0 and r["left"] - r["rowLeft"] == r["rowPad"], "the empty place of a line with no address moved: " + str(r)
+            continue
+        # (to within the half pixel a browser snaps the cell's box to: the row's border is 1 px, and 0.5 px of it may hit)
+        assert r["hitFrom"] is not None and -1 <= r["hitFrom"] <= 0, \
+            f"{r['view']} {r['name']}: a click on the row's first pixels does not reach the gutter, or the cell leaves the row: {r}"
+        assert r["holes"] == [], f"{r['view']} {r['name']}: a click at {r['holes']} px does not reach the gutter (the PC's ▶ lies there): {r}"
+        assert r["hitTo"] - r["hitFrom"] >= 23.5, f"{r['view']} {r['name']}: the hit area is {r['hitTo'] - r['hitFrom']} px wide"
+        assert r["left"] >= r["rowLeft"] and r["right"] <= r["rowRight"], "the cell leaves its row: " + str(r)
+        # the glyph's room: where the old 2ch cell started (after the row's padding), 2ch wide, and what follows it
+        assert r["left"] + r["padLeft"] - r["rowLeft"] == r["rowPad"], f"{r['view']} {r['name']}: the content of the cell moved: {r}"
+        assert abs(r["right"] - (r["rowLeft"] + r["rowPad"] + r["content"])) < 0.01, f"{r['view']} {r['name']}: the margin box is not 2ch: {r}"
+        assert abs(r["after"] - r["right"]) < 0.01, f"what follows the cell (the ≠ cell, the C) moved: {r}"
+    # a ○ and a ● in the same view stand in the same place, and the C of a line with no address and one with start together
+    dis_cells = {(r["content"], r["rowPad"], r["left"] + r["padLeft"] - r["rowLeft"]) for r in rows if r["isGutter"] and r["view"] == "dis"}
+    assert len(dis_cells) == 1, dis_cells
+    starts = {r["name"]: round(r["after"] - r["rowLeft"], 2) for r in rows if r["view"] == "dec"}
+    assert starts["pad"] == starts["off"] == starts["on"], "the C of lines with and without an address does not start on one column: " + str(starts)
 
 
 @needs_node

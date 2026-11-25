@@ -9747,6 +9747,9 @@ table[data-sortable] > thead > tr > th:focus-visible {
     left: 1px;
     font-size: 8px;
     color: var(--accent-orange);
+    /* a mark, not a control: the gutter's hit area reaches the row's edge, under it, and a click on a pseudo-element
+       lands on the row */
+    pointer-events: none;
 }
 /* The gutter, left of the address: a ● where a breakpoint is set (one click sets or removes it), a faint ○ on every
    other line so that the column can be seen and aimed at, the same ○ stronger under the pointer; then a cell for a
@@ -9754,11 +9757,18 @@ table[data-sortable] > thead > tr > th:focus-visible {
    whether a line has a mark or not; neither is text to copy.
    The three marks of a line are three shapes, none of them colour alone: this ● in the gutter, the PC's ▶ and dashed
    edge, the current line's solid bar. DECOMPILER's gutter (.rizin-dec-gutter, before the C of a line with an
-   address) is this same cell, so it shares each rule. */
+   address) is this same cell, so it shares each rule.
+   The hit area is 10px + 2ch (~24px): left of the glyph's room it takes the row's own 10px of padding (a click there
+   jumped), and the ○ stays where it was. box-sizing is content-box because the global border-box would let the padding
+   eat the 2ch the glyph is centred in; the negative margin gives back what the padding took, so the margin box is
+   still 2ch and the ≠ cell and the C start where they did. The 10px is the left padding of .rizin-op and .rizin-dec-line. */
 .rizin-gutter,
 .rizin-dec-gutter {
     display: inline-block;
+    box-sizing: content-box;
     width: 2ch;
+    padding-left: 10px;
+    margin-left: -10px;
     vertical-align: top;
     text-align: center;
     color: var(--accent-red);
