@@ -328,11 +328,14 @@ def test_kinds_that_supersede_each_other_are_refused(tdc, kinds):
         tdc.memory_evidence._check_kinds(kinds)
 
 
-def test_a_chain_of_supersedes_is_not_a_cycle(tdc):
+def test_a_chain_of_supersedes_is_refused(tdc):
+    # A phenomenon has two sides; a kind that supersedes and is superseded
+    # would give it a third, and "the larger side" would not be defined.
     me = tdc.memory_evidence
-    kinds = {"a": {"supersedes": ("b", "c")}, "b": {"supersedes": ("c",)}, "c": {}}
+    kinds = {"a": {"supersedes": ("b",)}, "b": {"supersedes": ("c",)}, "c": {}}
     kinds.update({k: {} for k in me.NETWORK_KINDS})
-    me._check_kinds(kinds)
+    with pytest.raises(ValueError, match="chain"):
+        me._check_kinds(kinds)
 
 
 # --- Supersede never lowers the score ----------------------------------------------
@@ -394,7 +397,7 @@ def test_a_checkin_takes_the_place_of_two_beacons_only_if_it_counts_more(tdc):
     assert out["suppressed"][0]["kind"] == "c2_checkin"
 
 
-def test_adding_any_finding_never_lowers_the_score(tdc):
+def test_adding_a_finding_lowers_the_score_only_when_it_joins_two_phenomena(tdc):
     import random
     me = tdc.memory_evidence
     rng = random.Random(3)
@@ -418,9 +421,11 @@ def test_adding_any_finding_never_lowers_the_score(tdc):
 
     for _ in range(3000):
         base = [one() for _ in range(rng.randint(0, 6))]
+        new = one()
         before = me.score(base)["score"]
-        after = me.score(base + [one()])["score"]
-        assert after >= before, (base, after, before)
+        after = me.score(base + [new])["score"]
+        # The one exception: a finding that shows two phenomena to be one.
+        assert after >= before or _joins(me, base, new), (base, after, before)
 
 
 @pytest.mark.parametrize("kind, weight, evidence", [
@@ -469,3 +474,129 @@ def test_sysmon_beaconing_names_its_destination(tdc):
     conns = [(60.0 * i, "10.0.0.1", 443) for i in range(8)]
     f = tdc.memory_evidence.beaconing_from_connections(conns, "b.exe")[0]
     assert f["dest"] == "10.0.0.1" and f["endpoint"] == "10.0.0.1:443"
+
+
+# --- Supersede: one phenomenon per component, independent of order ---------------------
+
+def _f(me, kind, dest, weight, source=None, addresses=None, port=0, corroborate=None):
+    extra = {"dest": dest}
+    if addresses:
+        extra["addresses"] = addresses
+    if corroborate is not None:
+        extra["needs_corroboration"] = corroborate
+    source = source or ("sysmon-network" if kind == "c2_beaconing" else "network")
+    return me.MemoryFinding(source, kind, "a.exe", identity=(dest, port, weight),
+                            weight=weight, extra=extra)
+
+
+def _reviewer_case(me):
+    return {"bc443": _f(me, "c2_beaconing", "1.1.1.1", 3.0, port=443, corroborate=False),
+            "bc80": _f(me, "c2_beaconing", "1.1.1.1", 2.1, port=80, corroborate=True),
+            "ck_ip": _f(me, "c2_checkin", "1.1.1.1", 4.0),
+            "ck_name": _f(me, "c2_checkin", "a.com", 2.1, addresses=["1.1.1.1"])}
+
+
+def test_adding_a_sysmon_beacon_on_another_port_does_not_lower_the_verdict(tdc):
+    import itertools
+    me = tdc.memory_evidence
+    case = _reviewer_case(me)
+    without = me.score([case[k] for k in ("bc80", "ck_ip", "ck_name")])
+    assert (without["score"], without["label"]) == (6.1, "MALICIOUS")
+    for order in itertools.permutations(case):
+        out = me.score([case[k] for k in order])
+        # the check-ins (4.0 + 2.1) against the beacons (3.0 + 2.1): one side counts
+        assert (out["score"], out["label"], out["superseded_count"]) == (6.1, "MALICIOUS", 2), order
+
+
+def _pool(me):
+    return [
+        lambda: _f(me, "c2_beaconing", "1.1.1.1", 3.0, port=443, corroborate=False),
+        lambda: _f(me, "c2_beaconing", "1.1.1.1", 2.1, port=80, corroborate=True),
+        lambda: _f(me, "c2_beaconing", "2.2.2.2", 3.0, corroborate=False),
+        lambda: _f(me, "c2_checkin", "1.1.1.1", 4.0),
+        lambda: _f(me, "c2_checkin", "a.com", 2.1, addresses=["1.1.1.1"]),
+        lambda: _f(me, "c2_checkin", "b.com", 4.0, addresses=["2.2.2.2"], corroborate=False),
+        lambda: _f(me, "c2_checkin", "c.com", 1.0, addresses=["1.1.1.1", "2.2.2.2"]),
+        lambda: me.MemoryFinding("aether", "heap_api_table", "a.exe", identity=(1,)),
+    ]
+
+
+def _joins(me, old, new):
+    """Does ``new`` connect two supersede components that ``old`` had apart?"""
+    kinds = ("c2_checkin", "c2_beaconing")
+    parent = list(range(len(old)))
+
+    def root(i):
+        while parent[i] != i:
+            i = parent[i]
+        return i
+    def tagged(f):
+        if f["kind"] not in kinds:
+            return set()
+        return {(f["process"].lower(), e) for e in me._endpoints(f)}
+    ends = [tagged(f) for f in old]
+    # edges as in memory_evidence._components: a check-in and a beacon only
+    for i in range(len(old)):
+        for j in range(i):
+            if old[i]["kind"] != old[j]["kind"] and ends[i] & ends[j]:
+                parent[root(i)] = root(j)
+    mine = tagged(new)
+    return len({root(i) for i in range(len(old))
+                if old[i]["kind"] != new["kind"] and ends[i] & mine}) >= 2
+
+
+def test_no_set_of_two_to_four_findings_loses_score_when_one_is_added(tdc):
+    import itertools
+    me = tdc.memory_evidence
+    pool = _pool(me)
+    checked = 0
+    for size in range(1, 4):
+        for combo in itertools.combinations_with_replacement(range(len(pool)), size):
+            base = [pool[i]() for i in combo]
+            before = me.score(base)["score"]
+            for extra in range(len(pool)):
+                new = pool[extra]()
+                after = me.score(base + [new])["score"]
+                assert after >= before or _joins(me, base, new), (combo, extra, before, after)
+                checked += 1
+    assert checked > 1000
+
+
+def test_no_set_of_up_to_four_findings_depends_on_the_order(tdc):
+    import itertools
+    me = tdc.memory_evidence
+    pool = _pool(me)
+    for size in range(2, 5):
+        for combo in itertools.combinations_with_replacement(range(len(pool)), size):
+            findings = [pool[i]() for i in combo]
+            scores = {(me.score(list(p))["score"], me.score(list(p))["label"])
+                      for p in itertools.permutations(findings)}
+            assert len(scores) == 1, (combo, scores)
+
+
+def test_random_sets_are_order_independent_and_only_an_identification_lowers_them(tdc):
+    import random
+    me = tdc.memory_evidence
+    rng = random.Random(12)
+    hosts = ["1.1.1.1", "2.2.2.2", "3.3.3.3"]
+
+    def one():
+        kind = rng.choice(["c2_beaconing", "c2_checkin", "c2_checkin", "heap_api_table"])
+        if kind == "heap_api_table":
+            return me.MemoryFinding("aether", kind, "a.exe", identity=(rng.random(),))
+        if kind == "c2_beaconing":
+            return _f(me, kind, rng.choice(hosts), rng.choice([2.1, 3.0]),
+                      port=rng.choice([80, 443]), corroborate=rng.random() < 0.5)
+        dest = rng.choice(hosts + ["a.com", "b.com"])
+        addresses = rng.sample(hosts, rng.randint(0, 2)) if "." in dest and dest[0].isalpha() else None
+        return _f(me, kind, dest, rng.choice([1.0, 2.1, 4.0]), addresses=addresses,
+                  corroborate=rng.choice([None, True, False]))
+
+    for _ in range(3000):
+        base = [one() for _ in range(rng.randint(1, 7))]
+        shuffled = base[:]
+        rng.shuffle(shuffled)
+        assert me.score(base)["score"] == me.score(shuffled)["score"]
+        new = one()
+        before, after = me.score(base)["score"], me.score(base + [new])["score"]
+        assert after >= before or _joins(me, base, new), (base, new, before, after)

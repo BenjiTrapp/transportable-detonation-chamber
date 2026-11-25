@@ -27,10 +27,14 @@ from any source are normalized into one schema and weighted by five factors:
 Two sources can see one phenomenon. Sysmon's connection log and a capture of
 the same traffic both see a beacon loop, and the two findings together would
 cross the malicious threshold on their own. A kind may therefore name kinds it
-``supersedes``: for the same process and destination only one side is scored,
-whichever leaves the higher total (so more evidence never lowers the score);
-the other stays listed with ``superseded_by`` and still counts as the
-independent second opinion that it is.
+``supersedes``. The findings of both kinds on one process that share an
+endpoint, directly or through each other, are one phenomenon, and only one side
+of it is scored: whichever gives the higher total, chosen over the whole set at
+once so that the order findings arrive in cannot change the verdict. The other
+side stays listed with ``superseded_by`` and still counts as the independent
+second opinion that it is. Adding a finding never lowers the score, except a
+finding that shows two such phenomena to be one: what was counted twice is then
+counted once.
 
 Adding a scanner means adding a normalizer function; nothing else changes.
 """
@@ -242,13 +246,16 @@ NETWORK_KINDS = ("c2_checkin", "exfil_upload", "credential_in_transit", "payload
 
 def _check_kinds(kinds=None):
     """Every ``supersedes`` target is a kind, the relation has no cycle (two
-    kinds that supersede each other would take each other out), and every
-    network kind is a kind."""
+    kinds that supersede each other would take each other out), no kind is on
+    both sides of it (a phenomenon has two sides, the superseding kinds and
+    the superseded ones, and a chain would give it three), and every network
+    kind is a kind."""
     kinds = KINDS if kinds is None else kinds
     for kind, spec in kinds.items():
         for other in spec.get("supersedes", ()):
             if other not in kinds:
                 raise ValueError("kind %r supersedes %r, which is not a kind" % (kind, other))
+    superseded = {k for spec in kinds.values() for k in spec.get("supersedes", ())}
     done = set()
     for start in kinds:
         if start in done:
@@ -271,6 +278,10 @@ def _check_kinds(kinds=None):
                 on_path.add(nxt)
                 path.append(nxt)
                 stack.append((nxt, iter(kinds[nxt].get("supersedes", ()))))
+    for kind, spec in kinds.items():
+        if spec.get("supersedes") and kind in superseded:
+            raise ValueError("kind %r supersedes others and is superseded itself: a chain "
+                             "of supersedes has no two sides to choose between" % kind)
     for kind in NETWORK_KINDS:
         if kind not in kinds:
             raise ValueError("network kind %r is not a kind" % kind)
@@ -886,40 +897,116 @@ def _total(entries, excluded):
     return round(sum(_group_total(values) for values in groups.values()), 6)
 
 
+# Components of one process whose sides are chosen together, by trying every
+# combination. Real captures have one or two per C2; past this the sides are
+# chosen per component, which is still independent of the order of findings.
+SUPERSEDE_MAX_ENUMERATED = 10
+
+
+def _components(findings, entries, proc_key):
+    """One phenomenon per component: ``[(process, superseding side, other side)]``.
+
+    Findings take part when they are scored, name an endpoint and are of a kind
+    that supersedes or is superseded. Two of them on the same process that
+    share an endpoint are in one component, whichever side they are on, so a
+    check-in to a name and one to its address and the Sysmon beacons on two
+    ports of that address are one component. Only components with both sides
+    are returned, ordered by their content, not by where the findings sat.
+    """
+    superseding = {k for k, spec in KINDS.items() if spec.get("supersedes")}
+    superseded = {k for spec in KINDS.values() for k in spec.get("supersedes", ())}
+    parent = {}
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    first = {}
+    for i, f in enumerate(findings):
+        if i not in entries or f.get("kind") not in superseding | superseded:
+            continue
+        ends = _endpoints(f)
+        if not ends:
+            continue
+        parent[i] = i
+        side = "a" if f.get("kind") in superseding else "b"
+        for end in ends:
+            first.setdefault((proc_key(f), end, side), []).append(i)
+    # An edge joins a superseding finding and a superseded one that share an
+    # endpoint. Two check-ins on one address are not one phenomenon by that
+    # alone (a CDN address carries many names); a beacon to it makes them one.
+    for (process, end, side), here in first.items():
+        if side != "a":
+            continue
+        for j in first.get((process, end, "b"), ()):
+            for i in here:
+                a, b = root(i), root(j)
+                if a != b:
+                    parent[max(a, b)] = min(a, b)
+    members = {}
+    for i in parent:
+        members.setdefault(root(i), []).append(i)
+    out = []
+    for group in members.values():
+        side_a = sorted(i for i in group if findings[i]["kind"] in superseding)
+        side_b = sorted(i for i in group if findings[i]["kind"] not in superseding)
+        if side_a and side_b:
+            out.append((proc_key(findings[group[0]]), side_a, side_b))
+
+    def content(i):
+        f = findings[i]
+        return (f.get("kind") or "", f.get("source") or "", f.get("key") or "", entries[i][1])
+
+    out.sort(key=lambda c: (c[0], sorted(content(i) for i in c[1] + c[2])))
+    return out
+
+
 def _supersessions(findings, entries, proc_key):
     """``{index: index of the winner}`` for the findings supersede takes out.
 
     ``entries`` maps the index of every scored finding (not known to the
-    baseline) to its saturation group and contribution. A finding G whose
-    kind ``supersedes`` others and the findings of those kinds on the same
-    process that share a destination with it are one phenomenon, so only one
-    side counts: the one that leaves the higher total. G absorbs them when
-    that is at least what they add together; otherwise G is the one left out.
-    Either way adding G never lowers the score below what it was without G.
-    A finding the baseline knows takes part in neither side: it counts
-    nothing, so it must not take away what another would have counted.
+    baseline) to its saturation group and contribution. Each component of
+    ``_components`` is one phenomenon seen two ways (the check-ins of a C2 and
+    Sysmon's beacons to it), so only one side of it counts: of all the ways to
+    choose a side in every component of a process, the one with the highest
+    total wins; a tie goes to the superseding side. The choice is made over
+    the whole set at once, so it does not depend on the order of the findings,
+    and adding a finding can only lower the score when that finding shows two
+    components to be one phenomenon (it joins them): what was counted twice is
+    then counted once. A finding the baseline knows takes part in neither side:
+    it counts nothing, so it must not take away what another would have counted.
     """
     out = {}
-    for g, f in enumerate(findings):
-        targets = KINDS.get(f.get("kind"), {}).get("supersedes")
-        if not targets or g not in entries or g in out:
-            continue
-        mine = _endpoints(f)
-        if not mine:
-            continue
-        winners = set(out.values())
-        victims = [i for i, other in enumerate(findings)
-                   if i != g and i in entries and i not in out and i not in winners
-                   and other.get("kind") in targets and proc_key(other) == proc_key(f)
-                   and mine & _endpoints(other)]
-        if not victims:
-            continue
-        excluded = set(out)
-        if _total(entries, excluded | set(victims)) >= _total(entries, excluded | {g}):
-            for i in victims:
-                out[i] = g
+    by_process = {}
+    for component in _components(findings, entries, proc_key):
+        by_process.setdefault(component[0], []).append(component)
+
+    def winner_of(side):
+        return max(side, key=lambda i: (entries[i][1], findings[i].get("key") or ""))
+
+    for process, components in sorted(by_process.items()):
+        local = {i: e for i, e in entries.items() if e[0][0] == process}
+        if len(components) <= SUPERSEDE_MAX_ENUMERATED:
+            best = None
+            for mask in range(1 << len(components)):
+                excluded = set()
+                for bit, (_p, side_a, side_b) in enumerate(components):
+                    excluded.update(side_b if not mask >> bit & 1 else side_a)
+                rank = (_total(local, excluded), -bin(mask).count("1"), -mask)
+                if best is None or rank > best[0]:
+                    best = (rank, mask)
+            choices = [not best[1] >> bit & 1 for bit in range(len(components))]
         else:
-            out[g] = max(victims, key=lambda i: entries[i][1])
+            choices = [_total({i: entries[i] for i in side_a}, set())
+                       >= _total({i: entries[i] for i in side_b}, set())
+                       for _p, side_a, side_b in components]
+        for keep_a, (_p, side_a, side_b) in zip(choices, components):
+            keep, drop = (side_a, side_b) if keep_a else (side_b, side_a)
+            winner = winner_of(keep)
+            for i in drop:
+                out[i] = winner
     return out
 
 
@@ -958,7 +1045,7 @@ def score(findings, baseline=None):
         sources_by_process.setdefault(proc_key(f), set()).add(f["source"])
 
     # Every finding is weighed first, then supersede decides which side of
-    # one phenomenon counts; it compares what each side contributes. The
+    # each phenomenon counts, from the totals of all choices at once. The
     # findings it takes out stay in sources_by_process above, so they still
     # corroborate, the one that won as well as any other.
     weighed = {}
