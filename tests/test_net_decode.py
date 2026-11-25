@@ -63,6 +63,11 @@ Regressions covered:
     ``name: value`` line in an upload) was not marked by anything, because only
     decoded values carry ``credential``; ``mask_credentials`` masks it with the
     same detection, for the report boundary
+  * that mask read ``keys.top:8080/stage.exe`` as the key ``keys.top`` and its
+    value, cutting host, port and path out of URLs, Host headers and IOCs, and
+    rewrote free text (a rule's ``token_exfil: auth: bearer``, a User-Agent
+    ending ``key:val``); a key now starts at a boundary, and outside bodies only
+    ``=`` (or a quoted JSON pair) separates it from its value
 """
 
 import base64
@@ -995,3 +1000,31 @@ def test_masking_a_long_hostile_body_takes_linear_time():
     for body in ("pass=" * 50000, "p:" * 100000, "a|" * 100000 + "http://x", '"pass":"' * 40000):
         net_decode.mask_credentials(body, lines=True)
     assert time.time() - started < 10
+
+
+@pytest.mark.parametrize("text", [
+    "keys.top:8080/stage.exe", "http://keys.top:8080/stage.exe", "monkey.top:8443",
+    "http://monkey.top:8443/a/b?c=1", "token_exfil: auth: bearer",
+    "Mozilla/5.0 (Windows NT 10.0) Agent/2 key:val", "/dl/token=abc/file.bin",
+])
+def test_names_urls_and_free_text_are_not_read_as_credentials(text):
+    assert net_decode.mask_credentials(text) == text
+
+
+@pytest.mark.parametrize("text,masked", [
+    ("pass=Pw-1", "pass=***"),
+    ("/login?pass=Pw-2&x=1", "/login?pass=***&x=1"),
+    ("a=1&token=Tk-3", "a=1&token=***"),
+    ("/dl;token=Tk-4/f", "/dl;token=***"),
+    ("Agent/1.0 token=Tk-5", "Agent/1.0 token=***"),
+    ("x=1, password=Pw-6", "x=1, password=***"),
+    ("{'secret_key': 'Sk-7'}", "{'secret_key': '***'}"),
+    ('{"api_token":"Tk-8"}', '{"api_token":"***"}'),
+])
+def test_a_credential_after_a_boundary_is_still_masked(text, masked):
+    assert net_decode.mask_credentials(text) == masked
+
+
+def test_in_a_body_a_colon_still_separates_a_secret_key_from_its_value():
+    assert net_decode.mask_credentials("token: Tk-9 more", lines=True) == "token: ***"
+    assert net_decode.mask_credentials("token: Tk-9") == "token: Tk-9"

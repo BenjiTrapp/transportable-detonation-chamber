@@ -87,6 +87,7 @@ import ipaddress
 import math
 import os
 
+import net_baseline
 import net_behavior
 import net_decode
 import net_dns
@@ -108,7 +109,7 @@ MAX_IOCS = 5000
 
 BEHAVIOR_TYPES = ("beacon", "retry", "fanout")
 NAME_FIELDS = ("dest", "sni", "mail_from", "user", "url")
-NAME_LIST_FIELDS = ("rcpt_to",)
+NAME_LIST_FIELDS = ("rcpt_to", "hosts")
 EXECUTABLES = net_evidence.EXECUTABLES
 
 # The fake internet answers from these addresses: a connection to one says
@@ -288,6 +289,9 @@ def _render_names(event):
         values = event.get(field)
         if isinstance(values, list):
             event[field] = [render_name(v) if isinstance(v, str) else v for v in values]
+    headers = event.get("headers")
+    if isinstance(headers, dict) and isinstance(dict.get(headers, "host"), str):
+        headers["host"] = render_name(dict.get(headers, "host"))
     dest = event.get("dest")
     event["dest_is_ip"] = isinstance(dest, str) and _ip(dest) is not None
     return event
@@ -358,6 +362,8 @@ def _mask_header(name, value):
     if not isinstance(value, str):
         return mask_report(value)
     lname = name.lower() if isinstance(name, str) else ""
+    if lname == "host":
+        return value            # a name, rendered like dest; nothing in it is a secret
     if lname in _SECRET_HEADERS or net_decode.is_secret_name(lname):
         value = value.strip()
         if lname in ("authorization", "proxy-authorization") and " " in value:
@@ -508,8 +514,9 @@ def _quiet_addresses(events, claimed, known_good):
         ip = _ip(e.get("dest")) if e.get("type") == "conn" else None
         if ip is None or str(ip) not in quiet:
             continue
-        for f in claimed.get(id(e)) or ():
-            name = f.get("dest")
+        claims = [n for f in claimed.get(id(e)) or ()
+                  for n in (f.get("hosts") or [f.get("dest")])]
+        for name in claims:
             if not isinstance(name, str) or not name or _ip(name) is not None:
                 continue            # a profile of bytes claims no name
             if _norm(name) not in names[str(ip)]:
@@ -531,9 +538,15 @@ def _iocs(copies, known_good, quiet=frozenset()):
         if e.get("baseline") == "known" or etype in BEHAVIOR_TYPES:
             continue
         dest = e.get("dest")
-        name_known = isinstance(dest, str) and known_good.hides({"dest": dest})
+        hosts = [h for h in e.get("hosts") or () if isinstance(h, str)]
+        name_known = isinstance(dest, str) and known_good.hides({"dest": dest, "hosts": hosts})
         if etype != "decoded" and foreign(dest):
             out.name(dest, e, known_good)
+        if len(set(hosts)) > 1:
+            # every name of a request that gives several, known good or not
+            for host in hosts:
+                if _ip(host) is None:
+                    out.add("domain", _norm(host), e)
         for address in e.get("addresses") or ():
             if foreign(address):
                 out.ip(address, e)
@@ -691,6 +704,12 @@ def analyze_pcap(path, rules=None, baseline=None, process="", mode="online"):
         findings = []
 
     copies = net_mail_ftp.masked(events)
+    for event, copy in zip(events, copies):
+        # computed before masking, so that a baseline fed the report's events
+        # keys them as it keys the raw ones (net_baseline.event_key reads it)
+        key = net_baseline.event_key(event)
+        if key is not None:
+            copy[net_baseline.KEY_FIELD] = key
     _mask_decoded(events, copies, source_of)
     copies = mask_report(copies)
     for event, copy, is_known in zip(events, copies, known):

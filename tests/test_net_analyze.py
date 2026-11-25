@@ -32,6 +32,14 @@ Regressions covered:
   * every server address of the idle machine came back as an IOC through the
     connection events, although the name it served was ``known_good``
   * an error line copied a raw NUL out of an exception text
+  * the mask cut ``keys.top:8080/stage.exe`` down to ``keys.top:***`` in a
+    finding's URL, the Host header and the URL IOC, and rewrote a rule's text
+    and a User-Agent
+  * a baseline built from a report's (masked) events no longer matched the
+    raw event whose path or User-Agent the mask had changed
+  * a second or folded Host header was dropped, so ``Host: <known good>``
+    followed by ``Host: evil.top`` hid the request and lost the IOC
+  * ``headers.host`` kept raw ESC and NUL
   * one parser that raised took the whole analysis down
   * an empty capture looked the same as a capture in which nothing was found
 """
@@ -285,7 +293,7 @@ def test_the_rule_fields_of_connection_events_are_what_the_analysis_emits(tmp_pa
     for e in r["events"]:
         seen.setdefault(e["type"], set()).update(e)
     for etype in ("conn", "conn_failed", "udp"):
-        keys = seen[etype] - {"baseline", "known_good"}
+        keys = seen[etype] - {"baseline", "known_good", "baseline_key"}
         assert keys - net_rules.UNMATCHABLE == net_rules.FIELDS[etype], etype
 
 
@@ -711,3 +719,76 @@ def test_an_address_that_also_served_another_name_stays_an_ioc(tmp_path):
     only.get(5.0, "www.msftconnecttest.com", "/connecttest.txt", b"Microsoft Connect Test")
     r = net_analyze.analyze_pcap(_write(tmp_path, only, "only.pcap"))
     assert address not in [i["value"] for i in r["iocs"] if i["type"] == "ip"]
+
+
+# --- review round 2 ----------------------------------------------------------------------
+
+@pytest.mark.parametrize("host,port", [("keys.top", 8080), ("monkey.top", 8443)])
+def test_a_host_with_a_secret_word_and_a_port_keeps_host_port_and_path(tmp_path, host, port):
+    cap = Capture()
+    authority = "%s:%d" % (host, port)
+    cap.web(5.0, host, b"GET /stage.exe HTTP/1.1\r\nHost: " + authority.encode() + b"\r\n\r\n",
+            _ok(_pe(), "application/octet-stream"), port=port)
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap), process="a.exe")
+    url = "http://%s/stage.exe" % authority
+    staging = [f for f in r["evidence_findings"] if f["kind"] == "payload_staging"]
+    assert staging and staging[0]["url"] == url
+    http = [e for e in r["events"] if e["type"] == "http"][0]
+    assert http["headers"]["host"] == authority and http["url"] == url
+    assert url in [i["value"] for i in r["iocs"] if i["type"] == "url"]
+
+
+def test_rule_text_and_a_user_agent_are_not_rewritten(tmp_path):
+    rule = tmp_path / "r.yaml"
+    rule.write_text("rules:\n  - {id: t, name: 'token_exfil: auth: bearer', event: http,"
+                    " description: 'auth: bearer token: x', match: {method: GET}}\n")
+    cap = Capture()
+    cap.web(5.0, "x.top", b"GET / HTTP/1.1\r\nHost: x.top\r\nUser-Agent: Agent/2 key:val\r\n\r\n",
+            _ok(b"hi"))
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap), rules=[str(rule)])
+    assert r["rule_hits"][0]["name"] == "token_exfil: auth: bearer"
+    assert r["rule_hits"][0]["description"] == "auth: bearer token: x"
+    http = [e for e in r["events"] if e["type"] == "http"][0]
+    assert http["ua"] == "Agent/2 key:val" and http["headers"]["user-agent"] == "Agent/2 key:val"
+
+
+def test_a_baseline_from_a_report_matches_a_path_the_mask_changed(tmp_path):
+    cap = Capture()
+    cap.web(5.0, "dl.top", b"GET /dl;token=Tk-1/file.bin HTTP/1.1\r\nHost: dl.top\r\n"
+            b"User-Agent: Agent/1.0 token=Tk-2\r\n\r\n", _ok(b"data"))
+    first = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    http = [e for e in first["events"] if e["type"] == "http"][0]
+    assert http["path"] == "/dl;token=***" and http["ua"] == "Agent/1.0 token=***"
+    assert "Tk-1" not in json.dumps(first) and "Tk-2" not in json.dumps(first)
+    bl = net_baseline.NetBaseline(str(tmp_path / "bl.json"))
+    bl.add(first["events"])
+    again = net_analyze.analyze_pcap(_write(tmp_path, cap, "again.pcap"), baseline=bl)
+    assert again["suppressed_count"] == len(again["events"])
+
+
+def _two_hosts(cap, second):
+    cap.tcp(5.0, C2, 80, [("c", b"GET /t HTTP/1.1\r\nHost: www.msftconnecttest.com\r\n" + second
+                                + b"\r\n"), ("s", _ok(b"ok"))])
+
+
+@pytest.mark.parametrize("second", [b"Host: evil.top\r\n", b" evil.top\r\n"])
+def test_every_host_name_of_a_request_counts_and_two_are_never_known_good(tmp_path, second):
+    cap = Capture()
+    _two_hosts(cap, second)
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    http = [e for e in r["events"] if e["type"] == "http"][0]
+    assert http["hosts"] == ["www.msftconnecttest.com", "evil.top"]
+    assert http["known_good"] is False
+    domains = [i["value"] for i in r["iocs"] if i["type"] == "domain"]
+    assert "evil.top" in domains and "www.msftconnecttest.com" in domains
+    assert C2 in [i["value"] for i in r["iocs"] if i["type"] == "ip"]
+    assert net_rules.KnownGood(["www.msftconnecttest.com"]).hides(http) is False
+
+
+def test_the_host_header_value_is_rendered_like_the_name(tmp_path):
+    cap = Capture()
+    cap.web(6.0, "x", b"GET / HTTP/1.1\r\nHost: " + _ODD + b"\r\n\r\n", _ok(b"hi"), lookup=False)
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    http = [e for e in r["events"] if e["type"] == "http"][0]
+    assert http["headers"]["host"] == _ODD_TEXT
+    assert "\\u001b" not in json.dumps(r) and "\\u0000" not in json.dumps(r)

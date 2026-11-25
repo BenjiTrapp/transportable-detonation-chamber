@@ -604,10 +604,20 @@ def _record_delimiter(line):
 # keep the value, since rules and evidence read it.
 
 MASK = "***"
-_SECRET_KEY = "(?:" + _SECRET_WORDS + r"[A-Za-z0-9_.-]{0,32}|" + _SHORT_WORDS + ")"
+# A key is a whole name that begins at the start of the text or after a
+# separator of pairs (whitespace ? & ; , quotes {), so that ``keys.top:8080`` or
+# ``monkey.top`` in a URL is not a key. ``pass`` and the other long words may
+# sit anywhere in that name (``api_key``, ``user.password``).
+_KEY_START = r"(?<![^\s?&;,\"'{])"
+_SECRET_KEY = (_KEY_START + "(?:[A-Za-z0-9_.-]{0,32}" + _SECRET_WORDS + r"[A-Za-z0-9_.-]{0,32}|"
+               + _SHORT_WORDS + ")")
 _SECRET_QUOTED = re.compile(
     "(" + _SECRET_KEY + r"[\"']?[ \t]*[=:][ \t]*)([\"'])((?:[^\"'\\\n]|\\.)*)\2", re.I)
-_SECRET_BARE = re.compile("(" + _SECRET_KEY + r"[\"']?[ \t]*[=:][ \t]*)([^\s&;,\"'<>]+)", re.I)
+_BARE_VALUE = r"[ \t]*)([^\s&;,\"'<>]+)"
+# Outside a body only "=" separates a bare value: "keys.top:8080", a rule's
+# "token_exfil: auth: bearer" and a User-Agent's "key:val" are not pairs.
+_SECRET_BARE = re.compile("(" + _SECRET_KEY + r"[\"']?[ \t]*=" + _BARE_VALUE, re.I)
+_SECRET_BARE_LINES = re.compile("(" + _SECRET_KEY + r"[\"']?[ \t]*[=:]" + _BARE_VALUE, re.I)
 _USERINFO_PASSWORD = re.compile("(" + _URL_SCHEME + r"[^/\s:@]{1,64}:)([^/\s@]{1,128})(@)")
 
 
@@ -663,11 +673,15 @@ def mask_credentials(text, lines=False):
 
     Masked: the value of a key that says secret (``pass``, ``pwd``, ``secret``,
     ``token``, ``key``, ``auth``, ``cred`` anywhere in the name, ``pw`` and
-    ``p`` as whole words) in a form, a query, JSON or ``key: value`` text, the
-    password of URL userinfo, and the content of a multipart part with such a
-    name. With ``lines`` (a body, not a query or a URL) every ``name: value``
-    line also loses its value and a credential-dump record keeps only its
-    first field and its URL, as ``_is_credential`` marks both. Like that flag
+    ``p`` as whole words; the name begins at the start of the text or after
+    whitespace, ``?``, ``&``, ``;``, ``,``, a quote or ``{``) in a form, a
+    query or a quoted JSON pair, the password of URL userinfo, and the content
+    of a multipart part with such a name. With ``lines`` (a body, not a query,
+    a URL, a header or other text) ``key: value`` counts as a pair too, every
+    ``name: value`` line loses its value and a credential-dump record keeps
+    only its first field and its URL, as ``_is_credential`` marks both.
+    Outside a body only ``=`` separates a bare value, so ``keys.top:8080`` and
+    a User-Agent's ``key:val`` are left alone. Like that flag
     it errs towards masking. Not a str: returned as it is.
     """
     if not isinstance(text, str) or not text:
@@ -676,8 +690,8 @@ def mask_credentials(text, lines=False):
         text = _mask_parts(text)
     text = _USERINFO_PASSWORD.sub(lambda m: m.group(1) + MASK + m.group(3), text)
     text = _SECRET_QUOTED.sub(lambda m: m.group(1) + m.group(2) + MASK + m.group(2), text)
-    text = _SECRET_BARE.sub(lambda m: m.group(1) + (m.group(2) if m.group(2) == MASK else MASK),
-                            text)
+    bare = _SECRET_BARE_LINES if lines else _SECRET_BARE
+    text = bare.sub(lambda m: m.group(1) + (m.group(2) if m.group(2) == MASK else MASK), text)
     if lines:
         out = []
         for line in text.splitlines(True):

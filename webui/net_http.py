@@ -101,7 +101,10 @@ frames are not inflated, so such a message has ``text`` None.
 server address; ``port`` is the TCP port. ``dest`` and ``url`` keep the bytes of
 the request (ASCII, any other byte as a ``surrogateescape`` code point), not a
 guess at their character set: ``net_analyze`` renders every name of every
-protocol from its bytes, so one name has one spelling. ``content_type`` and
+protocol from its bytes, so one name has one spelling. ``hosts`` lists every
+distinct name the request gives (each Host header, a folded continuation, or the
+absolute target's), ``dest`` being the first: a sample can send a harmless name
+first and its own second, so a reader that took one would be fooled. ``content_type`` and
 ``content_encoding`` are the response's (the response decides whether a
 download happened); the request's are ``headers["content-type"]`` and
 ``request_encoding``.
@@ -133,6 +136,7 @@ _METHODS = frozenset(
 _REQUEST_LINE = re.compile(r"([A-Z][A-Z-]*) +(\S+)(?: +HTTP/(\d\.\d))?[ \t]*$")
 _STATUS_LINE = re.compile(r"HTTP/(\d\.\d) +(\d{3})(?: +(.*))?$")
 _HEAD_END = re.compile(rb"\r?\n\r?\n")
+_HOST_SPLIT = re.compile(rb"[\s,]+")
 _HEX = re.compile(rb"[0-9a-fA-F]+$")
 _DIGITS = re.compile(rb"[0-9]{1,18}$")
 _CONTROL = re.compile("[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]")
@@ -210,7 +214,7 @@ class _Message:
         self.target = ""
         self.status = None
         self.headers = []           # [(name, value)] in order, original case
-        self.host_raw = None        # the bytes of the first Host header
+        self.host_raws = []         # the bytes of every Host header, folds joined
         self.body = b""
         self.truncated = False
 
@@ -243,14 +247,21 @@ def _read_head(stream, pos, request):
             continue
         if line[:1] in (b" ", b"\t") and msg.headers:
             name, value = msg.headers[-1]
-            msg.headers[-1] = (name, value + " " + _decode(line).strip())
+            if name.lower() == "host":
+                msg.host_raws[-1] += b" " + line.strip()
+                msg.headers[-1] = (name, value + " " + _name_text(line.strip()))
+            else:
+                msg.headers[-1] = (name, value + " " + _decode(line).strip())
             continue
         name, sep, value = line.partition(b":")
         name = name.strip()
         if sep and name:
-            msg.headers.append((_decode(name), _decode(value).strip()))
-            if msg.host_raw is None and name.lower() == b"host":
-                msg.host_raw = value.strip()
+            if name.lower() == b"host":
+                # a name: its bytes are kept, for net_analyze to render (see _name_text)
+                msg.host_raws.append(value.strip())
+                msg.headers.append((_decode(name), _name_text(value.strip())))
+            else:
+                msg.headers.append((_decode(name), _decode(value).strip()))
     msg.end = body_start
     msg.truncated = not complete
     return msg
@@ -747,16 +758,20 @@ class _Origin:
         self.path, self.query, absolute = _split_target(target) if req else ("", "", False)
         # dest and url keep the bytes of the name (see _name_text); the request
         # line was read as Latin-1, which gives them back byte for byte
-        raw_host = req.host_raw if req is not None else None
-        authority = _name_text(raw_host).lower() if raw_host is not None else ""
+        tokens = [_name_text(t).lower() for raw in (req.host_raws if req else ())
+                  for t in _HOST_SPLIT.split(raw) if t]
+        authority = tokens[0] if tokens else ""
         target = _name_text(target.encode("latin-1"))
-        name = _host_of(authority) if authority else ""
-        if not name and absolute:
+        # Every name a request gives (a second Host header, a folded one): a
+        # sample can put a harmless name first and its own after it.
+        self.hosts = list(dict.fromkeys(h for h in (_host_of(t) for t in tokens) if h))
+        if not self.hosts and absolute:
             try:
                 name = (urlsplit(target).hostname or "").lower()
             except ValueError:
                 name = ""
-        self.dest = name or ctx.server
+            self.hosts = [name] if name else []
+        self.dest = self.hosts[0] if self.hosts else ctx.server
         if not req:
             self.url = ""
         elif absolute:
@@ -904,7 +919,7 @@ def _exchange_events(ctx, req, resp):
     data = decoded[0]
     resp_text, resp_capped, resp_failed, resp_decoded = _body_text(reply, response_encoding)
     http = NetEvent(
-        "http", ts, dest=origin.dest, port=origin.port,
+        "http", ts, dest=origin.dest, port=origin.port, hosts=origin.hosts,
         method=origin.method, url=origin.url, path=origin.path, query=origin.query,
         ua=origin.headers.get("user-agent", ""), headers=origin.headers,
         header_order=origin.order,

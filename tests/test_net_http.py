@@ -1309,6 +1309,22 @@ def test_the_host_keeps_its_bytes_for_the_caller_to_render(raw):
     assert _wire(e["url"]) == b"http://" + raw.lower() + b"/"
 
 
+@pytest.mark.parametrize("extra", [b"Host: Evil.top\r\n", b" evil.top\r\n",
+                                   b"Host: www.msftconnecttest.com, evil.top\r\n"])
+def test_every_host_name_of_a_request_is_listed(extra):
+    request = b"GET / HTTP/1.1\r\nHost: www.msftconnecttest.com\r\n" + extra + b"\r\n"
+    e = _events(request, b"")[0]
+    assert e["hosts"] == ["www.msftconnecttest.com", "evil.top"]
+    assert e["dest"] == "www.msftconnecttest.com"
+
+
+def test_one_host_or_an_absolute_target_is_one_name_and_none_is_none():
+    assert _events(_get(host=b"a.top:81"), b"")[0]["hosts"] == ["a.top"]
+    assert _events(b"GET http://b.top/x HTTP/1.1\r\n\r\n", b"")[0]["hosts"] == ["b.top"]
+    e = _events(b"GET /x HTTP/1.0\r\n\r\n", b"")[0]
+    assert e["hosts"] == [] and e["dest"] == SERVER
+
+
 def test_an_absolute_target_keeps_its_bytes_too():
     e = _events(b"GET http://a\xe9\x01.top/x HTTP/1.1\r\n\r\n", b"")[0]
     assert _wire(e["dest"]) == b"a\xe9\x01.top" and _wire(e["url"]) == b"http://a\xe9\x01.top/x"

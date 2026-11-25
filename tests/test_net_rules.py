@@ -1408,3 +1408,15 @@ def test_a_large_rule_set_over_many_events_stays_fast():
     elapsed = time.time() - start
     assert len(hits) == 300
     assert elapsed < 5.0, elapsed
+
+
+def test_a_request_that_names_two_hosts_is_never_known_good():
+    kg = net_rules.KnownGood(["www.msftconnecttest.com"])
+    one = {"type": "http", "dest": "www.msftconnecttest.com", "hosts": ["www.msftconnecttest.com"]}
+    two = dict(one, hosts=["www.msftconnecttest.com", "evil.top"])
+    assert kg.hides(one) is True and kg.hides(two) is False
+    rs = _rules("lists:\n  known_good: [www.msftconnecttest.com]\n"
+                "rules:\n  - {id: g, name: g, event: http, match: {method: GET}}\n")
+    events = [net_events.NetEvent("http", 1.0, method="GET", **{k: v for k, v in two.items()
+                                                               if k != "type"})]
+    assert _ids(rs.evaluate(events)) == ["g"]

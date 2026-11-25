@@ -77,7 +77,8 @@ not learn a second notation. Several things are easy to get wrong:
     something crossed the wire, which is not a claim about a name, and are never
     hidden (``ALWAYS_VISIBLE``). Every other event with a known-good destination
     is still hidden, and for those the name is as trustworthy as the sample's
-    own header or SNI; requiring a DNS answer for it in the capture would close
+    own header or SNI (a request that gives more than one Host name is never
+    hidden: the sample may have put a known one first); requiring a DNS answer for it in the capture would close
     that and belongs to a later phase.
   * Events carry a credential. A hit names its events (index, type, time,
     destination, port) and copies nothing else, so a hit on an ``ftp`` event
@@ -160,7 +161,7 @@ FIELDS = {
     "tls": COMMON | {"sni", "cert_subject", "cert_issuer", "cert_not_after", "self_signed",
                      "stream_capped", "version", "ciphers", "extensions", "alpn", "ja3",
                      "ja3_hash", "ja4", "hello_incomplete"},
-    "http": COMMON | {"method", "url", "path", "query", "ua", "header_order", "body_text",
+    "http": COMMON | {"hosts", "method", "url", "path", "query", "ua", "header_order", "body_text",
                       "body_bytes", "body_capped", "body_decode_failed", "request_encoding",
                       "form_names", "status", "resp_text", "resp_bytes", "resp_capped",
                       "resp_decode_failed", "content_type", "content_encoding",
@@ -1010,6 +1011,9 @@ class KnownGood:
         return bool(self.exact)
 
     def hides(self, event):
+        hosts = event.get("hosts")
+        if isinstance(hosts, (list, tuple)) and len(set(hosts)) > 1:
+            return False        # a request that names two hosts is never one of ours
         dest = event.get("dest")
         if not isinstance(dest, str) or not dest:
             return False
