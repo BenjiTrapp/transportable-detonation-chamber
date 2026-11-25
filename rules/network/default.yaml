@@ -43,8 +43,9 @@ lists:
     # Windows Update, Defender updates, Delivery Optimization, SmartScreen
     - '*.windowsupdate.com'
     - '*.update.microsoft.com'
-    - '*.delivery.mp.microsoft.com'
-    - '*.do.dsp.mp.microsoft.com'
+    - '*.mp.microsoft.com'                # Store, delivery.mp, dsp.mp (traffic shaping, Delivery Optimization)
+    - '*.storequality.microsoft.com'
+    - checkappexec.microsoft.com          # app reputation check before a program starts
     - go.microsoft.com
     - definitionupdates.microsoft.com
     - wdcp.microsoft.com
@@ -84,6 +85,12 @@ lists:
     - msedge.api.cdp.microsoft.com
     - config.edge.skype.com
     - ntp.msn.com
+    # content the shell fetches on its own timers (lock screen, widgets, weather, tiles)
+    - arc.msn.com
+    - assets.msn.com
+    - fd.api.iris.microsoft.com
+    - ris.api.iris.microsoft.com
+    - tile-service.weather.microsoft.com
     # lookups the resolver and the network stack make without being asked
     - wpad
     - isatap
@@ -204,19 +211,40 @@ rules:
     name: POST to a bot gate page
     description: >-
       A POST to a PHP page named like the receiving end of a panel: gate.php, bot.php,
-      tasks.php, cmd.php or command.php, in any directory. Bots and stealers report to such a
+      tasks.php, cmd.php, command.php or fre.php (LokiBot), in any directory. Bots and stealers report to such a
       page and fetch their orders from it. Ordinary web forms rarely use these names.
     event: http
     match:
       method: POST
-      path|re: '(?i)(^|/)(gate|bot|tasks?|cmd|command)\.php$'
+      path|re: '(?i)(^|/)(gate|bot|tasks?|cmd|command|fre)\.php$'
     severity: high
     role: c2
     behavior: >-
       The sample sent a POST request to a PHP gate page, the way bots and stealers report
       to their control panel.
     attack: [T1071.001, T1041]
-    family: Zeus, Pony and other panel-based bots
+    family: Zeus, Pony, LokiBot and other panel-based bots
+
+  - id: net.index_post_without_browser_headers
+    name: POST to index.php without browser headers
+    description: >-
+      Several stealers and loaders (AZORult, Amadey and others) report to a bare index.php,
+      which ordinary sites use too. What tells them apart is the request: a browser that
+      submits a form sends Origin or Referer, and these clients do not. A script or a
+      command-line tool that posts to an index.php fires this as well; a sample that adds a
+      Referer header does not.
+    event: http
+    match:
+      method: POST
+      path|re: '(?i)(^|/)index\.php$'
+      not:
+        header_order|in: [Origin, Referer]
+    severity: medium
+    role: c2
+    behavior: >-
+      The sample sent a POST request to index.php with none of the headers a browser adds
+      when it submits a form.
+    attack: [T1071.001, T1041]
 
   - id: net.periodic_checkin
     name: Regular contact with one host
@@ -231,9 +259,7 @@ rules:
       interval|gt: 0
     severity: medium
     role: c2
-    behavior: >-
-      The sample contacted the same host at regular intervals, like malware waiting for
-      orders.
+    behavior: The sample contacted the same host again and again at regular intervals.
     attack: T1071
     kind: c2_checkin
 
@@ -249,16 +275,19 @@ rules:
     severity: critical
     role: c2
     behavior: >-
-      The sample downloaded an executable and also contacts a host at regular intervals:
-      a loader that fetched its payload and reports in.
+      The same process transferred an executable file in HTTP traffic (received it, sent
+      it, or carried it encoded in a field) and also contacts a host at regular intervals.
     attack: [T1105, T1071]
 
   - id: net.nxdomain_burst
     name: Burst of names that do not exist
     description: >-
       Ten or more different names answered NXDOMAIN within one minute. A domain generation
-      algorithm tries names until one is registered. A few failed lookups (wpad, a typo)
-      stay below this.
+      algorithm tries names until one is registered. A few failed lookups (a typo) stay
+      below this, and names a machine asks for on its own (reverse lookups under
+      in-addr.arpa, wpad and isatap, single-label host names, .local and .lan) are not
+      counted into the burst: net_behavior leaves them out, because a rule compares the
+      elements of a list as "any of" and cannot say "most of these are infrastructure".
     event: fanout
     match:
       nxdomain: true
@@ -295,13 +324,19 @@ rules:
     description: >-
       A user name and password sent over an FTP control connection that was not upgraded to
       TLS. Stealers upload what they collect to an FTP server with an account built into the
-      sample. The password itself is never shown: the event keeps it as a Secret.
+      sample. An anonymous login (user anonymous or ftp) does not count: its "password" is an
+      e-mail address given as a courtesy. The password itself is never shown: the event keeps
+      it as a Secret.
     event: ftp
     match:
       password_captured: true
+      not:
+        user: [anonymous, ftp]
     severity: high
     role: exfil
-    behavior: The sample logged in to an FTP server with a password sent in clear text.
+    behavior: >-
+      The sample logged in to an FTP server with a named account and a password sent
+      in clear text.
     attack: T1048.003
     kind: credential_in_transit
 

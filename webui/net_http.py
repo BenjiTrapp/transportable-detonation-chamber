@@ -105,7 +105,7 @@ import zlib
 from urllib.parse import parse_qsl, urlsplit
 
 import net_flows
-from net_events import NetEvent
+from net_events import NetEvent, is_readable_text
 
 MAX_BODY_TEXT = 256 * 1024       # text kept per body or message; the size is still exact
 MAX_INFLATED = MAX_BODY_TEXT     # output of one inflate step kept for text; nothing past it is kept anyway
@@ -566,15 +566,20 @@ def _payload(wire, decoded, encoding):
 
 
 def _kind(body):
-    if body[:2] == b"MZ":
-        return "pe"
+    """The file type a body starts with, or "".
+
+    ``MZ`` and ``%PDF`` are printable ASCII, so a sentence can begin with them
+    ("MZ-Berlin weekly report"). They count as a file only when the bytes are
+    not readable text, the rule ``net_decode`` applies to the same two kinds.
+    """
     if body[:4] == b"\x7fELF":
         return "elf"
     if body[:4] in (b"PK\x03\x04", b"PK\x05\x06"):
         return "zip"
-    if body[:4] == b"%PDF":
-        return "pdf"
-    return ""
+    kind = "pe" if body[:2] == b"MZ" else "pdf" if body[:4] == b"%PDF" else ""
+    if kind and is_readable_text(body):
+        return ""
+    return kind
 
 
 def _form_names(content_type, body):

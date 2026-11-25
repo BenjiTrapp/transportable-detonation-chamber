@@ -28,7 +28,9 @@ Event timestamps are Unix seconds as float. Parser-specific data goes into
 extra keyword fields; the mandatory ones are always present.
 """
 
+import codecs
 import ipaddress
+import unicodedata
 
 EVENT_TYPES = (
     "dns", "conn", "conn_failed", "tls", "http", "udp", "raw", "ftp", "smtp",
@@ -118,3 +120,108 @@ def event_summary(events):
     for e in events:
         counts[e["type"]] = counts.get(e["type"], 0) + 1
     return counts
+
+
+# --- readable text -----------------------------------------------------------
+# Shared by ``net_decode`` (is a decoded value text or bytes?) and ``net_http``
+# (is a body that starts with a printable magic such as ``MZ`` a file or a
+# sentence?). ``net_decode`` reads the events ``net_http`` makes, so neither can
+# import the other's judgement without the layering running backwards; it lives
+# with the schema, like ``render_bytes``.
+
+MIN_TEXT = 5            # characters of decoded text
+TEXT_SHARE = 0.95       # printable share of a text; the slack is a stray control byte or a cut
+MIN_ALNUM_SHARE = 0.25  # a text of dashes, dots and spaces is filler, not content
+SHORT_TEXT = 16         # a text shorter than this may use only plain characters (see _plain)
+TEXT_SAMPLE = 64 * 1024     # characters judged; the rest of a long text is taken as it comes
+_BOM8 = b"\xef\xbb\xbf"
+_PLAIN_PUNCTUATION = " \t\r\n_-.:/\\@=&,;|"
+_ONE_SCRIPT = {"HIRAGANA": "CJK", "KATAKANA": "CJK", "BOPOMOFO": "CJK",
+               "HALFWIDTH": "CJK", "FULLWIDTH": "CJK"}
+
+
+def _scripts(sample):
+    """Scripts of the non-ASCII letters of a text, Japanese counted as one."""
+    found = set()
+    for c in sample:
+        if c > "\x7f" and c.isalpha():
+            word = unicodedata.name(c, "?").split()[0]
+            found.add(_ONE_SCRIPT.get(word, word))
+    return found
+
+
+def _plain(sample):
+    """Letters, digits, whitespace and the punctuation of paths, addresses and
+    key=value pairs (and any non-ASCII punctuation). Random printable bytes
+    use quotes, brackets and symbols about a quarter of the time; a short text
+    must not."""
+    return all(c.isalnum() or c in _PLAIN_PUNCTUATION
+               or (c > "\x7f" and unicodedata.category(c).startswith("P")) for c in sample)
+
+
+def _texty(text):
+    """Is this decoded text, as opposed to bytes that happen to decode?"""
+    text = text.rstrip("\x00")
+    if len(text) < MIN_TEXT:
+        return None
+    sample = text[:TEXT_SAMPLE]
+    printable = sum(1 for c in sample if (c.isprintable() and c != "\ufffd") or c in "\t\r\n")
+    if printable < TEXT_SHARE * len(sample):
+        return None
+    if sum(1 for c in sample if c.isalnum()) < MIN_ALNUM_SHARE * len(sample):
+        return None
+    if len(_scripts(sample)) > 1:
+        return None
+    if len(text) < SHORT_TEXT and not _plain(text):
+        return None
+    return text
+
+
+def _utf16_like(raw):
+    pairs = len(raw) // 2
+    if pairs < MIN_TEXT:
+        return False
+    highs = raw[1:2 * pairs:2].count(0)
+    lows = raw[0:2 * pairs:2].count(0)
+    return highs * 10 >= pairs * 9 and lows * 10 <= pairs
+
+
+def _decode_with(raw, charset, cut):
+    try:
+        return codecs.getincrementaldecoder(charset)().decode(raw, final=not cut)
+    except UnicodeDecodeError:
+        return None
+
+
+def read_text(raw, cut=False):
+    """``(text, charset)`` if ``raw`` is readable text, else None.
+
+    ``cut`` says the bytes are the start of something longer, so a character
+    split at the end is not an error.
+    """
+    if raw[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        charset = "utf-16-le" if raw[:2] == b"\xff\xfe" else "utf-16-be"
+        body = raw[2:]
+        text = _decode_with(body[:len(body) & ~1], charset, cut)
+        text = _texty(text) if text is not None else None
+        return (text, charset) if text is not None else None
+    if _utf16_like(raw):
+        text = _decode_with(raw[:len(raw) & ~1], "utf-16-le", cut)
+        text = _texty(text) if text is not None else None
+        return (text, "utf-16-le") if text is not None else None
+    body = (raw[3:] if raw.startswith(_BOM8) else raw).rstrip(b"\x00")
+    text = _decode_with(body, "utf-8", cut)
+    if text is not None:
+        text = _texty(text)
+        return (text, "utf-8") if text is not None else None
+    sample = body[:TEXT_SAMPLE]
+    plain = sum(1 for b in sample if 0x20 <= b < 0x7F or b in (9, 10, 13))
+    if plain < TEXT_SHARE * len(sample):
+        return None
+    text = _texty(body.decode("cp1252", "replace"))
+    return (text, "cp1252") if text is not None else None
+
+
+def is_readable_text(raw, cut=True):
+    """Is ``raw`` readable text (the start of a longer body when ``cut``)?"""
+    return read_text(raw[:TEXT_SAMPLE], cut) is not None

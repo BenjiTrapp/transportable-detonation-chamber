@@ -20,6 +20,8 @@ Regressions covered:
   * a path every browser requests ("/") on many hosts was reported as a sample
     working through a fallback list
   * NXDOMAIN answers spread over hours were counted as one burst
+  * twelve reverse lookups of a subnet (``*.in-addr.arpa``), or wpad and
+    isatap under every search suffix, were reported as a generated-name search
   * a NaN or missing timestamp raised, or poisoned the sort
   * the cost grew faster than the number of events
   * one C2 became two beacons when its check-ins were a connection to an
@@ -341,6 +343,30 @@ def test_nxdomain_burst_is_found_inside_a_longer_capture():
     f = [e for e in net_behavior.analyze(evs) if e["type"] == "fanout"]
     assert len(f) == 1
     assert f[0]["hosts"] == 12 and f[0]["ts"] == 100000.0 and f[0]["nxdomain"] is True
+
+
+@pytest.mark.parametrize("name", [
+    "%d.2.0.192.in-addr.arpa", "%d.0.0.0.0.0.0.0.0.0.0.0.0.0.0.0.ip6.arpa", "host%d", "wpad.corp%d.example.com",
+    "isatap.site%d.example.net", "printer%d.corp.local", "nas%d.lan", "pc%d.home.arpa",
+    "Host%d.Example.Local.",
+])
+def test_names_the_machine_asks_for_by_itself_are_not_an_nxdomain_burst(name):
+    evs = [ev("dns", float(i), dest=name % i, nxdomain=True) for i in range(14)]
+    assert of_type(net_behavior.analyze(evs), "fanout") == []
+
+
+def test_housekeeping_failures_are_still_failures_of_their_own_name():
+    evs = [ev("dns", float(i), dest="wpad", nxdomain=True) for i in range(6)]
+    assert [e["dest"] for e in of_type(net_behavior.analyze(evs), "retry")] == ["wpad"]
+
+
+def test_housekeeping_names_do_not_hide_or_count_into_a_real_burst():
+    evs = [ev("dns", float(i), dest="%d.2.0.192.in-addr.arpa" % i, nxdomain=True)
+           for i in range(30)]
+    evs += [ev("dns", 5.0 + i, dest="q%dz.top" % i, nxdomain=True) for i in range(11)]
+    f = of_type(net_behavior.analyze(evs), "fanout")
+    assert len(f) == 1 and f[0]["hosts"] == 11
+    assert all(d.endswith(".top") for d in f[0]["dests"])
 
 
 def test_answered_lookups_are_not_an_nxdomain_burst():

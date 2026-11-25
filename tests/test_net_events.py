@@ -224,3 +224,10 @@ def test_dns_labels_are_written_exactly_as_before_the_rule_moved_here():
     labels = [bytes(p) for n in (0, 1, 2) for p in itertools.product(range(256), repeat=n)]
     for raw in labels:
         assert net_events.render_bytes(raw, escape=b".") == _original_dns_label(raw)
+
+
+def test_readable_text_is_told_from_bytes():
+    assert net_events.is_readable_text(b"MZ-Berlin weekly report: the numbers are in the sheet")
+    assert net_events.is_readable_text("Grüße aus Köln, das Wetter ist schön".encode("utf-8"))
+    assert not net_events.is_readable_text(b"MZ\x90\x00\x03\x00\x00\x00" + bytes(range(256)))
+    assert not net_events.is_readable_text(b"")

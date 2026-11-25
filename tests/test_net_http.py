@@ -653,6 +653,29 @@ def test_an_ordinary_response_is_not_a_download():
         assert _events(_get(), _ok(body), kind="download") == [], body
 
 
+def test_a_sentence_that_begins_like_a_pe_or_a_pdf_is_not_a_download():
+    # "MZ" and "%PDF" are printable: text may start with them. net_decode already
+    # refuses them as files when the bytes read as text; the download event must too.
+    for body in (b"MZ-Berlin weekly report: the numbers for the week are in the sheet",
+                 b"MZ is how a DOS executable begins, and this page explains the header",
+                 b"%PDF is the first word of a PDF, and this is a note about the format"):
+        assert _events(_get(), _ok(body), kind="download") == [], body
+
+
+def test_a_pe_or_a_pdf_with_binary_content_is_still_a_download():
+    pe = b"MZ\x90\x00\x03\x00\x00\x00\x04" + bytes(range(256)) * 4
+    pdf = b"%PDF-1.7\n%\xe2\xe3\xcf\xd3\n1 0 obj\n" + bytes(range(256)) * 4
+    for body, kind in ((pe, "pe"), (pdf, "pdf")):
+        assert [x["kind"] for x in _events(_get(), _ok(body), kind="download")] == [kind]
+
+
+def test_an_upload_that_begins_like_a_sentence_has_no_file_kind():
+    body = b"MZ-Berlin weekly report: " + b"the numbers for the week are in the sheet. " * 20
+    up = _events(b"POST /u HTTP/1.1\r\nHost: x.top\r\nContent-Length: %d\r\n\r\n" % len(body) + body,
+                 _ok(b"ok"), kind="upload")
+    assert [u["kind"] for u in up] == [""]
+
+
 def test_a_download_event_names_its_origin_and_type():
     d = _events(_get(b"/s.dll"), _ok(b"MZ\x90\x00", b"Content-Type: application/octet-stream\r\n"),
                 kind="download")[0]
@@ -971,14 +994,16 @@ def test_a_gzipped_payload_above_the_text_ceiling_still_gets_its_file_hash():
 
 
 def test_the_retained_text_keeps_its_own_smaller_cap_beside_the_big_hash():
-    big = b"%PDF-1.4\n" + b"a" * (3 * _MIB)
+    # a zip: its magic is not printable text, so the readable body below does not
+    # turn it into a sentence (a body that begins "%PDF" and reads as text is not a PDF)
+    big = b"PK\x03\x04" + b"a" * (3 * _MIB)
     wire = gzip.compress(big)
     evs = net_http.events_from_flow(_http_flow(_get(), _encoded(wire, b"gzip")))
     http = [e for e in evs if e["type"] == "http"][0]
     d = [e for e in evs if e["type"] == "download"][0]
     assert len(http["resp_text"]) == net_http.MAX_BODY_TEXT and http["resp_capped"] is True
     assert http["resp_bytes"] == len(wire) and http["resp_decode_failed"] is False
-    assert d["kind"] == "pdf" and d["sha256"] == _sha(big) and d["size"] == len(big)
+    assert d["kind"] == "zip" and d["sha256"] == _sha(big) and d["size"] == len(big)
 
 
 def test_a_stacked_encoding_hashes_the_whole_file_too():

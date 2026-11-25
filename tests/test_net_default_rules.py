@@ -59,6 +59,8 @@ EVIDENCE_ARTS = {"c2_checkin", "exfil_upload", "credential_in_transit", "fallbac
                  "payload_staging"}
 
 _SYN, _ACK, _PSH = dpkt.tcp.TH_SYN, dpkt.tcp.TH_ACK, dpkt.tcp.TH_PUSH
+_FORM_HEADERS = (b"Origin: http://www.example.com\r\nReferer: http://www.example.com/\r\n"
+                 b"Accept-Language: en-US,en;q=0.9\r\n")
 _UA = b"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0 Safari/537.36"
 
 
@@ -153,10 +155,11 @@ class Capture:
         self.web(ts, host, request, _ok(body, ctype))
 
     def post(self, ts, host, path, body, ctype="application/x-www-form-urlencoded",
-             reply=b"ok", reply_type="text/plain"):
+             reply=b"ok", reply_type="text/plain", headers=b""):
         request = (b"POST " + path.encode() + b" HTTP/1.1\r\nHost: " + host.encode()
                    + b"\r\nUser-Agent: " + _UA + b"\r\nContent-Type: " + ctype.encode()
-                   + b"\r\nContent-Length: " + str(len(body)).encode() + b"\r\n\r\n" + body)
+                   + b"\r\nContent-Length: " + str(len(body)).encode() + b"\r\n" + headers
+                   + b"\r\n" + body)
         self.web(ts, host, request, _ok(reply, reply_type))
 
     def tls(self, ts, name, lookup=True):
@@ -311,6 +314,14 @@ def _benign_capture():
         cap.udp(61.0 + 1024.0 * i, cap.server("time.windows.com"), 123,
                 b"\x23" + bytes(47), b"\x24" + noise(47))
     # telemetry and Edge, over TLS, on timers
+    for name, first, every in (("tsfe.trafficshaping.dsp.mp.microsoft.com", 70.0, 600.0),
+                               ("checkappexec.microsoft.com", 33.0, 90.0),
+                               ("arc.msn.com", 51.0, 240.0),
+                               ("fd.api.iris.microsoft.com", 27.0, 360.0),
+                               ("displaycatalog.mp.microsoft.com", 80.0, 500.0),
+                               ("tile-service.weather.microsoft.com", 95.0, 700.0)):
+        for i in range(6):
+            cap.tls(first + every * i, name)
     for i in range(8):
         cap.tls(20.0 + 300.0 * i, "v10.events.data.microsoft.com")
         cap.tls(45.0 + 60.0 * i, "settings-win.data.microsoft.com")
@@ -320,12 +331,25 @@ def _benign_capture():
         cap.dns(15.0 + 9.0 * i, "wpad", rcode=3)
     cap.dns(16.0, "isatap", rcode=3)
     cap.dns(17.0, "10.2.0.192.in-addr.arpa", rcode=3, qtype="PTR")
+    # reverse lookups of a subnet, and wpad under every search suffix: a burst of failures
+    for i in range(14):
+        cap.dns(800.0 + 1.5 * i, "%d.2.0.192.in-addr.arpa" % (20 + i), rcode=3, qtype="PTR")
+    for i, suffix in enumerate(("corp.example.com", "example.com", "com", "branch.corp.example.com")):
+        cap.dns(830.0 + i, "wpad." + suffix, rcode=3)
+    for i in range(6):
+        cap.dns(840.0 + i, "fileserver%d.corp.local" % i, rcode=3)
     # a person browsing: pages, forms, files, secure sites, each in its own time
     visits = (3.0, 3.9, 17.0, 52.0, 53.0, 190.0)
     for at, path in zip(visits, ("/", "/style.css", "/logo.png", "/news", "/favicon.ico", "/")):
         cap.get(at + 1200.0, "www.example.com", path,
                 b"<html><body>hello</body></html>", "text/html")
-    cap.post(1330.0, "www.example.com", "/login", b"user=alice&pass=correct+horse")
+    cap.post(1330.0, "www.example.com", "/login", b"user=alice&pass=correct+horse",
+             headers=_FORM_HEADERS)
+    cap.post(1335.0, "www.example.com", "/index.php", b"s=weather&go=Search", headers=_FORM_HEADERS)
+    for i, (user, secret) in enumerate((("anonymous", "guest@example.com"), ("ftp", "me@example.org"))):
+        _session(cap, 1345.0 + 5 * i, "203.0.113.%d" % (30 + i), 21,
+                 ("USER %s\r\nPASS %s\r\nRETR README\r\n" % (user, secret)).encode(),
+                 b"220 ok\r\n331 ok\r\n230 ok\r\n150 ok\r\n")
     cap.get(1340.0, "intranet.example.com", "/reports", b"<html>reports</html>", "text/html",
             headers=b"Authorization: Basic " + base64.b64encode(b"alice:correct horse") + b"\r\n")
     cap.get(1500.0, "files.example.org", "/guide.pdf", b"%PDF-1.7\n" + noise(2000),
@@ -343,10 +367,17 @@ def _benign_capture():
 def test_the_benign_capture_holds_what_it_claims_to():
     events = _benign_capture()
     kinds = {e["type"] for e in events}
-    assert {"dns", "http", "tls", "raw", "beacon", "retry", "decoded", "download"} <= kinds
+    assert {"dns", "http", "tls", "raw", "beacon", "retry", "decoded", "download",
+            "ftp"} <= kinds
     beacons = {e["dest"] for e in events if e["type"] == "beacon"}
     assert {"www.msftconnecttest.com", "www.msftncsi.com", "ctldl.windowsupdate.com",
-            "v10.events.data.microsoft.com", "settings-win.data.microsoft.com"} <= beacons
+            "v10.events.data.microsoft.com", "settings-win.data.microsoft.com",
+            "tsfe.trafficshaping.dsp.mp.microsoft.com", "checkappexec.microsoft.com",
+            "arc.msn.com"} <= beacons
+    # the reverse lookups and search-suffix names failed, and none of it became a burst
+    assert sum(1 for e in events if e["type"] == "dns" and e["nxdomain"]) >= 25
+    assert not [e for e in events if e["type"] == "fanout"]
+    assert [e["password_captured"] for e in events if e["type"] == "ftp"] == [True, True]
     assert {e["kind"] for e in events if e["type"] == "download"} == {"pdf", "zip"}
 
 
@@ -403,6 +434,15 @@ def test_an_elf_over_http_fires_too():
     assert _fired(cap.read()) == ["net.exe_download"]
 
 
+def test_a_page_that_begins_with_mz_is_not_an_executable_download():
+    cap = Capture()
+    cap.get(5.0, "www.example.com", "/report",
+            b"MZ-Berlin weekly report: the numbers for the week are in the sheet.", "text/html")
+    events = cap.read()
+    assert not [e for e in events if e["type"] == "download"]
+    assert _fired(events) == []
+
+
 @pytest.mark.parametrize("body,ctype", [
     (b"%PDF-1.7\n" + bytes(300), "application/pdf"),
     (b"PK\x03\x04" + bytes(300), "application/zip"),
@@ -443,6 +483,18 @@ def test_an_executable_inside_base64_in_a_response_fires():
     assert hits[0]["kind"] == ""
 
 
+@pytest.mark.parametrize("magic,kind", [(b"\x7fELF\x02\x01\x01", "elf"),
+                                        (b"\xcf\xfa\xed\xfe\x07\x00\x00\x01", "macho"),
+                                        (b"\xfe\xed\xfa\xce\x00\x00\x00\x07", "macho")])
+def test_an_elf_or_macho_inside_base64_fires(magic, kind):
+    cap = Capture()
+    cap.get(5.0, "cdn.evil.top", "/data.php", base64.b64encode(magic + bytes(range(1, 120))),
+            "text/html")
+    events = cap.read()
+    assert [e["kind"] for e in events if e["type"] == "decoded"] == [kind]
+    assert _fired(events) == ["net.exe_in_encoded_field"]
+
+
 def test_base64_text_is_not_an_encoded_executable():
     cap = Capture()
     cap.get(5.0, "cdn.evil.top", "/data.php",
@@ -455,7 +507,7 @@ def test_base64_text_is_not_an_encoded_executable():
 # --- command and control --------------------------------------------------------------------------
 
 @pytest.mark.parametrize("path", ["/gate.php", "/panel/Gate.PHP", "/a/b/bot.php", "/tasks.php",
-                                  "/cmd.php", "/command.php"])
+                                  "/cmd.php", "/command.php", "/loki/fre.php"])
 def test_a_post_to_a_gate_page_fires(path):
     cap = Capture()
     cap.post(5.0, "c2.evil.top", path, b"id=1234&os=10&data=QWxhZGRpbjpvcGVu")
@@ -469,6 +521,7 @@ def test_a_post_to_a_gate_page_fires(path):
     ("GET", "/gate.php"),              # fetching the page is not reporting to it
     ("POST", "/gateway.php"), ("POST", "/gate.php.txt"), ("POST", "/navigate.php"),
     ("POST", "/submit.php"), ("POST", "/login.php"), ("POST", "/api/gate"),
+    ("POST", "/free.php"), ("POST", "/refresh.php"), ("POST", "/fre.html"),
 ])
 def test_other_requests_are_not_a_gate_post(method, path):
     cap = Capture()
@@ -477,6 +530,36 @@ def test_other_requests_are_not_a_gate_post(method, path):
     else:
         cap.post(5.0, "site.example.org", path, b"a=1&b=2")
     assert "net.gate_post" not in _fired(cap.read())
+
+
+def test_a_post_to_index_php_without_browser_headers_fires_the_index_rule_only():
+    cap = Capture()
+    cap.post(5.0, "c2.evil.top", "/index.php", b"\x8f\x02\x91\xaa\x10\x44", "application/octet-stream")
+    hits = _rules().evaluate(cap.read())
+    assert [h["rule_id"] for h in hits] == ["net.index_post_without_browser_headers"]
+    assert hits[0]["severity"] == "medium" and hits[0]["kind"] == ""
+
+
+def test_the_index_rule_also_reads_a_hidden_directory_gate():
+    cap = Capture()
+    cap.post(5.0, "c2.evil.top", "/a8fd3c1b/index.php", b"id=1")
+    assert _fired(cap.read()) == ["net.index_post_without_browser_headers"]
+
+
+@pytest.mark.parametrize("headers", [b"Origin: http://site.example.org\r\n",
+                                     b"Referer: http://site.example.org/\r\n", _FORM_HEADERS])
+def test_a_browser_form_post_to_index_php_does_not_fire(headers):
+    cap = Capture()
+    cap.post(5.0, "site.example.org", "/index.php", b"q=news", headers=headers)
+    assert _fired(cap.read()) == []
+
+
+def test_other_methods_and_pages_do_not_fire_the_index_rule():
+    cap = Capture()
+    cap.get(5.0, "site.example.org", "/index.php", b"<html></html>", "text/html")
+    cap.post(9.0, "site.example.org", "/reindex.php", b"a=1")
+    cap.post(12.0, "site.example.org", "/index.php.bak", b"a=1")
+    assert _fired(cap.read()) == []
 
 
 def _checkins(cap, host="c2.evil.top", start=100.0, every=60.0, n=6, jitter=(0, 1, -1, 2, -2, 0)):
@@ -566,6 +649,39 @@ def test_a_burst_of_names_that_do_not_exist_fires():
     assert hits[0]["kind"] == "dga_pattern"
 
 
+def test_a_burst_of_reverse_lookups_is_not_a_burst_of_generated_names():
+    cap = Capture()
+    for i in range(14):
+        cap.dns(100.0 + 1.7 * i, "%d.2.0.192.in-addr.arpa" % (30 + i), rcode=3, qtype="PTR")
+    events = cap.read()
+    assert sum(1 for e in events if e["type"] == "dns" and e["nxdomain"]) == 14
+    assert _fired(events) == []
+
+
+def test_resolver_housekeeping_names_do_not_make_a_burst_either():
+    cap = Capture()
+    names = (["wpad.%s" % d for d in ("corp.example.com", "example.com", "branch.example.com")]
+             + ["isatap.example.com", "fileserver", "printer", "nas.lan", "host1.corp.local",
+                "host2.corp.local", "host3.corp.local", "host4.corp.local",
+                "9.2.0.192.in-addr.arpa"])
+    for i, name in enumerate(names):
+        cap.dns(100.0 + i, name, rcode=3)
+    assert len(names) >= 12
+    assert _fired(cap.read()) == []
+
+
+def test_generated_names_still_fire_when_infrastructure_noise_surrounds_them():
+    cap = Capture()
+    for i in range(20):
+        cap.dns(98.0 + 0.5 * i, "%d.2.0.192.in-addr.arpa" % (40 + i), rcode=3, qtype="PTR")
+    for i in range(11):
+        cap.dns(100.0 + i, "k%dxv%dq.top" % (i * 31, i), rcode=3)
+    events = cap.read()
+    fan = [e for e in events if e["type"] == "fanout"]
+    assert len(fan) == 1 and fan[0]["hosts"] == 11
+    assert _fired(events) == ["net.nxdomain_burst"]
+
+
 def test_a_few_failed_lookups_are_not_a_burst():
     cap = Capture()
     for i in range(6):
@@ -625,6 +741,28 @@ def test_an_ftp_login_in_clear_text_fires_and_the_hit_carries_no_password():
     assert "Tr0ub4dor" not in json.dumps(hits)
 
 
+@pytest.mark.parametrize("user,secret", [("anonymous", "guest@example.com"),
+                                         ("Anonymous", "-wget@"), ("ftp", "me@example.org")])
+def test_an_anonymous_ftp_login_is_not_a_credential(user, secret):
+    cap = Capture()
+    _session(cap, 5.0, "203.0.113.20", 21,
+             ("USER %s\r\nPASS %s\r\nRETR README\r\n" % (user, secret)).encode(),
+             b"220 ok\r\n331 ok\r\n230 ok\r\n150 ok\r\n")
+    events = cap.read()
+    assert [e["password_captured"] for e in events if e["type"] == "ftp"] == [True]
+    assert _fired(events) == []
+
+
+def test_a_named_account_next_to_an_anonymous_one_still_fires():
+    cap = Capture()
+    _session(cap, 5.0, "203.0.113.20", 21, b"USER anonymous\r\nPASS a@b.org\r\n",
+             b"220 ok\r\n331 ok\r\n230 ok\r\n")
+    _session(cap, 9.0, "203.0.113.21", 21, b"USER anonymous2\r\nPASS secretpw\r\n",
+             b"220 ok\r\n331 ok\r\n230 ok\r\n")
+    hits = _rules().evaluate(cap.read())
+    assert [(h["rule_id"], h["count"]) for h in hits] == [("net.ftp_cleartext_credentials", 1)]
+
+
 def test_an_ftp_session_without_a_password_does_not_fire():
     cap = Capture()
     _session(cap, 5.0, "203.0.113.20", 21, b"USER anonymous\r\nRETR readme.txt\r\n",
@@ -659,6 +797,7 @@ def test_every_rule_fires_on_events_that_came_through_the_real_parsers():
     cap.get(20.0, "cdn.evil.top", "/img/logo.png", _pe(), "image/png")
     cap.get(30.0, "cdn.evil.top", "/data.php", base64.b64encode(_pe(300)), "text/html")
     cap.post(40.0, "c2.evil.top", "/gate.php", b"id=1")
+    cap.post(45.0, "panel.evil.top", "/index.php", b"id=2")
     cap.get(50.0, "api.ipify.org", "/", b"203.0.113.77")
     _session(cap, 60.0, "203.0.113.20", 21, b"USER s\r\nPASS pw\r\n", b"220 ok\r\n331 ok\r\n230 ok\r\n")
     _session(cap, 70.0, "203.0.113.25", 587,

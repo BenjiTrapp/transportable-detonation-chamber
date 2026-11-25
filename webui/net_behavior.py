@@ -86,6 +86,15 @@ Several assumptions would make the result wrong:
   * All traffic that has a path is a signal. ``/`` on many hosts is browsing,
     and NXDOMAIN answers hours apart are typing mistakes, so neither counts as
     fanout; a failure burst has to fall within ``NXDOMAIN_WINDOW_S``.
+  * Every failing name is a name the sample tried. A resolver and a network
+    stack fail on names nobody chose: reverse lookups of a subnet
+    (``*.in-addr.arpa``), ``wpad`` and ``isatap`` with every search suffix,
+    single-label host names, ``.local`` and the like. Twelve PTR lookups in
+    24 seconds is a machine looking up its neighbours, not a generated-name
+    search, so those names are not counted into the NXDOMAIN burst (they still
+    count as failures of their own name for ``retry``). A rule cannot do this
+    afterwards: it compares the elements of a list as "any of", so "most of
+    these names are infrastructure" has no spelling.
   * Every destination is a name. A check-in is often a connection to an address
     plus an HTTP request to the name, and the same C2 would be counted as two
     beacons; a fingerprint built on endpoints and intervals would then depend
@@ -163,6 +172,10 @@ FANOUT_IGNORED_PATHS = frozenset(("", "/"))
 
 NXDOMAIN_MIN_NAMES = 10
 NXDOMAIN_WINDOW_S = 60.0
+# Names that fail without the sample having chosen them (see the module docstring).
+HOUSEKEEPING_SUFFIXES = (".in-addr.arpa", ".ip6.arpa", ".local", ".localdomain", ".lan",
+                         ".home.arpa", ".internal", ".intranet", ".corp", ".home")
+HOUSEKEEPING_PREFIXES = ("wpad.", "isatap.")
 
 # Hosts named in a fanout event; the count in ``hosts`` is complete.
 MAX_LISTED_DESTS = 20
@@ -445,6 +458,13 @@ def _path_fanout(path, hosts, first_ts):
         dests=list(hosts)[:MAX_LISTED_DESTS])
 
 
+def _housekeeping(name):
+    """Is this a name a resolver or network stack asks for on its own?"""
+    name = name.lower().rstrip(".")
+    return ("." not in name or name.startswith(HOUSEKEEPING_PREFIXES)
+            or name.endswith(HOUSEKEEPING_SUFFIXES))
+
+
 def _nxdomain_fanout(failures):
     """The densest window of NXDOMAIN answers, as one event if it is a burst.
 
@@ -512,7 +532,7 @@ def analyze(events):
             beacons.setdefault((e.get("pid"), dest), _Group()).add(e, ts, address)
         if failed:
             retries.setdefault(dest, _Group()).add(e, ts, address)
-        if etype == "dns" and e.get("nxdomain"):
+        if etype == "dns" and e.get("nxdomain") and not _housekeeping(dest):
             nx_failures.append((ts, dest))
         path = e.get("path")
         if etype == "http" and isinstance(path, str) and path not in FANOUT_IGNORED_PATHS:
