@@ -51,6 +51,11 @@ Regressions covered:
     this URL) was lost; it is reported with its kind and no hash
   * an encoding the module cannot undo (br, zstd) was treated as if it had
     been undone, or the body was dropped, instead of being left as it was
+  * many small decompression bombs in one capture each inflated into the
+    hash up to ``MAX_HASHED``, so the parser hashed about a thousand times
+    the bytes the capture retained; a ``HashBudget`` passed in by the caller
+    bounds the total over every flow it is given to, and a download past it
+    says so (``hash_budget_spent``) instead of carrying a hash
 """
 
 import gzip
@@ -1198,3 +1203,89 @@ def test_a_websocket_message_cut_by_the_text_cap_is_not_garbled():
     ws = _ws_events(b"", _ws_frame(text))[0]
     m = ws["messages"][0]
     assert m["size"] == len(text) and m["text"] == "a" + "\u00e9" * ((net_http.MAX_BODY_TEXT - 1) // 2)
+
+
+# --- a hashing budget shared by the flows of a capture ---------------------------------
+
+class _CountingSha:
+    """hashlib.sha256 that counts the bytes streamed into it with update(), and
+    all bytes it was given (``total``)."""
+
+    streamed = 0
+    total = 0
+
+    def __init__(self, data=b""):
+        _CountingSha.total += len(data)
+        self._h = hashlib.sha256(data)
+
+    def update(self, chunk):
+        _CountingSha.streamed += len(chunk)
+        _CountingSha.total += len(chunk)
+        self._h.update(chunk)
+
+    def hexdigest(self):
+        return self._h.hexdigest()
+
+
+class _Hashlib:
+    sha256 = _CountingSha
+
+
+def _bomb_downloads(monkeypatch, n, size=_MIB, **kw):
+    """``n`` downloads of one gzipped PE; above the text ceiling it is streamed
+    into the hash, below it hashed from memory."""
+    monkeypatch.setattr(net_http, "hashlib", _Hashlib)
+    _CountingSha.streamed = _CountingSha.total = 0
+    payload = b"MZ" + b"\x00" * size
+    flow = _http_flow(_get(), _encoded(gzip.compress(payload, 9), b"gzip"))
+    downloads = []
+    for _ in range(n):
+        downloads += [e for e in net_http.events_from_flow(flow, **kw) if e["type"] == "download"]
+    return payload, downloads
+
+
+def test_without_a_budget_every_download_is_hashed_as_before(monkeypatch):
+    payload, downloads = _bomb_downloads(monkeypatch, 6)
+    assert [d["sha256"] for d in downloads] == [_sha(payload)] * 6
+    assert all("hash_budget_spent" not in d for d in downloads)
+    assert _CountingSha.streamed == 6 * len(payload)
+
+
+def test_a_hashing_budget_bounds_the_total_over_many_flows(monkeypatch):
+    budget = net_http.HashBudget(3 * _MIB)
+    payload, downloads = _bomb_downloads(monkeypatch, 20, hash_budget=budget)
+    assert _CountingSha.streamed <= 3 * _MIB and budget.spent == _CountingSha.streamed
+    hashed = [d for d in downloads if d["sha256"] is not None]
+    assert [d["sha256"] for d in hashed] == [_sha(payload)] * 2
+    rest = downloads[len(hashed):]
+    assert len(rest) == 18 and all(d["hash_budget_spent"] is True and d["kind"] == "pe"
+                                   and d["size"] is None and d["inflate_capped"] is True
+                                   for d in rest)
+    assert all(d["wire_sha256"] for d in rest)
+
+
+def test_a_spent_budget_costs_no_more_inflating(monkeypatch):
+    budget = net_http.HashBudget(0)
+    calls = []
+    real = net_http._chunks
+
+    def counted(data, wbits, run):
+        for chunk in real(data, wbits, run):
+            calls.append(len(chunk))
+            yield chunk
+
+    monkeypatch.setattr(net_http, "_chunks", counted)
+    _payload, downloads = _bomb_downloads(monkeypatch, 5, hash_budget=budget)
+    assert all(d["hash_budget_spent"] for d in downloads)
+    # the text inflate stops at its ceiling; the hash adds nothing once the budget is gone
+    assert sum(calls) <= 5 * (net_http.MAX_INFLATED + net_http._CHUNK)
+
+
+def test_the_budget_covers_small_bombs_hashed_from_memory_too(monkeypatch):
+    budget = net_http.HashBudget(_MIB)
+    payload, downloads = _bomb_downloads(monkeypatch, 20, size=200 * 1024, hash_budget=budget)
+    assert len(payload) < net_http.MAX_INFLATED
+    wire = len(gzip.compress(payload, 9))
+    assert budget.spent <= _MIB and _CountingSha.total <= _MIB + 20 * wire
+    assert sum(1 for d in downloads if d["sha256"]) == _MIB // len(payload) == 5
+    assert all(d["hash_budget_spent"] and d["kind"] == "pe" for d in downloads[5:])

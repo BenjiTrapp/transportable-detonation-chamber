@@ -125,6 +125,13 @@ class Flow:
     is: a TCP capture that starts after the SYN (the first sender is taken as
     the client) and every UDP flow (there is no handshake). A parser that
     depends on the direction should treat such a flow with care.
+
+    ``client_packets`` / ``server_packets`` count every packet each side sent,
+    payload or not, retransmissions included. ``server_reset`` is True when the
+    server sent a RST, and ``answered`` when it sent anything else: a SYN that
+    nobody answered and one that was refused both leave ``answered`` False,
+    which is how a failed connection attempt is told from a connection that
+    simply carried no data.
     """
 
     def __init__(self, proto, client, server, ts, client_guessed):
@@ -140,6 +147,10 @@ class Flow:
         self.server_gaps = []
         self.packets = []
         self.capped = False
+        self.client_packets = 0
+        self.server_packets = 0
+        self.server_reset = False
+        self.answered = False
         self._half = {"c": _Half(), "s": _Half()}
         self._streams = {"c": b"", "s": b""}
 
@@ -161,6 +172,16 @@ class Flow:
             self.first_ts = ts
         if ts > self.last_ts:
             self.last_ts = ts
+
+    def _seen(self, direction, reset=False):
+        if direction == "c":
+            self.client_packets += 1
+        else:
+            self.server_packets += 1
+            if reset:
+                self.server_reset = True
+            else:
+                self.answered = True
 
     def _count(self, direction, n):
         if direction == "c":
@@ -325,10 +346,11 @@ class _Reader:
         if flow is None:
             return
         flow._touch(ts)
+        d = flow._direction(src, dgram.sport)
+        flow._seen(d)
         payload = bytes(dgram.data)
         if not payload:
             return
-        d = flow._direction(src, dgram.sport)
         half = flow._half[d]
         flow._count(d, len(payload))
         if self._admit(flow, half, len(payload), len(half.chunks)):
@@ -353,6 +375,7 @@ class _Reader:
                 return
         flow._touch(ts)
         d = flow._direction(src, seg.sport)
+        flow._seen(d, reset=bool(seg.flags & dpkt.tcp.TH_RST))
         half = flow._half[d]
         seq = seg.seq & _MASK32
         if syn and half.isn is None:

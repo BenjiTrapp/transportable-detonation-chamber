@@ -147,9 +147,16 @@ _SESSION = ("user", "password_captured", "auth_attempts", "auth_ok", "starttls",
 
 FIELDS = {
     "dns": COMMON | {"server", "query", "query_type", "answers", "rcode", "nxdomain"},
-    "conn": COMMON,
-    "conn_failed": COMMON,
-    "udp": COMMON,
+    # made from the flows by net_analyze, one per TCP flow (conn or conn_failed)
+    # and one per UDP flow no parser claims
+    "conn": COMMON | {"src", "sport", "proto", "app", "first_ts", "last_ts", "duration",
+                      "client_bytes", "server_bytes", "client_packets", "server_packets",
+                      "client_guessed", "stream_capped"},
+    "conn_failed": COMMON | {"src", "sport", "proto", "attempts", "refused", "first_ts",
+                             "last_ts"},
+    "udp": COMMON | {"src", "sport", "first_ts", "last_ts", "duration", "client_bytes",
+                     "server_bytes", "client_packets", "server_packets", "answered",
+                     "stream_capped"},
     "tls": COMMON | {"sni", "cert_subject", "cert_issuer", "cert_not_after", "self_signed",
                      "stream_capped", "version", "ciphers", "extensions", "alpn", "ja3",
                      "ja3_hash", "ja4", "hello_incomplete"},
@@ -167,7 +174,7 @@ FIELDS = {
     "websocket": COMMON | {"url", "path", "messages_capped", "truncated", "stream_capped"},
     "download": COMMON | {"url", "path", "kind", "content_type", "content_encoding", "truncated",
                           "sha256", "size", "inflate_capped", "inflate_failed", "wire_sha256",
-                          "wire_size", "addresses"},
+                          "wire_size", "hash_budget_spent", "addresses"},
     "upload": COMMON | {"method", "url", "path", "size", "sha256", "kind", "content_type",
                         "content_encoding", "truncated", "addresses"},
     "decoded": COMMON | {"source", "field", "name", "scheme", "layers", "kind", "charset",

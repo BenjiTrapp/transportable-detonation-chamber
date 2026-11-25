@@ -7,7 +7,8 @@ Regressions covered:
     with its reason and the other rules run
   * a rule written against a field no event has (a typo, or ``password``)
     loaded cleanly and never fired; the documented fields are checked against
-    what the real parsers emit
+    what the real parsers emit (and against the ``conn``, ``conn_failed`` and
+    ``udp`` events the orchestration makes from the flows)
   * a rule that could read the captured FTP/SMTP password, and a hit that
     carried a ``Secret`` into a report and made ``json.dumps`` raise
   * ``(a+)+$`` and its relatives: nested repetition, overlapping alternation
@@ -228,7 +229,7 @@ MAX_BOMB = 6
 
 
 # set by a parser in some cases only; a single sample cannot show them
-SOMETIMES = {"download": {"wire_sha256", "wire_size"}}
+SOMETIMES = {"download": {"wire_sha256", "wire_size", "hash_budget_spent"}}
 
 
 def _fields_of(events):
@@ -278,9 +279,23 @@ def test_the_documented_fields_are_what_the_parsers_emit():
         + [net_events.NetEvent("http", float(t), dest="h%d.top" % t, path="/p") for t in range(6)]
         + [net_events.NetEvent("dns", float(t), dest="n%d.top" % t, nxdomain=True)
            for t in range(12)])
+    # conn, conn_failed and udp come from the flows, made by the orchestration
+    import net_analyze
+    import test_net_flows
+    with tempfile.TemporaryDirectory() as tmp:
+        c = (test_net_flows.CLIENT, test_net_flows.CPORT, test_net_flows.SERVER, 443)
+        packets = (test_net_flows._tcp_exchange(b"a", b"b")
+                   + [test_net_flows._tcp(9.0, *c, 1000, test_net_flows.SYN)]
+                   + test_net_flows._udp_packet(4444, b"x", ts=11.0))
+        path = os.path.join(tmp, "flows.pcap")
+        with open(path, "wb") as fh:
+            writer = test_net_flows.dpkt.pcap.Writer(fh)
+            for ts, buf in packets:
+                writer.writepkt(buf, ts)
+        events += net_analyze.collect_events(path)[0]
     emitted = _fields_of(events)
     assert {"dns", "http", "upload", "download", "websocket", "tls", "raw", "ftp", "smtp",
-            "decoded", "beacon", "retry", "fanout"} <= set(emitted)
+            "decoded", "beacon", "retry", "fanout", "conn", "conn_failed", "udp"} <= set(emitted)
     for etype, keys in emitted.items():
         unlisted = keys - net_rules.FIELDS[etype] - net_rules.UNMATCHABLE
         assert not unlisted, "%s events carry fields the rules cannot name: %s" % (etype, sorted(unlisted))

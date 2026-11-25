@@ -258,6 +258,13 @@ def test_the_server_name_is_read_from_the_client_hello():
     assert e["dest_is_ip"] is False and e["in_tree"] is False
 
 
+def test_a_server_name_keeps_its_bytes_for_the_caller_to_render():
+    raw = b"Caf\xe9\x00\n.top"
+    entry = b"\x00" + _u(len(raw), 2) + raw
+    hello = net_tls.parse_client_hello(_records(_hello(exts=[_ext(0, _u(len(entry), 2) + entry)])))
+    assert hello.sni.encode("ascii", "surrogateescape") == raw.lower()
+
+
 def test_ja3_is_stable_for_the_same_hello():
     f = _tls_flow(sni="a.top")
     assert net_tls.events_from_flow(f)[0]["ja3_hash"] == net_tls.events_from_flow(f)[0]["ja3_hash"]
@@ -389,7 +396,8 @@ def test_an_empty_server_name_extension_falls_back_to_the_address():
 
 def test_a_name_with_odd_bytes_is_kept_readable_and_bounded():
     odd = _one(_tls_flow(hello=_hello(exts=[_ext(0, _u(6 + 3, 2) + b"\x00" + _u(6, 2) + b"a\xffb\x00c\n")])))
-    assert odd["sni"] == "a\\xffb\x00c\n" and isinstance(odd["dest"], str)
+    # raw here; net_analyze renders it (a\\255b\\000c\\010) as it renders DNS names
+    assert odd["sni"] == "a\udcffb\x00c\n" and isinstance(odd["dest"], str)
     long_name = _one(_tls_flow(sni="a" * 5000))
     assert len(long_name["sni"]) == net_tls.MAX_NAME
 

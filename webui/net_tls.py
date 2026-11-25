@@ -41,6 +41,11 @@ module refuses to make:
     address, as for HTTP without a Host. JA4 says it too (``i`` instead of
     ``d``). When there is one, ``dest`` is that name, not the address, like
     the queried name rather than the resolver in the DNS events.
+  * A server name is text. It is whatever bytes the client sent, NUL and
+    newline included. They are kept recoverable (ASCII, every other byte as a
+    ``surrogateescape`` code point) and not rendered here: ``net_analyze``
+    renders every name field of every event once, with
+    ``net_events.render_bytes``, the way DNS names are rendered.
   * The certificate is in the stream. For TLS 1.2 and older the server sends
     it in clear and the leaf is read with ``cryptography.x509``; with TLS 1.3
     it is encrypted, and a chain in a capture is often incomplete or damaged.
@@ -199,7 +204,9 @@ def _name(data):
         size = int.from_bytes(body[pos + 1:pos + 3], "big")
         value = body[pos + 3:pos + 3 + size]
         if kind == 0:
-            return value[:MAX_NAME].decode("ascii", "backslashreplace").lower()
+            # Bytes that are not ASCII stay recoverable (surrogateescape), so that
+            # net_analyze can render the name exactly as a DNS label is rendered.
+            return value[:MAX_NAME].decode("ascii", "surrogateescape").lower()
         pos += 3 + size
     return None
 

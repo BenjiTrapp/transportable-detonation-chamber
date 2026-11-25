@@ -33,6 +33,10 @@ Regressions covered:
     first time, and segments that arrived out of order or lie beyond a hole
     were placed at the wrong offset or not at all; ``stream_time_index`` and
     ``time_at_offset`` give each stream offset the time of its own segment
+  * a SYN nobody answered and one the server refused looked the same as a
+    connection that carried no data, so failed attempts (a dead C2) could not
+    be told from established connections; ``answered``, ``server_reset`` and
+    the packet counts say which
 """
 
 import socket
@@ -652,6 +656,37 @@ def test_a_syn_ack_first_capture_is_not_a_guess(tmp_path):
 def test_a_udp_flow_always_has_a_guessed_client(tmp_path):
     f = net_flows.read_pcap(_pcap(tmp_path, _udp_packet(53, b"x"))).flows[0]
     assert f.client_guessed is True
+
+
+# --- did the server answer --------------------------------------------------
+
+def test_a_completed_handshake_is_answered(tmp_path):
+    f = net_flows.read_pcap(_pcap(tmp_path, _tcp_exchange(b"a", b"b"))).flows[0]
+    assert f.answered is True and f.server_reset is False
+    assert (f.client_packets, f.server_packets) == (4, 3)
+
+
+def test_a_syn_nobody_answers_is_not_answered_and_its_retries_are_counted(tmp_path):
+    c = (CLIENT, CPORT, SERVER, SPORT)
+    pk = [_tcp(1.0, *c, 1000, SYN), _tcp(2.0, *c, 1000, SYN), _tcp(4.0, *c, 1000, SYN)]
+    f = net_flows.read_pcap(_pcap(tmp_path, pk)).flows[0]
+    assert f.answered is False and f.server_reset is False
+    assert (f.client_packets, f.server_packets) == (3, 0)
+
+
+def test_a_reset_is_a_refusal_not_an_answer(tmp_path):
+    c, s = (CLIENT, CPORT, SERVER, SPORT), (SERVER, SPORT, CLIENT, CPORT)
+    pk = [_tcp(1.0, *c, 1000, SYN), _tcp(1.1, *s, 0, RST | ACK, ack=1001)]
+    f = net_flows.read_pcap(_pcap(tmp_path, pk)).flows[0]
+    assert f.answered is False and f.server_reset is True and f.server_packets == 1
+
+
+def test_a_udp_flow_is_answered_when_the_server_sent_a_datagram(tmp_path):
+    asked = net_flows.read_pcap(_pcap(tmp_path, _udp_packet(9999, b"x"))).flows[0]
+    pk = _udp_packet(9999, b"x") + _udp_packet(40000, b"y", ts=1.1, src=SERVER, sport=9999,
+                                               dst=CLIENT)
+    both = net_flows.read_pcap(_pcap(tmp_path, pk, name="u2.pcap")).flows[0]
+    assert asked.answered is False and both.answered is True
 
 
 # --- time of a byte in a stream ---------------------------------------------

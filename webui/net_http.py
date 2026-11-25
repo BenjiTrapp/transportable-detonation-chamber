@@ -73,7 +73,14 @@ intervals (``ts`` of each request), rules (``method``, ``path``, ``body_text``,
     the payload. The text ceiling is far too small for a real file, so a
     download that outgrows it is inflated again into the hash alone: each
     piece is hashed and discarded, which costs time and no memory, and
-    ``MAX_HASHED`` bounds the time. A payload that could not be inflated
+    ``MAX_HASHED`` bounds the time of one download. One download is not the
+    bound that matters: a capture of many small bombs would be hashed about a
+    thousand times the bytes it retained, so a caller that reads a whole
+    capture passes one ``HashBudget`` to every flow; it is charged for every
+    inflated byte hashed (streamed or held, the wire bytes are bounded by the
+    capture's retention already), and a download that would outgrow what is
+    left of it is reported like one above ``MAX_HASHED``, with
+    ``hash_budget_spent`` True as the reason. A payload that could not be inflated
     whole has no hash (``sha256`` and ``size`` None), because the hash of
     part of a file identifies nothing: ``inflate_capped`` says it outgrew
     ``MAX_HASHED``, ``inflate_failed`` that the stream broke or ended early.
@@ -433,14 +440,32 @@ def _inflate(data, limit):
     return b"", False, True
 
 
-def _digest(data, ceiling):
+class HashBudget:
+    """Inflated bytes the file hash may still take, shared by every flow it is
+    passed to (see the module docstring). ``spent`` never exceeds ``limit``: a
+    piece that would go past it is not hashed, and once it is gone a download
+    is not inflated for its hash at all."""
+
+    def __init__(self, limit):
+        self.limit = limit
+        self.spent = 0
+
+    @property
+    def left(self):
+        return max(0, self.limit - self.spent)
+
+
+def _digest(data, ceiling, budget=None):
     """``(sha256, size, status)`` of the last layer of ``data``, kept by nothing.
 
     The output is hashed piece by piece and discarded, so the only bound that
     matters is time, and ``ceiling`` bounds that. ``status`` is "ok",
     "capped" (the payload is larger than ``ceiling``; a hash of part of a file
-    identifies nothing, so there is none) or "failed".
+    identifies nothing, so there is none), "budget" (``budget`` ran out first)
+    or "failed".
     """
+    if budget is not None and budget.left <= 0:
+        return None, None, "budget"
     for wbits in _FRAMINGS:
         run = _Run()
         digest = hashlib.sha256()
@@ -449,6 +474,10 @@ def _digest(data, ceiling):
             size += len(chunk)
             if size > ceiling:
                 return None, None, "capped"
+            if budget is not None:
+                if len(chunk) > budget.left:
+                    return None, None, "budget"
+                budget.spent += len(chunk)
             digest.update(chunk)
         if run.failed and not size and wbits > 0:
             continue
@@ -500,7 +529,7 @@ def _body_text(body, encoding):
     return text, capped or inflate_capped, failed, decoded
 
 
-def _file_digest(wire, encoding):
+def _file_digest(wire, encoding, budget=None):
     """``(sha256, size, status)`` of the whole payload behind ``wire``.
 
     A stack of encodings is undone layer by layer; all but the last layer are
@@ -513,10 +542,10 @@ def _file_digest(wire, encoding):
         data, capped, failed = _inflate(data, MAX_INFLATED)
         if capped or failed:
             return None, None, "capped" if capped else "failed"
-    return _digest(data, MAX_HASHED)
+    return _digest(data, MAX_HASHED, budget)
 
 
-def _payload(wire, decoded, encoding):
+def _payload(wire, decoded, encoding, budget=None):
     """``(kind, fields)`` of a downloaded body, as the receiving application sees it.
 
     When an encoding was undone completely the file is the inflated bytes: the
@@ -552,10 +581,19 @@ def _payload(wire, decoded, encoding):
     if not kind:
         return "", {}
     if capped:
-        sha, size, status = _file_digest(wire, encoding)
+        sha, size, status = _file_digest(wire, encoding, budget)
         if status != "ok":
-            return kind, unhashed("capped" if status == "capped" else "failed")
+            fields = unhashed("failed" if status == "failed" else "capped")
+            if status == "budget":
+                fields["hash_budget_spent"] = True
+            return kind, fields
     else:
+        if budget is not None:
+            if len(data) > budget.left:
+                fields = unhashed("capped")
+                fields["hash_budget_spent"] = True
+                return kind, fields
+            budget.spent += len(data)
         sha, size = hashlib.sha256(data).hexdigest(), len(data)
     fields = {"sha256": sha, "size": size, "inflate_capped": False, "inflate_failed": False}
     if sha != wire_sha:
@@ -663,7 +701,8 @@ def _split_target(target):
 class _Context:
     """What is known about the flow as a whole, in client/server terms."""
 
-    def __init__(self, flow, swapped):
+    def __init__(self, flow, swapped, hash_budget=None):
+        self.hash_budget = hash_budget
         if swapped:
             self.server, self.port = flow.src, flow.sport
             self.client_dir, self.server_dir = "s", "c"
@@ -872,7 +911,7 @@ def _exchange_events(ctx, req, resp):
             content_encoding=request_encoding, truncated=req.truncated,
             addresses=_connected(ctx)))
     if reply:
-        kind, identity = _payload(reply, resp_decoded, response_encoding)
+        kind, identity = _payload(reply, resp_decoded, response_encoding, ctx.hash_budget)
         if kind:
             events.append(NetEvent(
                 "download", resp_ts, dest=origin.dest, port=origin.port, url=origin.url,
@@ -900,16 +939,19 @@ def _reversed(client, server):
     return not _is_request(client) and (_is_response(client) or _is_request(server))
 
 
-def events_from_flow(flow):
+def events_from_flow(flow, hash_budget=None):
     """``http`` events of a TCP flow, with ``download``, ``upload`` and
     ``websocket`` events beside the exchange they belong to. A flow that does
-    not carry HTTP gives an empty list."""
+    not carry HTTP gives an empty list.
+
+    ``hash_budget`` is a ``HashBudget`` shared by the flows of one capture;
+    without one each download is bounded by ``MAX_HASHED`` alone."""
     if flow.proto != "tcp":
         return []
     client, server = flow.client_stream(), flow.server_stream()
     if not looks_like_http(client) and not looks_like_http(server):
         return []
-    ctx = _Context(flow, bool(flow.client_guessed) and _reversed(client, server))
+    ctx = _Context(flow, bool(flow.client_guessed) and _reversed(client, server), hash_budget)
     requests = _read_messages(ctx.client_stream, True, ctx.client_cut)
     responses = _read_messages(ctx.server_stream, False, ctx.server_cut,
                                [r.method for r in requests])
