@@ -25,6 +25,16 @@ Regressions covered:
   * one C2 became two beacons when its check-ins were a connection to an
     address plus an HTTP request to the name: the same sample fingerprinted
     differently depending on whether its DNS lookup was inside the capture
+  * a DNS lookup two seconds before each request was a check-in of its own:
+    interval 2.0 with jitter 0.0 for a 60 s beacon, one lookup plus three
+    connections made a beacon, TTL re-lookups raised the connection count, and
+    a resolver asking for wpad.lan on a timer was reported as a beacon
+  * a GET and a POST one second apart per check-in measured an interval of
+    1.0 with jitter 0.0, a confident wrong number; the burst is now collapsed
+    relative to the gap between check-ins, and a capture whose two time scales
+    cannot be told apart reports nothing
+  * an IPv6 answer and the same address written in another letter case did not
+    meet
   * that merge went too far: an address answered for two names, or looked up
     only after the connection, was claimed by a name, and the address a
     connection really used disappeared from the event
@@ -318,6 +328,128 @@ def test_nxdomain_burst_is_found_inside_a_longer_capture():
 def test_answered_lookups_are_not_an_nxdomain_burst():
     evs = [ev("dns", float(i), dest="x%d.top" % i, nxdomain=False) for i in range(12)]
     assert of_type(net_behavior.analyze(evs), "fanout") == []
+
+
+# --- DNS is not a check-in --------------------------------------------------
+
+def test_a_lookup_two_seconds_ahead_of_each_check_in_does_not_change_the_interval():
+    evs = []
+    for k in range(8):
+        evs.append(lookup(k * 60.0 - 2.0, "c2.top", IP))
+        evs.append(ev("http", k * 60.0, dest="c2.top"))
+    b = of_type(net_behavior.analyze(evs), "beacon")
+    assert len(b) == 1
+    assert b[0]["interval"] == 60.0 and b[0]["connections"] == 8 and b[0]["jitter"] == 0.0
+    assert b[0]["via"] == ["http"]
+
+
+def test_one_lookup_and_three_connections_are_not_a_beacon():
+    evs = [lookup(-2.0, "c2.top", IP)] + check_ins("c2.top", count=3)
+    assert of_type(net_behavior.analyze(evs), "beacon") == []
+
+
+def test_ttl_re_lookups_do_not_raise_the_connection_count():
+    evs = check_ins("c2.top", count=20)
+    evs += [lookup(k * 300.0 + 20.0, "c2.top", IP) for k in range(4)]
+    b = of_type(net_behavior.analyze(evs), "beacon")
+    assert len(b) == 1 and b[0]["connections"] == 20 and b[0]["interval"] == 60.0
+
+
+def test_lookups_on_a_timer_are_not_a_beacon():
+    evs = [lookup(k * 300.0, "wpad.lan", "192.0.2.1") for k in range(8)]
+    assert of_type(net_behavior.analyze(evs), "beacon") == []
+
+
+def test_failed_lookups_on_a_timer_are_a_retry_not_a_beacon():
+    evs = [ev("dns", k * 300.0, dest="gone.top", nxdomain=True) for k in range(8)]
+    out = net_behavior.analyze(evs)
+    assert of_type(out, "beacon") == [] and len(of_type(out, "retry")) == 1
+
+
+# --- Bursts of any spacing --------------------------------------------------
+
+def get_and_post(count=8, step=60.0, gap=1.0, start=0.0):
+    out = []
+    for k in range(count):
+        out.append(ev("http", start + k * step, dest="c2.top", method="GET"))
+        out.append(ev("http", start + k * step + gap, dest="c2.top", method="POST"))
+    return out
+
+
+def test_a_get_and_a_post_per_check_in_measure_the_check_in_interval():
+    b = of_type(net_behavior.analyze(get_and_post()), "beacon")
+    assert len(b) == 1
+    assert b[0]["interval"] == 60.0 and b[0]["jitter"] == 0.0 and b[0]["connections"] == 8
+
+
+def test_a_get_and_a_post_with_one_extra_check_in_still_measure_60():
+    evs = get_and_post(count=9)[:-1]            # last check-in has no POST
+    b = of_type(net_behavior.analyze(evs), "beacon")
+    assert [(x["interval"], x["connections"]) for x in b] == [(60.0, 9)]
+
+
+def test_a_burst_with_uneven_spacing_is_one_check_in():
+    evs = []
+    for k in range(8):
+        for offset in (0.0, 0.8, 2.6, 3.4):
+            evs.append(ev("http", k * 120.0 + offset, dest="c2.top"))
+    b = of_type(net_behavior.analyze(evs), "beacon")
+    assert [(x["interval"], x["connections"]) for x in b] == [(120.0, 8)]
+
+
+def test_a_jittery_get_and_post_beacon_measures_the_check_in_jitter():
+    starts = [0, 60, 125, 183, 245, 307, 365, 430]
+    evs = []
+    for t in starts:
+        evs += [ev("http", float(t), dest="c2.top"), ev("http", t + 1.0, dest="c2.top")]
+    b = of_type(net_behavior.analyze(evs), "beacon")[0]
+    assert abs(b["interval"] - 61.5) < 3 and 0.0 < b["jitter"] < 0.3
+
+
+def test_bursts_at_random_times_report_nothing_rather_than_the_burst_spacing():
+    starts = [0, 30, 400, 450, 1000, 1700, 1760, 2500]
+    evs = []
+    for t in starts:
+        evs += [ev("http", float(t), dest="c2.top"), ev("http", t + 1.0, dest="c2.top")]
+    assert of_type(net_behavior.analyze(evs), "beacon") == []
+    p = net_behavior.periodicity(sorted(e["ts"] for e in evs))
+    assert p["periodic"] is False
+
+
+def test_a_fast_beacon_with_one_pause_keeps_its_interval():
+    ts = [float(t) for t in range(0, 30)] + [float(t) for t in range(400, 430)]
+    p = net_behavior.periodicity(ts)
+    assert p["periodic"] is True and p["interval"] == 1.0
+
+
+def test_a_steady_beacon_with_one_outage_keeps_its_interval():
+    ts = [t * 60.0 for t in range(10)] + [540.0 + 3600.0 + t * 60.0 for t in range(1, 10)]
+    p = net_behavior.periodicity(ts)
+    assert p["periodic"] is True and p["interval"] == 60.0
+
+
+def test_a_burst_beacon_with_one_long_outage_still_measures_the_check_in():
+    ts = []
+    for k in range(10):
+        ts += [k * 60.0, k * 60.0 + 1.0]
+    for k in range(10):
+        ts += [4000.0 + k * 60.0, 4000.0 + k * 60.0 + 1.0]
+    p = net_behavior.periodicity(ts)
+    assert p["periodic"] is True and p["interval"] == 60.0
+
+
+def test_a_single_request_per_check_in_is_unchanged():
+    p = net_behavior.periodicity([t * 60.0 for t in range(8)])
+    assert p["interval"] == 60.0 and p["connections"] == 8 and p["periodic"] is True
+
+
+# --- Address spelling ---------------------------------------------------------
+
+def test_an_ipv6_address_in_another_spelling_still_meets_its_name():
+    evs = [lookup(-0.2, "c2.top", "2001:db8::1")]
+    evs += check_ins("c2.top", "2001:DB8:0:0:0:0:0:1")
+    b = of_type(net_behavior.analyze(evs), "beacon")
+    assert len(b) == 1 and b[0]["dest"] == "c2.top" and b[0]["addresses"] == ["2001:db8::1"]
 
 
 # --- Names and addresses ------------------------------------------------------

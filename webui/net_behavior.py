@@ -18,11 +18,29 @@ Several assumptions would make the result wrong:
     check-in does not hide a rhythm). Both results feed one evidence model, so
     this module uses the same thresholds and estimator; a second definition
     would let one sample be periodic by one and irregular by the other.
-  * Every event is a separate connection. One check-in is a DNS lookup, a
-    connection and an HTTP request within a fraction of a second. Counting
-    them separately puts tiny intervals into the statistics and moves the
-    measured interval off the true one. Events closer than
-    ``BEACON_MIN_INTERVAL_S`` to the check-in they belong to are one check-in.
+  * Every event is a separate connection. One check-in is a connection and one
+    or several HTTP requests (a GET for tasks, a POST with the result), a
+    second or more apart. Counting them separately puts a second, smaller time
+    scale into the statistics and the measured interval is the spacing inside
+    the burst, with zero jitter: confidently wrong. Events closer than
+    ``BEACON_MIN_INTERVAL_S`` to the one before are one check-in; and where the
+    gaps between events fall into two scales at least ``BURST_GAP_RATIO``
+    apart, the smaller scale is the inside of a check-in and is collapsed too,
+    when that leaves at least four check-ins. Four or more bursts that are not
+    regular at the larger scale are not a beacon, and the small spacing is not
+    reported as one: no beacon beats a wrong interval. (This is the one place
+    where the result differs from ``memory_evidence``, which would report the
+    1 s spacing; the later merge of the two keeps this behaviour.) The price: a
+    fast beacon that also pauses four times for several times its interval is
+    reported as nothing.
+  * A DNS lookup is a check-in. It is not: it happens seconds before the
+    connection it serves, again whenever a TTL expires, and a resolver asks for
+    names such as wpad.lan on a timer with no sample involved. Its time would
+    put a spurious start into a group (interval 2 s for a 60 s beacon), and
+    a lookup plus three connections would reach the four-connection minimum.
+    ``dns`` events therefore only build the name-to-address table and feed
+    retry and fanout; they never time a beacon, so a DNS-only rhythm is not
+    reported either.
   * A reported interval is a label. It is a measurement: a fingerprint of the
     sample is built on it later, so a wrong interval is worse than none. A
     group that is not clearly periodic produces no beacon event.
@@ -40,6 +58,13 @@ Several assumptions would make the result wrong:
     only credible when it is unambiguous: an address answered for two names, or
     contacted at or before the first lookup that returned it, stays on its own.
     An address with no lookup at all is itself a finding and is never named.
+    A lookup in the middle of a capture splits one host into two groups: the
+    connections before it stay on the address, the ones after it join the name.
+    Those two beacons (``dest`` an address, ``dest`` a name whose ``addresses``
+    holds it) can be the same host.
+  * The port is part of the identity of a connection. It is deliberately not
+    part of the grouping key, unlike ``memory_evidence``'s ``(ip, port)``: one
+    host that beacons on two ports is one beacon, not two half-strength ones.
   * The cost may grow with the size of the capture. The events are read once,
     grouped in dictionaries, and each group is measured from at most
     ``MAX_INTERVALS`` intervals, so the work is linear in the number of events
@@ -66,14 +91,21 @@ BEACON_MIN_INTERVAL_S = 0.5
 ON_RHYTHM_TOLERANCE = 0.25
 ON_RHYTHM_MIN_SHARE = 0.5
 
+# Two gap scales are one burst structure when the larger is at least this many
+# times the smaller. The gaps are profiled from the first PROFILE_EVENTS events
+# of a group, which bounds the sort.
+BURST_GAP_RATIO = 5.0
+PROFILE_EVENTS = 4000
+
 # Intervals taken into the measurement of one group. A beacon is established
 # long before this; the cap keeps the cost of one huge group bounded.
 MAX_INTERVALS = 2000
 
 # Events that are a check-in. Download, upload and websocket events repeat an
-# http event, decoded/raw describe a payload, and beacon/retry/fanout are this
-# module's own output.
-BEACON_TYPES = frozenset(("conn", "conn_failed", "tls", "http", "udp", "dns"))
+# http event, decoded/raw describe a payload, dns lookups are not a check-in
+# (see the module docstring), and beacon/retry/fanout are this module's own
+# output.
+BEACON_TYPES = frozenset(("conn", "conn_failed", "tls", "http", "udp"))
 
 RETRY_MIN_ATTEMPTS = 5
 
@@ -92,20 +124,32 @@ def _usable(ts):
             and math.isfinite(ts))
 
 
-def _check_ins(times):
+def _check_ins(times, gap=BEACON_MIN_INTERVAL_S):
     """Start of each check-in of an ascending list.
 
-    An event less than ``BEACON_MIN_INTERVAL_S`` after the one before it
-    belongs to the same check-in, so a run of closely spaced requests is one
-    check-in however long it goes on.
+    An event less than ``gap`` after the one before it belongs to the same
+    check-in, so a run of closely spaced requests is one check-in however long
+    it goes on.
     """
     starts = []
     previous = None
     for t in times:
-        if previous is None or t - previous >= BEACON_MIN_INTERVAL_S:
+        if previous is None or t - previous >= gap:
             starts.append(t)
         previous = t
     return starts
+
+
+def _burst_gaps(times):
+    """Gaps, smallest first, that separate two time scales of an ascending list.
+
+    A gap is returned when the next smaller distinct gap (none below the
+    minimum interval) is at least ``BURST_GAP_RATIO`` times smaller: events
+    closer than it may be the inside of one check-in.
+    """
+    head = times[:PROFILE_EVENTS]
+    gaps = sorted(max(b - a, BEACON_MIN_INTERVAL_S) for a, b in zip(head, head[1:]))
+    return [high for low, high in zip(gaps, gaps[1:]) if high >= BURST_GAP_RATIO * low]
 
 
 def periodicity(timestamps):
@@ -118,10 +162,19 @@ def periodicity(timestamps):
     25% of the median) and ``periodic``. Fewer than ``BEACON_MIN_CONNECTIONS``
     check-ins measure nothing: interval, cov, jitter and on_rhythm are None.
     A group that was measured but is not regular keeps its numbers and has
-    ``periodic`` False.
+    ``periodic`` False. ``connections`` counts check-ins: requests closer than
+    the gap between two time scales (see the module docstring) are one.
     """
     # sorted() on input that is already in order is a single pass.
-    starts = _check_ins(sorted(t for t in timestamps if _usable(t)))
+    times = sorted(t for t in timestamps if _usable(t))
+    starts = _check_ins(times)
+    if len(starts) > BEACON_MIN_CONNECTIONS:
+        # The smallest scale break that still leaves a rhythm to measure.
+        for gap in _burst_gaps(times):
+            coarse = _check_ins(times, gap)
+            if BEACON_MIN_CONNECTIONS <= len(coarse) < len(starts):
+                starts = coarse
+                break
     result = {"interval": None, "jitter": None, "cov": None, "on_rhythm": None,
               "connections": len(starts), "periodic": False}
     if len(starts) < BEACON_MIN_CONNECTIONS:
@@ -286,9 +339,13 @@ def analyze(events):
         if not isinstance(dest, str) or not dest:
             continue
         address = None
-        known = resolved.get(dest) if etype != "dns" else None
+        known = None
+        if etype != "dns":
+            # Answers are canonical; only IPv6 has more than one spelling.
+            key = (_address(dest) or dest) if ":" in dest else dest
+            known = resolved.get(key)
         if known is not None and known[0] is not None and ts > known[1]:
-            address, dest = dest, known[0]
+            address, dest = key, known[0]
         failed = etype == "conn_failed" or (etype == "dns" and e.get("nxdomain"))
         if etype in BEACON_TYPES:
             beacons.setdefault((e.get("pid"), dest), _Group()).add(e, ts, address)
