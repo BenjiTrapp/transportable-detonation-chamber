@@ -39,7 +39,8 @@ not learn a second notation. Several things are easy to get wrong:
     ``PRICE_LEN`` characters over ``MAX_REGEX_STEPS`` is refused. The estimate has
     known gaps (the cost of a lookahead inside a repeat's body is not priced) and
     is not the thing to rely on. A list field is shown to a regex only up to its
-    first ``MAX_REGEX_ELEMENTS`` elements, and one ``evaluate`` may spend only
+    first ``MAX_REGEX_ELEMENTS`` elements (a longer list with no match among them
+    is unknown, reason ``cut``, like a field longer than the cut), and one ``evaluate`` may spend only
     ``REGEX_BUDGET_S`` seconds in regexes, shared by all rules. The other string
     operators are linear and see the whole field.
   * A regex that was not run is "could not tell", not "no". A timeout, a spent
@@ -895,6 +896,9 @@ class _Compiler:
                         return True
                 except _Unknown as exc:
                     unknown = _merge(unknown, exc)
+            if len(found) > MAX_REGEX_ELEMENTS:
+                # elements nobody looked at: padding the list must not choose "no"
+                unknown = _merge(unknown, _Unknown("cut"))
             if unknown is not None:
                 raise unknown
             return False

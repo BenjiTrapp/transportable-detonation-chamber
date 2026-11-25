@@ -1187,12 +1187,30 @@ rules:
         ("a", ["budget"]), ("chain", ["requires a"])]
 
 
-def test_a_regex_looks_only_at_the_first_elements_of_a_list_field():
+def test_a_long_list_is_undecided_unless_a_match_is_among_the_elements_seen():
     rs = _rules("rules:\n  - {id: r, name: r, event: smtp, match: {rcpt_to|re: 'target'}}")
     last = net_rules.MAX_REGEX_ELEMENTS
     near = net_events.NetEvent("smtp", 1.0, rcpt_to=["x"] * (last - 1) + ["target@d.top"])
-    far = net_events.NetEvent("smtp", 1.0, rcpt_to=["x"] * last + ["target@d.top"])
-    assert len(rs.evaluate([near])) == 1 and rs.evaluate([far]) == []
+    padded = net_events.NetEvent("smtp", 1.0, rcpt_to=["a"] * 20 + ["target@x"])
+    seen = net_events.NetEvent("smtp", 1.0, rcpt_to=["target@x"] + ["a"] * 20)
+    assert len(rs.evaluate([near])) == 1 and len(rs.evaluate([seen])) == 1
+    got = rs.evaluate([padded])
+    assert got == [] and got.unevaluated == [{"rule_id": "r", "events": 1, "reasons": ["cut"]}]
+
+
+def test_padding_a_list_does_not_choose_the_answer_of_a_negated_regex():
+    rs = _rules("rules:\n  - {id: r, name: r, event: smtp, match: {not: {rcpt_to|re: 'target'}}}")
+    padded = net_events.NetEvent("smtp", 1.0, rcpt_to=["a"] * 20 + ["target@x"])
+    got = rs.evaluate([padded])
+    assert got == [] and got.unevaluated[0]["reasons"] == ["cut"]
+
+
+def test_a_list_within_the_limit_that_does_not_match_is_a_decided_no():
+    rs = _rules("rules:\n  - {id: r, name: r, event: smtp, match: {rcpt_to|re: 'target'}}\n"
+                "  - {id: n, name: n, event: smtp, match: {not: {rcpt_to|re: 'target'}}}")
+    exactly = net_events.NetEvent("smtp", 1.0, rcpt_to=["a"] * net_rules.MAX_REGEX_ELEMENTS)
+    got = rs.evaluate([exactly, net_events.NetEvent("smtp", 2.0, rcpt_to=[])])
+    assert _ids(got) == ["n"] and got.unevaluated == []
 
 
 def test_other_operators_look_at_every_element_of_a_list_field():
