@@ -906,3 +906,71 @@ def test_an_empty_body_with_an_encoding_is_empty_not_failed():
     e = _events(b"HEAD /h HTTP/1.1\r\nHost: x.top\r\n\r\n",
                 b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip\r\nContent-Length: 40\r\n\r\n")[0]
     assert e["resp_text"] == "" and e["resp_decode_failed"] is False and e["content_encoding"] == "gzip"
+
+
+# --- downloads of encoded bodies ----------------------------------------------
+
+_PE = b"MZ\x90\x00\x03" + bytes(range(256)) * 8
+
+
+def _sha(data):
+    return hashlib.sha256(data).hexdigest()
+
+
+def test_a_gzipped_pe_is_a_pe_download_hashed_as_the_file():
+    wire = gzip.compress(_PE)
+    d = _events(_get(b"/stage2"), _encoded(wire, b"gzip"), kind="download")[0]
+    assert d["kind"] == "pe" and d["sha256"] == _sha(_PE) and d["size"] == len(_PE)
+    assert d["wire_sha256"] == _sha(wire) != d["sha256"]
+    assert d["wire_size"] == len(wire) != d["size"]
+    assert d["inflate_capped"] is False and d["content_encoding"] == "gzip"
+    assert d["truncated"] is False and d["path"] == "/stage2"
+
+
+def test_the_same_payload_with_and_without_gzip_has_the_same_file_hash():
+    plain = _events(_get(), _ok(_PE), kind="download")[0]
+    for coding, wire in ((b"gzip", gzip.compress(_PE)), (b"deflate", zlib.compress(_PE)),
+                         (b"deflate", _raw_deflate(_PE)), (b"deflate, gzip", gzip.compress(zlib.compress(_PE)))):
+        d = _events(_get(), _encoded(wire, coding), kind="download")[0]
+        assert d["sha256"] == plain["sha256"] and d["size"] == plain["size"], coding
+
+
+def test_an_uncompressed_download_has_no_wire_fields():
+    d = _events(_get(), _ok(_PE), kind="download")[0]
+    assert d["sha256"] == _sha(_PE) and d["size"] == len(_PE) and d["kind"] == "pe"
+    assert "wire_sha256" not in d and "wire_size" not in d
+    assert d["inflate_capped"] is False and d["content_encoding"] == ""
+
+
+def test_a_body_stopped_by_the_inflate_ceiling_is_marked_and_has_no_file_hash():
+    big = b"MZ" + b"\x00" * (net_http.MAX_INFLATED + 5000)
+    wire = gzip.compress(big)
+    d = _events(_get(), _encoded(wire, b"gzip"), kind="download")[0]
+    assert d["kind"] == "pe" and d["inflate_capped"] is True
+    assert d["sha256"] is None and d["size"] is None
+    assert d["wire_sha256"] == _sha(wire) and d["wire_size"] == len(wire)
+    assert d["sha256"] != _sha(big[:net_http.MAX_INFLATED])
+
+
+def test_a_failed_inflate_falls_back_to_the_wire_bytes_for_kind_and_hash():
+    d = _events(_get(), _encoded(_PE, b"gzip"), kind="download")[0]
+    assert d["kind"] == "pe" and d["sha256"] == _sha(_PE) and d["size"] == len(_PE)
+    assert "wire_sha256" not in d and d["inflate_capped"] is False
+    e = _events(_get(), _encoded(_PE, b"gzip"))[0]
+    assert e["resp_decode_failed"] is True
+
+
+def test_a_gzipped_pe_cut_mid_stream_is_no_download_but_keeps_the_http_event():
+    evs = net_http.events_from_flow(_http_flow(_get(), _encoded(gzip.compress(_PE)[:40], b"gzip")))
+    assert [e["type"] for e in evs] == ["http"] and evs[0]["resp_decode_failed"] is True
+
+
+def test_an_encoding_that_is_not_understood_is_hashed_as_it_arrived():
+    d = _events(_get(), _encoded(_PE, b"br"), kind="download")[0]
+    assert d["kind"] == "pe" and d["sha256"] == _sha(_PE) and "wire_sha256" not in d
+    assert d["content_encoding"] == "br"
+
+
+def test_a_gzipped_response_that_is_not_a_file_is_not_a_download():
+    assert _events(_get(), _encoded(gzip.compress(_TEXT), b"gzip"), kind="download") == []
+    assert _events(_get(), _encoded(gzip.compress(b""), b"gzip"), kind="download") == []

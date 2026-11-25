@@ -62,8 +62,15 @@ intervals (``ts`` of each request), rules (``method``, ``path``, ``body_text``,
     ``body_decode_failed`` / ``resp_decode_failed`` are True. An encoding that
     is not understood (br, zstd) leaves the body as it is; the encoding
     applied or seen is in ``content_encoding`` (response) and
-    ``request_encoding``. ``download`` and ``upload`` still describe the wire
-    bytes: size and hash are those of what was transferred.
+    ``request_encoding``. A ``download`` is the file as the
+    receiving application sees it: when an encoding was undone, ``kind``,
+    ``sha256`` and ``size`` are those of the inflated bytes and the wire
+    bytes' are ``wire_sha256`` / ``wire_size`` (present only when they
+    differ); if inflating failed, or no encoding applies, the wire bytes are
+    the payload. When inflating stopped at the ceiling only a prefix exists
+    and a hash of a prefix identifies nothing, so ``sha256`` and ``size`` are
+    None and ``inflate_capped`` is True. An ``upload`` still describes the
+    wire bytes.
   * Bytes from a capture are inert. Nothing is executed or opened as a file;
     a download is hashed and its first bytes name its kind.
 
@@ -422,37 +429,66 @@ def _inflate(data, limit):
 
 
 def _decoded(body, encoding):
-    """``(data, capped, failed)``: the body with its content encoding undone.
+    """``(data, capped, failed, applied)``: the body with its content encoding undone.
 
-    ``capped`` means more output existed than ``MAX_INFLATED``; ``failed`` that
+    ``applied`` is True when an inflate was attempted. ``capped`` means more output existed than ``MAX_INFLATED``; ``failed`` that
     a supported encoding could not be undone completely, in which case ``data``
     is what came out before it broke. An encoding that is not understood leaves
     the body as it is.
     """
     codings = [c.strip() for c in encoding.split(",") if c.strip()]
     if not body or not codings or any(c not in _CODINGS for c in codings):
-        return body, False, False
-    data, capped, failed = body, False, False
+        return body, False, False, False
+    data, capped, failed, applied = body, False, False, False
     for coding in reversed(codings):
         if coding == "identity":
             continue
+        applied = True
         data, capped, failed = _inflate(data, MAX_INFLATED)
         if capped or failed:
             break
-    return data, capped, failed
+    return data, capped, failed, applied
 
 
 def _body_text(body, encoding):
-    """``(text or None, capped, decode_failed, data)`` of a message body.
+    """``(text or None, capped, decode_failed, decoded)`` of a message body.
 
-    ``data`` is the body with its encoding undone. A body that could not be
-    decoded at all has no text, however empty its remains are.
+    ``decoded`` is what ``_decoded`` returned. A body that could not be decoded
+    at all has no text, however empty its remains are.
     """
-    data, inflate_capped, failed = _decoded(body, encoding)
+    decoded = _decoded(body, encoding)
+    data, inflate_capped, failed, _applied = decoded
     text, capped = _text(data)
     if failed and not data:
         text = None
-    return text, capped or inflate_capped, failed, data
+    return text, capped or inflate_capped, failed, decoded
+
+
+def _payload(wire, decoded):
+    """``(kind, fields)`` of a downloaded body, as the receiving application sees it.
+
+    When an encoding was undone completely the file is the inflated bytes, and
+    the wire bytes' hash and size are added beside it. When inflating stopped
+    at the ceiling only a prefix of the file exists, and a hash of a prefix
+    identifies nothing, so ``sha256`` and ``size`` are None (the kind, read
+    from the start, is still known) and ``inflate_capped`` says why. When
+    inflating failed, or no encoding applies, the wire bytes are the payload.
+    """
+    data, capped, failed, applied = decoded
+    wire_sha = hashlib.sha256(wire).hexdigest()
+    if not applied or failed:
+        return _kind(wire), {"sha256": wire_sha, "size": len(wire), "inflate_capped": False}
+    kind = _kind(data)
+    if capped:
+        return kind, {"sha256": None, "size": None, "inflate_capped": True,
+                      "wire_sha256": wire_sha, "wire_size": len(wire)}
+    fields = {"sha256": hashlib.sha256(data).hexdigest(), "size": len(data),
+              "inflate_capped": False}
+    if fields["sha256"] != wire_sha:
+        fields["wire_sha256"] = wire_sha
+    if fields["size"] != len(wire):
+        fields["wire_size"] = len(wire)
+    return kind, fields
 
 
 def _kind(body):
@@ -697,8 +733,9 @@ def _exchange_events(ctx, req, resp):
     ctype = resp_headers.get("content-type", "")
     request_encoding = origin.headers.get("content-encoding", "").strip().lower()
     response_encoding = resp_headers.get("content-encoding", "").strip().lower()
-    body_text, body_capped, body_failed, data = _body_text(body, request_encoding)
-    resp_text, resp_capped, resp_failed, _data = _body_text(reply, response_encoding)
+    body_text, body_capped, body_failed, decoded = _body_text(body, request_encoding)
+    data = decoded[0]
+    resp_text, resp_capped, resp_failed, resp_decoded = _body_text(reply, response_encoding)
     http = NetEvent(
         "http", ts, dest=origin.dest, port=origin.port,
         method=origin.method, url=origin.url, path=origin.path, query=origin.query,
@@ -721,11 +758,13 @@ def _exchange_events(ctx, req, resp):
             url=origin.url, path=origin.path, size=len(body),
             sha256=hashlib.sha256(body).hexdigest(), kind=_kind(body),
             content_type=origin.headers.get("content-type", ""), truncated=req.truncated))
-    if reply and _kind(reply):
-        events.append(NetEvent(
-            "download", resp_ts, dest=origin.dest, port=origin.port, url=origin.url,
-            path=origin.path, size=len(reply), sha256=hashlib.sha256(reply).hexdigest(),
-            kind=_kind(reply), content_type=ctype, truncated=resp.truncated))
+    if reply:
+        kind, identity = _payload(reply, resp_decoded)
+        if kind:
+            events.append(NetEvent(
+                "download", resp_ts, dest=origin.dest, port=origin.port, url=origin.url,
+                path=origin.path, kind=kind, content_type=ctype,
+                content_encoding=response_encoding, truncated=resp.truncated, **identity))
     if req and resp and resp.status == 101 and _is_upgrade(req):
         events.append(_websocket_event(ctx, origin, req, resp, req_ts))
     return events
