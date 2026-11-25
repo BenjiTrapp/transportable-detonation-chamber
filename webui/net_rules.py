@@ -22,13 +22,20 @@ not learn a second notation. Several things are easy to get wrong:
     it as a ``Secret`` so that nothing copies it, and a rule that could read it
     would make the engine the first thing that does.
   * A regex is harmless. ``(a+)+$`` against forty characters runs for hours, and
-    ``\\d+\\d+\\d+x`` against a thousand for longer than anyone waits, in one
-    event of a capture the malware chose. ``re`` cannot be interrupted, so the
-    defence is refusal at load time of the shapes that make it blow up (nested
-    repetition, overlapping alternatives under a repetition, adjacent
-    overlapping repeats, more than two ambiguous repeats) and a bound on what a
-    regex is shown: the first ``MAX_SUBJECT`` characters of a field. The other
-    string operators are linear and see the whole field.
+    ``^/(\\w+/?){1,5}\\.php$`` against two hundred for longer than anyone waits,
+    in one event of a capture the malware chose. ``re`` cannot be interrupted, so
+    there are three lines of defence. At load time a regex is read as a parse
+    tree: shapes that are exponential (a repeat that holds a repeat or an
+    optional part it cannot tell from what follows, alternatives that start
+    alike inside a repeat, conditional groups) are refused, and for the rest the
+    steps a worst-case field would cost are estimated (each repeat that can
+    swallow what follows it multiplies the work after it) and a regex over
+    ``MAX_REGEX_STEPS`` is refused. A regex is shown only the first
+    ``MAX_SUBJECT`` characters of a field, and of a list field only the first
+    ``MAX_REGEX_ELEMENTS`` elements. And one ``evaluate`` may spend only
+    ``REGEX_BUDGET_S`` seconds in regexes, after which they stop matching and
+    the result says so (``regex_budget_exceeded``). The other string operators are
+    linear and see the whole field.
   * Every rule against every event. Rules are filed under the event types they
     name, and a rule whose match has a plain equality or ``in`` condition is
     additionally filed under that field's values, so an event is tried on the
@@ -41,6 +48,15 @@ not learn a second notation. Several things are easy to get wrong:
     There is no weight key, and one is rejected.
   * ``True == 1``. A flag is not a number: ``nxdomain: true`` does not match
     ``1`` and ``port: 1`` does not match ``True``.
+  * A destination is a fact. ``dest`` is what the sample says it talks to (a Host
+    header, a server name), so ``known_good`` hiding by destination lets malware
+    pick its own invisibility: ``Host: www.msftconnecttest.com`` on a connection
+    to its own address. ``download``, ``upload`` and ``decoded`` events state that
+    something crossed the wire, which is not a claim about a name, and are never
+    hidden (``ALWAYS_VISIBLE``). Every other event with a known-good destination
+    is still hidden, and for those the name is as trustworthy as the sample's
+    own header or SNI; requiring a DNS answer for it in the capture would close
+    that and belongs to a later phase.
   * Events carry a credential. A hit names its events (index, type, time,
     destination, port) and copies nothing else, so a hit on an ``ftp`` event
     serializes, and the password cannot reach a report through it.
@@ -55,6 +71,8 @@ import math
 import operator
 import os
 import re
+import threading
+import time
 
 import yaml
 
@@ -67,13 +85,17 @@ except ImportError:                      # 3.9, 3.10
     import sre_constants
     import sre_parse
 
-MAX_SUBJECT = 1024          # characters of a field that a regex is shown
+MAX_SUBJECT = 256           # characters of a field that a regex is shown (a path, a user
+#                             agent, a server name, a header value all fit)
 MAX_PATTERN = 500           # characters of a regex
 MAX_FILE_BYTES = 4 * 1024 * 1024
 MAX_DEPTH = 6               # any / all / not inside each other
 MAX_NODES = 400             # conditions and blocks of one rule
 MAX_HIT_EVENTS = 20         # events named by one hit; ``count`` is exact
-MAX_AMBIGUOUS_REPEATS = 2   # unbounded repeats that can swallow what follows them
+MAX_REGEX_ELEMENTS = 16     # elements of a list field a regex is tried on
+REGEX_BUDGET_S = 20.0       # seconds of regex matching one ``evaluate`` may spend
+ALWAYS_VISIBLE = frozenset(("download", "upload", "decoded"))   # never hidden by known_good
+MAX_REGEX_STEPS = 20000000  # estimated worst case of one regex on one field
 
 SEVERITIES = ("info", "low", "medium", "high", "critical")
 KNOWN_GOOD = "known_good"
@@ -134,6 +156,9 @@ _CORRELATION_FORBIDDEN = ("event", "match", "count_gte", "include_known_good")
 _TEXT_KEYS = ("description", "role", "behavior", "family", "kind")
 
 
+_run = threading.local()        # the regex budget of the evaluate() running in this thread
+
+
 class RuleError(ValueError):
     """A rule that cannot be used; the message is the reason shown to the analyst."""
 
@@ -182,76 +207,147 @@ def _plain(value):
 
 
 # --- regex safety -------------------------------------------------------------------
+# ``re`` backtracks and cannot be interrupted. What blows up is ambiguity: more than one
+# way to divide a string among repeats. This reads the parsed pattern and refuses the
+# shapes that are ambiguous; ``MAX_SUBJECT`` and the budget in ``evaluate`` are the
+# backstops for the ones it misses.
 
-_HEAVY = 5          # a repeat that can run more often than this multiplies what is inside
 _OPEN = 16          # a repeat that can run more often than this is open-ended
-_ASCII_SETS = {
-    "CATEGORY_DIGIT": frozenset(range(48, 58)),
-    "CATEGORY_SPACE": frozenset((9, 10, 11, 12, 13, 32)),
-    "CATEGORY_WORD": frozenset(list(range(48, 58)) + list(range(65, 91))
-                               + list(range(97, 123)) + [95]),
+
+# The characters a pattern can consume, as sets over a small alphabet: ASCII as itself
+# and four stand-ins for what is not ASCII, so that negated classes can be complemented
+# (``[^/]`` and ``/`` are disjoint, ``\S`` and ``\s`` too).
+_NON_ASCII = (128, 129, 130, 131)       # word character, digit, whitespace, anything else
+_UNIVERSE = frozenset(range(132))
+_DIGITS = frozenset(range(48, 58)) | {129}
+_SPACES = frozenset((9, 10, 11, 12, 13, 28, 29, 30, 31, 32, 130))
+_WORD = (frozenset(range(48, 58)) | frozenset(range(65, 91)) | frozenset(range(97, 123))
+         | {95, 128, 129})
+_CATEGORIES = {
+    "CATEGORY_DIGIT": _DIGITS, "CATEGORY_NOT_DIGIT": _UNIVERSE - _DIGITS,
+    "CATEGORY_SPACE": _SPACES, "CATEGORY_NOT_SPACE": _UNIVERSE - _SPACES,
+    "CATEGORY_WORD": _WORD, "CATEGORY_NOT_WORD": _UNIVERSE - _WORD,
 }
-_REPEATS = tuple(getattr(sre_constants, name) for name in
-                 ("MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT") if hasattr(sre_constants, name))
-_ZERO_WIDTH = tuple(getattr(sre_constants, name) for name in ("AT", "ASSERT", "ASSERT_NOT"))
 
 
-def _flatten(items):
-    out = []
-    for op, av in items:
-        if op == sre_constants.SUBPATTERN:
-            out.extend(_flatten(av[-1]))
-        else:
-            out.append((op, av))
-    return out
+def _names_in(*names):
+    return tuple(getattr(sre_constants, n) for n in names if hasattr(sre_constants, n))
+
+
+_REPEATS = _names_in("MAX_REPEAT", "MIN_REPEAT", "POSSESSIVE_REPEAT")
+_ZERO_WIDTH = _names_in("AT", "ASSERT", "ASSERT_NOT")
+_ASSERTS = _names_in("ASSERT", "ASSERT_NOT")
+_ATOMIC = _names_in("ATOMIC_GROUP")             # Python 3.11 and later
+_CONDITIONAL = sre_constants.GROUPREF_EXISTS
+
+
+def _symbol(code):
+    if code < 128:
+        return code
+    char = chr(code)
+    if char.isspace():
+        return 130
+    if char.isdecimal():
+        return 129
+    return 128 if char.isalnum() else 131
 
 
 def _fold(chars, fold):
-    if not fold or chars is None:
+    if not fold:
         return chars
-    return frozenset(chars | {ord(chr(c).swapcase()) for c in chars if c < 0x110000
-                              and len(chr(c).swapcase()) == 1})
+    return chars | {ord(chr(c).swapcase()) for c in chars if 65 <= c <= 122 and chr(c).isalpha()}
 
 
 def _in_set(av, fold):
-    chars = set()
+    exact, loose, negate = set(), set(), False
     for op, arg in av:
-        if op == sre_constants.LITERAL:
-            chars.add(arg)
-        elif op == sre_constants.RANGE and arg[1] - arg[0] < 256:
-            chars.update(range(arg[0], arg[1] + 1))
-        elif op == sre_constants.CATEGORY and str(arg) in _ASCII_SETS:
-            chars |= _ASCII_SETS[str(arg)]
+        if op == sre_constants.NEGATE:
+            negate = True
+        elif op == sre_constants.LITERAL:
+            (exact if arg < 128 else loose).add(_symbol(arg))
+        elif op == sre_constants.RANGE:
+            low, high = arg
+            exact.update(range(low, min(high, 127) + 1))
+            if high > 127:
+                loose.update(_NON_ASCII)
+        elif op == sre_constants.CATEGORY:
+            exact |= _CATEGORIES.get(str(arg), _UNIVERSE)
         else:
-            return None                     # a negation, a wide range, a non-ASCII category
-    return _fold(frozenset(chars), fold)
+            return _UNIVERSE
+    exact = _fold(frozenset(exact), fold)
+    # a negated class keeps every non-ASCII stand-in it did not name as a whole category
+    return _UNIVERSE - exact if negate else exact | loose
 
 
-def _union(a, b):
-    return None if a is None or b is None else a | b
+def _single(op, av, fold):
+    """The characters one LITERAL/IN/ANY ... consumes, or None if ``op`` is not one."""
+    if op == sre_constants.LITERAL:
+        return _fold(frozenset((_symbol(av),)), fold)
+    if op == sre_constants.NOT_LITERAL:
+        return _UNIVERSE - _fold(frozenset((av,)), fold) if av < 128 else _UNIVERSE
+    if op == sre_constants.ANY:
+        return _UNIVERSE - {10}
+    if op == sre_constants.IN:
+        return _in_set(av, fold)
+    if op == sre_constants.CATEGORY:
+        return _CATEGORIES.get(str(av), _UNIVERSE)
+    return None
+
+
+def _subitems(op, av):
+    """The item lists nested in one element, whatever its kind."""
+    if op == sre_constants.SUBPATTERN:
+        return [av[-1]]
+    if op in _REPEATS:
+        return [av[2]]
+    if op == sre_constants.BRANCH:
+        return list(av[1])
+    if op in _ASSERTS:
+        return [av[1]]
+    if op in _ATOMIC:
+        return [av]
+    if op == _CONDITIONAL:
+        return [part for part in av[1:] if part is not None]
+    return []
+
+
+def _everything(items):
+    """Every element at any depth."""
+    for op, av in items:
+        yield op, av
+        for sub in _subitems(op, av):
+            for found in _everything(sub):
+                yield found
+
+
+def _has_repeat(items):
+    return any(op in _REPEATS for op, av in _everything(items))
+
+
+def _has_open(items):
+    return any(op in _REPEATS and _is_open(av) for op, av in _everything(items))
+
+
+def _is_open(av):
+    return av[1] == sre_constants.MAXREPEAT or av[1] > _OPEN
 
 
 def _chars(items, fold):
-    """Every character the items can consume; None when that is too broad to say."""
+    """Every character the items can consume."""
     total = frozenset()
-    for op, av in _flatten(items):
-        if op == sre_constants.LITERAL:
-            part = _fold(frozenset((av,)), fold)
-        elif op == sre_constants.IN:
-            part = _in_set(av, fold)
-        elif op in _REPEATS:
-            part = _chars(av[2], fold)
-        elif op == sre_constants.BRANCH:
-            part = frozenset()
-            for alt in av[1]:
-                part = _union(part, _chars(alt, fold))
+    for op, av in items:
+        one = _single(op, av, fold)
+        if one is not None:
+            total |= one
         elif op in _ZERO_WIDTH:
-            part = frozenset()
+            continue
+        elif op in _REPEATS or op == sre_constants.SUBPATTERN or op in _ATOMIC:
+            total |= _chars(_subitems(op, av)[0], fold)
+        elif op == sre_constants.BRANCH:
+            for alt in av[1]:
+                total |= _chars(alt, fold)
         else:
-            part = None                     # ANY, NOT_LITERAL, a group reference ...
-        total = _union(total, part)
-        if total is None:
-            return None
+            return _UNIVERSE                # a group reference, a conditional ...
     return total
 
 
@@ -260,91 +356,180 @@ def _nullable(op, av):
         return True
     if op in _REPEATS:
         return av[0] == 0
+    if op == sre_constants.SUBPATTERN:
+        return all(_nullable(o, a) for o, a in av[-1])
     if op == sre_constants.BRANCH:
-        return any(all(_nullable(o, a) for o, a in _flatten(alt)) for alt in av[1])
+        return any(all(_nullable(o, a) for o, a in alt) for alt in av[1])
     return False
 
 
 def _first(items, fold):
     """(characters a match of ``items`` can start with, whether it can be empty)."""
     start = frozenset()
-    for op, av in _flatten(items):
+    for op, av in items:
         if op in _ZERO_WIDTH:
             continue
-        if op in _REPEATS:
-            part = _first(av[2], fold)[0]
+        if op in _REPEATS or op == sre_constants.SUBPATTERN or op in _ATOMIC:
+            start |= _first(_subitems(op, av)[0], fold)[0]
         elif op == sre_constants.BRANCH:
-            part = frozenset()
             for alt in av[1]:
-                part = _union(part, _first(alt, fold)[0])
+                start |= _first(alt, fold)[0]
         else:
-            part = _chars([(op, av)], fold)
-        start = _union(start, part)
+            start |= _chars([(op, av)], fold)
         if not _nullable(op, av):
             return start, False
     return start, True
 
 
-def _overlap(a, b):
-    if a is not None and not a or b is not None and not b:
-        return False
-    return a is None or b is None or bool(a & b)
+def _empty():
+    return RuleError("a repeated or optional part that can match nothing "
+                     "((?:a*)?, (?:\\s{0,2})*) can do so in more than one way")
 
 
-def _is_open(av):
-    return av[1] == sre_constants.MAXREPEAT or av[1] > _OPEN
+def _sequence(items):
+    """``(op, av, optional)`` of one level: groups opened up, and the contents of
+    an optional group that holds an open repeat counted as optional elements of the
+    level, so ``(?:\\d+)?(?:\\d+)?`` is seen as the two adjacent repeats it is."""
+    out = []
+    for op, av in items:
+        if op == sre_constants.SUBPATTERN:
+            out.extend(_sequence(av[-1]))
+        elif op in _REPEATS and av[0] == 0 and av[1] == 1 and _has_open(av[2]):
+            if _first(av[2], False)[1]:
+                raise _empty()
+            out.extend((o, a, True) for o, a, _ in _sequence(av[2]))
+        else:
+            out.append((op, av, False))
+    return out
 
 
 class _Risk:
+    """Walks a parsed pattern, refuses the shapes that are exponential, and estimates
+    the work of the rest as a number of steps on a ``MAX_SUBJECT`` field.
+
+    A repeat is *ambiguous* when it can swallow a character that may follow it, so
+    that where it ends is a choice; each choice multiplies the work of everything
+    after it. A repeat that cannot swallow its follower is *deterministic* and only
+    adds its own run. So ``\\d+\\d+x`` is the product of two lengths (and a third
+    for the start position), ``\\w+@\\w+\\.\\w+`` the sum of three.
+    """
+
     def __init__(self, fold):
         self.fold = fold
-        self.ambiguous = 0
 
-    def walk(self, items, heavy):
-        flat = _flatten(items)
-        for i, (op, av) in enumerate(flat):
-            if op in _REPEATS:
-                lo, hi, body = av
-                if heavy and hi > 1:
-                    raise RuleError("a repetition inside a repetition backtracks exponentially")
-                if _is_open(av):
-                    self.open_repeat(flat, i, body)
-                self.walk(body, heavy or hi > _HEAVY)
-            elif op == sre_constants.BRANCH:
-                if heavy:
-                    self.alternatives(av[1])
-                for alt in av[1]:
-                    self.walk(alt, heavy)
-            elif op in (sre_constants.ASSERT, sre_constants.ASSERT_NOT):
-                self.walk(av[1], heavy)
+    def work(self, items, inside=False):
+        flat = _sequence(items)
+        rest = 0
+        for i in range(len(flat) - 1, -1, -1):
+            rest = self.element(flat, i, inside, rest)
+        return rest
+
+    def follow(self, flat, i):
+        found = frozenset()
+        for op, av, optional in flat[i + 1:]:
+            if op in _ZERO_WIDTH:
+                continue
+            found |= _first([(op, av)], self.fold)[0]
+            if not (optional or _nullable(op, av)):
+                break
+        return found
+
+    def element(self, flat, i, inside, rest):
+        """The work of ``flat[i:]`` given the work of ``flat[i + 1:]``."""
+        op, av, optional = flat[i]
+        if op in _REPEATS:
+            lo, hi, body = av
+            if _first(body, self.fold)[1]:
+                raise _empty()
+            if hi > 1 and _has_repeat(body):
+                self.delimited(body)
+            self.work(body, inside or hi > 1)
+            run = MAX_SUBJECT if _is_open(av) else hi
+            if (hi > 1 or lo == 0 or optional) and (
+                    _chars(body, self.fold) & self.follow(flat, i)):
+                return (run if hi > 1 else 2) * (1 + rest)
+            # the last element of a pattern cannot fail after it matched: it costs nothing more
+            last = i == len(flat) - 1
+            return (1 if last else run if hi > 1 else 1) + rest
+        if op == sre_constants.BRANCH:
+            if inside:
+                self.alternatives(av[1])
+            works = [self.work(alt, inside) for alt in av[1]]
+            starts = [_first(alt, self.fold)[0] for alt in av[1]]
+            overlapping = sum(len(x) for x in starts) > len(frozenset().union(*starts))
+            if overlapping:
+                return len(av[1]) * (1 + rest)
+            return max(works) + rest
+        if op == _CONDITIONAL:
+            raise RuleError("a conditional group (?(1)..|..) is not supported")
+        if op in _ZERO_WIDTH:
+            return sum(self.work(sub, inside) for sub in _subitems(op, av)) + rest
+        if op in _ATOMIC:
+            return self.work(av, inside) + rest
+        return 1 + rest
+
+    def delimited(self, body):
+        """The body of a repeat may only hold a repeat or an optional part if the
+        characters that follow it (inside the body, or the start of the next
+        round) are ones it cannot match, so that where it ends is never a choice.
+        ``(?:[a-z]+\\.)+`` and ``(?:ab?)+`` are fine; ``(a+)+``, ``(\\w+/?)+`` and
+        ``(?:[ab][a-z]?)*`` are not."""
+        flat = _sequence(body)
+        start = _first(body, self.fold)[0]
+        for i, (op, av, optional) in enumerate(flat):
+            if op in _REPEATS and (av[1] > 1 or av[0] == 0) or optional:
+                follow = frozenset()
+                for later, args, later_optional in flat[i + 1:]:
+                    if later in _ZERO_WIDTH:
+                        continue
+                    follow |= _first([(later, args)], self.fold)[0]
+                    if not (later_optional or _nullable(later, args)):
+                        break
+                else:
+                    follow |= start
+                if _chars([(op, av)], self.fold) & follow:
+                    raise RuleError("a part of a repeated group can match what comes after "
+                                    "it, so where it ends is a choice that multiplies: "
+                                    "(?:[a-z]+\\.)+ is fine, (a+)+ and (\\w+/?)+ are not")
+            elif op not in _REPEATS and op not in _ZERO_WIDTH and _has_repeat([(op, av)]):
+                raise RuleError("alternatives that hold repeats cannot sit inside a repeat")
 
     def alternatives(self, alts):
         seen = frozenset()
         for alt in alts:
             first, empty = _first(alt, self.fold)
-            if empty or first is None or first & seen:
+            if empty or first & seen:
                 raise RuleError("alternatives that can start alike inside a repetition "
                                 "backtrack exponentially")
             seen |= first
 
-    def open_repeat(self, flat, i, body):
-        swallows = _chars(body, self.fold)
-        follow = frozenset()
-        for op, av in flat[i + 1:]:
-            if op in _ZERO_WIDTH:
-                continue
-            if op in _REPEATS and _is_open(av) and _overlap(swallows, _chars(av[2], self.fold)):
-                raise RuleError("adjacent repeats that can match the same characters "
-                                "backtrack in a product of their lengths")
-            follow = _union(follow, _first([(op, av)], self.fold)[0])
-            if not _nullable(op, av):
-                break
-        if _overlap(swallows, follow):
-            self.ambiguous += 1
-            if self.ambiguous > MAX_AMBIGUOUS_REPEATS:
-                raise RuleError("more than %d unbounded repeats that can swallow what "
-                                "follows them backtrack in a power of the length"
-                                % MAX_AMBIGUOUS_REPEATS)
+
+def _starts(parsed, fold):
+    """How many positions of a ``MAX_SUBJECT`` field a search can start a real attempt at.
+
+    One when the pattern is anchored. When it opens with literal characters, an
+    attempt needs those, and the most starts they allow is the length divided by
+    how soon the literal can overlap itself (``cmd`` 3, ``aa`` 1). Otherwise all.
+    """
+    flat = _sequence(parsed)
+    if flat and flat[0][0] == sre_constants.AT and str(flat[0][1]) in (
+            "AT_BEGINNING", "AT_BEGINNING_STRING"):
+        return 1
+    prefix = []
+    for op, av, _optional in flat:
+        if op != sre_constants.LITERAL:
+            break
+        prefix.append(chr(av).lower() if fold else chr(av))
+    if not prefix:
+        return MAX_SUBJECT
+    border = [0] * len(prefix)             # longest proper prefix that is also a suffix
+    for i in range(1, len(prefix)):
+        k = border[i - 1]
+        while k and prefix[i] != prefix[k]:
+            k = border[k - 1]
+        border[i] = k + (prefix[i] == prefix[k])
+    period = len(prefix) - border[-1]
+    return -(-MAX_SUBJECT // period)
 
 
 def _compile_regex(pattern):
@@ -352,8 +537,15 @@ def _compile_regex(pattern):
         raise RuleError("regex longer than %d characters" % MAX_PATTERN)
     try:
         compiled = re.compile(pattern)
+        if compiled.flags & (re.ASCII | re.LOCALE):
+            raise RuleError("the ASCII and LOCALE flags are not supported")
         parsed = sre_parse.parse(pattern)
-        _Risk(bool(compiled.flags & re.IGNORECASE)).walk(parsed, False)
+        fold = bool(compiled.flags & re.IGNORECASE)
+        steps = _Risk(fold).work(parsed) * _starts(parsed, fold)
+        if steps > MAX_REGEX_STEPS:
+            raise RuleError("its worst case on a %d-character field is about %d steps "
+                            "(limit %d): too many repeats that can swallow what follows "
+                            "them" % (MAX_SUBJECT, steps, MAX_REGEX_STEPS))
     except RuleError as exc:
         raise RuleError("regex %r refused: %s" % (pattern, exc))
     except (re.error, RecursionError, OverflowError) as exc:
@@ -398,8 +590,21 @@ class _Compiler:
             return list(self.lists[name])
         return value
 
+    def element(self, text, item):
+        """An item written inside a list: ``$name`` there would be silently literal."""
+        if isinstance(item, str) and item.startswith("$"):
+            if item.startswith("$$"):
+                return item[1:]
+            raise RuleError("%s: %r inside a list is text, not a list name; use $$ for a "
+                            "literal $, or give the list name alone as the value"
+                            % (text, item))
+        return item
+
     def values(self, text, value, scalar_ok=True, kind=None):
-        value = self.resolve(value)
+        if isinstance(value, list):
+            value = [self.element(text, item) for item in value]
+        else:
+            value = self.resolve(value)
         if isinstance(value, list):
             if not value:
                 raise RuleError("%s: the list is empty" % text)
@@ -526,15 +731,24 @@ class _Compiler:
             def check(item):
                 if not isinstance(item, str):
                     return False
+                left = getattr(_run, "left", None)
+                if left is not None and left <= 0:
+                    _run.exceeded = True
+                    return False
                 head = item[:MAX_SUBJECT]
                 cut = len(item) > MAX_SUBJECT
+                started = time.perf_counter()
+                found = False
                 for pattern in patterns:
                     m = pattern.search(head)
                     # a match that reaches the cut might have been anchored there or
                     # have run on, so it counts for nothing
                     if m and not (cut and m.end() == len(head)):
-                        return True
-                return False
+                        found = True
+                        break
+                if left is not None:
+                    _run.left = left - (time.perf_counter() - started)
+                return found
         else:
             number = _number(self.resolve(value))
             if number is None:
@@ -546,10 +760,12 @@ class _Compiler:
                 n = _number(item)
                 return n is not None and compare(n, number)
 
+        elements = MAX_REGEX_ELEMENTS if op == "re" else None
+
         def test(event):
             found = event.get(field)
             if isinstance(found, (list, tuple)):
-                return any(check(item) for item in found)
+                return any(check(item) for item in found[:elements])
             return check(found)
         return cost, test, keys
 
@@ -590,6 +806,14 @@ class RuleHit(dict):
 def _reference(index, event):
     return {"index": index, "type": event["type"], "ts": _plain(event.get("ts")),
             "dest": _plain(event.get("dest")), "port": _plain(event.get("port"))}
+
+
+class Hits(list):
+    """The result of ``evaluate``: a list of ``RuleHit``. ``regex_budget_exceeded`` is
+    True when the regex time of the call ran out and later regex conditions were
+    treated as not matching, so the hits may be incomplete."""
+
+    regex_budget_exceeded = False
 
 
 class _KnownGood:
@@ -669,13 +893,33 @@ class RuleSet:
         loaded, then the correlations. The events are not changed."""
         seen = {}               # rule position -> process -> [count, event references]
         hidden = self._known.hides if self._known else None
+        _run.left, _run.exceeded = REGEX_BUDGET_S, False
+        try:
+            self._scan_events(events, seen, hidden)
+            exceeded = _run.exceeded
+        finally:
+            _run.left = None
+        hits, by_rule = Hits(), {}
+        for position in sorted(seen):
+            rule = self.rules[position]
+            for process, (count, refs) in seen[position].items():
+                if count >= rule["count_gte"]:
+                    hit = RuleHit(rule, process, count, refs)
+                    hits.append(hit)
+                    by_rule.setdefault(rule["id"], {})[process] = hit
+        hits.extend(self._correlate(by_rule))
+        hits.regex_budget_exceeded = exceeded
+        return hits
+
+    def _scan_events(self, events, seen, hidden):
         for index, event in enumerate(events):
             if not isinstance(event, dict):
                 continue
             etype = event.get("type")
             if not isinstance(etype, str):
                 continue
-            invisible = hidden is not None and hidden(event)
+            invisible = (hidden is not None and etype not in ALWAYS_VISIBLE
+                         and hidden(event))
             for rule in self._candidates(event, etype):
                 if invisible and not rule._sees_known:
                     continue
@@ -686,15 +930,6 @@ class RuleSet:
                     entry[0] += 1
                     if len(entry[1]) < MAX_HIT_EVENTS:
                         entry[1].append(_reference(index, event))
-        hits, by_rule = [], {}
-        for position in sorted(seen):
-            rule = self.rules[position]
-            for process, (count, refs) in seen[position].items():
-                if count >= rule["count_gte"]:
-                    hit = RuleHit(rule, process, count, refs)
-                    hits.append(hit)
-                    by_rule.setdefault(rule["id"], {})[process] = hit
-        return hits + self._correlate(by_rule)
 
     def _correlate(self, by_rule):
         chains = []
@@ -771,7 +1006,7 @@ def _read(path, errors):
         with open(path, "rb") as fh:
             text = fh.read().decode("utf-8")
         return yaml.load(text, Loader=_Loader)
-    except (OSError, UnicodeDecodeError, yaml.YAMLError, RecursionError) as exc:
+    except (OSError, ValueError, TypeError, OverflowError, yaml.YAMLError, RecursionError) as exc:
         errors.append("%s: cannot read the rule file: %s" % (path, _one_line(exc)))
         return None
 

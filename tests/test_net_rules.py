@@ -31,6 +31,7 @@ Regressions covered:
 import json
 import os
 import random
+import re
 import tempfile
 import time
 
@@ -417,6 +418,18 @@ def test_a_dollar_dollar_is_a_literal_dollar():
     assert rs.errors == [] and len(rs.evaluate([_http(path="$HOME")])) == 1
 
 
+@pytest.mark.parametrize("value", ["[$bad, x.top]", "[x.top, $bad]", "[$nope]"])
+def test_a_list_name_inside_a_list_literal_is_an_error_not_literal_text(value):
+    rs = _rules("lists: {bad: [evil.top]}\nrules:\n"
+                "  - {id: l, name: l, event: dns, match: {dest|in: %s}}" % value)
+    assert rs.rules == [] and any("$" in e and "list" in e for e in rs.errors)
+
+
+def test_a_dollar_dollar_inside_a_list_literal_is_a_literal_dollar():
+    rs = _rules("rules:\n  - {id: l, name: l, event: http, match: {path|in: [$$HOME, /x]}}")
+    assert rs.errors == [] and len(rs.evaluate([_http(path="$HOME")])) == 1
+
+
 def test_a_list_works_with_every_string_operator():
     rs = _rules("""
 lists:
@@ -548,6 +561,29 @@ def test_no_events_and_foreign_objects_are_harmless():
     assert rs.evaluate([None, 5, "x", {"no": "type"}, {"type": "nope"}]) == []
 
 
+def _type_events():
+    return {etype: net_events.NetEvent(etype, 1.0, dest="www.msftconnecttest.com")
+            for etype in net_events.EVENT_TYPES}
+
+
+@pytest.mark.parametrize("etype", net_events.EVENT_TYPES)
+def test_known_good_hides_every_type_but_the_ones_that_say_something_crossed_the_wire(etype):
+    """``Host: <known-good name>`` on a connection to the sample's own address is
+    free to forge, so the evidence of a transfer must not depend on it."""
+    rs = _rules("lists: {known_good: [www.msftconnecttest.com]}\n"
+                "rules:\n  - {id: r, name: r, event: %s, match: {}}" % etype)
+    hits = rs.evaluate([_type_events()[etype]])
+    assert bool(hits) == (etype in ("download", "upload", "decoded"))
+    assert net_rules.ALWAYS_VISIBLE == {"download", "upload", "decoded"}
+
+
+def test_a_forged_host_does_not_hide_a_download_from_a_correlation():
+    rs = _rules("lists: {known_good: [www.msftconnecttest.com]}\n" + _CHAIN)
+    evs = [net_events.NetEvent("download", 1.0, dest="www.msftconnecttest.com", kind="pe"),
+           net_events.NetEvent("beacon", 2.0, dest="c2.top")]
+    assert "chain" in _ids(rs.evaluate(evs))
+
+
 # --- credentials ----------------------------------------------------------------
 
 def test_a_hit_on_an_ftp_event_serializes_and_holds_no_password():
@@ -613,8 +649,8 @@ def test_a_correlation_works_in_a_capture_that_knows_no_process():
 
 def test_known_good_events_do_not_complete_a_correlation():
     rs = _rules("lists: {known_good: [ok.top]}\n" + _CHAIN)
-    evs = [net_events.NetEvent("download", 1.0, dest="ok.top", kind="pe"),
-           net_events.NetEvent("beacon", 2.0)]
+    evs = [net_events.NetEvent("download", 1.0, kind="pe"),
+           net_events.NetEvent("beacon", 2.0, dest="ok.top")]
     assert "chain" not in _ids(rs.evaluate(evs))
 
 
@@ -798,6 +834,21 @@ def test_a_yaml_that_does_not_stay_small_is_refused(tmp_path):
     assert rs.rules == [] and any("big.yaml" in e for e in rs.errors)
 
 
+@pytest.mark.parametrize("text", [
+    "rules: [{id: 2026-13-45, name: x}]",
+    "rules: [{id: r, name: x, event: dns, match: {dest: !!float abc}}]",
+    "rules: [{id: r, name: x, event: dns, match: {port|gte: !!int zz}}]",
+    "rules: [{id: r, name: x, event: dns, match: {dest: !!timestamp 2026-02-30}}]",
+    "rules: [{id: r, name: x, event: dns, match: {dest: !!binary '!!'}}]",
+])
+def test_a_scalar_yaml_cannot_construct_is_reported_not_raised(text, tmp_path):
+    (tmp_path / "ok.yaml").write_text("rules:\n  - {id: fine, name: f, event: dns, match: {}}\n")
+    (tmp_path / "bad.yaml").write_text(text)
+    rs = net_rules.load_rules([str(tmp_path / "bad.yaml"), str(tmp_path / "ok.yaml")])
+    assert [r["id"] for r in rs.rules] == ["fine"]
+    assert len(rs.errors) == 1 and "bad.yaml" in rs.errors[0]
+
+
 def test_python_objects_in_yaml_are_not_constructed(tmp_path):
     p = tmp_path / "evil.yaml"
     p.write_text("rules:\n  - !!python/object/apply:os.system ['true']\n")
@@ -835,10 +886,26 @@ def test_deeply_nested_blocks_are_refused():
     r"(?:\w\w|\d)+$",
     r"(\w+\s?)+$",
     r"(x+x+)+y",
-    r"\d+\d+x",
     r"\w*\w*\w*$",
     r".*.*x",
     r".*a.*a.*b",
+    # found by review: a bounded repeat around an open one, an open repeat hidden
+    # in an optional group, a conditional group; each took seconds to minutes
+    r"^/(\w+/?){1,5}\.php$",
+    r"(a+){5}$",
+    r"((a+){5}){5}$",
+    r"(\w+){1,5}\.exe",
+    r"(?:\d+)?(?:\d+)?(?:\d+)?(?:\d+)?x",
+    r"()?(?(1)(a+)+$|b)",
+    r"(a)?(?(1)(?:b+)+$|c)",
+    # found while fuzzing: an optional part that can match what the next round starts with
+    r"^(?:(?:(?:a|b)[a-z]?)*/+(?:\.){2})/+x",
+    r"(?:[ab][a-z]?)*c",
+    r"(?:a?a)+b",
+    r"(?:\d{1,3}\.?)+x",
+    r"^(?:(?:\s{0,2})?(?:a|bc))+?x",
+    r"(?:(?:(?:(?:(?:(?:(?:a*)?)?)?)?)?)?)?x",
+    r"(?:\w*)?(?:\d*)?x",
 ])
 def test_a_hostile_regex_is_refused_at_load_time(pattern):
     rs = _rules("rules:\n  - {id: h, name: h, event: http, match: {\"path|re\": '%s'}}" % pattern)
@@ -859,18 +926,83 @@ def test_a_hostile_regex_is_refused_at_load_time(pattern):
     r"\w+@\w+\.\w+",
     r"(ab)+c",
     r"\d+a\d+b\d+c",
+    r"^(?:[a-z0-9-]+\.)+top$",
+    r"[^/]+/[^/]+/[^/]+\.php",
+    r"\S+\s\S+\s\S+x",
+    r"(?:\w+\.)+x",
+    r"(?:[a-z0-9-]+\.){2,}[a-z]{2,}$",
+    r"(?i)mozilla/5\.0.*windows nt 10.*chrome/\d+",
+    r"(?:ab?)+c",
+    r"a.*b",
 ])
 def test_ordinary_regexes_are_accepted(pattern):
     rs = _rules("rules:\n  - {id: h, name: h, event: http, match: {\"path|re\": '%s'}}" % pattern)
     assert rs.errors == [] and len(rs.rules) == 1, (pattern, rs.errors)
 
 
-def test_the_worst_regex_that_is_accepted_is_cheap_on_a_huge_field():
-    rs = _rules("rules:\n  - {id: h, name: h, event: http, match: {\"path|re\": 'a.*a.*b'}}")
-    assert rs.errors == []
-    start = time.time()
-    assert rs.evaluate([_http(path="a" * 2000000)]) == []
-    assert time.time() - start < 2.0
+_SUBJECTS = ["a", "1", "a1", "a.", "ab", "a/", " ", "a b ", "x-", "a.b."]
+
+
+@pytest.mark.parametrize("pattern", [
+    r"a.*b", r"\d+\d+x", r"^.*a.*b", r"\S*?(?:a|bc)+?\.php", r"[ab]*(?:a|bc)*?/{1,5}$",
+    r"(?:[a-z0-9-]+\.){2,}[a-z]{2,}$",
+])
+def test_the_worst_regexes_that_are_accepted_stay_cheap_on_a_huge_field(pattern):
+    """Accepted does not mean free; it means bounded: the field is cut first."""
+    rs = _rules("rules:\n  - {id: h, name: h, event: http, match: {\"path|re\": '%s'}}"
+                % pattern.replace("'", "''"))
+    assert rs.errors == [], rs.errors
+    for unit in _SUBJECTS:
+        subject = (unit * (2000000 // len(unit)))[:2000000]
+        start = time.time()
+        rs.evaluate([_http(path=subject), _http(path=subject + "!")])
+        assert time.time() - start < 0.5, (pattern, unit)
+
+
+def test_no_regex_that_is_accepted_is_slow_on_a_field_made_to_hurt_it():
+    """Random patterns, judged by what they do and not by what the checker thinks.
+
+    Whatever the load-time check lets through is run on subjects built from the
+    characters the patterns are made of. The limit is generous (a pattern that
+    stalls takes minutes, not a tenth of a second), so a failure here is a hole.
+    """
+    rng = random.Random(20261125)
+    atoms = ["a", "b", "x", r"\.", "/", "-", r"\w", r"\d", r"\s", r"\S", r"\W", ".", "[ab]",
+             "[^a]", "[a-z]", "[^/]", "(?:a|b)", "(?:ab|a)", "(?:a|bc)"]
+    quants = ["", "", "", "?", "+", "*", "{2}", "{1,3}", "{0,2}", "{2,}", "{1,5}", "+?",
+              "*?", "{1,40}"]
+
+    def seq(depth, n):
+        out = []
+        for _ in range(n):
+            if depth < 2 and rng.random() < 0.35:
+                out.append("(?:" + seq(depth + 1, rng.randint(1, 3)) + ")")
+            else:
+                out.append(rng.choice(atoms))
+            out[-1] += rng.choice(quants)
+        return "".join(out)
+
+    n = net_rules.MAX_SUBJECT
+    subjects = ["a" * n, "a" * n + "!", "1" * n, "a1" * (n // 2), "a." * (n // 2) + "!",
+                "ab" * (n // 2) + "!", "a/" * (n // 2), " " * n, "a b " * (n // 4) + "!",
+                "x-" * (n // 2) + "."]
+    accepted = slowest = 0
+    for _ in range(1200):
+        pattern = (rng.choice(["", "^"]) + seq(0, rng.randint(1, 5))
+                   + rng.choice(["", "$", "x", r"\.php"]))
+        try:
+            net_rules._compile_regex(pattern)
+        except net_rules.RuleError:
+            continue
+        accepted += 1
+        compiled = re.compile(pattern)
+        for subject in subjects:
+            start = time.perf_counter()
+            compiled.search(subject)
+            took = time.perf_counter() - start
+            assert took < 0.5, (pattern, subject[:6], took)
+            slowest = max(slowest, took)
+    assert accepted > 300           # the generator is not refused wholesale
 
 
 def test_a_regex_sees_only_the_start_of_a_field_and_not_a_cut_end():
@@ -887,6 +1019,60 @@ def test_a_regex_sees_only_the_start_of_a_field_and_not_a_cut_end():
 def test_linear_operators_see_the_whole_field():
     rs = _rules("rules:\n  - {id: h, name: h, event: http, match: {\"body_text|contains\": 'needle'}}")
     assert rs.evaluate([_http(body_text="a" * 500000 + "needle")]) != []
+
+
+def test_the_regex_budget_stops_regexes_and_says_so(monkeypatch):
+    rs = _rules("rules:\n  - {id: r, name: r, event: http, match: {path|re: 'a'}}")
+    evs = [_http(float(i), path="a") for i in range(50)]
+    hits = rs.evaluate(evs)
+    assert hits[0]["count"] == 50 and hits.regex_budget_exceeded is False
+    monkeypatch.setattr(net_rules, "REGEX_BUDGET_S", 0.0)
+    spent = rs.evaluate(evs)
+    assert spent == [] and spent.regex_budget_exceeded is True
+    assert isinstance(spent, list)
+
+
+def test_the_regex_budget_is_spent_by_regex_time_only(monkeypatch):
+    rs = _rules("rules:\n  - {id: r, name: r, event: http, match: {method: GET}}")
+    monkeypatch.setattr(net_rules, "REGEX_BUDGET_S", 0.0)
+    hits = rs.evaluate([_http(method="GET")])
+    assert len(hits) == 1 and hits.regex_budget_exceeded is False
+
+
+def test_the_regex_budget_does_not_leak_into_the_next_call(monkeypatch):
+    rs = _rules("rules:\n  - {id: r, name: r, event: http, match: {path|re: 'a'}}")
+    monkeypatch.setattr(net_rules, "REGEX_BUDGET_S", 0.0)
+    assert rs.evaluate([_http(path="a")]).regex_budget_exceeded is True
+    monkeypatch.setattr(net_rules, "REGEX_BUDGET_S", 20.0)
+    assert len(rs.evaluate([_http(path="a")])) == 1
+    assert len(rs.rules[0]._match(_http(path="a")) and [1]) == 1       # outside evaluate: no budget
+
+
+def test_a_regex_looks_only_at_the_first_elements_of_a_list_field():
+    rs = _rules("rules:\n  - {id: r, name: r, event: smtp, match: {rcpt_to|re: 'target'}}")
+    last = net_rules.MAX_REGEX_ELEMENTS
+    near = net_events.NetEvent("smtp", 1.0, rcpt_to=["x"] * (last - 1) + ["target@d.top"])
+    far = net_events.NetEvent("smtp", 1.0, rcpt_to=["x"] * last + ["target@d.top"])
+    assert len(rs.evaluate([near])) == 1 and rs.evaluate([far]) == []
+
+
+def test_other_operators_look_at_every_element_of_a_list_field():
+    rs = _rules("rules:\n  - {id: r, name: r, event: smtp, match: {rcpt_to|endswith: '@d.top'}}")
+    far = net_events.NetEvent("smtp", 1.0, rcpt_to=["x"] * 200 + ["a@d.top"])
+    assert len(rs.evaluate([far])) == 1
+
+
+def test_the_cost_of_one_evaluate_of_hostile_events_is_bounded(monkeypatch):
+    """The point of the budget: a capture of many fields made to hurt the
+    most expensive regex that is accepted costs a budget, not hours."""
+    rs = _rules("rules:\n  - {id: r, name: r, event: http, "
+                "match: {path|re: '\\S*?(?:a|bc)+?\\.php'}}")
+    monkeypatch.setattr(net_rules, "REGEX_BUDGET_S", 0.3)
+    evs = [_http(float(i), path="a" * 5000) for i in range(2000)]
+    start = time.time()
+    hits = rs.evaluate(evs)
+    assert time.time() - start < 1.5
+    assert hits.regex_budget_exceeded is True
 
 
 # --- cost -----------------------------------------------------------------------
