@@ -47,8 +47,15 @@ def _is_ip(text):
 class NetEvent(dict):
     """One network event.
 
-    Behaves as a plain dict so it serializes straight to JSON, but is built
-    through a constructor that enforces the schema.
+    A dict subclass built through a constructor that enforces the schema. The
+    mandatory fields and the fields of every parser except one are plain JSON
+    values, so such an event goes through ``json.dumps`` as it is. The
+    exception is deliberate: ``net_mail_ftp`` stores a captured password as a
+    ``Secret``, which is not JSON-serializable and makes ``json.dumps`` (and
+    pickling) raise ``TypeError``. Events that may hold one (``ftp``, ``smtp``)
+    are serialized through ``net_mail_ftp.masked(...)``, which accepts one
+    event, a list of them or any nesting and returns plain dicts. Using it on
+    every event is always safe.
     """
 
     def __init__(self, type, ts, process="", pid=None, dest="", **fields):

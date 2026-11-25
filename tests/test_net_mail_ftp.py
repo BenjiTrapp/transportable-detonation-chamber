@@ -7,6 +7,15 @@ Regressions covered:
     event's repr, in ``str()``, in the recorded command list or in the
     ``masked`` copy (``password_captured`` tells a captured password from an
     absent one without printing it)
+  * the password was a ``str`` subclass, so ``json.dumps(event)`` (what
+    ``NetEvent`` is documented to allow), pickle, concatenation and ``join``
+    wrote the real value with no error; ``Secret`` is not a ``str`` and each of
+    those raises, so a report or API response that forgets ``masked`` fails in
+    its first test instead of leaking; ``masked`` takes an event, a list of
+    events or any nesting and finds credentials by type, not by key name
+  * a body of nothing but MIME boundary lines made every line parse the
+    previous (empty or header-only) part, which let a capture buy seconds of
+    CPU per message; empty parts are not parsed and parsed parts are bounded
   * ``AUTH LOGIN`` / ``AUTH PLAIN`` send base64: both forms (value inline or on
     the next line) are decoded; a line that is not base64, or a server that
     refused the mechanism so the client went on with commands, neither drops
@@ -30,12 +39,15 @@ Regressions covered:
 """
 
 import base64
+import copy
 import json
 import os
+import pickle
 import socket
 import tempfile
 
 import dpkt
+import pytest
 
 import net_flows
 import net_mail_ftp
@@ -203,6 +215,64 @@ def test_smtp_password_is_masked_like_ftp():
     assert e["password_captured"] is True and e["user"] == "bot"
     assert "s3cret" not in repr(e) and "s3cret" not in str(e)
     assert "s3cret" not in json.dumps(net_mail_ftp.masked(e))
+
+
+# --- the credential type fails closed ---------------------------------------
+
+def test_json_refuses_an_event_that_holds_a_credential():
+    e = _one(21, b"USER bot\r\nPASS s3cret\r\n")
+    for doc in (e, [e], {"events": [e]}):
+        with pytest.raises(TypeError):
+            json.dumps(doc)
+    absent = _one(21, b"USER bot\r\n")
+    with pytest.raises(TypeError):              # not a function of what the capture held
+        json.dumps(absent)
+
+
+def test_a_secret_cannot_be_turned_into_text_by_accident():
+    secret = _one(21, b"USER bot\r\nPASS s3cret\r\n")["password"]
+    assert not isinstance(secret, str)
+    with pytest.raises(TypeError):
+        "pw=" + secret
+    with pytest.raises(TypeError):
+        secret + "x"
+    with pytest.raises(TypeError):
+        ",".join([secret])
+    with pytest.raises(TypeError):
+        pickle.dumps(secret)
+    with pytest.raises(TypeError):
+        pickle.dumps(_one(21, b"USER bot\r\nPASS s3cret\r\n"))
+    with pytest.raises(TypeError):
+        "s" in secret
+    with pytest.raises(TypeError):
+        list(secret)
+    rendered = "%s %r " % (secret, secret) + "{} {:>10}".format(secret, secret)
+    assert "s3cret" not in rendered
+
+
+def test_a_secret_still_compares_and_counts_like_its_text():
+    secret = net_mail_ftp.Secret("s3cret")
+    assert secret == "s3cret" and "s3cret" == secret and secret != "other"
+    assert secret == net_mail_ftp.Secret("s3cret") and secret != 5
+    assert hash(secret) == hash("s3cret") and {"s3cret": 1}[secret] == 1
+    assert bool(secret) and len(secret) == 6
+    assert not net_mail_ftp.Secret("") and len(net_mail_ftp.Secret("")) == 0
+    assert secret.reveal() == "s3cret" and type(secret.reveal()) is str
+    assert copy.deepcopy(secret) == "s3cret" and copy.copy(secret) == "s3cret"
+
+
+def test_masked_takes_one_event_or_many_and_finds_credentials_by_type():
+    one = _one(21, b"USER bot\r\nPASS s3cret\r\n")
+    two = _one(587, b"AUTH LOGIN\r\nYm90\r\nczNjcmV0\r\n")
+    for shaped in (one, [one, two], (one, two), iter([one, two]),
+                   {"events": [one], "other": {"deep": [two]}}):
+        text = json.dumps(net_mail_ftp.masked(shaped))
+        assert "s3cret" not in text and "***" in text
+    nested = net_mail_ftp.masked({"a": {"cred": net_mail_ftp.Secret("x1")},
+                                  "b": [net_mail_ftp.Secret("")], "c": 3, "d": "text"})
+    assert nested == {"a": {"cred": "***"}, "b": [""], "c": 3, "d": "text"}
+    assert type(net_mail_ftp.masked(one)) is dict
+    assert one["password"] == "s3cret"                    # the original is untouched
 
 
 # --- SMTP authentication -----------------------------------------------------
@@ -456,3 +526,27 @@ def test_non_ascii_bytes_do_not_raise():
     e = _one(21, b"USER b\xe4\xf6t\r\nSTOR \xff\xfe.txt\r\n")
     assert e["user"] == "b\xe4\xf6t"
     assert len(e["files"]) == 1
+
+
+def test_boundary_lines_do_not_buy_a_parse_each(monkeypatch):
+    calls = []
+    real = net_mail_ftp._headers
+    monkeypatch.setattr(net_mail_ftp, "_headers", lambda block: calls.append(1) or real(block))
+    empty = [b"--x"] * 20000
+    e = _one(25, _mail("Subject: s", "", *[line.decode() for line in empty]), _OK_SERVER)
+    assert e["data_complete"] is True and len(calls) == 1      # the message headers only
+    del calls[:]
+    parts = []
+    for _ in range(5000):
+        parts += ["--x", "X-Filler: 1", ""]
+    e = _one(25, _mail("Subject: s", "", *parts), _OK_SERVER)
+    assert len(calls) <= net_mail_ftp.MAX_MIME_PARTS + 1
+    assert "attachments" in e["capped"]
+    assert e["subject"] == "s" and e["body_bytes"] > 0
+
+
+def test_attachments_before_the_part_limit_are_still_found():
+    e = _one(25, _mail(
+        "Subject: s", "", "--B", 'Content-Disposition: attachment; filename="a.zip"', "",
+        "data", "--B--"), _OK_SERVER)
+    assert e["attachments"] == ["a.zip"] and e["capped"] == []

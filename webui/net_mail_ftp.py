@@ -7,20 +7,22 @@ attachment names) and the names of uploaded files. The assumptions this module
 refuses to make:
 
   * A credential is harmless to carry around. The password is kept in the event
-    because the evidence needs it, but as a ``Secret``: a ``str`` whose repr,
-    ``str()`` and format all give ``***``, so it does not reach a log or a
-    traceback by accident. That protects ``print``, logging and ``repr``
-    only: ``json.dumps(event)`` (and so ``flask.jsonify``) writes the REAL
-    password, because the encoder reads the string's content and never calls
-    ``str()``. Anything that puts an event into a report, an API response, a
-    file or any other serialized form MUST serialize ``masked(event)``, never
-    the event itself. ``masked`` returns a plain copy with ``password`` set to
-    ``***`` (or ``""`` when none was captured); ``password_captured`` is the
-    bool that says whether there is one without showing it, and it survives
-    serialization. The ``commands`` list of an FTP session holds ``PASS ***``,
-    never the argument. ``Secret.reveal()`` returns the plain text for the one
-    consumer that must have it, and nothing else should
-    call it.
+    because the evidence needs it, but as a ``Secret``, which is deliberately
+    not a ``str``. Its repr, ``str()`` and format give ``***``, so a log line or
+    traceback does not show it, and anything that would silently copy the text
+    out (``json.dumps`` and so ``flask.jsonify``, pickling, ``+``, ``join``)
+    raises ``TypeError`` instead. This holds for every ftp and smtp event, with
+    or without a password, so a consumer that forgets to mask fails in its
+    first test and not on the one capture that held a credential. To put an
+    event into a report, an API response, a file or any other serialized form,
+    serialize ``masked(event)`` (it also takes a list of events or any nesting,
+    and finds a ``Secret`` by type, not by key). The copy has ``***`` (or
+    ``""`` when none was captured) for the password; ``password_captured`` is
+    the bool that says whether there is one without showing it. The
+    ``commands`` list of an FTP session holds ``PASS ***``, never the argument.
+    ``Secret.reveal()`` returns the plain text for the one consumer that must
+    have it, and nothing else should call it. A ``Secret`` still compares and
+    hashes equal to its text, has a truth value and a length.
   * A stream is a whole session. It is routinely cut: a hole ends it
     (``Flow.client_stream`` stops at the first gap), the capture can stop, the
     retention cap shortens it. A line that has no line end is never used (half
@@ -83,6 +85,7 @@ client's first byte (the ``MAIL FROM`` line for an ``smtp`` event).
 
 import base64
 import re
+from collections.abc import Iterable, Mapping
 from email.header import decode_header, make_header
 from email.parser import HeaderParser
 
@@ -92,6 +95,7 @@ from net_events import NetEvent
 MAX_ITEMS = 500             # entries of any kept list
 MAX_ITEM_CHARS = 512        # characters of one kept entry
 MAX_HEADER_BLOCK = 64 * 1024
+MAX_MIME_PARTS = 1000       # header blocks of MIME parts parsed per message
 
 _FTP_VERBS = frozenset(
     "USER PASS ACCT CWD CDUP XCUP PWD XPWD LIST NLST MLSD MLST RETR STOR STOU APPE "
@@ -116,8 +120,39 @@ _RCPT_TO = re.compile(r"RCPT\s+TO:\s*<?([^>\s]*)", re.I)
 _UNFOLD = re.compile(r"\r?\n(?=[ \t])")
 
 
-class Secret(str):
-    """A password: equal to its text, printed as ``***``."""
+class Secret:
+    """A password: equal to its text, printed as ``***``, and nothing else.
+
+    Not a ``str``, so the ways a ``str`` leaks without a sound all fail with a
+    ``TypeError`` instead: ``json.dumps`` (and so ``flask.jsonify``), pickling,
+    concatenation, ``join``, ``in`` and iteration. It still compares and hashes
+    like its text, has a truth value and a length, and prints as ``***`` under
+    ``repr``, ``str`` and ``format``. ``reveal()`` is the one way to the text.
+    """
+
+    __slots__ = ("_text",)
+
+    def __init__(self, text):
+        object.__setattr__(self, "_text", text)
+
+    def __setattr__(self, name, value):
+        raise AttributeError("a Secret does not change")
+
+    def __eq__(self, other):
+        if isinstance(other, Secret):
+            return self._text == other._text
+        if isinstance(other, str):
+            return self._text == other
+        return NotImplemented
+
+    def __hash__(self):
+        return hash(self._text)
+
+    def __bool__(self):
+        return bool(self._text)
+
+    def __len__(self):
+        return len(self._text)
 
     def __repr__(self):
         return "'***'"
@@ -128,16 +163,35 @@ class Secret(str):
     def __format__(self, spec):
         return format("***", spec)
 
+    def __reduce__(self):
+        raise TypeError("a Secret cannot be pickled")
+
+    def __copy__(self):
+        return self
+
+    def __deepcopy__(self, memo):
+        return self
+
     def reveal(self):
-        return "".join(self)
+        return self._text
 
 
-def masked(event):
-    """A plain copy of ``event`` that is safe to render, log or serialize."""
-    out = dict(event)
-    if "password" in out:
-        out["password"] = "***" if out["password"] else ""
-    return out
+def masked(value):
+    """A copy of an event, a list of events or any nesting of them that is safe
+    to render, log or serialize.
+
+    Every ``Secret`` found, wherever it sits and whatever its key is called, is
+    replaced by ``"***"`` (``""`` when it was empty). Mappings come back as
+    plain dicts and other iterables (not strings) as lists; everything else is
+    returned as it is.
+    """
+    if isinstance(value, Secret):
+        return "***" if value else ""
+    if isinstance(value, Mapping):
+        return {key: masked(item) for key, item in value.items()}
+    if isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
+        return value
+    return [masked(item) for item in value]
 
 
 # --- reading lines --------------------------------------------------------------
@@ -394,6 +448,7 @@ class _Mail:
         self.capped = set()
         self._head = bytearray()    # the message's header section
         self._part = None           # the header block of the MIME part being read
+        self._parsed = 0            # part blocks parsed so far
         self._in_head = True
 
     def _grow(self, block, text):
@@ -414,11 +469,16 @@ class _Mail:
             self._name(_filename(message))
 
     def _part_done(self):
-        if self._part is not None:
-            message = _headers(bytes(self._part))
-            self._part = None
-            if message is not None:
-                self._name(_filename(message))
+        block, self._part = self._part, None
+        if not block:               # no header lines: nothing to read
+            return
+        if self._parsed >= MAX_MIME_PARTS:
+            self.capped.add("attachments")
+            return
+        self._parsed += 1
+        message = _headers(bytes(block))
+        if message is not None:
+            self._name(_filename(message))
 
     def line(self, text, size, complete):
         """Take one line of DATA; True when it is the terminating dot."""
