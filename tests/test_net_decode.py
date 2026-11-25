@@ -59,6 +59,10 @@ Regressions covered:
   * an event with thousands of encoded values (a WebSocket stream, a huge form)
     made the walk unbounded; the number of values, the scanned size and the
     reported events are capped
+  * a plain-text password (a login form, a query string, URL userinfo, a
+    ``name: value`` line in an upload) was not marked by anything, because only
+    decoded values carry ``credential``; ``mask_credentials`` masks it with the
+    same detection, for the report boundary
 """
 
 import base64
@@ -935,4 +939,59 @@ def test_hostile_json_and_forms_are_scanned_in_linear_time():
     for body in ('"a":"' * 40000, '"' * 200000, "{" + '"k":"v",' * 30000,
                  "&=" * 100000, "a=" * 100000, "--" + "x" * 100000):
         net_decode.decode_event_fields(http(body_text=body))
+    assert time.time() - started < 10
+
+
+# --- masking plain-text credentials for a report ------------------------------------
+
+@pytest.mark.parametrize("text,masked", [
+    ("user=bob&pass=hunter2", "user=bob&pass=***"),
+    ("user=bob&password=hunter2&go=1", "user=bob&password=***&go=1"),
+    ("u=bob&p=hunter2", "u=bob&p=***"),
+    ("u=bob&pw=hunter2&page=2&map=x", "u=bob&pw=***&page=2&map=x"),
+    ("api_key=abc123&token=xyz", "api_key=***&token=***"),
+    ('{"user": "bob", "password": "correct horse"}', '{"user": "bob", "password": "***"}'),
+    ("ftp://bob:hunter2@files.top/x", "ftp://bob:***@files.top/x"),
+    ("http://h.top/login?user=bob&pass=hunter2", "http://h.top/login?user=bob&pass=***"),
+    ("q=weather&lang=en", "q=weather&lang=en"),
+])
+def test_a_credential_value_is_masked_and_the_rest_kept(text, masked):
+    assert net_decode.mask_credentials(text) == masked
+
+
+def test_name_value_lines_and_dump_records_are_masked_in_a_body():
+    body = ("Host: PC01\nUser: bob\nPassword: correct horse battery\n"
+            "Chrome|https://bank.com|bob|Passw0rd!\nplain prose line\n")
+    out = net_decode.mask_credentials(body, lines=True)
+    assert "correct" not in out and "horse" not in out and "Passw0rd" not in out
+    assert "plain prose line" in out and "https://bank.com" in out
+    assert out.splitlines()[0] == "Host: ***"
+
+
+def test_lines_are_not_read_as_pairs_unless_asked():
+    assert net_decode.mask_credentials("a=1&t=12:30") == "a=1&t=12:30"
+
+
+def test_a_multipart_password_field_is_masked():
+    body = ('--xyz\r\nContent-Disposition: form-data; name="user"\r\n\r\nbob\r\n'
+            '--xyz\r\nContent-Disposition: form-data; name="passwd"\r\n\r\nhunter2\r\n'
+            '--xyz--\r\n')
+    out = net_decode.mask_credentials(body, lines=True)
+    assert "hunter2" not in out and "bob" in out
+
+
+def test_masking_agrees_with_the_credential_flag():
+    """What the flag marks in decoded text, the mask removes from plain text."""
+    for text in ("user=alice&pass=s3cretpw", "admin:hunter2", "https://bob:pw1@x.top/",
+                 "Chrome|https://bank.com|bob|Passw0rd!"):
+        decoded = net_decode.decode(b64(text.encode()))
+        assert net_decode._is_credential("body_text", "", decoded), text
+        secret = text.replace("@x.top/", "").split(":")[-1].split("=")[-1].split("|")[-1]
+        assert secret not in net_decode.mask_credentials(text, lines=True), text
+
+
+def test_masking_a_long_hostile_body_takes_linear_time():
+    started = time.time()
+    for body in ("pass=" * 50000, "p:" * 100000, "a|" * 100000 + "http://x", '"pass":"' * 40000):
+        net_decode.mask_credentials(body, lines=True)
     assert time.time() - started < 10

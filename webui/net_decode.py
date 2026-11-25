@@ -553,6 +553,11 @@ def _colon_pair(line):
     letters, ``ip:port`` and clock times; a URL as the *value* is
     (``bob:https://x.com/zzz``). URL userinfo is looked for separately.
     """
+    return _colon_pair_match(line) is not None
+
+
+def _colon_pair_match(line):
+    """The first ``_COLON_PAIR`` match that ``_colon_pair`` counts, or None."""
     for match in _COLON_PAIR.finditer(line):
         left, head = match.groups()
         if not head or head.startswith("//") or left.startswith("//"):
@@ -569,22 +574,111 @@ def _colon_pair(line):
                 continue
             except ValueError:
                 pass
-        return True
-    return False
+        return match
+    return None
 
 
 def _credential_record(line):
     """A delimited line with a URL field and at least two other fields."""
+    return _record_delimiter(line) is not None
+
+
+def _record_delimiter(line):
+    """The delimiter that makes a line a credential record, or None."""
     if "://" not in line and "www." not in line:
-        return False
+        return None
     for delimiter in _RECORD_DELIMITERS:
         fields = [field.strip() for field in line.split(delimiter)]
         if len(fields) < 3:
             continue
         urls = [field for field in fields if _URL_FIELD.fullmatch(field)]
         if urls and sum(1 for field in fields if field) - len(urls) >= 2:
-            return True
-    return False
+            return delimiter
+    return None
+
+
+# --- masking plain-text credentials -------------------------------------------------
+# ``credential`` marks a *decoded* value. A password sent in plain text (a login
+# form, a query string) is never decoded, so nothing marked it. The same shapes
+# are masked here, for the layer that serializes a report; the events themselves
+# keep the value, since rules and evidence read it.
+
+MASK = "***"
+_SECRET_KEY = "(?:" + _SECRET_WORDS + r"[A-Za-z0-9_.-]{0,32}|" + _SHORT_WORDS + ")"
+_SECRET_QUOTED = re.compile(
+    "(" + _SECRET_KEY + r"[\"']?[ \t]*[=:][ \t]*)([\"'])((?:[^\"'\\\n]|\\.)*)\2", re.I)
+_SECRET_BARE = re.compile("(" + _SECRET_KEY + r"[\"']?[ \t]*[=:][ \t]*)([^\s&;,\"'<>]+)", re.I)
+_USERINFO_PASSWORD = re.compile("(" + _URL_SCHEME + r"[^/\s:@]{1,64}:)([^/\s@]{1,128})(@)")
+
+
+def _mask_line(line):
+    delimiter = _record_delimiter(line)
+    if delimiter is not None:
+        fields = line.split(delimiter)
+        kept = 0
+        for i, field in enumerate(fields):
+            if _URL_FIELD.fullmatch(field.strip()):
+                continue
+            if field.strip() and kept == 0:
+                kept = 1                # the first field names the source (a browser)
+                continue
+            if field.strip():
+                fields[i] = MASK
+        return delimiter.join(fields)
+    match = _colon_pair_match(line)
+    if match is not None:
+        cut = match.end(1) + 1
+        space = line[cut:len(line) - len(line[cut:].lstrip(" \t"))]
+        return line[:cut] + space + MASK
+    return line
+
+
+def _mask_parts(text):
+    """Mask the content of multipart parts whose name says secret."""
+    boundary = text.partition("\n")[0].strip()
+    if not 4 <= len(boundary) <= 200:
+        return text
+    pieces = text.split(boundary)
+    for i, part in enumerate(pieces[1:], 1):
+        blank = _BLANK_LINE.search(part)
+        if not blank:
+            continue
+        found = _PART_NAME.search(part[:min(blank.start(), 2048)])
+        if found and _SECRET_NAME.search(found.group(1)):
+            content = part[blank.end():]
+            ending = content[len(content.rstrip("\r\n")):]
+            pieces[i] = part[:blank.end()] + MASK + ending
+    return boundary.join(pieces)
+
+
+def mask_credentials(text, lines=False):
+    """``text`` with every credential value the ``credential`` flag would name
+    replaced by ``***``, and everything else kept.
+
+    Masked: the value of a key that says secret (``pass``, ``pwd``, ``secret``,
+    ``token``, ``key``, ``auth``, ``cred`` anywhere in the name, ``pw`` and
+    ``p`` as whole words) in a form, a query, JSON or ``key: value`` text, the
+    password of URL userinfo, and the content of a multipart part with such a
+    name. With ``lines`` (a body, not a query or a URL) every ``name: value``
+    line also loses its value and a credential-dump record keeps only its
+    first field and its URL, as ``_is_credential`` marks both. Like that flag
+    it errs towards masking. Not a str: returned as it is.
+    """
+    if not isinstance(text, str) or not text:
+        return text
+    if text.startswith("--"):
+        text = _mask_parts(text)
+    text = _USERINFO_PASSWORD.sub(lambda m: m.group(1) + MASK + m.group(3), text)
+    text = _SECRET_QUOTED.sub(lambda m: m.group(1) + m.group(2) + MASK + m.group(2), text)
+    text = _SECRET_BARE.sub(lambda m: m.group(1) + (m.group(2) if m.group(2) == MASK else MASK),
+                            text)
+    if lines:
+        out = []
+        for line in text.splitlines(True):
+            body = line.rstrip("\r\n")
+            out.append(_mask_line(body) + line[len(body):])
+        text = "".join(out)
+    return text
 
 
 def _field_text(value):

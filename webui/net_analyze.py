@@ -54,8 +54,13 @@ module is that order, in ``analyze_pcap``. The false assumptions it avoids:
     ``net_mail_ftp.masked`` copies only. A decoded credential carries the
     plain text and its encoded form (``text``, ``encoded``): both are ``***``
     in the report, and so are the encoded value where it sat in the request
-    and every ``Authorization`` header. Nothing secret is written to the
-    baseline either.
+    and every ``Authorization`` header. A password sent in plain text (a
+    login form, a query string, URL userinfo, a ``name: value`` line in a
+    request body) is masked in the report's ``url``, ``query`` and
+    ``body_text`` by ``net_decode.mask_credentials``, the detection behind the
+    ``credential`` flag. Rules and findings ran on the plain events before,
+    so masking changes no verdict. Nothing secret is written to the baseline
+    either.
   * A step that fails ends the analysis. A capture is hostile input: a parser
     that raises on one flow is an entry in ``errors`` and the next parser (at
     the end ``net_raw``) is tried; the decoder, the behaviour analysis, the
@@ -272,6 +277,8 @@ def collect_events(path, hash_budget=None):
 
 _CREDENTIAL_HEADERS = ("authorization", "proxy-authorization")
 _SCRUBBED_TEXT = ("query", "url", "body_text", "resp_text")
+# events whose url, query or request body may carry a password in plain text
+_PLAIN_TEXT_CREDENTIALS = ("http", "websocket", "download", "upload")
 
 
 def _scrub_text(text, prefix, length):
@@ -319,6 +326,12 @@ def _mask_report_events(events, copies, source_of):
     for event, copy in zip(events, copies):
         if event.get("type") in ("http", "websocket"):
             _mask_headers(copy)
+        if event.get("type") in _PLAIN_TEXT_CREDENTIALS:
+            for field in ("url", "query"):
+                if field in copy:
+                    copy[field] = net_decode.mask_credentials(copy[field])
+            if "body_text" in copy:
+                copy["body_text"] = net_decode.mask_credentials(copy["body_text"], lines=True)
     for event, copy in zip(events, copies):
         if event.get("type") != "decoded" or not event.get("credential"):
             continue

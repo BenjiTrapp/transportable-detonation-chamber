@@ -20,7 +20,8 @@ Regressions covered:
     such a host with another path, size or hash
   * a report built from the raw events raised on the ``Secret`` of an FTP or
     SMTP login, or showed the password, or the text and base64 of a decoded
-    credential
+    credential, or a password sent in plain text (a login form, a query
+    string, URL userinfo, a ``name: value`` upload)
   * one parser that raised took the whole analysis down
   * an empty capture looked the same as a capture in which nothing was found
 """
@@ -509,15 +510,35 @@ def test_the_report_carries_no_password_in_any_form(tmp_path):
     basic = base64.b64encode(b"alice:Correct-Horse-9").decode()
     cap.get(9.0, "panel.top", "/admin", b"hi", headers=b"Authorization: Basic "
             + basic.encode() + b"\r\n")
+    cap.post(11.0, "shop.top", "/login", b"user=alice&pass=Plain-Form-77&go=1")
+    cap.get(13.0, "shop.top", "/api?user=alice&password=Query-Pw-55", b"ok")
+    cap.web(15.0, "proxy.top", b"GET ftp://bob:Userinfo-Pw-3@files.top/x HTTP/1.1\r\n"
+            b"Host: files.top\r\n\r\n", _ok(b"ok"))
+    cap.post(17.0, "drop.top", "/up", b"Host: PC01\nUser: bob\nPassword: Line Pw 99\n",
+             "text/plain")
     r = net_analyze.analyze_pcap(_write(tmp_path, cap))
     text = json.dumps(r)
-    for secret in ("Tr0ub4dor", "Hunter2Login", login, "Correct-Horse-9", basic):
+    for secret in ("Tr0ub4dor", "Hunter2Login", login, "Correct-Horse-9", basic,
+                   "Plain-Form-77", "Query-Pw-55", "Userinfo-Pw-3", "Line Pw", "Pw 99"):
         assert secret not in text, secret
     ftp = [e for e in r["events"] if e["type"] == "ftp"][0]
     assert ftp["password"] == "***" and ftp["password_captured"] is True
     creds = [e for e in r["events"] if e["type"] == "decoded" and e["credential"]]
     assert creds and all(e["text"] == "***" and e["encoded"] == "***" for e in creds)
     assert "ftp://stealer@" + C2 in [i["value"] for i in r["iocs"]]
+    form = [e for e in r["events"] if e["type"] == "http" and e["path"] == "/login"][0]
+    assert form["body_text"] == "user=alice&pass=***&go=1"
+
+
+def test_rules_see_the_plain_value_and_only_the_report_is_masked(tmp_path):
+    rule = tmp_path / "r.yaml"
+    rule.write_text("rules:\n  - {id: pw, name: pw, event: http, "
+                    "match: {body_text|contains: Plain-Form-77}}\n")
+    cap = Capture()
+    cap.post(11.0, "shop.top", "/login", b"user=alice&pass=Plain-Form-77")
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap), rules=[str(rule)])
+    assert [h["rule_id"] for h in r["rule_hits"]] == ["pw"]
+    assert "Plain-Form-77" not in json.dumps(r)
 
 
 # --- one failure stops nothing --------------------------------------------------------------------
