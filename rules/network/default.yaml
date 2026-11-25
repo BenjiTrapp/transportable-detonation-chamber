@@ -7,7 +7,8 @@
 #   event     the event type(s) the rule looks at (dns tls http download upload decoded
 #             ftp smtp beacon retry fanout ...). The fields that exist per type are the
 #             FIELDS table in webui/net_rules.py; a field the type does not have is
-#             refused when the file loads, and `events.json` of a run shows real values.
+#             refused when the file loads, and the events of a report show real values
+#             (GET /api/network/report?id=<id>, or the NETWORK tab of an imported pcap).
 #   match     field: value is equality (case-insensitive, a list means "any of");
 #             field|op: value with op in re contains startswith endswith in gte lte gt lt
 #             count_gte has_all; any / all / not combine conditions.

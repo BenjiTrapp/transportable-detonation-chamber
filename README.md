@@ -1771,7 +1771,7 @@ One rizin session per opened file and browser tab (RIZIN tab). Addresses are int
 | GET / DELETE | `/api/memory/baseline` | Host memory baseline statistics / clear it. `stale: true` means it was built with an older key scheme and is ignored until captured again |
 | POST | `/api/memory/baseline/capture` | Record findings of named processes as baseline. Params: `names`, `samples` |
 | POST / GET | `/api/memory/sweep` | Background sweep of every process (`aether`, `processdump`, `baseline`) / status + result |
-| POST | `/api/network/import` | Analyze an uploaded pcap or pcapng and keep the report. Form fields: `file`, `mode` (`online` default, or `isolated`), `process`, `sha256` (optional: the SHA256 of the detonated sample the capture belongs to, 64 hex digits, else 400; `/api/detonation/results` of that sample then carries the newest such report as `network`, without its events). Returns the report (events, rule hits, findings, IOCs, files; passwords masked) with `id`, `filename`, `timestamp`, `sample_sha256`; 400 for a file that is not a pcap, 413 over 256 MB |
+| POST | `/api/network/import` | Analyze an uploaded pcap or pcapng and keep the report. Form fields: `file`, `mode` (`online` default, or `isolated`), `process`, `sha256` (optional: the SHA256 of the detonated sample the capture belongs to, 64 hex digits, else 400; `/api/detonation/results` of that sample then carries the newest such report as `network`, without its events). Returns the report (events, rule hits, findings, IOCs, files; passwords masked) with `id`, `filename`, `timestamp`, `sample_sha256`; `events_capped` / `text_budget_spent` when the capture held more events or body text than one report keeps; 400 for a file that is not a pcap, 413 over 256 MB, 503 (with the `pip install` to run) when the network packages are missing |
 | GET | `/api/network/report` | A stored network report. Params: `id` (as returned by the import) |
 | GET | `/api/network/reports` | Stored network reports, newest first: `id`, `filename`, `timestamp`, `mode` and a `summary` (counts, `verdict`, `score`), not the report |
 | GET | `/api/network/baseline` | What the network baseline of this VM holds (`count`, `by_type`; `stale: true` when built with an older key scheme) |
@@ -2201,6 +2201,8 @@ make install    # or: .\make.ps1 install
 | [rizinorg/rz-ghidra](https://github.com/rizinorg/rz-ghidra) | Ghidra's decompiler as a rizin plugin (DECOMPILER) |
 | [rizinorg/cutter](https://github.com/rizinorg/cutter) | Its Windows package supplies rizin and rz-ghidra |
 | [Microsoft WinDbg](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/) | Windows debugger |
+
+The idea for the network analysis (the NETWORK tab and `webui/net_*.py`) comes from [NetLens](https://github.com/FzRsLLaSheR/NetLens); only the idea: no code, rule, fixture or translation of it is in TDC.
 
 ---
 

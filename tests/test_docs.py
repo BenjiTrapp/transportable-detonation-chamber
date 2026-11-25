@@ -2,7 +2,10 @@
 
 Regressions covered: the README documented a /api/fibratus proxy that did not
 exist, missed 17 routes and had no MCP section; the in-app help described
-layouts and tabs that were gone; screenshots showed an old UI.
+layouts and tabs that were gone; screenshots showed an old UI; the README did
+not say that NetLens gave the idea of the network analysis (the spec's
+"Herkunft"), nor that nothing of it is used; the network rules pointed their
+authors at an events.json nothing writes.
 """
 
 import ast
@@ -137,3 +140,17 @@ def test_help_lists_every_pipe_interception_route():
         r'<td class="api-\w+">(\w+)</td><td><code>(/api/pipes/intercept[^<]*)</code>', HELP)}
     assert routes <= rows, routes - rows
     assert '<td class="api-delete">DELETE</td>' in HELP
+
+
+def test_readme_credits_netlens_with_the_idea_and_nothing_else():
+    lines = [line for line in README.splitlines() if "NetLens" in line]
+    assert len(lines) == 1, lines
+    assert "github.com/FzRsLLaSheR/NetLens" in lines[0] and "idea" in lines[0]
+    assert "no code, rule, fixture" in lines[0]
+
+
+def test_the_network_rules_point_their_authors_at_what_exists():
+    with open(os.path.join(ROOT, "rules", "network", "default.yaml"), encoding="utf-8") as fh:
+        rules = fh.read()
+    assert "events.json" not in rules
+    assert "/api/network/report" in rules
