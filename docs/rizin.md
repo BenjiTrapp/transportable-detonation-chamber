@@ -253,7 +253,9 @@ The point of the emulator is a patch inside freshly decrypted code: run the
 decryption, read the code, switch off the anti-VM check in it. The project
 saves such a patch with a mark (`:r`, the ⚠ of SET BY HAND), and this section
 is what the project does with it when the file is opened again, and how the run
-comes back.
+comes back. What it looks like once the file is open again — the notice, the
+WAITING group and the **Restore the run** button together — is the second
+screenshot of [Rizin (Reverse Engineering)](web-ui.md#rizin-reverse-engineering).
 
 **What a waiting patch is, and why it waits.** A patch set over bytes a run wrote is not written when the file is opened: opening happens before any run, so it would land in the file's own, still encrypted bytes, and the next decryption would XOR over it instead of over the file's bytes. The patch would be gone, and the decrypted output would be wrong at exactly the place you wanted to read. So it waits. It stays in the project through every save, and the session's note names it once when the file is opened ("Held back, not applied: 1 saved patch over bytes an emulation run wrote (0x…). The file's own bytes there are still encrypted, and a patch written into them would be decrypted over by the next run."). PATCHES shows it in a group of its own, WAITING, between SET BY HAND and WRITTEN BY THE RUN: the address, the function, the bytes and the reason on a line below, under the heading "not applied · kept with the project". The group says "These are not in rizin's cache: written into the file's own bytes, which are still encrypted, the next decryption would run over them. Apply now is there once a run's bytes lie under a patch; ✕ removes one from the project." A waiting patch is no write of rizin's cache, so it is not among the patches, not touched by "Clear rizin's whole cache" and not exported (`GET /patches` lists it under `waiting`). A patch saved by an older version has no mark and is written back as it always was.
 
