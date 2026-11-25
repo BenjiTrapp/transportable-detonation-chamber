@@ -51,6 +51,10 @@ together. The assumptions this module refuses to make:
     transfer, not a keep-alive. Times come from ``Flow.packets``, which holds
     one entry per message with retransmissions folded in, so a retransmit is
     not a beat.
+  * A delimiter is a byte string. It is reported as text, written as ``net_dns``
+    writes a DNS label (a printable byte as itself, any other as ``\\DDD`` with
+    its decimal value: newline is ``\\010``), so an event is plain JSON. Every
+    other field is a string, number, bool, None or a list of numbers.
   * The two directions look alike. A request and its reply do not, so each
     direction with data is profiled separately (``direction`` "c" or "s", the
     client's first) and ``client_guessed`` is carried over from the flow.
@@ -63,6 +67,7 @@ import statistics
 from collections import Counter
 from math import log2
 
+import net_dns
 from memory_evidence import (
     BEACON_MAX_COV, BEACON_MIN_CONNECTIONS, BEACON_MIN_INTERVAL_S)
 from net_events import NetEvent
@@ -249,6 +254,17 @@ def _heartbeat(flow, direction):
 
 # --- events -------------------------------------------------------------------
 
+def _written(delimiter):
+    """The delimiter as text, the way ``net_dns`` writes a DNS label.
+
+    A printable byte stands for itself and any other is ``\\DDD`` (decimal), so a
+    newline is ``\\010`` and CRLF ``\\013\\010``. The event has to go through
+    ``json.dumps`` (report, API), which refuses ``bytes``; one escaping style
+    for the whole project keeps the output readable and reversible.
+    """
+    return None if delimiter is None else net_dns._label(delimiter)
+
+
 def _event(flow, direction, stream):
     window = stream[:MAX_PROFILE_BYTES]
     counts = Counter(window)
@@ -258,7 +274,7 @@ def _event(flow, direction, stream):
                 default=flow.first_ts)
     return NetEvent(
         "raw", first, dest=flow.dst, port=flow.dport, proto=flow.proto, direction=direction,
-        framing=framing, delimiter=delimiter, message_sizes=sizes, message_count=count,
+        framing=framing, delimiter=_written(delimiter), message_sizes=sizes, message_count=count,
         entropy=round(_entropy(counts, len(window)), 4),
         printable_ratio=round(_printable_ratio(counts, len(window)), 4),
         heartbeat=heartbeat, interval=interval, stream_bytes=len(stream),

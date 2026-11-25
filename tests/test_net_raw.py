@@ -34,9 +34,15 @@ Regressions covered:
     first, and nothing is averaged over both
   * entropy of a few bytes is low however random they are; ``stream_bytes``
     travels with it so a consumer can tell
+  * the delimiter was a ``bytes`` value, so ``json.dumps`` of a ``raw`` event
+    raised at the report and API boundary; it is text now, written as net_dns
+    writes a DNS label (a printable byte as itself, any other as ``\\DDD``
+    with its decimal value, so a newline is ``\\010``), and every event of every
+    framing kind goes through ``json.dumps``
   * an empty stream, or one whose first segment was lost, produces no event
 """
 
+import json
 import os
 import random
 import socket
@@ -170,7 +176,7 @@ def test_a_length_prefixed_stream_is_recognized():
 
 def test_a_newline_delimited_stream_is_recognized():
     e = net_raw.events_from_flow(_raw_flow(b"one\ntwo\nthree\n"))[0]
-    assert e["framing"] == "delimited" and e["delimiter"] == b"\n"
+    assert e["framing"] == "delimited" and e["delimiter"] == "\\010"
 
 
 def test_high_entropy_is_reported():
@@ -323,24 +329,24 @@ def test_a_stream_two_detectors_both_fit_is_unknown():
 
 def test_crlf_lines_report_a_crlf_delimiter():
     e = _profile(b"USER bob\r\nPASS x\r\nQUIT\r\n")
-    assert e["framing"] == "delimited" and e["delimiter"] == b"\r\n"
+    assert e["framing"] == "delimited" and e["delimiter"] == "\\013\\010"
     assert e["message_sizes"] == [8, 6, 4] and e["message_count"] == 3
 
 
 def test_a_lone_newline_inside_crlf_text_keeps_newline_as_the_delimiter():
     e = _profile(b"a\r\nb\nc\n")
-    assert e["delimiter"] == b"\n" and e["message_sizes"] == [2, 1, 1]
+    assert e["delimiter"] == "\\010" and e["message_sizes"] == [2, 1, 1]
 
 
 def test_long_text_lines_are_delimited_whatever_their_length():
     e = _profile((b"{" + b'"k": "v", ' * 40 + b"}\n") * 4)
-    assert e["framing"] == "delimited" and e["delimiter"] == b"\n"
+    assert e["framing"] == "delimited" and e["delimiter"] == "\\010"
     assert e["message_count"] == 4
 
 
 def test_a_null_terminated_message_stream_is_delimited():
     e = _profile(b"\x01ab\x00\x02cde\x00\x03f\x00" * 2)
-    assert e["framing"] == "delimited" and e["delimiter"] == b"\x00"
+    assert e["framing"] == "delimited" and e["delimiter"] == "\\000"
     assert e["message_sizes"] == [3, 4, 2, 3, 4, 2]
 
 
@@ -505,3 +511,35 @@ def test_the_thresholds_are_the_ones_of_the_beaconing_judgement():
     assert net_raw.BEACON_MIN_CONNECTIONS == memory_evidence.BEACON_MIN_CONNECTIONS
     assert net_raw.BEACON_MAX_COV == memory_evidence.BEACON_MAX_COV
     assert net_raw.BEACON_MIN_INTERVAL_S == memory_evidence.BEACON_MIN_INTERVAL_S
+
+
+# --- the event is JSON --------------------------------------------------------
+
+def test_the_delimiter_is_written_the_way_dns_writes_a_label():
+    assert _profile(b"a\nb\nc\n")["delimiter"] == "\\010"
+    assert _profile(b"a\r\nb\r\nc\r\n")["delimiter"] == "\\013\\010"
+    assert _profile(b"\x01a\xff" * 8)["delimiter"] == "\\255"
+    assert net_raw.net_dns._label(b"\xff\x00") == "\\255\\000"
+
+
+_EVERY_FRAMING = {
+    # name: (flow, framing of the first event)
+    "length-prefixed": (lambda: _flow([(2.0, "c", b"\x00\x03abc\x00\x04defg")]), "length-prefixed"),
+    "delimited": (lambda: _flow([(2.0, "c", b"one\ntwo\nthree\n")]), "delimited"),
+    "delimited-binary": (lambda: _flow([(2.0, "c", b"\x01ab\x00\x02cde\x00\x03f\x00" * 2)]),
+                         "delimited"),
+    "fixed": (lambda: _flow([(t, "c", _noise(16, t)) for t in (2.0, 3.0, 4.0)]), "fixed"),
+    "unknown": (lambda: _flow([(2.0, "c", _noise(512)), (3.0, "s", b"\x00\xff")]), "unknown"),
+    "udp": (lambda: _udp_flow([(2.0, "c", b"\x01abc"), (3.0, "s", b"\x02de")]), "unknown"),
+    "heartbeat": (lambda: _beats([0, 30, 60, 90, 120]), "fixed"),
+}
+
+
+@pytest.mark.parametrize("kind", sorted(_EVERY_FRAMING))
+def test_a_complete_raw_event_of_every_framing_kind_goes_through_json_dumps(kind):
+    make, framing = _EVERY_FRAMING[kind]
+    events = net_raw.events_from_flow(make())
+    assert events and events[0]["framing"] == framing
+    for e in events:
+        assert json.loads(json.dumps(e))["type"] == "raw"
+        assert not any(isinstance(v, (bytes, bytearray)) for v in e.values())
