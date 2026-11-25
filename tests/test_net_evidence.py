@@ -38,8 +38,9 @@ def _hit(rule_id, kind=None, process="", dests=("c2.top",), etype="beacon"):
 
 
 def _beacon(dest="c2.top", connections=8, cov=0.05, on_rhythm=0.9, interval=60.0,
-            via=("http",), process="a.exe", **extra):
-    return net_events.NetEvent("beacon", 1.0, process=process, dest=dest, interval=interval,
+            via=("http",), process="a.exe", pid=None, **extra):
+    return net_events.NetEvent("beacon", 1.0, process=process, pid=pid, dest=dest,
+                               interval=interval,
                                jitter=cov, cov=cov, on_rhythm=on_rhythm, periodic=True,
                                unmeasured=None, connections=connections, via=list(via),
                                **extra)
@@ -53,31 +54,31 @@ def _kinds(findings):
 
 def test_a_rule_hit_with_a_kind_becomes_a_finding():
     hits = [_hit("x", kind="exfil_upload", process="a.exe")]
-    f = net_evidence.findings_from([], hits, process="a.exe")[0]
+    f = net_evidence.findings_from([], hits, process="a.exe", known_good=())[0]
     assert f["kind"] == "exfil_upload" and f["source"] == "network"
 
 
 def test_a_rule_hit_without_a_kind_produces_no_finding():
-    assert net_evidence.findings_from([], [_hit("x", kind=None)]) == []
-    assert net_evidence.findings_from([], [_hit("x", kind="")]) == []
+    assert net_evidence.findings_from([], [_hit("x", kind=None)], known_good=()) == []
+    assert net_evidence.findings_from([], [_hit("x", kind="")], known_good=()) == []
 
 
 def test_a_beacon_event_becomes_a_checkin_finding():
     evs = [net_events.NetEvent("beacon", 1.0, process="a.exe", dest="c2.top", interval=60.0)]
-    kinds = [f["kind"] for f in net_evidence.findings_from(evs, [], process="a.exe")]
+    kinds = [f["kind"] for f in net_evidence.findings_from(evs, [], process="a.exe", known_good=())]
     assert "c2_checkin" in kinds
 
 
 def test_an_isolated_run_marks_its_findings_as_partly_observed():
     evs = [net_events.NetEvent("upload", 1.0, process="a.exe", dest="c2.top", body_bytes=4096)]
-    f = net_evidence.findings_from(evs, [], process="a.exe", observed_fully=False)[0]
+    f = net_evidence.findings_from(evs, [], process="a.exe", observed_fully=False, known_good=())[0]
     assert f["observation"] < 1.0
 
 
 def test_the_same_phenomenon_is_not_reported_twice():
     evs = [net_events.NetEvent("beacon", 1.0, process="a.exe", dest="c2.top", interval=60.0)]
     hits = [_hit("beaconing", kind="c2_checkin", process="a.exe")]
-    out = net_evidence.findings_from(evs, hits, process="a.exe")
+    out = net_evidence.findings_from(evs, hits, process="a.exe", known_good=())
     assert len([f for f in out if f["kind"] == "c2_checkin"]) == 1
 
 
@@ -126,16 +127,45 @@ def test_a_correlation_naming_an_unknown_kind_is_refused(tmp_path):
 
 def test_a_hit_with_a_kind_the_model_does_not_know_is_an_error():
     with pytest.raises(ValueError, match="nope"):
-        net_evidence.findings_from([], [_hit("x", kind="nope")])
+        net_evidence.findings_from([], [_hit("x", kind="nope")], known_good=())
 
 
 # --- events with one meaning -----------------------------------------------------------------
 
-def test_a_tight_beacon_is_a_full_checkin():
-    f = net_evidence.findings_from([_beacon()], [])[0]
+def test_a_tight_beacon_of_a_known_process_is_a_full_checkin():
+    f = net_evidence.findings_from([_beacon(pid=4242)], [], known_good=())[0]
     assert f["kind"] == "c2_checkin" and f["base_weight"] == 4.0
-    assert f["needs_corroboration"] is False
+    assert f["needs_corroboration"] is False and f["pid"] == 4242
     assert f["dest"] == "c2.top" and f["interval_s"] == 60.0
+
+
+def test_a_tight_beacon_without_a_process_needs_a_second_signal():
+    # A pcap knows no process: any periodic service on the machine is "the sample".
+    f = net_evidence.findings_from([_beacon()], [], known_good=())[0]
+    assert f["base_weight"] == 4.0 and f["needs_corroboration"] is True and f["pid"] is None
+
+
+def test_two_unlisted_periodic_services_are_not_a_verdict_on_their_own():
+    evs = [_beacon(dest="poller-a.example"), _beacon(dest="poller-b.example")]
+    assert memory_evidence.score(net_evidence.findings_from(evs, [], known_good=()))["score"] \
+        < memory_evidence.VERDICT_SUSPICIOUS * 2
+
+
+def test_uploads_without_a_process_need_a_second_signal():
+    evs = [net_events.NetEvent("upload", float(i), dest="t%d.example" % i, size=2000)
+           for i in range(2)]
+    out = memory_evidence.score(net_evidence.findings_from(evs, [], known_good=()))
+    assert all(f["needs_corroboration"] for f in out["findings"])
+    assert out["label"] == "SUSPICIOUS" and out["score"] < memory_evidence.VERDICT_MALICIOUS
+
+
+def test_an_upload_of_a_known_process_stands_alone_until_one_without_joins_it():
+    with_pid = net_events.NetEvent("upload", 1.0, pid=7, dest="c2.top", size=2000)
+    without = net_events.NetEvent("upload", 2.0, dest="c2.top", size=2000)
+    alone = net_evidence.findings_from([with_pid], [], known_good=())[0]
+    assert alone["needs_corroboration"] is False
+    mixed = net_evidence.findings_from([with_pid, without], [], known_good=())[0]
+    assert mixed["needs_corroboration"] is True and mixed["pid"] is None
 
 
 @pytest.mark.parametrize("connections, cov, on_rhythm", [(4, 0.0, 1.0), (5, 0.0, 1.0),
@@ -143,7 +173,7 @@ def test_a_tight_beacon_is_a_full_checkin():
 def test_a_short_or_loose_beacon_weighs_what_a_loose_sysmon_beacon_weighs(connections, cov,
                                                                          on_rhythm):
     f = net_evidence.findings_from([_beacon(connections=connections, cov=cov,
-                                            on_rhythm=on_rhythm)], [])[0]
+                                            on_rhythm=on_rhythm)], [], known_good=())[0]
     loose = memory_evidence.KINDS["c2_beaconing"]["weight"] * memory_evidence.BEACON_LOOSE_FACTOR
     assert f["base_weight"] == pytest.approx(loose) and f["needs_corroboration"] is True
 
@@ -153,25 +183,25 @@ def test_short_beacons_to_many_hosts_stay_below_suspicious():
     # a capture with many such hosts must not add up to a verdict on its own.
     evs = [_beacon(dest="h%d.example" % i, connections=4, cov=0.0, on_rhythm=1.0)
            for i in range(30)]
-    assert memory_evidence.score(net_evidence.findings_from(evs, []))["label"] == "CLEAN"
+    assert memory_evidence.score(net_evidence.findings_from(evs, [], known_good=()))["label"] == "CLEAN"
 
 
 def test_a_beacon_without_a_measurement_is_no_checkin():
     ev = _beacon(interval=None, cov=None, on_rhythm=None)
     ev["periodic"], ev["unmeasured"] = False, net_behavior.UNMEASURED_SCALES
-    assert net_evidence.findings_from([ev], []) == []
+    assert net_evidence.findings_from([ev], [], known_good=()) == []
 
 
 def test_a_rhythm_of_failed_connections_is_not_a_checkin():
-    assert net_evidence.findings_from([_beacon(via=("conn_failed",))], []) == []
-    assert _kinds(net_evidence.findings_from([_beacon(via=("conn", "conn_failed"))], [])) \
+    assert net_evidence.findings_from([_beacon(via=("conn_failed",))], [], known_good=()) == []
+    assert _kinds(net_evidence.findings_from([_beacon(via=("conn", "conn_failed"))], [], known_good=())) \
         == ["c2_checkin"]
 
 
 def test_an_upload_is_exfiltration_with_its_size_and_destination():
     ev = net_events.NetEvent("upload", 1.0, dest="c2.top", size=9000, sha256="ab" * 32,
                              kind="zip", method="POST", path="/up")
-    f = net_evidence.findings_from([ev], [], process="a.exe")[0]
+    f = net_evidence.findings_from([ev], [], process="a.exe", known_good=())[0]
     assert (f["kind"], f["process"], f["dest"], f["size"], f["sha256"]) == \
         ("exfil_upload", "a.exe", "c2.top", 9000, "ab" * 32)
     assert f["observation"] == 1.0
@@ -179,32 +209,32 @@ def test_an_upload_is_exfiltration_with_its_size_and_destination():
 
 def test_uploads_to_one_host_are_one_finding():
     evs = [net_events.NetEvent("upload", float(i), dest="c2.top", size=1000 + i) for i in range(5)]
-    out = net_evidence.findings_from(evs, [])
+    out = net_evidence.findings_from(evs, [], known_good=())
     assert _kinds(out) == ["exfil_upload"] and out[0]["count"] == 5 and out[0]["size"] == 5010
 
 
 def test_an_executable_download_is_staging_and_another_file_is_not():
     evs = [net_events.NetEvent("download", 1.0, dest="e.top", kind="pe", sha256="cd" * 32),
            net_events.NetEvent("download", 2.0, dest="e.top", kind="pdf")]
-    out = net_evidence.findings_from(evs, [])
+    out = net_evidence.findings_from(evs, [], known_good=())
     assert _kinds(out) == ["payload_staging"] and out[0]["sha256"] == "cd" * 32
 
 
 def test_retries_to_a_dead_host_are_dead_c2_retry():
     ev = net_events.NetEvent("retry", 1.0, dest="dead.top", attempts=7)
-    assert _kinds(net_evidence.findings_from([ev], [])) == ["dead_c2_retry"]
+    assert _kinds(net_evidence.findings_from([ev], [], known_good=())) == ["dead_c2_retry"]
 
 
 def test_retries_to_an_ipv6_address_are_not_taken_for_a_single_label_name():
     ev = net_events.NetEvent("retry", 1.0, dest="2001:db8::5", attempts=7)
-    assert _kinds(net_evidence.findings_from([ev], [])) == ["dead_c2_retry"]
+    assert _kinds(net_evidence.findings_from([ev], [], known_good=())) == ["dead_c2_retry"]
 
 
 @pytest.mark.parametrize("name", ["wpad", "wpad.corp.example.com", "isatap",
                                   "12.2.0.192.in-addr.arpa", "fileserver.corp.local"])
 def test_retries_of_a_name_the_resolver_asks_for_on_its_own_are_no_finding(name):
     ev = net_events.NetEvent("retry", 1.0, dest=name, attempts=7)
-    assert net_evidence.findings_from([ev], []) == []
+    assert net_evidence.findings_from([ev], [], known_good=()) == []
 
 
 def test_a_path_on_many_hosts_is_fallback_rotation_and_a_burst_of_nxdomain_is_dga():
@@ -212,22 +242,22 @@ def test_a_path_on_many_hosts_is_fallback_rotation_and_a_burst_of_nxdomain_is_dg
                                dests=["a%d.top" % i for i in range(6)]),
            net_events.NetEvent("fanout", 2.0, hosts=12, nxdomain=True, window_s=60.0,
                                dests=["x%d.top" % i for i in range(12)])]
-    assert _kinds(net_evidence.findings_from(evs, [])) == ["fallback_rotation", "dga_pattern"]
+    assert _kinds(net_evidence.findings_from(evs, [], known_good=())) == ["fallback_rotation", "dga_pattern"]
 
 
 def test_events_of_other_types_give_nothing():
     evs = [net_events.NetEvent(t, 1.0, dest="x.top") for t in
            ("dns", "conn", "conn_failed", "tls", "http", "udp", "raw", "ftp", "smtp",
             "websocket", "decoded")]
-    assert net_evidence.findings_from(evs, []) == []
+    assert net_evidence.findings_from(evs, [], known_good=()) == []
 
 
 # --- process, observation, deduplication ---------------------------------------------------
 
 def test_the_process_of_the_event_wins_over_the_default():
-    out = net_evidence.findings_from([_beacon(process="b.exe")], [], process="a.exe")
+    out = net_evidence.findings_from([_beacon(process="b.exe")], [], process="a.exe", known_good=())
     assert out[0]["process"] == "b.exe"
-    assert net_evidence.findings_from([_beacon(process="")], [], process="a.exe")[0]["process"] \
+    assert net_evidence.findings_from([_beacon(process="")], [], process="a.exe", known_good=())[0]["process"] \
         == "a.exe"
 
 
@@ -235,42 +265,43 @@ def test_isolated_mode_lowers_only_what_our_server_accepted():
     evs = [_beacon(), net_events.NetEvent("upload", 1.0, dest="c2.top", size=4096),
            net_events.NetEvent("download", 1.0, dest="c2.top", kind="pe")]
     hits = [_hit("ftp", kind="credential_in_transit", dests=("203.0.113.5",), etype="ftp")]
-    out = {f["kind"]: f for f in net_evidence.findings_from(evs, hits, observed_fully=False)}
+    out = {f["kind"]: f for f in net_evidence.findings_from(evs, hits, observed_fully=False, known_good=())}
     assert out["exfil_upload"]["observation"] == net_evidence.OBSERVATION_ISOLATED
     assert out["credential_in_transit"]["observation"] == net_evidence.OBSERVATION_ISOLATED
     assert out["c2_checkin"]["observation"] == 1.0
     assert out["payload_staging"]["observation"] == 1.0
 
 
-def test_an_attempted_upload_alone_is_still_suspicious():
-    ev = net_events.NetEvent("upload", 1.0, dest="c2.top", size=4096)
-    ev_score = memory_evidence.score(net_evidence.findings_from([ev], [], observed_fully=False))
-    assert ev_score["label"] == "SUSPICIOUS"
+def test_an_attempted_upload_of_a_known_process_alone_is_still_suspicious():
+    ev = net_events.NetEvent("upload", 1.0, pid=7, dest="c2.top", size=4096)
+    out = memory_evidence.score(net_evidence.findings_from([ev], [], observed_fully=False,
+                                                           known_good=()))
+    assert out["label"] == "SUSPICIOUS"
 
 
 def test_a_hit_on_the_same_host_adds_its_rule_to_the_event_finding():
     hits = [_hit("net.periodic_checkin", kind="c2_checkin", process="a.exe")]
-    out = net_evidence.findings_from([_beacon()], hits, process="a.exe")
+    out = net_evidence.findings_from([_beacon()], hits, process="a.exe", known_good=())
     assert len(out) == 1 and out[0]["rules"] == ["net.periodic_checkin"]
     assert out[0]["base_weight"] == 4.0          # the measured finding, not the bare hit
 
 
 def test_a_hit_on_another_host_is_its_own_finding():
-    hits = [_hit("r", kind="c2_checkin", dests=("other.top",))]
-    out = net_evidence.findings_from([_beacon()], hits, process="a.exe")
+    hits = [_hit("r", kind="c2_checkin", dests=("other.top",), etype="http")]
+    out = net_evidence.findings_from([_beacon()], hits, process="a.exe", known_good=())
     assert sorted(f["dest"] for f in out) == ["c2.top", "other.top"]
 
 
 def test_a_hit_is_one_finding_per_destination():
     hits = [_hit("net.ip_lookup", kind="recon_service",
                  dests=("api.ipify.org", "api.ipify.org", "ip-api.com"), etype="dns")]
-    out = net_evidence.findings_from([], hits)
+    out = net_evidence.findings_from([], hits, known_good=())
     assert sorted(f["dest"] for f in out) == ["api.ipify.org", "ip-api.com"]
 
 
 def test_a_hit_and_an_event_without_a_process_are_the_sample_s():
     hits = [_hit("r", kind="c2_checkin", process="")]
-    out = net_evidence.findings_from([_beacon(process="")], hits, process="a.exe")
+    out = net_evidence.findings_from([_beacon(process="")], hits, process="a.exe", known_good=())
     assert len(out) == 1 and out[0]["process"] == "a.exe"
 
 
@@ -278,14 +309,14 @@ def test_network_findings_supersede_the_sysmon_beacon_of_the_same_loop():
     conns = [(1000.0 + 60.0 * i, "203.0.113.7", 443) for i in range(8)]
     sysmon = memory_evidence.beaconing_from_connections(conns, process=r"C:\x\a.exe")
     net = net_evidence.findings_from([_beacon(process="", addresses=["203.0.113.7"])], [],
-                                     process="a.exe")
+                                     process="a.exe", known_good=())
     out = memory_evidence.score(sysmon + net)
     assert _kinds(out["findings"]) == ["c2_checkin"] and out["score"] == 4.0
 
 
 def test_the_findings_are_plain_json():
     evs = [_beacon(), net_events.NetEvent("upload", 1.0, dest="c2.top", size=4096)]
-    out = net_evidence.findings_from(evs, [_hit("r", kind="recon_service", dests=("x.top",))])
+    out = net_evidence.findings_from(evs, [_hit("r", kind="recon_service", dests=("x.top",))], known_good=())
     assert json.loads(json.dumps(out)) == out
 
 
@@ -302,7 +333,7 @@ def test_a_credential_finding_carries_neither_the_password_nor_the_secret():
     with pytest.raises(TypeError):
         json.dumps(ftp)
     hits = _rules().evaluate(events)
-    out = net_evidence.findings_from(events, hits, process="a.exe")
+    out = net_evidence.findings_from(events, hits, process="a.exe", known_good=())
     assert _kinds(out) == ["credential_in_transit"]
     text = json.dumps(out)
     assert "Tr0ub4dor" not in text and "stealer" not in text
@@ -313,7 +344,7 @@ def test_a_hit_with_extra_fields_does_not_carry_them_into_the_finding():
     hit = _hit("ftp", kind="credential_in_transit", dests=("203.0.113.5",), etype="ftp")
     hit["events"][0]["password"] = net_mail_ftp.Secret("hunter2")
     hit["password"] = net_mail_ftp.Secret("hunter2")
-    out = net_evidence.findings_from([], [hit])
+    out = net_evidence.findings_from([], [hit], known_good=())
     assert "hunter2" not in json.dumps(out)
 
 
@@ -359,4 +390,70 @@ def test_a_loader_capture_through_the_real_parsers_is_scored():
     out = net_evidence.findings_from(events, rs.evaluate(events), process="a.exe",
                                      known_good=rs.lists["known_good"])
     assert sorted(_kinds(out)) == ["c2_checkin", "payload_staging"]
-    assert memory_evidence.score(out)["label"] == "MALICIOUS"
+    # No process in a pcap: the check-in waits for a second signal, the staging does not.
+    assert memory_evidence.score(out)["label"] == "SUSPICIOUS"
+    sysmon = memory_evidence.beaconing_from_connections(
+        [(100.0 + 60.0 * i, cap.server("c2.top"), 80) for i in range(8)], process="a.exe")
+    both = memory_evidence.score(out + sysmon)
+    assert both["label"] == "MALICIOUS" and both["superseded_count"] == 1
+
+
+# --- known_good is not optional ---------------------------------------------------------
+
+def test_known_good_has_no_default():
+    with pytest.raises(TypeError):
+        net_evidence.findings_from([_beacon()], [])
+    with pytest.raises(TypeError):
+        net_evidence.findings_from([_beacon()], [], known_good=None)
+
+
+def test_the_rule_set_itself_can_be_passed_as_known_good():
+    rs = _rules()
+    events = _benign_capture()
+    assert net_evidence.findings_from(events, rs.evaluate(events), process="a.exe",
+                                      known_good=rs) == []
+
+
+# --- a rule hit is held to what the event is held to --------------------------------------
+
+def _failed_rhythm():
+    return [_beacon(via=("conn_failed",), addresses=["203.0.113.7"])]
+
+
+def test_a_rule_cannot_make_a_checkin_of_failed_connections():
+    rs = _rules()
+    events = _failed_rhythm()
+    hits = rs.evaluate(events)
+    assert [h["rule_id"] for h in hits] == ["net.periodic_checkin"]
+    assert net_evidence.findings_from(events, hits, process="a.exe", known_good=rs) == []
+
+
+def test_a_checkin_hit_whose_beacon_cannot_be_looked_up_is_dropped():
+    rs = _rules()
+    events = [_beacon()]
+    hits = rs.evaluate(events)
+    assert net_evidence.findings_from([], hits, process="a.exe", known_good=rs) == []
+
+
+def test_a_checkin_from_a_rule_carries_the_addresses_and_supersedes_sysmon():
+    rs = _rules()
+    events = [_beacon(process="", addresses=["203.0.113.7"])]
+    hits = rs.evaluate(events)
+    net = net_evidence.findings_from(events, hits, process="a.exe", known_good=rs)
+    assert len(net) == 1 and net[0]["addresses"] == ["203.0.113.7"]
+    assert net[0]["rules"] == ["net.periodic_checkin"]
+    sysmon = memory_evidence.beaconing_from_connections(
+        [(1000.0 + 60.0 * i, "203.0.113.7", 443) for i in range(8)], process="a.exe")
+    out = memory_evidence.score(sysmon + net)
+    assert out["score"] == 4.0 and out["superseded_count"] == 1
+
+
+def test_a_checkin_rule_on_a_request_without_an_answer_gives_nothing(tmp_path):
+    path = tmp_path / "r.yaml"
+    path.write_text("rules:\n  - {id: gate, name: gate, event: http, kind: c2_checkin}\n")
+    rs = net_rules.load_rules([str(path)])
+    unanswered = [net_events.NetEvent("http", 1.0, dest="c2.top", status=None)]
+    answered = [net_events.NetEvent("http", 1.0, dest="c2.top", status=200)]
+    assert net_evidence.findings_from(unanswered, rs.evaluate(unanswered), known_good=rs) == []
+    assert _kinds(net_evidence.findings_from(answered, rs.evaluate(answered),
+                                             known_good=rs)) == ["c2_checkin"]

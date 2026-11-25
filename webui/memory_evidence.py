@@ -27,8 +27,9 @@ from any source are normalized into one schema and weighted by five factors:
 Two sources can see one phenomenon. Sysmon's connection log and a capture of
 the same traffic both see a beacon loop, and the two findings together would
 cross the malicious threshold on their own. A kind may therefore name kinds it
-``supersedes``: for the same process and destination the weaker finding is not
-scored, stays listed with ``superseded_by``, and still counts as the
+``supersedes``: for the same process and destination only one side is scored,
+whichever leaves the higher total (so more evidence never lowers the score);
+the other stays listed with ``superseded_by`` and still counts as the
 independent second opinion that it is.
 
 Adding a scanner means adding a normalizer function; nothing else changes.
@@ -239,13 +240,39 @@ NETWORK_KINDS = ("c2_checkin", "exfil_upload", "credential_in_transit", "payload
                  "recon_service")
 
 
-def _check_kinds():
-    for kind, spec in KINDS.items():
+def _check_kinds(kinds=None):
+    """Every ``supersedes`` target is a kind, the relation has no cycle (two
+    kinds that supersede each other would take each other out), and every
+    network kind is a kind."""
+    kinds = KINDS if kinds is None else kinds
+    for kind, spec in kinds.items():
         for other in spec.get("supersedes", ()):
-            if other not in KINDS:
+            if other not in kinds:
                 raise ValueError("kind %r supersedes %r, which is not a kind" % (kind, other))
+    done = set()
+    for start in kinds:
+        if start in done:
+            continue
+        path, stack = [], [(start, iter(kinds[start].get("supersedes", ())))]
+        on_path = {start}
+        path.append(start)
+        while stack:
+            kind, targets = stack[-1]
+            nxt = next(targets, None)
+            if nxt is None:
+                stack.pop()
+                on_path.discard(path.pop())
+                done.add(kind)
+                continue
+            if nxt in on_path:
+                raise ValueError("kinds supersede each other in a cycle: %s"
+                                 % " -> ".join(path[path.index(nxt):] + [nxt]))
+            if nxt not in done:
+                on_path.add(nxt)
+                path.append(nxt)
+                stack.append((nxt, iter(kinds[nxt].get("supersedes", ()))))
     for kind in NETWORK_KINDS:
-        if kind not in KINDS:
+        if kind not in kinds:
             raise ValueError("network kind %r is not a kind" % kind)
 
 
@@ -839,33 +866,60 @@ def _endpoints(finding):
     return out
 
 
-def _supersessions(findings, proc_key, known):
-    """``{index: superseding finding}`` for the findings another one absorbs.
+def _group_total(contributions):
+    """What one (process, kind) group adds once saturation has capped it."""
+    values = sorted(contributions, reverse=True)
+    if not values:
+        return 0.0
+    allowance = values[0] * SATURATION_CAP
+    running = 0.0
+    for value in values:
+        running += min(value, max(0.0, allowance - running))
+    return running
 
-    A finding is absorbed when a finding of a kind that ``supersedes`` its kind
-    names the same process and shares a destination with it. Only a finding
-    that is itself scored absorbs another: one the baseline knows counts
-    nothing, so it must not take away what the other would have counted.
+
+def _total(entries, excluded):
+    groups = {}
+    for index, (group, contribution) in entries.items():
+        if index not in excluded:
+            groups.setdefault(group, []).append(contribution)
+    return round(sum(_group_total(values) for values in groups.values()), 6)
+
+
+def _supersessions(findings, entries, proc_key):
+    """``{index: index of the winner}`` for the findings supersede takes out.
+
+    ``entries`` maps the index of every scored finding (not known to the
+    baseline) to its saturation group and contribution. A finding G whose
+    kind ``supersedes`` others and the findings of those kinds on the same
+    process that share a destination with it are one phenomenon, so only one
+    side counts: the one that leaves the higher total. G absorbs them when
+    that is at least what they add together; otherwise G is the one left out.
+    Either way adding G never lowers the score below what it was without G.
+    A finding the baseline knows takes part in neither side: it counts
+    nothing, so it must not take away what another would have counted.
     """
-    absorbers = {}
-    for f in findings:
-        spec = KINDS.get(f.get("kind"), {})
-        if not spec.get("supersedes") or known(f):
-            continue
-        for kind in spec["supersedes"]:
-            absorbers.setdefault((proc_key(f), kind), []).append(f)
     out = {}
-    if not absorbers:
-        return out
-    for i, f in enumerate(findings):
-        candidates = absorbers.get((proc_key(f), f.get("kind")))
-        if not candidates or known(f):
+    for g, f in enumerate(findings):
+        targets = KINDS.get(f.get("kind"), {}).get("supersedes")
+        if not targets or g not in entries or g in out:
             continue
         mine = _endpoints(f)
-        for other in candidates:
-            if mine & _endpoints(other):
-                out[i] = other
-                break
+        if not mine:
+            continue
+        winners = set(out.values())
+        victims = [i for i, other in enumerate(findings)
+                   if i != g and i in entries and i not in out and i not in winners
+                   and other.get("kind") in targets and proc_key(other) == proc_key(f)
+                   and mine & _endpoints(other)]
+        if not victims:
+            continue
+        excluded = set(out)
+        if _total(entries, excluded | set(victims)) >= _total(entries, excluded | {g}):
+            for i in victims:
+                out[i] = g
+        else:
+            out[g] = max(victims, key=lambda i: entries[i][1])
     return out
 
 
@@ -903,21 +957,42 @@ def score(findings, baseline=None):
             continue
         sources_by_process.setdefault(proc_key(f), set()).add(f["source"])
 
-    # Supersede runs before anything is weighed: it decides what is weighed at
-    # all. The absorbed findings stay in sources_by_process above, so they
-    # still corroborate, the one that absorbed them as well as any other.
-    absorbed_by = _supersessions(findings, proc_key, known)
+    # Every finding is weighed first, then supersede decides which side of
+    # one phenomenon counts; it compares what each side contributes. The
+    # findings it takes out stay in sources_by_process above, so they still
+    # corroborate, the one that won as well as any other.
+    weighed = {}
+    for index, f in enumerate(findings):
+        if known(f):
+            continue
+        factors = {"persistence": _persistence_factor(f)}
+        corroborated_by = None
+        cf = 1.0
+        if f.get("needs_corroboration"):
+            others = sources_by_process.get(proc_key(f), set()) - {f["source"]}
+            if others:
+                corroborated_by = sorted(others)
+            else:
+                cf = UNCORROBORATED
+        factors["corroboration"] = cf
+        factors["observation"] = _observation_factor(f)
+        confidence = round(min(1.0, factors["persistence"] * cf * factors["observation"]), 3)
+        contribution = round(f.get("base_weight", 1.0) * confidence, 3)
+        weighed[index] = (factors, corroborated_by, confidence, contribution)
+
+    out_by = _supersessions(
+        findings, {i: ((proc_key(findings[i]), findings[i]["kind"]), w[3])
+                   for i, w in weighed.items()}, proc_key)
     absorbed = {}
-    for index, winner in absorbed_by.items():
-        absorbed.setdefault(id(winner), []).append(
+    for index, winner in out_by.items():
+        absorbed.setdefault(winner, []).append(
             {"kind": findings[index].get("kind"), "source": findings[index].get("source")})
     baseline_count = superseded_count = 0
 
     for index, f in enumerate(findings):
         item = dict(f)
-        factors = {}
 
-        if known(f):
+        if index not in weighed:
             item["baseline"] = "known"
             item["confidence"] = 0.0
             item["score"] = 0.0
@@ -925,8 +1000,8 @@ def score(findings, baseline=None):
             suppressed.append(item)
             baseline_count += 1
             continue
-        if index in absorbed_by:
-            winner = absorbed_by[index]
+        if index in out_by:
+            winner = findings[out_by[index]]
             item["superseded_by"] = winner["kind"]
             item["superseded_by_key"] = winner.get("key")
             item["confidence"] = 0.0
@@ -937,30 +1012,15 @@ def score(findings, baseline=None):
             continue
         item["baseline"] = "new"
 
-        pf = _persistence_factor(f)
-        factors["persistence"] = pf
-
-        cf = 1.0
-        if f.get("needs_corroboration"):
-            others = sources_by_process.get(proc_key(f), set()) - {f["source"]}
-            if others:
-                item["corroborated_by"] = sorted(others)
-            else:
-                cf = UNCORROBORATED
-        factors["corroboration"] = cf
-
-        of = _observation_factor(f)
-        factors["observation"] = of
-
-        confidence = round(min(1.0, pf * cf * of), 3)
-        contribution = round(f.get("base_weight", 1.0) * confidence, 3)
-
+        factors, corroborated_by, confidence, contribution = weighed[index]
+        if corroborated_by:
+            item["corroborated_by"] = corroborated_by
         item["confidence"] = confidence
         item["raw_score"] = contribution
         item["score"] = contribution
         item["factors"] = factors
-        if id(f) in absorbed:
-            item["absorbed"] = absorbed[id(f)]
+        if index in absorbed:
+            item["absorbed"] = absorbed[index]
         scored.append(item)
 
     # Saturation: cap what one kind can contribute per process. Without this a

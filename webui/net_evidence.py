@@ -16,12 +16,13 @@ the findings wrong:
     are measured as periodic about one time in ten, and a poller is periodic
     too. Raising the minimum of four would barely help (five to seven random
     contacts pass about as often) and would lose every short beacon, so the
-    weight decides instead: a rhythm stands alone only when it is tight
-    (``memory_evidence.beacon_is_tight``, the rule Sysmon beaconing uses);
-    otherwise it weighs what a loose Sysmon beacon weighs and needs a second
-    opinion, so many short rhythms in one capture cannot add up to a verdict.
-    A rhythm of failed connections had no answer and is no check-in; repeated
-    failures are ``dead_c2_retry`` from the ``retry`` event.
+    weight decides instead: a rhythm can stand alone only when it is tight
+    (``memory_evidence.beacon_is_tight``, the rule Sysmon beaconing uses) and
+    has a process (see below); otherwise it weighs what a loose Sysmon beacon
+    weighs and needs a second opinion, so many short rhythms in one capture
+    cannot add up to a verdict. A rhythm of failed connections had no answer
+    and is no check-in; repeated failures are ``dead_c2_retry`` from the
+    ``retry`` event.
   * Data out is data received. In the isolated mode our own server took the
     upload and the login: that shows the attempt, not that a real C2 got
     anything, so those findings carry ``observation`` ``OBSERVATION_ISOLATED``.
@@ -36,11 +37,29 @@ the findings wrong:
     update service beacon and upload on every clean Windows box. Events whose
     destination is in the rule set's ``known_good`` give no finding, as they
     give no rule hit; an executable download is never hidden, because the name
-    it came from is not evidence (``net_rules.ALWAYS_VISIBLE``). A retry of a
+    it came from is not evidence (``net_rules.ALWAYS_VISIBLE``). The list is a
+    required argument: without it an idle machine is MALICIOUS. A retry of a
     name the resolver asks for on its own (``wpad``, reverse lookups) is no
     dead C2.
   * A capture knows the process. It does not: an event without one is the
-    sample's, ``process`` names it.
+    sample's, ``process`` names it. That makes every periodic service and
+    every telemetry POST on the machine look like the sample's own, so a
+    ``c2_checkin`` or ``exfil_upload`` from an event without a ``pid`` needs a
+    second, independent signal (a host-side tool on the same process) before
+    it carries its full weight, however tight the rhythm. This is the honest
+    position for a pcap; the next phase, which attributes connections to
+    processes, can let an attributed finding stand alone again (an event with
+    a ``pid`` already does). ``credential_in_transit``, ``payload_staging`` and
+    ``dga_pattern`` still stand alone: a named-account login in clear text, an
+    executable over plain HTTP and ten invented names failing in a minute are
+    not what an idle machine does.
+  * A rule can say more than the event. A hit on a beacon event is held to
+    the same test as the event (measured, answered: "ein Check-in mit Antwort,
+    nicht bloss ein Connect"), and a finding from a hit carries the addresses
+    of the events it names, so it matches the Sysmon beacon it duplicates.
+    Every finding on a name also carries what the capture's DNS answers gave
+    for that name: an HTTP check-in is named by its Host header, Sysmon's by
+    the address, and only the answers tie the two together.
 """
 
 import ipaddress
@@ -53,11 +72,16 @@ import net_rules
 SOURCE = "network"
 NETWORK_KINDS = memory_evidence.NETWORK_KINDS
 
-# Share of an attempt that the isolated mode lets us see. Low enough that an
-# attempt counts less than a delivery, high enough that one attempted upload
-# (4.0 * 0.6) is still suspicious on its own, as it should be.
+# Share of an attempt that the isolated mode lets us see: an attempt counts
+# less than a delivery. With a process (the next phase) one attempted upload
+# (4.0 * 0.6) is still suspicious on its own; without one it needs a second
+# signal first, like every check-in and upload of this phase.
 OBSERVATION_ISOLATED = 0.6
 PARTLY_OBSERVED = frozenset(("exfil_upload", "credential_in_transit"))
+
+# Kinds that ordinary software produces too (a poller, a telemetry POST): with
+# no process to tie them to the sample, they need a second, independent signal.
+NEEDS_PROCESS = frozenset(("c2_checkin", "exfil_upload"))
 
 EXECUTABLES = frozenset(("pe", "elf", "macho"))
 FAILED_ONLY = frozenset(("conn_failed",))
@@ -112,11 +136,14 @@ class _Collector:
     def get(self, kind, process, dest):
         return self.by_key.get((kind, process.lower(), _dest_key(dest)))
 
-    def add(self, kind, process, dest, detail, weight=None, **extra):
+    def add(self, kind, process, dest, detail, weight=None, pid=None, **extra):
         observation = 1.0
         if kind in PARTLY_OBSERVED and not self.observed_fully:
             observation = OBSERVATION_ISOLATED
-        extra.update(dest=dest, observation=observation, rules=extra.get("rules", []))
+        extra.update(dest=dest, observation=observation, rules=extra.get("rules", []),
+                     pid=pid)
+        if kind in NEEDS_PROCESS and pid is None:
+            extra["needs_corroboration"] = True
         finding = memory_evidence.MemoryFinding(
             SOURCE, kind, process, detail=detail, identity=(_dest_key(dest),),
             weight=weight, extra=extra)
@@ -124,18 +151,56 @@ class _Collector:
         return finding
 
 
+def _pid(e):
+    pid = e.get("pid")
+    return pid if isinstance(pid, int) and not isinstance(pid, bool) else None
+
+
+def _merge_pid(finding, e):
+    """A finding stands alone only while every event behind it has a process."""
+    if _pid(e) is None and finding["kind"] in NEEDS_PROCESS:
+        finding["needs_corroboration"] = True
+        finding["pid"] = None
+
+
 # --- events ----------------------------------------------------------------------
 
-def _beacon(c, e, process):
+def _checkin(e):
+    """The measurement of a beacon event that is a check-in, or None.
+
+    A check-in is measured (``interval`` above 0, as ``net.periodic_checkin``
+    asks) and answered: a rhythm of failed connections is no check-in.
+    """
     interval = _number(e.get("interval"))
     via = set(_names(e.get("via")))
     if interval is None or interval <= 0 or (via and via <= FAILED_ONLY):
-        return
-    dest = e.get("dest") or ""
+        return None
     cov, on_rhythm = _number(e.get("cov")), _number(e.get("on_rhythm"))
     connections = _number(e.get("connections"))
     tight = (cov is not None and on_rhythm is not None and connections is not None
              and memory_evidence.beacon_is_tight(cov, on_rhythm, connections))
+    return {"interval": interval, "via": via, "cov": cov, "on_rhythm": on_rhythm,
+            "connections": connections, "tight": tight}
+
+
+def _answered(e):
+    """Did the event a check-in rule fired on get an answer?"""
+    etype = e.get("type")
+    if etype == "beacon":
+        return _checkin(e) is not None
+    if etype == "conn_failed":
+        return False
+    if etype == "http":
+        return e.get("status") is not None
+    return True
+
+
+def _beacon(c, e, process):
+    m = _checkin(e)
+    if m is None:
+        return
+    dest = e.get("dest") or ""
+    tight = m["tight"]
     weight = (memory_evidence.KINDS["c2_checkin"]["weight"] if tight else
               memory_evidence.KINDS["c2_beaconing"]["weight"] * memory_evidence.BEACON_LOOSE_FACTOR)
     weight = round(weight, 2)
@@ -143,18 +208,24 @@ def _beacon(c, e, process):
     if known is not None:
         known["count"] += 1
         if weight <= known["base_weight"]:
+            _merge_pid(known, e)
             return
+    connections, cov, on_rhythm = m["connections"], m["cov"], m["on_rhythm"]
     detail = "%s check-ins to %s, every %.1fs" % (
-        connections if connections is not None else "repeated", dest, interval)
+        connections if connections is not None else "repeated", dest, m["interval"])
     if cov is not None and on_rhythm is not None:
         detail += " (%.0f%% of intervals on rhythm, robust CoV %.2f)" % (100 * on_rhythm, cov)
-    finding = c.add("c2_checkin", process, dest, detail, weight=weight,
-                    addresses=_names(e.get("addresses")), interval_s=interval,
+    finding = c.add("c2_checkin", process, dest, detail, weight=weight, pid=_pid(e),
+                    addresses=_names(e.get("addresses")), interval_s=m["interval"],
                     jitter=_number(e.get("jitter")), cov=cov, on_rhythm=on_rhythm,
-                    connections=connections, via=sorted(via), needs_corroboration=not tight,
+                    connections=connections, via=sorted(m["via"]),
+                    needs_corroboration=not tight,
                     count=known["count"] if known is not None else 1)
     if known is not None:
         finding["rules"] = known["rules"]
+        if known["pid"] is None:
+            finding["needs_corroboration"] = True
+            finding["pid"] = None
 
 
 def _upload(c, e, process):
@@ -167,8 +238,9 @@ def _upload(c, e, process):
         known["count"] += 1
         known["size"] += size
         known["detail"] = "%d uploads to %s, %d bytes" % (known["count"], dest, known["size"])
+        _merge_pid(known, e)
         return
-    c.add("exfil_upload", process, dest, "Upload to %s, %d bytes" % (dest, size),
+    c.add("exfil_upload", process, dest, "Upload to %s, %d bytes" % (dest, size), pid=_pid(e),
           size=size, sha256=_plain(e.get("sha256")), file_kind=_plain(e.get("kind")),
           method=_plain(e.get("method")), path=_plain(e.get("path")), count=1)
 
@@ -182,7 +254,7 @@ def _download(c, e, process):
         known["count"] += 1
         return
     c.add("payload_staging", process, dest,
-          "%s file downloaded from %s" % (str(e["kind"]).upper(), dest),
+          "%s file downloaded from %s" % (str(e["kind"]).upper(), dest), pid=_pid(e),
           sha256=_plain(e.get("sha256")), size=_plain(e.get("size")),
           file_kind=e["kind"], url=_plain(e.get("url")), count=1)
 
@@ -198,7 +270,7 @@ def _retry(c, e, process):
     attempts = _number(e.get("attempts"))
     c.add("dead_c2_retry", process, dest,
           "%s failed attempts to reach %s" % (attempts if attempts is not None else "Repeated",
-                                              dest),
+                                              dest), pid=_pid(e),
           attempts=attempts, first_ts=_number(e.get("first_ts")),
           last_ts=_number(e.get("last_ts")), addresses=_names(e.get("addresses")), count=1)
 
@@ -215,7 +287,7 @@ def _fanout(c, e, process):
         detail = "%s names answered NXDOMAIN within %ss" % (hosts, _number(e.get("window_s")))
     else:
         detail = "%s requested from %s hosts" % (e.get("path"), hosts)
-    c.add(kind, process, dest, detail, hosts=hosts, path=_plain(e.get("path")),
+    c.add(kind, process, dest, detail, pid=_pid(e), hosts=hosts, path=_plain(e.get("path")),
           names=_names(e.get("dests")), count=1)
 
 
@@ -234,7 +306,19 @@ def _hidden(e, known_good):
 
 # --- rule hits ---------------------------------------------------------------------
 
-def _from_hit(c, hit):
+def _resolve(events, ref):
+    """The event a hit reference names, if ``events`` is the list it was evaluated on."""
+    index = ref.get("index")
+    if (not isinstance(index, int) or isinstance(index, bool) or not 0 <= index < len(events)
+            or not isinstance(events[index], dict)):
+        return None
+    e = events[index]
+    if e.get("type") != ref.get("type") or (e.get("dest") or "") != (ref.get("dest") or ""):
+        return None
+    return e
+
+
+def _from_hit(c, hit, events):
     kind = hit.get("kind")
     if not kind:
         return
@@ -243,45 +327,84 @@ def _from_hit(c, hit):
                          % (hit.get("rule_id"), kind, ", ".join(NETWORK_KINDS)))
     process = c.owner(hit)
     rule_id = hit.get("rule_id") if isinstance(hit.get("rule_id"), str) else ""
+
+    def credit(finding):
+        if rule_id and rule_id not in finding["rules"]:
+            finding["rules"].append(rule_id)
+
     per_dest = {}
     for ref in hit.get("events") or ():
-        if isinstance(ref, dict):
-            dest = ref.get("dest") if isinstance(ref.get("dest"), str) else ""
-            entry = per_dest.setdefault(_dest_key(dest), [dest, _plain(ref.get("port")), 0])
-            entry[2] += 1
-    if not per_dest:
-        count = _number(hit.get("count"))
-        per_dest[""] = ["", None, count if count is not None else 1]
-    for dest, port, count in per_dest.values():
-        known = c.get(kind, process, dest)
-        if known is not None:
-            if rule_id and rule_id not in known["rules"]:
-                known["rules"].append(rule_id)
+        if not isinstance(ref, dict):
             continue
+        e = _resolve(events, ref)
+        if kind == "c2_checkin":
+            # "Ein Check-in mit Antwort, nicht bloss ein Connect": a rule cannot
+            # make a check-in of what the event path refused, and a reference
+            # that cannot be looked up cannot show an answer.
+            if ref.get("type") == "beacon":
+                if e is None or _checkin(e) is None:
+                    continue
+                dest = e.get("dest") or ""
+                if c.get(kind, process, dest) is None:
+                    _beacon(c, e, process)
+                credit(c.get(kind, process, dest))
+                continue
+            if ref.get("type") == "conn_failed" or (e is not None and not _answered(e)):
+                continue
+        dest = ref.get("dest") if isinstance(ref.get("dest"), str) else ""
+        entry = per_dest.setdefault(_dest_key(dest), {
+            "dest": dest, "port": _plain(ref.get("port")), "count": 0, "addresses": [],
+            "pids": []})
+        entry["count"] += 1
+        entry["pids"].append(_pid(e) if e is not None else None)
+        for address in (_names(e.get("addresses")) if e is not None else ()):
+            if address not in entry["addresses"]:
+                entry["addresses"].append(address)
+    if not hit.get("events"):
+        count = _number(hit.get("count"))
+        per_dest[""] = {"dest": "", "port": None, "count": count if count is not None else 1,
+                        "addresses": [], "pids": [None]}
+    for entry in per_dest.values():
+        known = c.get(kind, process, entry["dest"])
+        if known is not None:
+            credit(known)
+            continue
+        pids = entry["pids"]
         name = hit.get("name") if isinstance(hit.get("name"), str) else rule_id
+        dest = entry["dest"]
         c.add(kind, process, dest, name + (" (%s)" % dest if dest else ""),
-              port=port, count=count, rules=[rule_id] if rule_id else [],
-              attack=_names(hit.get("attack")), family=_plain(hit.get("family")) or "",
-              severity=_plain(hit.get("severity")) or "")
+              pid=pids[0] if pids and None not in pids else None,
+              port=entry["port"], count=entry["count"], addresses=entry["addresses"],
+              rules=[rule_id] if rule_id else [], attack=_names(hit.get("attack")),
+              family=_plain(hit.get("family")) or "", severity=_plain(hit.get("severity")) or "")
 
 
-def findings_from(events, hits, process="", observed_fully=True, known_good=()):
+def findings_from(events, hits, process="", observed_fully=True, *, known_good):
     """``MemoryFinding`` objects for a capture's events and rule hits.
 
     ``events`` are network events (with the ``beacon``, ``retry`` and
     ``fanout`` events of ``net_behavior``), ``hits`` what
-    ``net_rules.RuleSet.evaluate`` returned for them. ``process`` is the
-    sample's process, used where an event or hit names none.
-    ``observed_fully`` is False in the isolated mode (see the module
-    docstring). ``known_good`` is the rule set's ``known_good`` list (or a
-    ``net_rules.KnownGood``); an event whose destination it names gives no
-    finding. A hit whose kind is not a network kind raises ``ValueError``:
-    ``net_rules`` refuses such a rule when it loads, so one here is a bug.
+    ``net_rules.RuleSet.evaluate`` returned for exactly this list: a hit names
+    its events by position, and a check-in hit whose beacon cannot be looked
+    up in it is dropped. ``process`` is the sample's process, used where an
+    event or hit names none. ``observed_fully`` is False in the isolated mode
+    (see the module docstring).
+
+    ``known_good`` has no default, because forgetting it is the worst mistake
+    a caller can make here: an hour of an idle Windows machine scores
+    MALICIOUS without it and CLEAN with it, and nothing else would say so.
+    Pass the ``net_rules.RuleSet`` the hits came from (its ``known_good`` list
+    is used, so the findings hide what the rules hide), a ``net_rules.KnownGood``
+    or a list of names; ``()`` hides nothing, and is then a choice in plain
+    sight. None is refused.
+
+    A hit whose kind is not a network kind raises ``ValueError``: ``net_rules``
+    refuses such a rule when it loads, so one here is a bug.
     """
-    if not isinstance(known_good, net_rules.KnownGood):
-        known_good = net_rules.KnownGood(known_good or ())
+    known_good = _known_good(known_good)
+    events = list(events or ())
     c = _Collector(process, observed_fully)
-    for e in events or ():
+    for e in events:
         if not isinstance(e, dict):
             continue
         handler = _EVENTS.get(e.get("type"))
@@ -290,5 +413,47 @@ def findings_from(events, hits, process="", observed_fully=True, known_good=()):
         handler(c, e, c.owner(e))
     for hit in hits or ():
         if isinstance(hit, dict):
-            _from_hit(c, hit)
+            _from_hit(c, hit, events)
+    answers = _answers(events)
+    for finding in c.by_key.values():
+        resolved = answers.get(_dest_key(finding.get("dest")))
+        if resolved:
+            addresses = list(finding.get("addresses") or [])
+            finding["addresses"] = addresses + [a for a in resolved if a not in addresses]
     return list(c.by_key.values())
+
+
+def _answers(events):
+    """Name -> the addresses the capture's DNS answers gave for it.
+
+    A check-in over HTTP names its host by the Host header and Sysmon by the
+    address it connected to; without these the two findings of one loop share
+    no endpoint and supersede cannot see that they are one.
+    """
+    table = {}
+    for e in events:
+        if not isinstance(e, dict) or e.get("type") != "dns":
+            continue
+        if e.get("query_type") not in (None, "A", "AAAA"):
+            continue
+        name = _dest_key(e.get("dest"))
+        for answer in _names(e.get("answers")):
+            try:
+                address = str(ipaddress.ip_address(answer))
+            except ValueError:
+                continue
+            known = table.setdefault(name, [])
+            if address not in known:
+                known.append(address)
+    return table
+
+
+def _known_good(value):
+    if isinstance(value, net_rules.KnownGood):
+        return value
+    if isinstance(value, net_rules.RuleSet):
+        return net_rules.KnownGood(value.lists.get(net_rules.KNOWN_GOOD, ()))
+    if value is None or isinstance(value, (str, bytes)):
+        raise TypeError("known_good must be the RuleSet, a KnownGood or a list of names "
+                        "(pass () to hide nothing), not %r" % (value,))
+    return net_rules.KnownGood(value)
