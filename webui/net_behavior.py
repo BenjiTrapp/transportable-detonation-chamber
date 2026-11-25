@@ -25,26 +25,50 @@ Several assumptions would make the result wrong:
     time scale into the statistics.
   * A short interval is the rhythm. Often it is the inside of a check-in: a
     GET for tasks and, a second or ten seconds later, a POST with the result.
-    The timestamps alone cannot say which, and the median of 1 s and 59 s
-    intervals is a confident, jitter-free, wrong "1 s". An attempt to find the
-    right scale from the gaps (collapse where two gap scales are five times
+    The timestamps alone cannot always say which, and the median of 1 s and
+    59 s intervals is a confident, jitter-free, wrong "1 s". An attempt to find
+    the right scale from the gaps (collapse where two gap scales are five times
     apart) was tried and removed: it picked the wrong scale for several burst
     shapes, turned a duty-cycled beacon into one of 3600 s and, because any
     break leaving four starts was accepted and four to six points pass the
     regularity gate by chance, produced more beacons from random traffic than
-    before. Instead a series whose intervals show more than one scale (see
-    ``_single_scale``) is reported without a measurement: the beacon event
+    before. Two rules replace it, both properties of the series. A request
+    within a tenth of the median interval after the start of a check-in is a
+    follow-up of that check-in, when the series shows its extra requests
+    after check-ins rather than just before them (see
+    ``_follow_ups_joined``): a beacon that posts its result a few seconds
+    after the GET on some check-ins keeps its interval. Only intervals far
+    *below* the median are joined; one far above it is a pause. Joining may
+    explain short intervals inside a rhythm the series already has; whether
+    it is regular at all is judged before the join. That works while the
+    median is the period, i.e. while fewer than about half the intervals are
+    follow-ups; a beacon that posts on (nearly) every check-in has the short
+    interval as its median and nothing to join against. What is left, a
+    series whose intervals still show more than one scale (see
+    ``_single_scale``), is reported without a measurement: the beacon event
     keeps the host, the number of check-ins and the span, ``interval``,
-    ``jitter``, ``cov`` and ``on_rhythm`` are None and ``unmeasured`` says why.
-    Repeated contact is a fact worth keeping; a number that may be the spacing
-    inside a burst is not, because a later run is compared against it. Only a
-    series that would otherwise have passed the regularity gate is reported
-    this way, or every host contacted four times at random would be.
+    ``jitter``, ``cov`` and ``on_rhythm`` are None and ``unmeasured`` says
+    why. Repeated contact is a fact worth keeping; a number that may be the
+    spacing inside a burst is not, because a later run is compared against
+    it. Only a series that would otherwise have passed the regularity gate is
+    reported this way, and only from ``UNMEASURED_MIN_CONNECTIONS`` check-ins
+    on, or every host contacted a few times at random would be.
   * Request kinds (method, path) say something about the rhythm. They do not:
     beacons rotate paths, pick URIs at random, mix GET and POST and add a
     favicon, and all of them are one rhythm. Known limitation: a GET every
-    60 s with its POST exactly half a period later is evenly spaced at 30 s,
-    only the kinds could tell it from a 30 s beacon, and it is reported as one.
+    period P with its POST a delay d later on every check-in, where d lies
+    strictly between P/3 and 2P/3 (on a 60 s beacon: 20 s < d < 40 s), gives
+    intervals d and P - d that are less than a factor of two apart. That is
+    one scale; the median is d (P/2 when there are as many d as P - d
+    intervals, e.g. one POST missing) and it is reported as a confident beacon
+    at that interval with jitter near 0. On a jittered beacon the edges of
+    the window follow the actual period. Only the kinds could tell it from a
+    beacon at d, and it is not detected. Outside the window such a series is
+    reported without a measurement, except when the POST comes within a tenth
+    of the period before the next GET: then every check-in is a POST with the
+    GET as its follow-up and the period is measured. When only some check-ins
+    carry the POST, the median stays at the period: a delay up to a tenth of
+    it is joined, a longer one counts as an off interval.
   * A DNS lookup is a check-in. It is not: it happens seconds before the
     connection it serves, again whenever a TTL expires, and a resolver asks for
     names such as wpad.lan on a timer with no sample involved. Its time would
@@ -55,7 +79,8 @@ Several assumptions would make the result wrong:
     reported either.
   * A reported interval is a label. It is a measurement: a fingerprint of the
     sample is built on it later, so a wrong interval is worse than none. A
-    group that is not clearly periodic produces no beacon event.
+    group that is not clearly periodic produces no interval (at most the
+    unmeasured form above).
   * Events arrive in time order. They are merged from several parsers, so the
     timestamps of each group are sorted before they are measured.
   * All traffic that has a path is a signal. ``/`` on many hosts is browsing,
@@ -108,10 +133,12 @@ ON_RHYTHM_MIN_SHARE = 0.5
 # less: an exact doubling is a second scale. It is "far" when it is off by
 # SCALE_FAR times. A rhythm tolerates a fifth of its intervals off (stalls, a
 # re-register), 5% far (an outage is an event; two in a thousand check-ins are
-# noise, two in eight are a second scale) but never fewer than SCALE_MIN_FAR so
-# that a short series is not judged by a percentage of three, and no run of
-# more than SCALE_MAX_RUN consecutive off intervals (a run is a second rhythm,
-# a stall is one interval).
+# noise, two in eight are a second scale; follow-ups that _follow_ups_joined
+# put into their check-in are no longer intervals here) but never fewer than
+# SCALE_MIN_FAR so that a short series is not judged by a percentage of three,
+# and no run of more than SCALE_MAX_RUN consecutive off intervals (a run is a
+# second rhythm, a stall is one interval). SCALE_FAR is also the follow-up
+# limit: a request within median / SCALE_FAR of a check-in may belong to it.
 SCALE_BAND = 2.0
 SCALE_FAR = 10.0
 SCALE_MAX_OFF_SHARE = 0.2
@@ -162,6 +189,58 @@ def _check_ins(times):
     return starts
 
 
+def _follow_ups_joined(starts, median):
+    """``starts`` with the follow-ups of each check-in joined to it.
+
+    The starts fall into clusters: a start and every start no more than
+    ``median / SCALE_FAR`` after it (measured from the cluster's first start,
+    so a long run of requests cannot be chained into one). A cluster is one
+    check-in with follow-ups (a task's result POSTed a few seconds after the
+    GET, a favicon, a retry) when the series as a whole shows its extra
+    requests after the check-in, not before the next one
+    (``_follow_ups_come_after``); the check-in is then the cluster's first
+    request. Otherwise every start is kept, and the short intervals count
+    against the series in ``_single_scale``. Only the short side is joined:
+    an interval far above the median is a pause, not part of a check-in.
+    """
+    limit = median / SCALE_FAR
+    clusters = []
+    for t in starts:
+        if clusters and t - clusters[-1][0] <= limit:
+            clusters[-1].append(t)
+        else:
+            clusters.append([t])
+    if not _follow_ups_come_after(clusters, limit):
+        return starts
+    return [cluster[0] for cluster in clusters]
+
+
+def _follow_ups_come_after(clusters, limit):
+    """Do the extra requests of the clusters follow their check-in?
+
+    Locally a GET with a POST three seconds later and a POST three seconds
+    before the next GET are the same two timestamps; joining the second kind
+    at its first request would put the check-in at the POST and measure the
+    POST's delay, not the period. Which request keeps the rhythm shows in the
+    intervals around a cluster: after a check-in with a follow-up the gap
+    from the previous check-in to the cluster's first request is longer than
+    the gap from its last request to the next check-in, by the cluster's
+    span; before a check-in it is shorter by as much. One cluster says little
+    under jitter, so the differences are summed over all clusters, each
+    clipped to ``limit`` (no cluster spans more, so a larger difference is a
+    pause next to it, not evidence). Zero or less joins nothing.
+    """
+    balance = 0.0
+    for i in range(1, len(clusters) - 1):
+        cluster = clusters[i]
+        if len(cluster) == 1:
+            continue
+        gap_in = cluster[0] - clusters[i - 1][0]
+        gap_out = clusters[i + 1][0] - cluster[-1]
+        balance += max(-limit, min(limit, gap_in - gap_out))
+    return balance > 0
+
+
 def _single_scale(intervals, median):
     """Do the intervals lie on one time scale?
 
@@ -206,9 +285,16 @@ def periodicity(timestamps):
     ``_single_scale``) has no rhythm to report either: the median of two
     scales is a number that belongs to neither, so interval, cov, jitter and
     on_rhythm are None there too; ``regular`` still says whether it would have
-    been taken for a beacon. A series on one scale that is merely irregular keeps its numbers and
-    has ``periodic`` False. ``connections`` counts check-ins: requests closer
-    than ``BEACON_MIN_INTERVAL_S`` are one.
+    been taken for a beacon. A series on one scale that is merely irregular
+    keeps its numbers and has ``periodic`` False. ``connections`` counts
+    check-ins: requests closer than ``BEACON_MIN_INTERVAL_S`` are one, and so
+    is a check-in with its follow-ups (see ``_follow_ups_joined``).
+
+    The follow-ups are found against the median of the series before they are
+    joined, once; the scale and the numbers are those of the joined series.
+    ``regular`` is judged on the series as it came, before the join: joining
+    may explain short intervals inside a rhythm the series already has, it
+    must never be what makes a series look regular.
     """
     # sorted() on input that is already in order is a single pass.
     starts = _check_ins(sorted(t for t in timestamps if _usable(t)))
@@ -217,6 +303,23 @@ def periodicity(timestamps):
               "periodic": False}
     if len(starts) < BEACON_MIN_CONNECTIONS:
         return result
+    raw = _measure(starts)
+    starts = _follow_ups_joined(starts, raw["median"])
+    result["connections"] = len(starts)
+    if len(starts) < BEACON_MIN_CONNECTIONS:
+        return result
+    joined = _measure(starts)
+    result.update(single_scale=joined["single"], regular=raw["regular"])
+    if joined["single"]:
+        result.update(
+            interval=round(joined["median"], 2), cov=round(joined["cov"], 3),
+            jitter=round(joined["cov"], 3), on_rhythm=round(joined["on_rhythm"], 2),
+            periodic=raw["regular"] and joined["regular"])
+    return result
+
+
+def _measure(starts):
+    """Median, robust cov, on_rhythm, the regularity gate and the scale."""
     window = starts[:MAX_INTERVALS + 1]
     intervals = [b - a for a, b in zip(window, window[1:])]
     median = statistics.median(intervals)
@@ -224,14 +327,9 @@ def periodicity(timestamps):
     cov = 1.4826 * mad / median
     on_rhythm = sum(1 for x in intervals
                     if abs(x - median) <= ON_RHYTHM_TOLERANCE * median) / len(intervals)
-    regular = cov <= BEACON_MAX_COV and on_rhythm >= ON_RHYTHM_MIN_SHARE
-    single = _single_scale(intervals, median)
-    result.update(single_scale=single, regular=regular)
-    if single:
-        result.update(
-            interval=round(median, 2), cov=round(cov, 3), jitter=round(cov, 3),
-            on_rhythm=round(on_rhythm, 2), periodic=regular)
-    return result
+    return {"median": median, "cov": cov, "on_rhythm": on_rhythm,
+            "regular": cov <= BEACON_MAX_COV and on_rhythm >= ON_RHYTHM_MIN_SHARE,
+            "single": _single_scale(intervals, median)}
 
 
 def _address(text):
@@ -296,6 +394,12 @@ class _Group:
 
 UNMEASURED_SCALES = "more than one time scale"
 
+# Repeated contact without a measurement needs enough check-ins for the scale
+# rule to tolerate one off interval (SCALE_MAX_OFF_SHARE of five intervals is
+# one). Below that a single stall already reads as "two scales", which random
+# traffic produces all the time.
+UNMEASURED_MIN_CONNECTIONS = 6
+
 
 def _beacon(pid, dest, group):
     """The beacon of a group, measured; or repeated contact without a number.
@@ -308,7 +412,8 @@ def _beacon(pid, dest, group):
     p = periodicity(group.times)
     if p["periodic"]:
         measured, unmeasured = True, None
-    elif p["single_scale"] is False and p["regular"]:
+    elif (p["single_scale"] is False and p["regular"]
+          and p["connections"] >= UNMEASURED_MIN_CONNECTIONS):
         measured, unmeasured = False, UNMEASURED_SCALES
     else:
         return None
