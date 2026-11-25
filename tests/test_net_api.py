@@ -408,3 +408,106 @@ def test_missing_rules_are_named_in_the_report_errors(client, tdc, tmp_path, mon
     report = _upload(client, _pcap_with_http_c2(tmp_path)).get_json()
     assert any(e.startswith("rules:") and "none.yaml" in e for e in report["errors"])
     assert report["rule_hits"] == [] and report["events"]
+
+
+# --- the report of a detonation (Task 16, Ruling 64) ----------------------------------------
+
+SAMPLE = "a1" * 32
+OTHER = "b2" * 32
+
+
+def _poll(client, tdc, monkeypatch, query):
+    """/api/detonation/results with LitterBox, the agent, the EDRs and Sysmon away."""
+    from test_api_payloads import _results_without_the_vm
+    _results_without_the_vm(tdc, monkeypatch)
+    r = client.get("/api/detonation/results?" + query)
+    assert r.status_code == 200
+    return r
+
+
+def test_an_import_keeps_the_sample_it_belongs_to(client, tmp_path):
+    """Regressions covered: nothing tied a report to a detonated sample, so the
+    results of a detonation could never carry one. The optional field `sha256`
+    is kept, lower case, on the report and its list entry; without it, None."""
+    tied = _upload(client, _pcap_with_http_c2(tmp_path), "a.pcap", sha256=SAMPLE.upper()).get_json()
+    loose = _upload(client, _pcap_with_http_c2(tmp_path), "b.pcap").get_json()
+    assert tied["sample_sha256"] == SAMPLE and loose["sample_sha256"] is None
+    rows = {r["filename"]: r for r in client.get("/api/network/reports").get_json()["reports"]}
+    assert rows["a.pcap"]["sample_sha256"] == SAMPLE and rows["b.pcap"]["sample_sha256"] is None
+    assert client.get("/api/network/report?id=" + tied["id"]).get_json()["sample_sha256"] == SAMPLE
+
+
+@pytest.mark.parametrize("bad", ["abc", "g" * 64, SAMPLE + "0", "../" + SAMPLE[3:], SAMPLE[:63] + " x"])
+def test_a_sample_hash_that_is_not_one_is_refused_and_stores_nothing(client, tdc, tmp_path, bad):
+    """Regressions covered: a malformed hash would become a key of the store; it
+    is a 400 that says what is wanted, before the capture is saved or analyzed."""
+    r = _upload(client, _pcap_with_http_c2(tmp_path), sha256=bad)
+    assert r.status_code == 400 and "sha256" in r.get_json()["error"]
+    assert client.get("/api/network/reports").get_json()["reports"] == []
+    upload_dir = tdc._net_upload_dir()
+    assert not os.path.isdir(upload_dir) or os.listdir(upload_dir) == []
+
+
+def test_the_baseline_capture_takes_no_sample(client, tdc, tmp_path):
+    """Regressions covered: the baseline capture shares the upload code; a sample
+    field there must neither refuse the capture nor tie anything to a sample."""
+    r = _upload(client, _pcap_with_http_c2(tmp_path), url="/api/network/baseline/capture", sha256="x")
+    assert r.status_code == 200
+    assert tdc._net_reports.keys("netsample_") == []
+
+
+def test_the_detonation_results_carry_the_newest_report_of_the_sample(client, tdc, tmp_path, monkeypatch):
+    """Regressions covered: nothing set results.network, so the NETWORK panel of
+    the Submit tab could never appear. The newest report imported for the sample
+    is returned as stored (masked; never rebuilt), the hash in any case; another
+    sample, or no sample, gets no `network` key."""
+    _upload(client, _pcap_with_http_c2(tmp_path), "old.pcap", sha256=SAMPLE)
+    newest = _upload(client, _pcap_with_http_c2(tmp_path), "new.pcap", sha256=SAMPLE).get_json()
+    _upload(client, _pcap_with_http_c2(tmp_path), "other.pcap", sha256=OTHER)
+    _upload(client, _pcap_with_http_c2(tmp_path), "loose.pcap")
+    stored = client.get("/api/network/report?id=" + newest["id"]).get_json()
+    got = _poll(client, tdc, monkeypatch, "sha256=%s&pid=4242" % SAMPLE).get_json()
+    assert got["network"] == stored and got["network"]["filename"] == "new.pcap"
+    assert _poll(client, tdc, monkeypatch, "sha256=" + SAMPLE.upper()).get_json()["network"]["id"] == newest["id"]
+    assert _poll(client, tdc, monkeypatch, "sha256=" + OTHER).get_json()["network"]["filename"] == "other.pcap"
+    assert "network" not in _poll(client, tdc, monkeypatch, "sha256=" + "c3" * 32).get_json()
+    assert "network" not in _poll(client, tdc, monkeypatch, "pid=4242").get_json()
+    assert "network" not in _poll(client, tdc, monkeypatch, "sha256=../etc").get_json()
+
+
+def test_the_poll_finds_the_report_by_key_and_survives_a_restart(client, tdc, tmp_path, monkeypatch):
+    """Regressions covered: the endpoint is polled every 5 s; finding the report
+    must not list or read every stored report. It is an index from the sample
+    to its newest report id, kept on disk like the reports."""
+    rid = _upload(client, _pcap_with_http_c2(tmp_path), sha256=SAMPLE).get_json()["id"]
+    tdc._net_reports = tdc._ResultStore(str(tmp_path / "net_results"))
+
+    def no_scan(*a, **k):
+        raise AssertionError("the poll listed the stored reports")
+
+    looked = []
+    real_lookup = tdc._net_reports.lookup
+    monkeypatch.setattr(tdc._net_reports, "keys", no_scan)
+    monkeypatch.setattr(tdc._net_reports, "lookup", lambda tool, **k: looked.append(tool) or real_lookup(tool, **k))
+    assert _poll(client, tdc, monkeypatch, "sha256=" + SAMPLE).get_json()["network"]["id"] == rid
+    assert looked == ["netsample", "netreport"]
+
+
+def test_a_report_the_store_dropped_is_not_returned(client, tdc, tmp_path, monkeypatch):
+    """Regressions covered: an index left behind after its report was evicted
+    must not break the poll; the results simply carry no report."""
+    rid = _upload(client, _pcap_with_http_c2(tmp_path), sha256=SAMPLE).get_json()["id"]
+    with tdc._net_reports._lock:
+        tdc._net_reports._mem.pop("netreport_" + rid)
+    assert "network" not in _poll(client, tdc, monkeypatch, "sha256=" + SAMPLE).get_json()
+
+
+def test_the_detonation_results_carry_no_password_of_the_report(client, tdc, tmp_path, monkeypatch):
+    """Regressions covered: the report in the detonation results must be the
+    masked one, like every other response of the network analysis."""
+    path, secrets = _credential_capture(tmp_path)
+    assert _upload(client, path, sha256=SAMPLE).status_code == 200
+    raw = _poll(client, tdc, monkeypatch, "sha256=" + SAMPLE).data
+    assert b'"network"' in raw
+    for secret in secrets:
+        assert secret.encode() not in raw, secret

@@ -57,6 +57,8 @@ let state = {
     rtraceSelectedPid: null,
     rtraceActiveDetailTab: 'live',
     rtraceEvents: [], // All events for the selected process
+    // The network report the results of the detonation shown last carry (results.network), or null
+    detonationNetwork: null,
     // Hex Editor state
     hexData: null,
     hexFileSize: 0,
@@ -3701,15 +3703,17 @@ function sankeySvg(layout, opts) {
 // =============================================
 
 function initRtraceTabs() {
-    document.querySelectorAll('.rtrace-detail-tabs .rtrace-tab').forEach(tab => {
-        tab.addEventListener('click', () => {
-            const target = tab.dataset.rtab;
-            state.rtraceActiveDetailTab = target;
-            document.querySelectorAll('.rtrace-tab').forEach(t => t.classList.remove('active'));
-            tab.classList.add('active');
-            renderRtraceEventTable();
+    // The buttons are drawn again with their counts (showRtraceDetailTabs): one listener on the bar
+    const bar = document.getElementById('rtrace-detail-tabs');
+    if (bar) {
+        bar.addEventListener('click', e => {
+            const tab = e.target && e.target.closest ? e.target.closest('.rtrace-tab') : null;
+            if (!tab || !bar.contains(tab)) return;
+            state.rtraceActiveDetailTab = tab.dataset.rtab;
+            bar.querySelectorAll('.rtrace-tab').forEach(t => t.classList.toggle('active', t === tab));
+            showRtraceEventTable();
         });
-    });
+    }
 
     // Process dropdown change
     const dropdown = document.getElementById('rtrace-process-select');
@@ -3730,8 +3734,8 @@ function renderRtraceConsole() {
     renderRtraceProcessTree();
     if (state.rtraceSelectedPid) {
         updateRtraceInfoBar();
-        renderRtraceDetailTabs();
-        renderRtraceEventTable();
+        showRtraceDetailTabs();
+        showRtraceEventTable();
     }
 }
 
@@ -3793,8 +3797,8 @@ function selectRtraceProcess(pid) {
     if (treeItem) treeItem.classList.add('active');
 
     // Render tabs and events
-    renderRtraceDetailTabs();
-    renderRtraceEventTable();
+    showRtraceDetailTabs();
+    showRtraceEventTable();
     renderProcessList();
 }
 
@@ -4117,58 +4121,170 @@ function renderRtraceProcessTree() {
     container.innerHTML = html;
 }
 
-function renderRtraceDetailTabs() {
-    const proc = state.processes[state.rtraceSelectedPid] || state.processes[String(state.rtraceSelectedPid)];
-    if (!proc) return;
+// The sub-tabs of a process in Tracing: data-rtab, label, and whether it shows a count
+const RTRACE_DETAIL_TABS = [['verdict', 'VERDICT', false], ['live', 'LIVE', false], ['http', 'HTTP REQUESTS', true], ['connections', 'CONNECTIONS', true], ['dns', 'DNS REQUESTS', true], ['tls', 'TLS', true], ['files', 'FILES', true], ['registry', 'REGISTRY', true], ['artifacts', 'ARTIFACTS', true], ['modules', 'MODULES', true]];
+// The event types of a network report each network sub-tab shows
+const RTRACE_NETWORK_TYPES = { http: ['http'], connections: ['conn', 'conn_failed', 'udp'], dns: ['dns'], tls: ['tls'] };
 
-    const act = proc.activity || {};
-    // Update tab counts
-    const tabCountMap = {
-        'http': act.http || 0,
-        'connections': act.network || 0,
-        'dns': act.dns || 0,
-        'files': act.file || 0,
-        'registry': act.registry || 0,
-        'artifacts': act.artifacts || 0,
-        'modules': act.modules || 0,
-    };
-
-    document.querySelectorAll('.rtrace-tab').forEach(tab => {
-        const rtab = tab.dataset.rtab;
-        const countEl = tab.querySelector('.rtrace-tab-count');
-        if (countEl && tabCountMap[rtab] !== undefined) {
-            countEl.textContent = tabCountMap[rtab];
-        }
-    });
+// What the sub-tabs of the selected process show: its alerts and its
+// children's, its activity counts, the active sub-tab, and the events of a
+// network report - the one the detonation's results carry, else the one open
+// in the NETWORK tab. A capture knows no processes: those events are the
+// whole capture's, not this process's.
+function rtraceState() {
+    const proc = state.processes[state.rtraceSelectedPid] || state.processes[String(state.rtraceSelectedPid)] || null;
+    let events = [];
+    if (proc) {
+        events = (proc.alerts || []).slice();
+        (proc.children || []).forEach(childPid => {
+            const child = state.processes[childPid] || state.processes[String(childPid)];
+            if (child && child.alerts) events = events.concat(child.alerts);
+        });
+    }
+    const view = { proc, events, activity: (proc && proc.activity) || {}, tab: state.rtraceActiveDetailTab };
+    const detonation = networkReportOf({ network: state.detonationNetwork });
+    const report = detonation || networkReportOf({ network: networkState.report });
+    if (report) {
+        view.network = Array.isArray(report.events) ? report.events : [];
+        view.networkReport = report;
+        view.networkSource = detonation ? 'detonation' : 'network-tab';
+    }
+    return view;
 }
 
-function renderRtraceEventTable() {
+// The network events of a sub-tab, or null when the sub-tab is no network one or there is no report
+function rtraceNetworkEvents(kind, view) {
+    const types = RTRACE_NETWORK_TYPES[kind];
+    if (!types || !view || !Array.isArray(view.network)) return null;
+    return view.network.filter(e => e && typeof e === 'object' && types.includes(e.type));
+}
+
+// The bar of sub-tabs with their counts. The network ones count the events of
+// the report when there is one (capture-wide), else what the agent counted for
+// the process.
+function renderRtraceDetailTabs(view) {
+    const act = (view && view.activity) || {};
+    const counts = {
+        http: act.http || 0, connections: act.network || 0, dns: act.dns || 0, tls: 0,
+        files: act.file || 0, registry: act.registry || 0, artifacts: act.artifacts || 0, modules: act.modules || 0,
+    };
+    const active = (view && view.tab) || 'live';
+    return RTRACE_DETAIL_TABS.map(([key, label, counted]) => {
+        const net = rtraceNetworkEvents(key, view);
+        let title = '';
+        if (net) {
+            const failed = key === 'connections' ? net.filter(e => e.type === 'conn_failed').length : 0;
+            title = (failed ? `${net.length - failed} connection(s), ${failed} failed. ` : '')
+                + 'Events of the network report, capture-wide: not attributed to a process.';
+        } else if (key === 'tls') {
+            title = 'TLS handshakes come from a network report: import a capture in the NETWORK tab.';
+        }
+        const count = net ? net.length : counts[key];
+        return `<button type="button" class="rtrace-tab${key === active ? ' active' : ''}" data-rtab="${escapeHtml(key)}"${title ? ` title="${escapeHtml(title)}"` : ''}>${escapeHtml(label)}${counted ? ` <span class="rtrace-tab-count">${escapeHtml(String(count))}</span>` : ''}</button>`;
+    }).join('');
+}
+
+function showRtraceDetailTabs() {
+    const bar = document.getElementById('rtrace-detail-tabs');
+    if (bar) bar.innerHTML = renderRtraceDetailTabs(rtraceState());
+}
+
+function showRtraceEventTable() {
     const container = document.getElementById('rtrace-event-table-body');
     if (!container) return;
-
-    const proc = state.processes[state.rtraceSelectedPid] || state.processes[String(state.rtraceSelectedPid)];
-    if (!proc) {
+    const view = rtraceState();
+    if (!view.proc) {
         container.innerHTML = '<div style="padding:20px;color:var(--text-muted);">Select a process to view events.</div>';
         return;
     }
-
-    // Get alerts for this process (and children)
-    let events = (proc.alerts || []).slice();
-    // Include children's events too
-    (proc.children || []).forEach(childPid => {
-        const child = state.processes[childPid] || state.processes[String(childPid)];
-        if (child && child.alerts) {
-            events = events.concat(child.alerts);
-        }
-    });
-
-    // Filter by active detail tab
-    const activeTab = state.rtraceActiveDetailTab;
-    if (activeTab === 'verdict') {
-        // Verdict tab: render summary view instead of event table
-        renderRtraceVerdictView(container, proc, events);
+    if (view.tab === 'verdict') {
+        // Verdict tab: a summary view instead of the event table
+        renderRtraceVerdictView(container, view.proc, view.events);
         return;
-    } else if (activeTab === 'dns') {
+    }
+    container.innerHTML = renderRtraceEventTable(view.tab, view);
+}
+
+// The one line of detail of a network event in the event grid
+function rtraceNetworkDetail(e) {
+    const where = networkText(e.dest) + (e.port !== null && e.port !== undefined && e.port !== '' ? ':' + networkText(e.port) : '');
+    switch (e.type) {
+        case 'http': {
+            const host = networkHeader(e.headers, 'host');
+            return `${networkText(e.method)} ${networkText(e.url) || where + networkText(e.path)}`
+                + (e.status ? ` \u2192 ${networkText(e.status)}` : '')
+                + (host && host !== networkText(e.dest) ? ` (Host: ${host})` : '');
+        }
+        case 'dns':
+            return `${networkText(e.dest)} ${networkText(e.query_type)} \u2192 `
+                + (e.nxdomain ? 'NXDOMAIN' : (networkText(e.answers) || networkText(e.rcode) || 'no answer seen'));
+        case 'tls':
+            return [networkText(e.sni) || where, networkText(e.version), e.alpn ? 'ALPN ' + networkText(e.alpn) : '',
+                    e.ja3_hash ? 'JA3 ' + networkText(e.ja3_hash) : '', e.self_signed ? 'self-signed' : ''].filter(Boolean).join(' \u00b7 ');
+        default:
+            return `${where} \u00b7 ${networkDetail(e)}`;
+    }
+}
+
+// What a network event sorts by in column col (the heads of the event grid)
+function rtraceNetworkSortValue(e, col) {
+    switch (col) {
+        case 1: return sortNumberValue(e.ts);
+        case 2: return networkText(e.type);
+        case 4: return networkText(e.pid);
+        case 5: return networkText(e.process);
+        case 6: return rtraceNetworkDetail(e);
+        default: return '';
+    }
+}
+
+// The rows of a network sub-tab from the events of the report, with what they are: the whole capture's
+function rtraceNetworkRows(kind, events, view) {
+    const report = (view && view.networkReport) || {};
+    const from = view && view.networkSource === 'detonation' ? 'the network report of this detonation' : 'the report open in the NETWORK tab';
+    let html = `<div class="net-note">Capture-wide, from ${escapeHtml(from)}${report.filename ? ' (' + escapeHtml(networkText(report.filename)) + ')' : ''}: a capture knows no processes, so these events are not attributed to a process.</div>`;
+    if (!events.length) {
+        const what = { http: 'HTTP requests', connections: 'connections', dns: 'DNS lookups', tls: 'TLS handshakes' }[kind] || 'events';
+        return html + networkEmpty(report, what);
+    }
+    let rows = events.map((e, index) => ({ e, index }))
+        .sort((a, b) => compareSortValues(sortNumberValue(a.e.ts), sortNumberValue(b.e.ts)) || a.index - b.index)
+        .map(entry => entry.e);
+    const sort = tableSortState[RTRACE_EVENT_SORT_ID];
+    if (sort) rows = sortItemsBy(rows, e => rtraceNetworkSortValue(e, sort.col), sort.dir);
+    const shown = rows.slice(0, NETWORK_ROWS_MAX);
+    shown.forEach(e => {
+        const failed = e.type === 'conn_failed';
+        const badge = failed ? 'miss' : (e.type === 'dns' ? 'query' : 'connect');
+        const attributed = e.pid !== null && e.pid !== undefined && e.pid !== '';
+        html += `<div class="rtrace-event-row${failed ? ' rtrace-net-failed' : ''}">
+            <span class="ev-sev"><span class="ev-sev-dot unknown"></span></span>
+            <span class="ev-time">${escapeHtml(networkTime(e.ts))}</span>
+            <span class="ev-action"><span class="rtrace-action-badge ${cssToken(badge)}">${escapeHtml(failed ? 'conn failed' : networkText(e.type))}</span></span>
+            <span class="ev-rule"><span class="ev-rule-name"></span><span class="ev-engine-tag">PCAP</span></span>
+            <span class="ev-pid">${attributed ? escapeHtml(networkText(e.pid)) : '\u2014'}</span>
+            <span class="ev-process">${attributed || e.process ? escapeHtml(networkText(e.process)) : 'not attributed'}</span>
+            <span class="ev-details">${escapeHtml(rtraceNetworkDetail(e))}${networkFlags(e)}</span>
+            <span class="ev-graph-btn-empty"></span>
+        </div>`;
+    });
+    return html + networkCut(shown.length, rows.length);
+}
+
+// The rows of sub-tab `kind`: the network report's events on a network
+// sub-tab when there is a report, else the process's alerts filtered for the
+// sub-tab (HTTP by its ports when nothing better is known)
+function renderRtraceEventTable(kind, view) {
+    const net = rtraceNetworkEvents(kind, view);
+    if (net) return rtraceNetworkRows(kind, net, view);
+    if (kind === 'tls') {
+        return '<div style="padding:20px;color:var(--text-muted);font-size:11px;">TLS handshakes come from a network report: import a capture in the NETWORK tab.</div>';
+    }
+    let events = ((view && view.events) || []).slice();
+
+    // Filter by the sub-tab
+    const activeTab = kind;
+    if (activeTab === 'dns') {
         events = events.filter(e => {
             const cat = (Array.isArray(e.category) ? e.category[0] : e.category || '').toLowerCase();
             const raw = e.raw || {};
@@ -4179,10 +4295,10 @@ function renderRtraceEventTable() {
         events = events.filter(e => {
             const raw = e.raw || {};
             const cat = (Array.isArray(e.category) ? e.category[0] : e.category || '').toLowerCase();
-            const destPort = raw.destination?.port || raw.network?.destination?.port || '';
+            const destPort = raw.destination?.port || raw.network?.destination?.port || raw['destination.port'] || raw.dest_port || '';
             const action = (raw.event?.action || '').toLowerCase();
-            // HTTP = network connections on ports 80/443, or explicit http data
-            return (cat === 'network' && (destPort == 80 || destPort == 443 || destPort == 8080 || destPort == 8443))
+            // Without a network report: HTTP = network connections on the web ports, or explicit http data
+            return ((cat === 'network' || cat === '') && (destPort == 80 || destPort == 443 || destPort == 8080 || destPort == 8443))
                 || !!raw.http || !!raw.url || action.includes('http');
         });
     } else if (activeTab === 'files') {
@@ -4236,8 +4352,7 @@ function renderRtraceEventTable() {
     if (sort) events = sortItemsBy(events, ev => rtraceEventSortValue(ev, sort.col), sort.dir);
 
     if (!events.length) {
-        container.innerHTML = '<div style="padding:20px;color:var(--text-muted);font-size:11px;">No events for this filter.</div>';
-        return;
+        return '<div style="padding:20px;color:var(--text-muted);font-size:11px;">No events for this filter.</div>';
     }
 
     let html = '';
@@ -4266,7 +4381,7 @@ function renderRtraceEventTable() {
             ${ev.pid ? `<span class="ev-graph-btn" title="Investigate PID ${escapeHtml(String(ev.pid))} in process graph" onclick="event.stopPropagation(); focusProcessGraph(${jsArg(ev.pid)}, {reset:true, at:${jsArg(ev.timestamp || '')}})">&#9673; Graph</span>` : '<span class="ev-graph-btn-empty"></span>'}
         </div>`;
     });
-    container.innerHTML = html;
+    return html;
 }
 
 // --- Sorting the event grid ---
@@ -4311,7 +4426,7 @@ function sortRtraceEvents(col) {
     const current = tableSortState[RTRACE_EVENT_SORT_ID];
     tableSortState[RTRACE_EVENT_SORT_ID] = { col, dir: current && current.col === col && current.dir === 'asc' ? 'desc' : 'asc' };
     updateRtraceEventSortHeads();
-    renderRtraceEventTable();
+    showRtraceEventTable();
 }
 
 // aria-sort on the sorted head, which style.css shows as ▲ / ▼ (↕ on the others)
@@ -4467,6 +4582,11 @@ function getEventDetails(ev) {
     if (raw.network?.destination?.ip) {
         const port = raw.network.destination?.port || '';
         return `${raw.network.destination.ip}${port ? ':' + port : ''}`;
+    }
+    const flatIp = raw['destination.ip'] || raw.dest_ip;
+    if (flatIp) {
+        const port = raw['destination.port'] || raw.dest_port || '';
+        return `${flatIp}${port ? ':' + port : ''}`;
     }
 
     // ECS-style fields (flat dotted keys from Rustinel)
@@ -6890,6 +7010,7 @@ async function viewDetonationResult(lbHash, sha256, pid, filename) {
         if (resp.ok) {
             const data = await resp.json();
             detData = data;
+            state.detonationNetwork = data && data.network ? networkReportOf(data) : null;
             fibratusAlerts = data.fibratus_alerts || [];
             fibratusCount = data.fibratus_alert_count || fibratusAlerts.length;
             verdict = data.verdict || null;
@@ -8476,6 +8597,7 @@ function renderDetonationPanels(data) {
     if (!panels) return;
 
     _detRawPayloads = [];
+    state.detonationNetwork = data && data.network ? networkReportOf(data) : null;
     let html = '';
 
     // --- Verdict banner (aggregated CLEAN / SUSPICIOUS / MALICIOUS) ---

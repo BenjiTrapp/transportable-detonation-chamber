@@ -4263,6 +4263,11 @@ def api_detonation_results():
     if exitcapture_result:
         results["exit_capture_result"] = exitcapture_result
 
+    # --- The network report imported for this sample (stored masked, returned as stored) ---
+    network_report = _net_report_for_sample(sha256)
+    if network_report is not None:
+        results["network"] = network_report
+
     # --- Network beaconing from Sysmon EID 3 (survives process exit) ---
     if pid:
         results["network_beaconing"] = _network_beaconing_for_pid(pid)
@@ -6171,11 +6176,13 @@ _memory_baseline = memory_evidence.MemoryBaseline(MEMORY_BASELINE_FILE)
 # Network reports, one entry per imported capture (a restart keeps them), and the
 # network baseline. Both are module objects so the tests can point them elsewhere.
 # Every report has two entries: "netreport_<id>" (the report) and "netsummary_<id>"
-# (what the list shows); the limit therefore holds twice the reports kept.
+# (what the list shows), and one imported for a detonated sample a third,
+# "netsample_<sha256>" (the id of the newest report of that sample); the limit
+# therefore holds three times the reports kept.
 NET_REPORTS_KEEP = 100
 _net_reports = _ResultStore(
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "net_results"),
-    limit=2 * NET_REPORTS_KEEP)
+    limit=3 * NET_REPORTS_KEEP)
 _net_baseline = net_baseline.NetBaseline(NET_BASELINE_FILE)
 
 
@@ -7699,6 +7706,7 @@ NET_UPLOADS_KEEP = 20
 NET_UPLOAD_MAX = 256 * 1024 * 1024
 _NET_FORM_ALLOWANCE = 1024 * 1024    # the other form fields and the multipart framing
 _NET_REPORT_ID = re.compile(r"[0-9a-f]{32}")
+_NET_SAMPLE_SHA256 = re.compile(r"[0-9a-f]{64}")
 _NET_MODES = ("online", "isolated")
 _NET_PROCESS_MAX = 260
 _net_sequence = itertools.count()
@@ -7773,12 +7781,15 @@ def _net_too_large():
                     % (NET_UPLOAD_MAX // (1024 * 1024))}), 413
 
 
-def _net_analyze_upload(baseline):
+def _net_analyze_upload(baseline, with_sample=False):
     """Analyze the uploaded capture of this request against `baseline` (or None).
 
     Returns (report, error response). The response is a ready (json, status)
     when the request is wrong; the report comes from net_analyze unchanged (it is
-    already masked and JSON-safe) with `id` and `filename` added.
+    already masked and JSON-safe) with `id` and `filename` added. With
+    `with_sample` the optional form field `sha256` (the detonated sample the
+    capture belongs to) is checked before anything is stored and kept as
+    `sample_sha256` (lower case, or None).
 
     The size is settled before the body is parsed: reading request.form parses
     (and spools) the whole multipart body, so a Content-Length over the limit is
@@ -7800,6 +7811,11 @@ def _net_analyze_upload(baseline):
     if mode is None:
         return None, (jsonify({"error": "mode must be one of %s"
                                % ", ".join(_NET_MODES)}), 400)
+    sample = None
+    if with_sample:
+        sample = (data.get("sha256") or "").strip().lower() or None
+        if sample is not None and not _NET_SAMPLE_SHA256.fullmatch(sample):
+            return None, (jsonify({"error": "sha256 must be the 64 hex digits of the sample's SHA256"}), 400)
     process = (data.get("process") or "")[:_NET_PROCESS_MAX]
     report_id = uuid.uuid4().hex
     path = _save_net_upload(upload, report_id)
@@ -7826,6 +7842,8 @@ def _net_analyze_upload(baseline):
         return None, (jsonify({"error": reason}), 400)
     report["id"] = report_id
     report["filename"] = filename
+    if with_sample:
+        report["sample_sha256"] = sample
     return report, None
 
 
@@ -7856,17 +7874,38 @@ def _net_summary(report):
 
 @app.route("/api/network/import", methods=["POST"])
 def api_network_import():
-    """Analyze an uploaded pcap and keep the report. Params: `file`, `mode` (online|isolated), `process`"""
-    report, error = _net_analyze_upload(_net_baseline)
+    """Analyze an uploaded pcap and keep the report.
+    Params: `file`, `mode` (online|isolated), `process`, `sha256` (optional: the detonated sample)"""
+    report, error = _net_analyze_upload(_net_baseline, with_sample=True)
     if error:
         return error
     report["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
     summary = {"id": report["id"], "filename": report["filename"],
                "timestamp": report["timestamp"], "mode": report.get("mode"),
+               "sample_sha256": report["sample_sha256"],
                "seq": next(_net_sequence), "summary": _net_summary(report)}
     _net_reports.put("netreport", report, sha256=report["id"])
     _net_reports.put("netsummary", summary, sha256=report["id"])
+    # after the report: a poll that finds the index finds the report too
+    if report["sample_sha256"]:
+        _net_reports.put("netsample", {"id": report["id"]}, sha256=report["sample_sha256"])
     return jsonify(report)
+
+
+def _net_report_for_sample(sha256):
+    """The newest stored network report imported for this sample, as stored, or None.
+
+    /api/detonation/results is polled every 5 s: this is two lookups by key
+    ("netsample_<sha256>" names the report id), never a scan over the reports.
+    """
+    sample = (sha256 or "").strip().lower()
+    if not _NET_SAMPLE_SHA256.fullmatch(sample):
+        return None
+    entry = _net_reports.lookup("netsample", sha256=sample)
+    report_id = entry.get("id") if isinstance(entry, dict) else None
+    if not isinstance(report_id, str) or not _NET_REPORT_ID.fullmatch(report_id):
+        return None
+    return _net_reports.lookup("netreport", sha256=report_id)
 
 
 @app.route("/api/network/report", methods=["GET"])

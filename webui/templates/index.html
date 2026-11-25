@@ -389,15 +389,16 @@
                         <div class="rtrace-detail-content" id="rtrace-detail-content" style="display:none;">
                             <!-- Detail tabs -->
                             <div class="rtrace-detail-tabs" id="rtrace-detail-tabs">
-                                <button class="rtrace-tab active" data-rtab="verdict">Verdict</button>
-                                <button class="rtrace-tab" data-rtab="live">Live</button>
-                                <button class="rtrace-tab" data-rtab="http">HTTP Requests <span class="rtrace-tab-count">0</span></button>
-                                <button class="rtrace-tab" data-rtab="connections">Connections <span class="rtrace-tab-count">0</span></button>
-                                <button class="rtrace-tab" data-rtab="dns">DNS Requests <span class="rtrace-tab-count">0</span></button>
-                                <button class="rtrace-tab" data-rtab="files">Files <span class="rtrace-tab-count">0</span></button>
-                                <button class="rtrace-tab" data-rtab="registry">Registry <span class="rtrace-tab-count">0</span></button>
-                                <button class="rtrace-tab" data-rtab="artifacts">Artifacts <span class="rtrace-tab-count">0</span></button>
-                                <button class="rtrace-tab" data-rtab="modules">Modules <span class="rtrace-tab-count">0</span></button>
+                                <button type="button" class="rtrace-tab" data-rtab="verdict">VERDICT</button>
+                                <button type="button" class="rtrace-tab active" data-rtab="live">LIVE</button>
+                                <button type="button" class="rtrace-tab" data-rtab="http">HTTP REQUESTS <span class="rtrace-tab-count">0</span></button>
+                                <button type="button" class="rtrace-tab" data-rtab="connections">CONNECTIONS <span class="rtrace-tab-count">0</span></button>
+                                <button type="button" class="rtrace-tab" data-rtab="dns">DNS REQUESTS <span class="rtrace-tab-count">0</span></button>
+                                <button type="button" class="rtrace-tab" data-rtab="tls">TLS <span class="rtrace-tab-count">0</span></button>
+                                <button type="button" class="rtrace-tab" data-rtab="files">FILES <span class="rtrace-tab-count">0</span></button>
+                                <button type="button" class="rtrace-tab" data-rtab="registry">REGISTRY <span class="rtrace-tab-count">0</span></button>
+                                <button type="button" class="rtrace-tab" data-rtab="artifacts">ARTIFACTS <span class="rtrace-tab-count">0</span></button>
+                                <button type="button" class="rtrace-tab" data-rtab="modules">MODULES <span class="rtrace-tab-count">0</span></button>
                             </div>
                             <!-- Event Table: a grid of <div>s whose heads sort the rows
                                  (initRtraceEventSort in app.js) -->
@@ -1541,7 +1542,7 @@
                     <table class="help-api-table">
                         <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
                         <tbody>
-                            <tr><td class="api-post">POST</td><td><code>/api/network/import</code></td><td>Analyze an uploaded pcap or pcapng and keep the report. Params: <code>file</code>, <code>mode</code> (online/isolated), <code>process</code></td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/network/import</code></td><td>Analyze an uploaded pcap or pcapng and keep the report. Params: <code>file</code>, <code>mode</code> (online/isolated), <code>process</code>, <code>sha256</code> (optional: the detonated sample; its detonation results then carry the newest such report as <code>network</code>)</td></tr>
                             <tr><td class="api-get">GET</td><td><code>/api/network/report</code></td><td>A stored network report. Param: <code>id</code></td></tr>
                             <tr><td class="api-get">GET</td><td><code>/api/network/reports</code></td><td>Stored reports, newest first, with a summary</td></tr>
                             <tr><td class="api-get">GET</td><td><code>/api/network/baseline</code></td><td>What the network baseline of this VM holds</td></tr>
@@ -1674,6 +1675,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
          in app.js); set as text, never as markup -->
     <div id="info-popover" class="info-popover" role="status" hidden></div>
 
-    <script src="/static/js/app.js?v=104"></script>
+    <script src="/static/js/app.js?v=105"></script>
 </body>
 </html>

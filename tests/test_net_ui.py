@@ -669,3 +669,234 @@ def test_the_panel_banner_and_chips_use_the_same_findings():
     assert "NO ACTIVE FINDING" in html and "NOTHING FOUND" not in html and "RAW-ONE" not in html
     clean = _panel({"network": _empty_report(events=[{"type": "dns", "ts": 1, "dest": "a"}])})
     assert "NOTHING FOUND" in clean and "suppressed or superseded" not in clean
+
+
+# --- the Tracing sub-tabs (Task 16) -------------------------------------------------------------
+#
+# Regressions covered:
+#   * HTTP REQUESTS was a guess from ports 80/443 even when a network report held the real requests;
+#     CONNECTIONS and DNS REQUESTS showed no event of a report; there was no TLS sub-tab
+#   * the capture's events shown as if the selected process had made them (a pcap knows no process)
+#   * a failed connection listed like one that was made
+#   * without a report the port guess and the agent's counts must still work
+#   * a value of a capture reaching the Tracing markup unescaped; a header read under its capitalised name
+
+RTRACE_FNS = [
+    "renderRtraceDetailTabs", "renderRtraceEventTable", "rtraceNetworkEvents", "rtraceNetworkRows",
+    "rtraceNetworkDetail", "rtraceNetworkSortValue", "networkText", "networkTime", "networkHeader",
+    "networkDetail", "networkFlags", "networkEmpty", "networkCut", "formatSize", "sortNumberValue",
+    "compareSortValues", "compareSortKeys", "sortKey", "sortItemsBy", "escapeHtml", "cssToken", "jsArg",
+    "formatRelativeTime", "formatTime", "rtraceEventAction", "rtraceEventSortValue", "getActionBadgeClass",
+    "getEventDetails", "severitySortValue", "sortTimeValue", "alertSeverity",
+]
+RTRACE_CONSTS = ["RTRACE_DETAIL_TABS", "RTRACE_NETWORK_TYPES", "NETWORK_ROWS_MAX", "tableSortState",
+                 "RTRACE_EVENT_SORT_ID", "SORT_COLLATOR", "ALERT_SEVERITIES"]
+
+
+def _rtrace_prelude():
+    return "\n".join(_const(c) for c in RTRACE_CONSTS)
+
+
+def _tabs(state):
+    return _run_node(RTRACE_FNS, "console.log(JSON.stringify(renderRtraceDetailTabs(%s)))"
+                     % json.dumps(state), _rtrace_prelude())
+
+
+def _rows(kind, state):
+    return _run_node(RTRACE_FNS, "console.log(JSON.stringify(renderRtraceEventTable(%s, %s)))"
+                     % (json.dumps(kind), json.dumps(state)), _rtrace_prelude())
+
+
+def _tab_counts(html):
+    return dict(re.findall(r'data-rtab="([a-z]+)"[^>]*>[^<]*<span class="rtrace-tab-count">([^<]*)<', html))
+
+
+@needs_node
+def test_the_http_subtab_counts_real_http_events():
+    out = _tabs({"network": [{"type": "http", "path": "/a"}, {"type": "http", "path": "/b"}]})
+    assert "HTTP REQUESTS" in out and ">2<" in out
+
+
+@needs_node
+def test_the_http_subtab_prefers_real_events_over_the_port_heuristic():
+    out = _rows("http", {"network": [{"type": "http", "dest": "evil.top", "path": "/gate.php"}],
+                         "events": [{"raw": {"dest_port": 443, "dest_ip": "203.0.113.9"}}]})
+    assert "/gate.php" in out and "203.0.113.9" not in out
+
+
+@needs_node
+def test_without_a_report_the_old_heuristic_still_works():
+    out = _rows("http", {"events": [{"raw": {"dest_port": 443, "dest_ip": "203.0.113.9"}}]})
+    assert "203.0.113.9" in out
+
+
+@needs_node
+def test_a_tls_subtab_exists_and_counts_tls_events():
+    assert "TLS" in _tabs({"network": [{"type": "tls", "sni": "a.top"}]})
+
+
+NET_EVENTS = [
+    {"type": "http", "ts": 3, "dest": "evil.top", "port": 80, "method": "POST", "path": "/gate.php", "status": 200},
+    {"type": "conn", "ts": 1, "dest": "203.0.113.5", "port": 443, "proto": "tcp", "client_bytes": 10, "server_bytes": 20},
+    {"type": "conn_failed", "ts": 2, "dest": "198.51.100.7", "port": 4444, "attempts": 3, "refused": True},
+    {"type": "udp", "ts": 4, "dest": "198.51.100.8", "port": 1900, "answered": False},
+    {"type": "dns", "ts": 0.5, "dest": "evil.top", "query_type": "A", "answers": ["203.0.113.5"]},
+    {"type": "dns", "ts": 0.6, "dest": "gone.top", "query_type": "A", "nxdomain": True},
+    {"type": "tls", "ts": 5, "dest": "203.0.113.5", "port": 443, "sni": "cdn.top", "version": "TLS 1.2",
+     "ja3_hash": "e7d705a3286e19ea42f587b344ee6865"},
+    {"type": "beacon", "ts": 6, "dest": "evil.top", "interval": 60},
+]
+
+
+@needs_node
+def test_each_network_subtab_counts_its_own_event_types():
+    """CONNECTIONS is conn, conn_failed and udp (a beacon or an http request is no connection row);
+    DNS REQUESTS the dns events; the other sub-tabs keep the agent's counts."""
+    html = _tabs({"network": NET_EVENTS, "activity": {"http": 9, "network": 9, "dns": 9, "file": 4, "registry": 2}})
+    assert _tab_counts(html) == {"http": "1", "connections": "3", "dns": "2", "tls": "1", "files": "4",
+                                 "registry": "2", "artifacts": "0", "modules": "0"}
+    assert "1 failed" in html and "not attributed to a process" in html
+
+
+@needs_node
+def test_without_a_report_the_tabs_keep_the_agents_counts():
+    html = _tabs({"activity": {"http": 5, "network": 7, "dns": 3}, "tab": "dns"})
+    counts = _tab_counts(html)
+    assert counts["http"] == "5" and counts["connections"] == "7" and counts["dns"] == "3" and counts["tls"] == "0"
+    assert re.search(r'class="rtrace-tab active" data-rtab="dns"', html)
+    assert "not attributed" not in html
+
+
+@needs_node
+def test_the_tab_bar_is_the_one_of_the_page():
+    """The bar drawn with counts has the buttons, labels and order of index.html (TLS among them)."""
+    drawn = re.findall(r'data-rtab="([a-z]+)"[^>]*>([A-Z ]+)', _tabs({}))
+    html = _index_html()
+    bar = html[html.index('id="rtrace-detail-tabs"'):]
+    bar = bar[:bar.index("</div>")]
+    static = re.findall(r'data-rtab="([a-z]+)"[^>]*>([A-Z ]+)', bar)
+    assert [(k, v.strip()) for k, v in drawn] == [(k, v.strip()) for k, v in static]
+    assert ("tls", "TLS") in [(k, v.strip()) for k, v in static]
+    assert re.search(r'class="rtrace-tab active" data-rtab="live"', bar), "the page marks another tab than the state's"
+
+
+@needs_node
+def test_the_connection_rows_show_a_failed_connection_apart_and_say_they_are_capture_wide():
+    out = _rows("connections", {"network": NET_EVENTS, "networkSource": "detonation",
+                                "networkReport": {"filename": "run.pcap"}})
+    rows = out.split('<div class="rtrace-event-row')[1:]
+    assert len(rows) == 3
+    assert "198.51.100.7:4444" in rows[1] and "rtrace-net-failed" in rows[1] and "conn failed" in rows[1]
+    assert "rtrace-net-failed" not in rows[0] + rows[2]
+    assert "refused" in rows[1] and "3 attempt(s)" in rows[1]
+    assert "not attributed to a process" in out and "this detonation" in out and "run.pcap" in out
+    assert all("not attributed" in r and "\u2014" in r for r in rows), "a pcap row given a process"
+    assert "openAlertDetailById" not in out and "focusProcessGraph" not in out
+
+
+@needs_node
+def test_the_rows_name_the_network_tab_when_the_report_is_from_there():
+    out = _rows("dns", {"network": NET_EVENTS, "networkSource": "network-tab"})
+    assert "NETWORK tab" in out and "NXDOMAIN" in out and "203.0.113.5" in out
+    assert out.index("evil.top") < out.index("gone.top"), "not in time order"
+
+
+@needs_node
+def test_the_tls_rows_show_the_server_name_and_fingerprint():
+    out = _rows("tls", {"network": NET_EVENTS})
+    assert "cdn.top" in out and "TLS 1.2" in out and "e7d705a3286e19ea42f587b344ee6865" in out
+
+
+@needs_node
+def test_a_report_without_events_of_a_kind_says_so_and_does_not_guess():
+    alerts = [{"raw": {"dest_port": 443, "dest_ip": "203.0.113.9"}}]
+    out = _rows("http", {"network": [{"type": "dns", "dest": "a"}], "networkReport": {}, "events": alerts})
+    assert "No HTTP requests in this capture." in out and "203.0.113.9" not in out
+    unobserved = _rows("dns", {"network": [], "networkReport": {"observed": False, "note": "no packets"},
+                               "events": alerts})
+    assert "Not observed: no packets" in unobserved
+
+
+@needs_node
+def test_tls_without_a_report_points_to_the_network_tab():
+    out = _rows("tls", {"events": [{"raw": {"dest_port": 443, "dest_ip": "203.0.113.9"}}]})
+    assert "NETWORK tab" in out and "203.0.113.9" not in out
+
+
+@needs_node
+def test_the_tracing_rows_escape_every_value_of_the_capture():
+    evil = '<img src=x onerror="alert(1)">'
+    events = [{"type": "http", "dest": evil, "method": evil, "path": evil, "status": evil,
+               "headers": {"host": evil}},
+              {"type": "tls", "sni": evil, "version": evil, "alpn": evil, "ja3_hash": evil},
+              {"type": "dns", "dest": evil, "query_type": evil, "answers": [evil]},
+              {"type": "conn_failed", "dest": evil, "port": evil, "attempts": evil, "pid": evil, "process": evil}]
+    report = {"filename": evil}
+    for kind in ("http", "tls", "dns", "connections"):
+        out = _rows(kind, {"network": events, "networkReport": report})
+        assert "<img" not in out and "&lt;img" in out, kind
+    assert "<img" not in _tabs({"network": events})
+
+
+@needs_node
+def test_the_host_header_is_read_under_its_lower_case_key():
+    out = _rows("http", {"network": [{"type": "http", "dest": "203.0.113.5", "path": "/", "headers": {"host": "fake.top"}},
+                                     {"type": "http", "dest": "203.0.113.6", "path": "/",
+                                      "headers": {"Host": "capital.top"}}]})
+    assert "Host: fake.top" in out and "capital.top" not in out
+
+
+def test_the_tracing_helpers_are_all_listed_for_the_node_tests():
+    """A helper missing from RTRACE_FNS is a ReferenceError only in these tests."""
+    defined = set(re.findall(r"^function (\w+)\(", SOURCE, re.M))
+    seen, todo = set(), ["renderRtraceDetailTabs", "renderRtraceEventTable"]
+    while todo:
+        name = todo.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        body = re.sub(r'\bon[a-z]+="[A-Za-z_]\w*\(', 'onX="(', _function_source(name))
+        # a call after event.stopPropagation(); inside a handler is no call of this script either
+        body = re.sub(r'event\.stopPropagation\(\); [A-Za-z_]\w*\(', '(', body)
+        todo += [c for c in re.findall(r"\b([A-Za-z_]\w*)\(", body) if c in defined and c != name]
+    assert seen <= set(RTRACE_FNS), sorted(seen - set(RTRACE_FNS))
+
+
+def test_the_tracing_functions_take_colours_from_theme_variables_only():
+    src = "\n".join(_function_source(n) for n in ("renderRtraceDetailTabs", "renderRtraceEventTable",
+                                                  "rtraceNetworkRows", "rtraceNetworkDetail", "showRtraceEventTable"))
+    assert not re.search(r"#[0-9a-fA-F]{3,8}\b|rgba?\(|hsl\(", re.sub(r"&#\d+;", "", src))
+
+
+STATE_FNS = ["rtraceState", "networkReportOf"]
+
+
+def _state_of(detonation, network_tab):
+    return _run_node(STATE_FNS, r"""
+        globalThis.state = { processes: { '7': { pid: 7, alerts: [{ id: 'a' }], children: ['8'], activity: { dns: 2 } },
+                                          '8': { pid: 8, alerts: [{ id: 'b' }] } },
+                             rtraceSelectedPid: 7, rtraceActiveDetailTab: 'dns', detonationNetwork: DET };
+        networkState.report = TAB;
+        const v = rtraceState();
+        console.log(JSON.stringify({ events: v.events.map(e => e.id), tab: v.tab, activity: v.activity,
+                                     network: v.network === undefined ? null : v.network.map(e => e.dest),
+                                     source: v.networkSource || null }));
+    """.replace("DET", json.dumps(detonation)).replace("TAB", json.dumps(network_tab)),
+        _const("networkState"))
+
+
+@needs_node
+def test_the_detonations_report_wins_over_the_one_open_in_the_network_tab():
+    det = {"events": [{"type": "dns", "dest": "det.top"}]}
+    tab = {"events": [{"type": "dns", "dest": "tab.top"}]}
+    both = _state_of(det, tab)
+    assert both == {"events": ["a", "b"], "tab": "dns", "activity": {"dns": 2}, "network": ["det.top"],
+                    "source": "detonation"}
+    assert _state_of(None, tab)["network"] == ["tab.top"] and _state_of(None, tab)["source"] == "network-tab"
+    assert _state_of(None, None)["network"] is None and _state_of({"nonsense": 1}, None)["network"] is None
+
+
+def test_the_detonation_results_hand_their_report_to_tracing():
+    for name in ("renderDetonationPanels", "viewDetonationResult"):
+        assert re.search(r"state\.detonationNetwork = .*networkReportOf\(data\)", _function_source(name)), name
+
