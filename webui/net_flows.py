@@ -26,8 +26,18 @@ assumptions this module refuses to make:
     capture and in flow count; whatever is dropped is flagged (``Flow.capped``,
     ``PcapResult.note``) instead of silently shortening a stream.
 
-Only classic pcap files are read (both byte orders, microsecond and nanosecond
-timestamps). pcapng is refused with a note.
+Both classic pcap (either byte order, microsecond or nanosecond timestamps) and
+pcapng are read, told apart by the file's magic bytes rather than its name.
+pcapng gets its own block reader instead of dpkt's: dpkt's reads the link type
+and timestamp resolution of the first interface only, applies them to every
+packet, and cannot tell a cut block from a short one, so a capture with a
+second interface would be decoded with the wrong clock or the wrong link layer.
+Here each packet carries the link type and resolution of its own interface.
+
+Two inherent guesses are visible in the output rather than hidden. A capture
+that starts mid-connection has no SYN, so the first sender is taken as the
+client (``Flow.client_guessed``). UDP has no connection at all and the same rule
+applies, so a UDP flow is always a guess.
 """
 
 import struct
@@ -52,18 +62,28 @@ _MAGICS = {
     b"\x4d\x3c\xb2\xa1": ("<", 10 ** 9),
     b"\xa1\xb2\x3c\x4d": (">", 10 ** 9),
 }
-_PCAPNG_MAGIC = b"\x0a\x0d\x0d\x0a"
+_PCAPNG_MAGIC = b"\x0a\x0d\x0d\x0a"       # the section header block's type
+_NG_BOM = {b"\x4d\x3c\x2b\x1a": "<", b"\x1a\x2b\x3c\x4d": ">"}
+_NG_IDB, _NG_EPB = 1, 6
+_NG_OPT_TSRESOL, _NG_OPT_TSOFFSET = 9, 14
+_MAX_BLOCK = _MAX_RECORD + 4096
 
 _LINK_ETHERNET = 1
 _LINK_SLL = 113
 _LINK_NULL = 0
 _LINK_RAW = (12, 101, 228, 229)
+_LINKS = (_LINK_ETHERNET, _LINK_SLL, _LINK_NULL) + _LINK_RAW
 
 
 class PcapResult:
-    """What a capture contained. ``note`` is empty when nothing needs saying."""
+    """What a capture contained. ``note`` is empty when nothing needs saying.
+
+    ``format`` is "pcap" or "pcapng" (decided by the file's magic bytes), or ""
+    when the file is neither.
+    """
 
     def __init__(self):
+        self.format = ""
         self.flows = []
         self.truncated = False
         self.note = ""
@@ -92,10 +112,16 @@ class Flow:
     sizes in bytes of holes in the TCP streams (client holes first); the
     streams end at their first hole. For UDP a stream is the datagrams joined
     in arrival order, so message-oriented protocols should read ``packets``.
+
+    ``client_guessed`` is True when nothing in the capture says who the client
+    is: a TCP capture that starts after the SYN (the first sender is taken as
+    the client) and every UDP flow (there is no handshake). A parser that
+    depends on the direction should treat such a flow with care.
     """
 
-    def __init__(self, proto, client, server, ts):
+    def __init__(self, proto, client, server, ts, client_guessed):
         self.proto = proto
+        self.client_guessed = client_guessed
         self.src, self.sport = client
         self.dst, self.dport = server
         self.first_ts = ts
@@ -197,6 +223,7 @@ class _Reader:
         self.total_kept = 0
         self.fragments = 0
         self.undecodable = 0
+        self.bad_links = set()
         self.flows_refused = 0
         self.any_capped = False
 
@@ -212,11 +239,11 @@ class _Reader:
         elif isinstance(l4, dpkt.udp.UDP):
             self._udp(ts, src, dst, l4)
 
-    def _flow_for(self, key, proto, client, server, ts):
+    def _flow_for(self, key, proto, client, server, ts, client_guessed):
         if len(self.result.flows) >= MAX_FLOWS:
             self.flows_refused += 1
             return None
-        flow = Flow(proto, client, server, ts)
+        flow = Flow(proto, client, server, ts, client_guessed)
         self.active[key] = flow
         self.result.flows.append(flow)
         return flow
@@ -240,7 +267,7 @@ class _Reader:
     def _udp(self, ts, src, dst, dgram):
         a, b = (src, dgram.sport), (dst, dgram.dport)
         key = self._key("udp", a, b)
-        flow = self.active.get(key) or self._flow_for(key, "udp", a, b, ts)
+        flow = self.active.get(key) or self._flow_for(key, "udp", a, b, ts, True)
         if flow is None:
             return
         flow._touch(ts)
@@ -263,9 +290,11 @@ class _Reader:
         if flow is not None and syn and _is_new_connection(flow, a, ack, seg.seq):
             flow = None
         if flow is None:
-            # a SYN/ACK comes from the server; anything else is taken as the client
+            # A SYN names its sender the client and a SYN/ACK names its receiver
+            # the client. Without either, the capture began mid-connection and
+            # the first sender is only a guess; client_guessed says so.
             client, server = (b, a) if syn and ack else (a, b)
-            flow = self._flow_for(key, "tcp", client, server, ts)
+            flow = self._flow_for(key, "tcp", client, server, ts, not syn)
             if flow is None:
                 return
         flow._touch(ts)
@@ -333,8 +362,11 @@ def _ip_from_frame(buf, linktype):
     return None
 
 
-def _records(fh, endian, divisor, result):
-    """Yield ``(ts, frame)`` for each complete record; flag a cut or corrupt tail."""
+def _records(fh, endian, divisor, linktype, result):
+    """Yield ``(ts, frame, linktype)`` per complete record of a classic pcap.
+
+    A cut or corrupt tail sets ``result.truncated`` and ends the iteration.
+    """
     hdr = struct.Struct(endian + "IIII")
     while True:
         raw = fh.read(hdr.size)
@@ -354,7 +386,95 @@ def _records(fh, endian, divisor, result):
             result.truncated = True
             result.note = "pcap is truncated: the last record is incomplete"
             return
-        yield sec + frac / divisor, frame
+        yield sec + frac / divisor, frame, linktype
+
+
+def _ng_options(buf, endian):
+    """``(code, value)`` pairs of a pcapng option list; stops at the end option."""
+    pos = 0
+    while pos + 4 <= len(buf):
+        code, length = struct.unpack_from(endian + "HH", buf, pos)
+        if code == 0:
+            return
+        yield code, buf[pos + 4:pos + 4 + length]
+        pos += 4 + ((length + 3) & ~3)
+
+
+def _ng_interface(body, endian):
+    """``(linktype, ticks_per_second, offset_seconds)`` from an interface block."""
+    linktype = struct.unpack_from(endian + "H", body, 0)[0] if len(body) >= 2 else -1
+    divisor, offset = 10 ** 6, 0
+    for code, value in _ng_options(body[8:], endian):
+        if code == _NG_OPT_TSRESOL and len(value) == 1:
+            raw = value[0]
+            divisor = (2 if raw & 0x80 else 10) ** (raw & 0x7F)
+        elif code == _NG_OPT_TSOFFSET and len(value) == 8:
+            offset = struct.unpack(endian + "q", value)[0]
+    return linktype, divisor, offset
+
+
+def _ng_records(fh, result):
+    """Yield ``(ts, frame, linktype)`` per packet block of a pcapng file.
+
+    Link type and clock come from the packet's own interface, and a new section
+    header starts a new interface list (and may change byte order). A frame of
+    None marks a packet block that could not be used. A cut or corrupt block
+    sets ``result.truncated`` and ends the iteration.
+    """
+    endian = None
+    interfaces = []
+    while True:
+        head = fh.read(8)
+        if not head:
+            return
+        if len(head) < 8:
+            result.truncated = True
+            result.note = "pcapng is truncated: the last block header is incomplete"
+            return
+        prefix = b""
+        if head[:4] == _PCAPNG_MAGIC:
+            prefix = fh.read(4)
+            if prefix not in _NG_BOM:
+                if result.packet_count or interfaces:
+                    result.truncated = True
+                    result.note = "pcapng is corrupt: bad section header"
+                else:
+                    result.note = "not a valid pcapng file: bad section header"
+                return
+            endian = _NG_BOM[prefix]
+            btype = 0x0A0D0D0A
+            length = struct.unpack(endian + "I", head[4:])[0]
+        elif endian is None:
+            result.note = "not a valid pcapng file: no section header"
+            return
+        else:
+            btype, length = struct.unpack(endian + "II", head)
+        if length < 12 + len(prefix) or length % 4 or length > _MAX_BLOCK:
+            result.truncated = True
+            result.note = "pcapng is corrupt: a block claims %d bytes" % length
+            return
+        want = length - 8 - len(prefix)
+        rest = fh.read(want)
+        if len(rest) < want:
+            result.truncated = True
+            result.note = "pcapng is truncated: the last block is incomplete"
+            return
+        body = (prefix + rest)[:-4]            # drop the trailing length field
+        if btype == 0x0A0D0D0A:
+            interfaces = []
+        elif btype == _NG_IDB:
+            interfaces.append(_ng_interface(body, endian))
+        elif btype == _NG_EPB:
+            if len(body) < 20:
+                yield 0.0, None, None
+                continue
+            iface, hi, lo, caplen, _orig = struct.unpack_from(endian + "IIIII", body, 0)
+            if iface >= len(interfaces) or caplen > len(body) - 20:
+                yield 0.0, None, None
+                continue
+            linktype, divisor, offset = interfaces[iface]
+            ts = offset + ((hi << 32) | lo) / divisor
+            yield ts, body[20:20 + caplen], linktype
 
 
 def read_pcap(path):
@@ -365,18 +485,25 @@ def read_pcap(path):
         with open(path, "rb") as fh:
             head = fh.read(24)
             if head[:4] == _PCAPNG_MAGIC:
-                result.note = "not a classic pcap file: pcapng is not supported"
+                result.format = "pcapng"
+                fh.seek(0)
+                records = _ng_records(fh, result)
+            elif len(head) >= 24 and head[:4] in _MAGICS:
+                result.format = "pcap"
+                endian, divisor = _MAGICS[head[:4]]
+                linktype = struct.unpack(endian + "I", head[20:24])[0] & 0x0FFFFFFF
+                records = _records(fh, endian, divisor, linktype, result)
+            else:
+                result.note = "not a pcap or pcapng file: unrecognised header"
                 return result
-            if len(head) < 24 or head[:4] not in _MAGICS:
-                result.note = "not a pcap file: unrecognised header"
-                return result
-            endian, divisor = _MAGICS[head[:4]]
-            linktype = struct.unpack(endian + "I", head[20:24])[0] & 0x0FFFFFFF
-            if linktype not in (_LINK_ETHERNET, _LINK_SLL, _LINK_NULL) + _LINK_RAW:
-                result.note = "unsupported pcap link type %d" % linktype
-                return result
-            for ts, frame in _records(fh, endian, divisor, result):
+            for ts, frame, linktype in records:
                 result.packet_count += 1
+                if frame is None:
+                    reader.undecodable += 1
+                    continue
+                if linktype not in _LINKS:
+                    reader.bad_links.add(linktype)
+                    continue
                 try:
                     ip = _ip_from_frame(frame, linktype)
                     if ip is not None:
@@ -399,6 +526,9 @@ def _write_note(reader):
     parts = [result.note] if result.note else []
     if reader.fragments:
         parts.append("%d IP fragment(s) skipped" % reader.fragments)
+    if reader.bad_links:
+        parts.append("frames with unsupported link type %s skipped"
+                     % ", ".join(str(n) for n in sorted(reader.bad_links)))
     if reader.undecodable:
         parts.append("%d undecodable frame(s) skipped" % reader.undecodable)
     if reader.flows_refused:

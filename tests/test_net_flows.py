@@ -19,6 +19,13 @@ Regressions covered:
   * a large capture was held in memory without bound
   * per-message timestamps were thrown away, so heartbeat intervals could not
     be measured
+  * pcapng, the format Wireshark and tshark write by default, was refused, so
+    importing a foreign capture failed in practice
+  * a pcapng with more than one interface was decoded with the first
+    interface's link type and clock
+  * a cut pcapng block was taken for a short packet instead of a truncation
+  * a capture that begins mid-connection looked as certain about who the
+    client is as one that begins with the SYN
 """
 
 import socket
@@ -117,6 +124,47 @@ def _pcap(tmp_path, packets, linktype=dpkt.pcap.DLT_EN10MB, name="t.pcap"):
         for ts, buf in packets:
             w.writepkt(buf, ts)
     return str(path)
+
+
+def _pcapng(tmp_path, packets, linktype=dpkt.pcap.DLT_EN10MB, name="t.pcapng"):
+    path = tmp_path / name
+    with open(path, "wb") as f:
+        w = dpkt.pcapng.Writer(f, linktype=linktype)
+        for ts, buf in packets:
+            w.writepkt(buf, ts)
+    return str(path)
+
+
+def _ng_block(endian, btype, body):
+    total = 12 + len(body)
+    return struct.pack(endian + "II", btype, total) + body + struct.pack(endian + "I", total)
+
+
+def _ng_file(endian, interfaces, packets):
+    """A hand-built pcapng. interfaces: [(linktype, tsresol or None)];
+    packets: [(interface, ts_ticks, frame)]."""
+    bom = struct.pack(endian + "I", 0x1A2B3C4D)
+    out = _ng_block(endian, 0x0A0D0D0A,
+                    bom + struct.pack(endian + "HHq", 1, 0, -1))
+    for linktype, tsresol in interfaces:
+        opts = b""
+        if tsresol is not None:
+            opts = struct.pack(endian + "HH", 9, 1) + bytes([tsresol]) + b"\0\0\0"
+            opts += struct.pack(endian + "HH", 0, 0)
+        out += _ng_block(endian, 1, struct.pack(endian + "HHI", linktype, 0, 65535) + opts)
+    for iface, ticks, frame in packets:
+        pad = b"\0" * (-len(frame) % 4)
+        body = struct.pack(endian + "IIIII", iface, ticks >> 32, ticks & 0xFFFFFFFF,
+                           len(frame), len(frame)) + frame + pad
+        out += _ng_block(endian, 6, body)
+    return out
+
+
+def _flow_view(flow):
+    return (flow.proto, flow.src, flow.sport, flow.dst, flow.dport,
+            flow.first_ts, flow.last_ts, flow.client_bytes, flow.server_bytes,
+            flow.gaps, flow.client_stream(), flow.server_stream(),
+            [(ts, d, bytes(pl)) for ts, d, pl in flow.packets])
 
 
 # --- the brief's behaviours -------------------------------------------------
@@ -362,6 +410,7 @@ def test_an_unsupported_link_type_is_reported(tmp_path):
     p = _pcap(tmp_path, _udp_packet(53, b"x"), linktype=147)
     r = net_flows.read_pcap(p)
     assert r.flows == [] and "link type" in r.note.lower()
+    assert r.packet_count == 1
 
 
 def test_garbage_frames_are_skipped_not_fatal(tmp_path):
@@ -402,3 +451,161 @@ def test_the_number_of_flows_is_capped(tmp_path, monkeypatch):
         pk += _udp_packet(53, b"x", ts=1.0 + i, sport=3000 + i)
     r = net_flows.read_pcap(_pcap(tmp_path, pk))
     assert len(r.flows) == 2 and r.packet_count == 4 and "limit" in r.note.lower()
+
+
+# --- pcapng -----------------------------------------------------------------
+
+def test_a_pcapng_yields_the_same_flows_as_the_equivalent_pcap(tmp_path):
+    pk = (_tcp_exchange(b"GET / HTTP/1.1\r\n\r\n", b"HTTP/1.1 200 OK\r\n\r\n",
+                        client_ts=10.0, server_ts=11.5)
+          + _tcp_segments([(2, b"world"), (1, b"hello ")], isn=7000)
+          + _udp_packet(53, b"q", ts=20.0))
+    classic = net_flows.read_pcap(_pcap(tmp_path, pk))
+    ng = net_flows.read_pcap(_pcapng(tmp_path, pk))
+    assert len(ng.flows) == len(classic.flows) == 3
+    assert [_flow_view(f) for f in ng.flows] == [_flow_view(f) for f in classic.flows]
+    assert ng.packet_count == classic.packet_count == len(pk)
+    assert ng.truncated is False and ng.note == ""
+
+
+def test_the_result_says_which_format_it_read(tmp_path):
+    pk = _udp_packet(53, b"x")
+    assert net_flows.read_pcap(_pcap(tmp_path, pk)).format == "pcap"
+    assert net_flows.read_pcap(_pcapng(tmp_path, pk)).format == "pcapng"
+    bad = tmp_path / "x.bin"
+    bad.write_bytes(b"this is not a capture")
+    assert net_flows.read_pcap(str(bad)).format == ""
+
+
+def test_the_format_comes_from_the_magic_not_the_file_name(tmp_path):
+    p = _pcapng(tmp_path, _udp_packet(53, b"x"), name="named-like-a-pcap.pcap")
+    r = net_flows.read_pcap(p)
+    assert r.format == "pcapng" and len(r.flows) == 1
+
+
+def test_a_truncated_pcapng_yields_what_was_readable(tmp_path):
+    full = _pcapng(tmp_path, _tcp_exchange(b"GET / HTTP/1.1\r\n\r\n", b"HTTP/1.1 200 OK\r\n\r\n"))
+    with open(full, "rb") as f:
+        (tmp_path / "cut.pcapng").write_bytes(f.read()[:-12])
+    r = net_flows.read_pcap(str(tmp_path / "cut.pcapng"))
+    assert r.truncated is True and r.note
+    assert r.packet_count >= 1 and r.flows
+
+
+@pytest.mark.parametrize("make", [_pcap, _pcapng])
+def test_a_capture_cut_at_any_byte_never_raises(tmp_path, make):
+    packets = _tcp_exchange(b"ping", b"pong")
+    with open(make(tmp_path, packets), "rb") as f:
+        data = f.read()
+    counts = []
+    clean_cuts = 0
+    for n in range(len(data) + 1):
+        (tmp_path / "c.bin").write_bytes(data[:n])
+        r = net_flows.read_pcap(str(tmp_path / "c.bin"))
+        counts.append(r.packet_count)
+        if r.packet_count and not r.truncated:
+            clean_cuts += 1
+    assert counts == sorted(counts) and counts[-1] == len(packets)
+    # only a cut on a record boundary may look clean; any other cut must say so
+    assert clean_cuts <= len(packets)
+
+
+def test_a_pcapng_that_is_cut_inside_a_section_header_is_not_a_capture(tmp_path):
+    p = _pcapng(tmp_path, _udp_packet(53, b"x"))
+    with open(p, "rb") as f:
+        (tmp_path / "h.pcapng").write_bytes(f.read()[:10])
+    r = net_flows.read_pcap(str(tmp_path / "h.pcapng"))
+    assert r.flows == [] and "pcap" in r.note.lower()
+
+
+def test_pcapng_magic_followed_by_nonsense_is_refused_with_a_reason(tmp_path):
+    bad = tmp_path / "n.pcapng"
+    bad.write_bytes(b"\x0a\x0d\x0d\x0a" + b"\x1c\x00\x00\x00" + b"\xde\xad\xbe\xef" * 8)
+    r = net_flows.read_pcap(str(bad))
+    assert r.flows == [] and "pcap" in r.note.lower()
+
+
+def test_a_pcapng_block_with_an_absurd_length_is_not_allocated(tmp_path):
+    good = _ng_file("<", [(1, None)], [])
+    blob = good + struct.pack("<II", 6, 0x7FFFFFF0) + b"\0" * 16
+    bad = tmp_path / "big.pcapng"
+    bad.write_bytes(blob)
+    r = net_flows.read_pcap(str(bad))
+    assert r.truncated is True and "corrupt" in r.note.lower()
+
+
+@pytest.mark.parametrize("endian", ["<", ">"])
+def test_pcapng_in_either_byte_order_is_read(tmp_path, endian):
+    frame = _udp_packet(53, b"hi")[0][1]
+    blob = _ng_file(endian, [(1, None)], [(0, 7 * 10**6 + 250000, frame)])
+    path = tmp_path / "e.pcapng"
+    path.write_bytes(blob)
+    f = net_flows.read_pcap(str(path)).flows[0]
+    assert f.first_ts == 7.25 and f.client_stream() == b"hi"
+
+
+def test_pcapng_honours_each_interfaces_timestamp_resolution(tmp_path):
+    frame = _udp_packet(53, b"hi")[0][1]
+    blob = _ng_file("<", [(1, 9)], [(0, 7 * 10**9 + 250000000, frame)])
+    path = tmp_path / "ns.pcapng"
+    path.write_bytes(blob)
+    assert net_flows.read_pcap(str(path)).flows[0].first_ts == 7.25
+
+
+def test_pcapng_interfaces_keep_their_own_link_type_and_clock(tmp_path):
+    eth = _udp_packet(53, b"eth", sport=1111)[0][1]
+    raw = bytes(dpkt.ethernet.Ethernet(_udp_packet(53, b"raw", sport=2222)[0][1]).data)
+    blob = _ng_file("<", [(1, None), (101, 9)],
+                    [(0, 2 * 10**6, eth), (1, 3 * 10**9, raw)])
+    path = tmp_path / "multi.pcapng"
+    path.write_bytes(blob)
+    flows = net_flows.read_pcap(str(path)).flows
+    assert sorted((f.sport, f.first_ts) for f in flows) == [(1111, 2.0), (2222, 3.0)]
+
+
+def test_a_pcapng_with_several_sections_resets_its_interfaces(tmp_path):
+    frame = _udp_packet(53, b"hi")[0][1]
+    one = _ng_file("<", [(147, None)], [])
+    two = _ng_file(">", [(1, None)], [(0, 2 * 10**6, frame)])
+    path = tmp_path / "sections.pcapng"
+    path.write_bytes(one + two)
+    r = net_flows.read_pcap(str(path))
+    assert [ts for ts, _, _ in r.flows[0].packets] == [2.0] and not r.note
+
+
+def test_a_pcapng_packet_naming_an_unknown_interface_is_skipped(tmp_path):
+    frame = _udp_packet(53, b"hi")[0][1]
+    path = tmp_path / "noif.pcapng"
+    path.write_bytes(_ng_file("<", [(1, None)], [(5, 10**6, frame), (0, 2 * 10**6, frame)]))
+    r = net_flows.read_pcap(str(path))
+    assert r.packet_count == 2 and len(r.flows) == 1 and "undecodable" in r.note
+
+
+def test_a_pcapng_interface_with_an_unsupported_link_type_is_reported(tmp_path):
+    frame = _udp_packet(53, b"hi")[0][1]
+    path = tmp_path / "lt.pcapng"
+    path.write_bytes(_ng_file("<", [(147, None)], [(0, 10**6, frame)]))
+    r = net_flows.read_pcap(str(path))
+    assert r.flows == [] and "link type" in r.note.lower()
+
+
+# --- who is the client ------------------------------------------------------
+
+def test_a_flow_that_began_with_a_syn_is_not_a_guess(tmp_path):
+    f = net_flows.read_pcap(_pcap(tmp_path, _tcp_exchange(b"a", b"b"))).flows[0]
+    assert f.client_guessed is False
+
+
+def test_a_capture_that_began_mid_connection_marks_the_client_as_a_guess(tmp_path):
+    p = _pcap(tmp_path, _tcp_segments([(1, b"abc")], syn=False))
+    assert net_flows.read_pcap(p).flows[0].client_guessed is True
+
+
+def test_a_syn_ack_first_capture_is_not_a_guess(tmp_path):
+    pk = _tcp_exchange(b"ping", b"pong")[1:]
+    assert net_flows.read_pcap(_pcap(tmp_path, pk)).flows[0].client_guessed is False
+
+
+def test_a_udp_flow_always_has_a_guessed_client(tmp_path):
+    f = net_flows.read_pcap(_pcap(tmp_path, _udp_packet(53, b"x"))).flows[0]
+    assert f.client_guessed is True
