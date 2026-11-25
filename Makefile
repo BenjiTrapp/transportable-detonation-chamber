@@ -319,7 +319,8 @@ deploy:
 		vagrant upload webui/net_raw.py C:\\DetonationChamberUI\\net_raw.py; \
 		vagrant upload webui/net_rules.py C:\\DetonationChamberUI\\net_rules.py; \
 		vagrant upload webui/net_tls.py C:\\DetonationChamberUI\\net_tls.py; \
-		vagrant upload rules/network C:\\DetonationChamberUI\\rules\\network; \
+		vagrant winrm -c "New-Item -ItemType Directory -Path C:\\DetonationChamberUI\\rules\\network -Force | Out-Null"; \
+		vagrant upload rules/network/default.yaml C:\\DetonationChamberUI\\rules\\network\\default.yaml; \
 		vagrant upload webui/minidump_analysis.py C:\\DetonationChamberUI\\minidump_analysis.py; \
 		vagrant upload webui/pipe_analysis.py C:\\DetonationChamberUI\\pipe_analysis.py; \
 		vagrant upload webui/pipe_signatures.json C:\\DetonationChamberUI\\pipe_signatures.json; \
@@ -358,7 +359,8 @@ deploy-app:
 		vagrant upload webui/net_raw.py C:\\DetonationChamberUI\\net_raw.py; \
 		vagrant upload webui/net_rules.py C:\\DetonationChamberUI\\net_rules.py; \
 		vagrant upload webui/net_tls.py C:\\DetonationChamberUI\\net_tls.py; \
-		vagrant upload rules/network C:\\DetonationChamberUI\\rules\\network; \
+		vagrant winrm -c "New-Item -ItemType Directory -Path C:\\DetonationChamberUI\\rules\\network -Force | Out-Null"; \
+		vagrant upload rules/network/default.yaml C:\\DetonationChamberUI\\rules\\network\\default.yaml; \
 		vagrant upload webui/minidump_analysis.py C:\\DetonationChamberUI\\minidump_analysis.py; \
 		vagrant upload webui/pipe_analysis.py C:\\DetonationChamberUI\\pipe_analysis.py; \
 		vagrant upload webui/pipe_signatures.json C:\\DetonationChamberUI\\pipe_signatures.json; \

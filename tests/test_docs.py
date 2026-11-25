@@ -5,7 +5,8 @@ exist, missed 17 routes and had no MCP section; the in-app help described
 layouts and tabs that were gone; screenshots showed an old UI; the README did
 not say that NetLens gave the idea of the network analysis (the spec's
 "Herkunft"), nor that nothing of it is used; the network rules pointed their
-authors at an events.json nothing writes.
+authors at an events.json nothing writes; the Vagrant deploy uploaded the
+directory rules/network, which WinRM nests inside an existing one.
 """
 
 import ast
@@ -102,7 +103,10 @@ def test_every_deploy_path_uploads_the_web_ui_modules():
         win = "rules\\network\\" + rule
         assert f'"rules/network/{rule}": r"C:\\DetonationChamberUI\\{win}"' in utm, rule
         assert f"'{win}' -Destination 'C:\\DetonationChamberUI\\{win}'" in hyperv, rule
-    assert "vagrant upload rules/network C:\\\\DetonationChamberUI\\\\rules\\\\network" in vagrant
+        # the file itself: WinRM nests an uploaded directory in an existing one (...\\network\\network)
+        assert ("vagrant upload rules/network/%s C:\\\\DetonationChamberUI\\\\rules\\\\network\\\\%s"
+                % (rule, rule)) in vagrant, rule
+    assert "vagrant upload rules/network " not in make
 
 
 def test_readme_rizin_rows_say_what_the_server_answers():
