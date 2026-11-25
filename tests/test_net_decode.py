@@ -55,6 +55,7 @@ import pytest
 import net_decode
 import net_events
 import net_mail_ftp
+import test_net_http as pcap_http     # builds events through the real read_pcap -> net_http path
 
 
 def b64(raw):
@@ -612,6 +613,60 @@ def test_a_set_cookie_value_with_attributes_and_a_quoted_value():
         "set-cookie": 'session="%s"; Path=/; HttpOnly' % b64(b"user=bob;role=admin;exp=999")}))
     assert [(d["field"], d["name"], d["text"]) for d in out] == [
         ("resp_headers.set-cookie", "session", "user=bob;role=admin;exp=999")]
+
+
+def test_several_set_cookie_headers_joined_by_the_parser_are_each_read():
+    joined = ("a=%s; Path=/, b=%s; Expires=Wed, 21 Oct 2037 07:28:00 GMT; HttpOnly"
+              % (b64(b"user=bob;role=admin;exp=999"), b64(b"host=PC01;os=Windows 10;x=1")))
+    out = net_decode.decode_event_fields(http(resp_headers={"set-cookie": joined}))
+    assert [(d["name"], d["text"]) for d in out] == [
+        ("a", "user=bob;role=admin;exp=999"), ("b", "host=PC01;os=Windows 10;x=1")]
+
+
+def _real_events(request, response):
+    return pcap_http._events(request, response)
+
+
+def test_a_set_cookie_of_a_real_http_exchange_is_decoded():
+    session = b64(b"role=operator;host=PC01;expires=999999")
+    response = pcap_http._ok(b"ok", b"Set-Cookie: session=%s; Path=/; HttpOnly\r\n" % session.encode())
+    [event] = _real_events(pcap_http._get(), response)
+    assert "set-cookie" in event["resp_headers"]
+    out = net_decode.decode_event_fields(event)
+    assert [(d["field"], d["name"], d["text"], d["credential"]) for d in out] == [
+        ("resp_headers.set-cookie", "session", "role=operator;host=PC01;expires=999999", False)]
+    json.dumps(out)
+
+
+def test_two_set_cookies_of_a_real_exchange_are_both_decoded():
+    one, two = b64(b"role=operator;host=PC01;n=1"), b64(b"role=guest;host=PC02;n=2")
+    response = pcap_http._ok(b"", b"Set-Cookie: a=%s; Path=/\r\nSet-Cookie: b=%s; Secure\r\n"
+                             % (one.encode(), two.encode()))
+    [event] = _real_events(pcap_http._get(), response)
+    out = net_decode.decode_event_fields(event)
+    assert [(d["name"], d["text"]) for d in out] == [
+        ("a", "role=operator;host=PC01;n=1"), ("b", "role=guest;host=PC02;n=2")]
+
+
+def test_request_and_response_headers_of_a_real_exchange_are_both_read():
+    request = pcap_http._get(extra=b"Authorization: Basic dXNlcjpwYXNz\r\n"
+                             b"Cookie: t=%s\r\n" % b64(b"user=bob;role=admin;exp=999").encode())
+    response = pcap_http._ok(b"", b"X-Token: %s\r\n" % b64(b"issued-to=bob;scope=all;n=7").encode())
+    [event] = _real_events(request, response)
+    out = net_decode.decode_event_fields(event)
+    assert [(d["field"], d["text"], d["credential"]) for d in out] == [
+        ("headers.authorization", "user:pass", True),
+        ("headers.cookie", "user=bob;role=admin;exp=999", False),
+        ("resp_headers.x-token", "issued-to=bob;scope=all;n=7", False)]
+
+
+def test_an_ordinary_real_exchange_decodes_nothing():
+    request = pcap_http._get(extra=b"User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64)\r\n"
+                             b"Accept: */*\r\n")
+    response = pcap_http._ok(b"<html>hi</html>", b"Content-Type: text/html\r\nServer: nginx/1.18.0\r\n"
+                             b"ETag: \"5e1c3b9d7f2048\"\r\nSet-Cookie: sid=7f3a9c1e4b2d8f06a5e1c3b9d7f20486; Path=/\r\n")
+    [event] = _real_events(request, response)
+    assert net_decode.decode_event_fields(event) == []
 
 
 def test_a_bare_base64_header_value_with_padding_is_not_taken_for_a_cookie():

@@ -31,7 +31,10 @@ intervals (``ts`` of each request), rules (``method``, ``path``, ``body_text``,
   * Header names have one case. ``header_order`` lists the names as sent, in
     order, duplicates included, because it feeds a fingerprint in which case
     and order are the signal. ``headers`` is keyed by lower-cased name (so it
-    survives a round trip through JSON) and answers any case.
+    survives a round trip through JSON) and answers any case. The response's
+    headers are ``resp_headers``, the same kind of object (a ``Set-Cookie`` is
+    a fact about the exchange); repeated headers are joined with ", " on both
+    sides.
   * A body is text. ``body_text`` / ``resp_text`` are set when the retained
     bytes decode as UTF-8 or Latin-1 and look like text; Latin-1 accepts every
     byte, so a body with NULs or many control characters is binary and gets
@@ -825,7 +828,7 @@ def _exchange_events(ctx, req, resp):
         form_names=_form_names(origin.headers.get("content-type", ""), data) if req else [],
         status=resp.status if resp else None,
         resp_text=resp_text, resp_bytes=len(reply), resp_capped=resp_capped,
-        resp_decode_failed=resp_failed, content_type=ctype,
+        resp_decode_failed=resp_failed, content_type=ctype, resp_headers=resp_headers,
         content_encoding=response_encoding,
         request_truncated=bool(req and req.truncated),
         response_truncated=bool(resp and resp.truncated),

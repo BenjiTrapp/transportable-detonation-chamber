@@ -280,6 +280,15 @@ def test_a_repeated_header_stays_in_the_order_twice_and_its_values_join():
     assert e["headers"]["cookie"] == "a=1, b=2"
 
 
+def test_response_headers_are_on_the_event_like_the_request_headers():
+    e = _events(_get(), _ok(b"x", b"sEt-CoOkIe: sid=1\r\nSet-Cookie: t=2\r\nX-Token: abc\r\n"))[0]
+    assert e["resp_headers"]["Set-Cookie"] == "sid=1, t=2" == e["resp_headers"]["set-cookie"]
+    assert e["resp_headers"].get("X-TOKEN") == "abc" and "x-token" in e["resp_headers"]
+    assert e["resp_headers"]["content-length"] == "1"
+    assert e["headers"]["host"] == "x.top" and "set-cookie" not in e["headers"]
+    assert _events(_get(), b"")[0]["resp_headers"] == {}
+
+
 def test_a_folded_header_line_continues_the_previous_header():
     e = _events(_get(extra=b"X-Long: first\r\n  second\r\n"), b"")[0]
     assert e["headers"]["x-long"] == "first second"

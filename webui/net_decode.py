@@ -102,6 +102,7 @@ _B64 = re.compile(rb"[A-Za-z0-9+/]*")
 _B64URL = re.compile(rb"[A-Za-z0-9_-]*")
 _UNNEEDED_ESCAPE = re.compile(rb"%(?:4[1-9A-Fa-f]|5[0-9Aa]|6[1-9A-Fa-f]|7[0-9Aa]|3[0-9])")
 _WHITESPACE = re.compile(r"\s")
+_COOKIE_PIECE = re.compile(r";|, ")
 _JSON_PAIR = re.compile(r'"([^"\\\n]{1,64})"\s*:\s*"((?:[^"\\]|\\.)*)"')
 _BLANK_LINE = re.compile(r"\r?\n\r?\n")
 _PART_NAME = re.compile(r'name="([^"]{0,128})"')
@@ -536,7 +537,9 @@ def _cookie_pairs(text):
     """``(name, value)`` of each ``name=value`` piece of a Cookie or Set-Cookie
     value; ``[]`` when the text is not one (a bare base64 value ends in ``=``)."""
     pairs = []
-    for piece in text.split(";"):
+    # Repeated Set-Cookie headers arrive joined by ", "; so does an Expires date,
+    # whose pieces have no "=" and are skipped.
+    for piece in _COOKIE_PIECE.split(text):
         key, equals, value = piece.strip().partition("=")
         if not equals or not key or len(key) > 128 or _WHITESPACE.search(key) or value.startswith("="):
             continue
