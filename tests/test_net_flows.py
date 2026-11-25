@@ -24,6 +24,9 @@ Regressions covered:
   * a pcapng with more than one interface was decoded with the first
     interface's link type and clock
   * a cut pcapng block was taken for a short packet instead of a truncation
+  * growing retransmits at one sequence number were each charged only for
+    their extra bytes yet kept in full, so the retention caps could be beaten
+    by a crafted capture, and one message appeared as several in ``packets``
   * a capture that begins mid-connection looked as certain about who the
     client is as one that begins with the SYN
 """
@@ -284,6 +287,18 @@ def test_retransmissions_do_not_appear_as_extra_messages(tmp_path):
     assert [bytes(pl) for _, _, pl in pk] == [b"abc", b"def"]
 
 
+def test_a_longer_retransmission_is_one_message_not_two(tmp_path):
+    c = (CLIENT, CPORT, SERVER, SPORT)
+    pk = [_tcp(0.5, *c, 1000, SYN),
+          _tcp(1.0, *c, 1001, ACK, b"ab"),
+          _tcp(1.7, *c, 1001, ACK, b"abcd"),
+          _tcp(2.0, *c, 1005, ACK, b"ef")]
+    f = net_flows.read_pcap(_pcap(tmp_path, pk)).flows[0]
+    assert [(ts, d, bytes(pl)) for ts, d, pl in f.packets] == [
+        (1.0, "c", b"abcd"), (2.0, "c", b"ef")]
+    assert f.client_bytes == 6
+
+
 def test_byte_counts_cover_each_direction(tmp_path):
     p = _pcap(tmp_path, _tcp_exchange(b"ping", b"pong!"))
     f = net_flows.read_pcap(p).flows[0]
@@ -429,6 +444,30 @@ def test_retained_payload_per_direction_is_capped(tmp_path, monkeypatch):
     assert f.client_stream() == b"aaaaaa"
     assert f.capped is True and "limit" in r.note.lower()
     assert f.client_bytes == 18
+
+
+def test_growing_retransmits_at_one_seq_cannot_beat_the_cap(tmp_path, monkeypatch):
+    monkeypatch.setattr(net_flows, "MAX_STREAM_BYTES", 1000)
+    monkeypatch.setattr(net_flows, "MAX_TOTAL_BYTES", 1000)
+    c = (CLIENT, CPORT, SERVER, SPORT)
+    pk = [_tcp(0.5, *c, 1000, SYN)]
+    pk += [_tcp(1.0 + n / 1000.0, *c, 1001, ACK, b"x" * n) for n in range(1, 301, 3)]
+    pk += [_tcp(3.0, *c, 1001, ACK, b"x" * 3000)]
+    r = net_flows.read_pcap(_pcap(tmp_path, pk))
+    f = r.flows[0]
+    assert f.capped is True and "limit" in r.note.lower()
+    assert sum(len(pl) for _, _, pl in f.packets) <= 1000
+    assert len(f.client_stream()) <= 1000
+    assert len(f.packets) == 1
+
+
+def test_growing_retransmits_do_not_exhaust_the_segment_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(net_flows, "MAX_SEGMENTS", 1)
+    c = (CLIENT, CPORT, SERVER, SPORT)
+    pk = [_tcp(0.5, *c, 1000, SYN)]
+    pk += [_tcp(1.0 + n / 100.0, *c, 1001, ACK, b"x" * n) for n in range(1, 40)]
+    r = net_flows.read_pcap(_pcap(tmp_path, pk))
+    assert r.flows[0].client_stream() == b"x" * 39 and not r.flows[0].capped
 
 
 def test_the_cap_does_not_mark_a_normal_flow(tmp_path):

@@ -98,6 +98,7 @@ class _Half:
         self.first_seq = None   # first data seq stored; the origin without a SYN
         self.fin = None         # sequence number just past the FIN
         self.segs = {}          # TCP: seq -> payload
+        self.slot = {}          # TCP: seq -> index of its entry in Flow.packets
         self.chunks = []        # UDP: payloads in arrival order
         self.kept = 0
 
@@ -316,12 +317,22 @@ class _Reader:
             return                              # retransmission
         added = len(payload) - (len(old) if old is not None else 0)
         flow._count(d, added)
-        if not self._admit(flow, half, added, len(half.segs)):
+        # Charged for exactly what stays alive: a longer retransmit replaces
+        # the shorter segment and its packets entry, so only the growth is new.
+        # `held` counts retained segment objects, one per entry in packets; a
+        # replacement adds none.
+        if not self._admit(flow, half, added, len(half.segs) if old is None else 0):
             return
-        if half.first_seq is None:
-            half.first_seq = seq
+        if old is None:
+            half.slot[seq] = len(flow.packets)
+            flow.packets.append((ts, d, payload))
+            if half.first_seq is None:
+                half.first_seq = seq
+        else:
+            # one logical message: keep the first arrival's timestamp
+            index = half.slot[seq]
+            flow.packets[index] = (flow.packets[index][0], d, payload)
         half.segs[seq] = payload
-        flow.packets.append((ts, d, payload))
 
 
 def _is_new_connection(flow, sender, ack, seq):
