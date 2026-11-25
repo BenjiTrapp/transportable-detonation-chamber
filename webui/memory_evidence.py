@@ -13,21 +13,36 @@ Live-process memory scanners are awkward to build a verdict on:
     Hunt-Sleeping-Beacons each see part of the picture.
 
 This module keeps the scoring independent of any particular scanner. Findings
-from any source are normalized into one schema and weighted by four factors:
+from any source are normalized into one schema and weighted by five factors:
 
   evidence class   structural facts outrank behavioural hints outrank strings
   persistence      how many samples of a repeated scan contained the finding
   corroboration    whether an independent source agrees on the same process
   novelty          whether the finding also occurs in this host's clean baseline
+  observation      how much of the act was seen: an upload that our own
+                   isolated server accepted shows the attempt, not that a real
+                   C2 received anything. A finding without the field was seen
+                   in full, so the scanners above are weighed as before.
+
+Two sources can see one phenomenon. Sysmon's connection log and a capture of
+the same traffic both see a beacon loop, and the two findings together would
+cross the malicious threshold on their own. A kind may therefore name kinds it
+``supersedes``: for the same process and destination the weaker finding is not
+scored, stays listed with ``superseded_by``, and still counts as the
+independent second opinion that it is.
 
 Adding a scanner means adding a normalizer function; nothing else changes.
 """
 
 import hashlib
+import ipaddress
 import json
+import math
 import os
 import threading
 import time
+
+import net_behavior
 
 # --- Evidence classes -------------------------------------------------
 # Ordered by how hard the signal is to fake or to trip accidentally.
@@ -164,7 +179,77 @@ KINDS = {
         "weight": 1.0, "evidence": EVIDENCE_STRING, "corroborate": True,
         "label": "In-memory signature match",
     },
+    # Network, from a capture (net_evidence). Weights from the design spec.
+    # A capture knows no process, so every source here is "network" and a
+    # second opinion has to come from a host-side tool on the same process.
+    # A check-in is a beacon whose server answered: the same loop c2_beaconing
+    # sees in Sysmon, measured on the wire, so it absorbs that finding rather
+    # than adding to it. Like c2_beaconing it stands alone only when tight
+    # (net_evidence clears needs_corroboration then); a loose rhythm also fits
+    # a poller.
+    "c2_checkin": {
+        "weight": 4.0, "evidence": EVIDENCE_STRUCTURAL, "corroborate": True,
+        "supersedes": ("c2_beaconing",),
+        "label": "Periodic check-in answered by its server",
+    },
+    "exfil_upload": {
+        "weight": 4.0, "evidence": EVIDENCE_STRUCTURAL, "corroborate": False,
+        "label": "Data sent out (size and destination on the wire)",
+    },
+    "credential_in_transit": {
+        "weight": 4.5, "evidence": EVIDENCE_STRUCTURAL, "corroborate": False,
+        "label": "Credentials sent in clear text",
+    },
+    "payload_staging": {
+        "weight": 4.0, "evidence": EVIDENCE_STRUCTURAL, "corroborate": False,
+        "label": "Executable downloaded (a file, not only a URL)",
+    },
+    # A JA3/JA4 hash is shared by every program built on the same TLS stack.
+    "tls_ja3_known": {
+        "weight": 2.5, "evidence": EVIDENCE_STRUCTURAL, "corroborate": True,
+        "label": "TLS client fingerprint of a catalogued tool",
+    },
+    # Updaters walk mirror lists too.
+    "fallback_rotation": {
+        "weight": 3.0, "evidence": EVIDENCE_BEHAVIORAL, "corroborate": True,
+        "label": "One request rotated through fallback hosts",
+    },
+    # Software retries an offline service as well.
+    "dead_c2_retry": {
+        "weight": 2.0, "evidence": EVIDENCE_BEHAVIORAL, "corroborate": True,
+        "label": "Repeated attempts to an unreachable host",
+    },
+    # Ten different invented names failing within a minute is not something
+    # ordinary software does; the resolver's own names are not counted.
+    "dga_pattern": {
+        "weight": 2.0, "evidence": EVIDENCE_BEHAVIORAL, "corroborate": False,
+        "label": "Generated-looking names, burst of NXDOMAIN answers",
+    },
+    # Installers ask for their public address too.
+    "recon_service": {
+        "weight": 1.0, "evidence": EVIDENCE_BEHAVIORAL, "corroborate": True,
+        "label": "Public address or location lookup",
+    },
 }
+
+# The kinds a network capture produces (net_evidence), and the only ones a
+# network rule may name (net_rules checks this when a rule loads).
+NETWORK_KINDS = ("c2_checkin", "exfil_upload", "credential_in_transit", "payload_staging",
+                 "tls_ja3_known", "fallback_rotation", "dead_c2_retry", "dga_pattern",
+                 "recon_service")
+
+
+def _check_kinds():
+    for kind, spec in KINDS.items():
+        for other in spec.get("supersedes", ()):
+            if other not in KINDS:
+                raise ValueError("kind %r supersedes %r, which is not a kind" % (kind, other))
+    for kind in NETWORK_KINDS:
+        if kind not in KINDS:
+            raise ValueError("network kind %r is not a kind" % kind)
+
+
+_check_kinds()
 
 # Aether finding type -> canonical kind
 AETHER_TYPE_MAP = {
@@ -478,13 +563,27 @@ def from_hsb(result, process=""):
 
 # --- Network behaviour ------------------------------------------------
 
-# A beacon needs enough check-ins to show a rhythm.
-BEACON_MIN_CONNECTIONS = 4
-# Coefficient of variation of the intervals: below this the timing is regular
-# enough to be machine-driven. Jittered C2 (20-30% jitter) stays under 0.5.
-BEACON_MAX_COV = 0.5
-# Connections closer than this are a burst (one request), not separate beacons.
-BEACON_MIN_INTERVAL_S = 0.5
+# What counts as regular is defined once, in net_behavior.periodicity; these
+# are its thresholds, named here for the callers that read them from this module.
+BEACON_MIN_CONNECTIONS = net_behavior.BEACON_MIN_CONNECTIONS
+BEACON_MAX_COV = net_behavior.BEACON_MAX_COV
+BEACON_MIN_INTERVAL_S = net_behavior.BEACON_MIN_INTERVAL_S
+
+# A rhythm that is tight and sustained is machine-driven on its own; a looser
+# or shorter one also fits update checks and telemetry. Four or five random
+# contacts pass the regularity gate about one time in ten; they can never be
+# tight, which takes six.
+BEACON_TIGHT_MAX_COV = 0.2
+BEACON_TIGHT_MIN_ON_RHYTHM = 0.7
+BEACON_TIGHT_MIN_CONNECTIONS = 6
+# Weight of a beacon that is periodic but not tight, as a share of its kind's.
+BEACON_LOOSE_FACTOR = 0.7
+
+
+def beacon_is_tight(cov, on_rhythm, connections):
+    """Is a periodic rhythm tight enough to stand without a second opinion?"""
+    return (cov <= BEACON_TIGHT_MAX_COV and on_rhythm >= BEACON_TIGHT_MIN_ON_RHYTHM
+            and connections >= BEACON_TIGHT_MIN_CONNECTIONS)
 
 
 def beaconing_from_connections(connections, process=""):
@@ -493,12 +592,12 @@ def beaconing_from_connections(connections, process=""):
     Works from any connection log - Sysmon EID 3, ETW, a pcap summary - so it
     is independent of whichever tool happens to watch the network.
 
-    Periodicity is measured robustly (median and median absolute deviation):
-    real check-in loops have outliers - a slow first connect, a retry - and a
-    mean/stdev estimate lets a single outlier hide an otherwise exact rhythm.
+    Each endpoint's timestamps are measured by ``net_behavior.periodicity``,
+    the one definition of a rhythm in this project: robust (median and median
+    absolute deviation, so a slow first connect or a retry does not hide an
+    exact rhythm), connections less than ``BEACON_MIN_INTERVAL_S`` apart are
+    one check-in, and a series with more than one time scale has no interval.
     """
-    import statistics
-
     by_endpoint = {}
     for ts, ip, port in connections:
         if not ip or ts is None:
@@ -507,23 +606,12 @@ def beaconing_from_connections(connections, process=""):
 
     out = []
     for (ip, port), times in by_endpoint.items():
-        times.sort()
-        intervals = [b - a for a, b in zip(times, times[1:]) if b - a >= BEACON_MIN_INTERVAL_S]
-        if len(intervals) + 1 < BEACON_MIN_CONNECTIONS:
+        p = net_behavior.periodicity(times, rounded=False)
+        if not p["periodic"]:
             continue
-        median = statistics.median(intervals)
-        if median <= 0:
-            continue
-        mad = statistics.median(abs(x - median) for x in intervals)
-        # 1.4826 * MAD estimates the standard deviation for normal data.
-        robust_cov = 1.4826 * mad / median
-        on_rhythm = sum(1 for x in intervals if abs(x - median) <= 0.25 * median) / len(intervals)
-        if robust_cov > BEACON_MAX_COV or on_rhythm < 0.5:
-            continue
-        # A tight, sustained rhythm is machine-driven on its own; looser timing
-        # also fits update checks and telemetry, so it needs a second opinion.
-        tight = robust_cov <= 0.2 and on_rhythm >= 0.7 and len(intervals) + 1 >= 6
-        weight = KINDS["c2_beaconing"]["weight"] * (1.0 if tight else 0.7)
+        median, robust_cov, on_rhythm = p["interval"], p["cov"], p["on_rhythm"]
+        tight = beacon_is_tight(robust_cov, on_rhythm, p["connections"])
+        weight = KINDS["c2_beaconing"]["weight"] * (1.0 if tight else BEACON_LOOSE_FACTOR)
         out.append(MemoryFinding(
             source="sysmon-network", kind="c2_beaconing", process=process,
             detail=f"{len(times)} connections to {ip}:{port}, every {median:.1f}s "
@@ -532,6 +620,7 @@ def beaconing_from_connections(connections, process=""):
             weight=round(weight, 2),
             extra={
                 "endpoint": f"{ip}:{port}",
+                "dest": ip,
                 "connections": len(times),
                 "mean_interval_s": round(median, 2),
                 "cov": round(robust_cov, 3),
@@ -729,12 +818,65 @@ class MemoryBaseline:
 
 # --- Scoring ----------------------------------------------------------
 
+def _observation_factor(finding):
+    """The share of the act that was seen, 0..1; 1.0 when the finding does not say."""
+    value = finding.get("observation", 1.0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or math.isnan(value):
+        return 1.0
+    return min(1.0, max(0.0, float(value)))
+
+
+def _endpoints(finding):
+    """The destinations a finding names: its dest and, for a name, its addresses."""
+    out = set()
+    for value in [finding.get("dest")] + list(finding.get("addresses") or ()):
+        if not isinstance(value, str) or not value:
+            continue
+        try:
+            out.add(str(ipaddress.ip_address(value)))
+        except ValueError:
+            out.add(value.lower().rstrip("."))
+    return out
+
+
+def _supersessions(findings, proc_key, known):
+    """``{index: superseding finding}`` for the findings another one absorbs.
+
+    A finding is absorbed when a finding of a kind that ``supersedes`` its kind
+    names the same process and shares a destination with it. Only a finding
+    that is itself scored absorbs another: one the baseline knows counts
+    nothing, so it must not take away what the other would have counted.
+    """
+    absorbers = {}
+    for f in findings:
+        spec = KINDS.get(f.get("kind"), {})
+        if not spec.get("supersedes") or known(f):
+            continue
+        for kind in spec["supersedes"]:
+            absorbers.setdefault((proc_key(f), kind), []).append(f)
+    out = {}
+    if not absorbers:
+        return out
+    for i, f in enumerate(findings):
+        candidates = absorbers.get((proc_key(f), f.get("kind")))
+        if not candidates or known(f):
+            continue
+        mine = _endpoints(f)
+        for other in candidates:
+            if mine & _endpoints(other):
+                out[i] = other
+                break
+    return out
+
+
 def score(findings, baseline=None):
     """Weigh normalized findings into a verdict.
 
     Returns a dict with the verdict, the scored findings (each carrying the
     factors that produced its confidence), and the suppressed ones, so the
-    result can be audited rather than trusted.
+    result can be audited rather than trusted. ``suppressed`` holds what the
+    baseline knows (``suppressed_count``) and what another finding absorbed
+    (``superseded_by``, ``superseded_count``).
     """
     scored, suppressed = [], []
 
@@ -761,8 +903,17 @@ def score(findings, baseline=None):
             continue
         sources_by_process.setdefault(proc_key(f), set()).add(f["source"])
 
+    # Supersede runs before anything is weighed: it decides what is weighed at
+    # all. The absorbed findings stay in sources_by_process above, so they
+    # still corroborate, the one that absorbed them as well as any other.
+    absorbed_by = _supersessions(findings, proc_key, known)
+    absorbed = {}
+    for index, winner in absorbed_by.items():
+        absorbed.setdefault(id(winner), []).append(
+            {"kind": findings[index].get("kind"), "source": findings[index].get("source")})
+    baseline_count = superseded_count = 0
 
-    for f in findings:
+    for index, f in enumerate(findings):
         item = dict(f)
         factors = {}
 
@@ -772,6 +923,17 @@ def score(findings, baseline=None):
             item["score"] = 0.0
             item["factors"] = {"baseline": BASELINE_KNOWN}
             suppressed.append(item)
+            baseline_count += 1
+            continue
+        if index in absorbed_by:
+            winner = absorbed_by[index]
+            item["superseded_by"] = winner["kind"]
+            item["superseded_by_key"] = winner.get("key")
+            item["confidence"] = 0.0
+            item["score"] = 0.0
+            item["factors"] = {"superseded": 0.0}
+            suppressed.append(item)
+            superseded_count += 1
             continue
         item["baseline"] = "new"
 
@@ -787,13 +949,18 @@ def score(findings, baseline=None):
                 cf = UNCORROBORATED
         factors["corroboration"] = cf
 
-        confidence = round(min(1.0, pf * cf), 3)
+        of = _observation_factor(f)
+        factors["observation"] = of
+
+        confidence = round(min(1.0, pf * cf * of), 3)
         contribution = round(f.get("base_weight", 1.0) * confidence, 3)
 
         item["confidence"] = confidence
         item["raw_score"] = contribution
         item["score"] = contribution
         item["factors"] = factors
+        if id(f) in absorbed:
+            item["absorbed"] = absorbed[id(f)]
         scored.append(item)
 
     # Saturation: cap what one kind can contribute per process. Without this a
@@ -849,6 +1016,8 @@ def score(findings, baseline=None):
         sat = item.get("saturation")
         if sat and sat["group_size"] > 1:
             bits.append(f"{sat['rank']} of {sat['group_size']} of this kind")
+        for other in item.get("absorbed") or ():
+            bits.append(f"absorbs {other['kind']} from {other['source']}")
         reasons.append(f"{reason} ({'; '.join(bits)})")
 
     by_evidence = {}
@@ -862,7 +1031,9 @@ def score(findings, baseline=None):
         "thresholds": {"suspicious": VERDICT_SUSPICIOUS, "malicious": VERDICT_MALICIOUS},
         "findings": scored,
         "suppressed": suppressed,
-        "suppressed_count": len(suppressed),
+        # Read as "suppressed by the host baseline" by app.py and the UI.
+        "suppressed_count": baseline_count,
+        "superseded_count": superseded_count,
         "by_evidence": by_evidence,
         "reasons": reasons[:12],
         "sources": sorted({f["source"] for f in findings}),

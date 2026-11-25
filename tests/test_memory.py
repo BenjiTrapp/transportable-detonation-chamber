@@ -7,6 +7,13 @@ Regressions covered:
     words that never occur in the real output, so nothing was ever found
   * baseline keyed by image name: a sample named svchost.exe inherited
     svchost's baseline
+  * one beacon loop counted twice: Sysmon's c2_beaconing (3.0) and the
+    network check-in (4.0) together crossed the malicious threshold from a
+    single phenomenon
+  * a new confidence factor shifting the verdicts of findings that do not
+    carry it
+  * two notions of "regular": memory_evidence measured a 60 s beacon with a
+    follow-up request as 59.7 s where net_behavior measured 60.0 s
 """
 
 import json
@@ -182,3 +189,178 @@ def test_beaconing_needs_a_regular_rhythm(tdc, interval, expected):
         t += interval if interval else rnd.uniform(0.5, 60)
         conns.append((t, "10.0.0.1", 443))
     assert len(tdc.memory_evidence.beaconing_from_connections(conns, "b.exe")) == expected
+
+
+# --- Observation factor and supersede ----------------------------------------
+
+def test_existing_findings_keep_their_score_without_an_observation_factor(tdc):
+    f = tdc.memory_evidence.MemoryFinding("aether", "reflective_pe", "a.exe")
+    assert tdc.memory_evidence.score([f])["findings"][0]["factors"]["observation"] == 1.0
+
+
+def test_an_observation_factor_below_one_lowers_the_contribution(tdc):
+    me = tdc.memory_evidence
+    full = me.score([me.MemoryFinding("net", "exfil_upload", "a.exe")])["score"]
+    half = me.score([me.MemoryFinding("net", "exfil_upload", "a.exe",
+                                      extra={"observation": 0.5})])["score"]
+    assert half < full
+    assert half == pytest.approx(full * 0.5)
+
+
+@pytest.mark.parametrize("value, factor", [(1.7, 1.0), (-0.2, 0.0), ("x", 1.0), (None, 1.0),
+                                           (float("nan"), 1.0), (True, 1.0)])
+def test_an_observation_outside_zero_to_one_is_held_to_it(tdc, value, factor):
+    me = tdc.memory_evidence
+    f = me.MemoryFinding("net", "exfil_upload", "a.exe", extra={"observation": value})
+    assert me.score([f])["findings"][0]["factors"]["observation"] == factor
+
+
+def test_a_checkin_supersedes_beaconing_for_the_same_process_and_host(tdc):
+    me = tdc.memory_evidence
+    bc = me.MemoryFinding("sysmon", "c2_beaconing", "a.exe", extra={"dest": "c2.top"})
+    ck = me.MemoryFinding("net", "c2_checkin", "a.exe", extra={"dest": "c2.top"})
+    out = me.score([bc, ck])
+    assert [f["kind"] for f in out["findings"]] == ["c2_checkin"]
+    assert out["suppressed"][0]["superseded_by"] == "c2_checkin"
+
+
+def test_beaconing_to_another_host_is_not_superseded(tdc):
+    me = tdc.memory_evidence
+    bc = me.MemoryFinding("sysmon", "c2_beaconing", "a.exe", extra={"dest": "other.top"})
+    ck = me.MemoryFinding("net", "c2_checkin", "a.exe", extra={"dest": "c2.top"})
+    assert len(me.score([bc, ck])["findings"]) == 2
+
+
+def test_one_beacon_seen_by_sysmon_and_on_the_wire_is_not_malicious_by_itself(tdc):
+    # The case the spec names: 3.0 + 4.0 from one loop would be 7.0 >= 6.0.
+    me = tdc.memory_evidence
+    conns = [(1000.0 + 60.0 * i, "203.0.113.7", 443) for i in range(8)]
+    bc = me.beaconing_from_connections(conns, process="a.exe")
+    ck = me.MemoryFinding("network", "c2_checkin", "a.exe",
+                          extra={"dest": "c2.top", "addresses": ["203.0.113.7"]})
+    out = me.score(bc + [ck])
+    assert out["score"] == 4.0 and out["label"] == "SUSPICIOUS"
+    assert out["suppressed"][0]["kind"] == "c2_beaconing"
+
+
+def test_sysmon_beaconing_matches_a_checkin_by_one_of_its_addresses(tdc):
+    me = tdc.memory_evidence
+    bc = me.MemoryFinding("sysmon", "c2_beaconing", "A.EXE", extra={"dest": "2001:db8::0001"})
+    ck = me.MemoryFinding("network", "c2_checkin", "a.exe",
+                          extra={"dest": "c2.top", "addresses": ["2001:db8::1"]})
+    assert [f["kind"] for f in me.score([bc, ck])["findings"]] == ["c2_checkin"]
+
+
+def test_a_superseded_finding_still_corroborates_the_one_that_absorbed_it(tdc):
+    # "Die Beobachtung aus Sysmon bleibt als Bestaetigung stehen".
+    me = tdc.memory_evidence
+    bc = me.MemoryFinding("sysmon-network", "c2_beaconing", "a.exe", extra={"dest": "c2.top"})
+    ck = me.MemoryFinding("network", "c2_checkin", "a.exe", weight=2.1,
+                          extra={"dest": "c2.top", "needs_corroboration": True})
+    alone = me.score([ck])["findings"][0]
+    together = me.score([bc, ck])["findings"][0]
+    assert alone["factors"]["corroboration"] == me.UNCORROBORATED
+    assert together["factors"]["corroboration"] == 1.0
+    assert together["corroborated_by"] == ["sysmon-network"]
+    assert together["absorbed"] == [{"kind": "c2_beaconing", "source": "sysmon-network"}]
+
+
+def test_a_superseded_finding_still_corroborates_other_kinds_as_before(tdc):
+    me = tdc.memory_evidence
+    mem = me.MemoryFinding("aether", "heap_api_table", "a.exe")
+    bc = me.MemoryFinding("sysmon-network", "c2_beaconing", "a.exe", extra={"dest": "c2.top"})
+    before = me.score([mem, bc])
+    ck = me.MemoryFinding("network", "c2_checkin", "a.exe", extra={"dest": "c2.top"})
+    after = me.score([mem, bc, ck])
+    heap = [f for f in after["findings"] if f["kind"] == "heap_api_table"][0]
+    assert heap["factors"] == [f for f in before["findings"]
+                               if f["kind"] == "heap_api_table"][0]["factors"]
+
+
+def test_a_checkin_the_baseline_knows_supersedes_nothing(tdc):
+    me = tdc.memory_evidence
+    bc = me.MemoryFinding("sysmon", "c2_beaconing", "a.exe", extra={"dest": "c2.top"})
+    ck = me.MemoryFinding("network", "c2_checkin", "a.exe", identity=("c2.top",),
+                          extra={"dest": "c2.top"})
+    baseline = me.MemoryBaseline(str(tdc._memory_baseline.path))
+    baseline.add([ck])
+    out = me.score([bc, ck], baseline=baseline)
+    assert [f["kind"] for f in out["findings"]] == ["c2_beaconing"]
+
+
+def test_superseded_findings_are_not_counted_as_suppressed_by_the_baseline(tdc):
+    me = tdc.memory_evidence
+    bc = me.MemoryFinding("sysmon", "c2_beaconing", "a.exe", extra={"dest": "c2.top"})
+    ck = me.MemoryFinding("network", "c2_checkin", "a.exe", extra={"dest": "c2.top"})
+    out = me.score([bc, ck])
+    assert out["suppressed_count"] == 0 and out["superseded_count"] == 1
+    assert out["suppressed"][0]["score"] == 0.0 and "baseline" not in out["suppressed"][0]
+
+
+def test_a_finding_without_a_destination_is_not_superseded(tdc):
+    me = tdc.memory_evidence
+    bc = me.MemoryFinding("sysmon", "c2_beaconing", "a.exe")
+    ck = me.MemoryFinding("network", "c2_checkin", "a.exe", extra={"dest": ""})
+    assert len(me.score([bc, ck])["findings"]) == 2
+
+
+def test_supersede_needs_the_same_process(tdc):
+    me = tdc.memory_evidence
+    bc = me.MemoryFinding("sysmon", "c2_beaconing", "b.exe", extra={"dest": "c2.top"})
+    ck = me.MemoryFinding("network", "c2_checkin", "a.exe", extra={"dest": "c2.top"})
+    assert len(me.score([bc, ck])["findings"]) == 2
+
+
+def test_every_superseded_kind_is_a_kind(tdc):
+    kinds = tdc.memory_evidence.KINDS
+    assert kinds["c2_checkin"]["supersedes"] == ("c2_beaconing",)
+    for spec in kinds.values():
+        assert set(spec.get("supersedes", ())) <= set(kinds)
+
+
+@pytest.mark.parametrize("kind, weight, evidence", [
+    ("c2_checkin", 4.0, "structural"), ("exfil_upload", 4.0, "structural"),
+    ("credential_in_transit", 4.5, "structural"), ("fallback_rotation", 3.0, "behavioral"),
+    ("dead_c2_retry", 2.0, "behavioral"), ("recon_service", 1.0, "behavioral"),
+    ("tls_ja3_known", 2.5, "structural"), ("dga_pattern", 2.0, "behavioral"),
+    ("payload_staging", 4.0, "structural"),
+])
+def test_the_network_kinds_carry_the_weights_of_the_spec(tdc, kind, weight, evidence):
+    spec = tdc.memory_evidence.KINDS[kind]
+    assert (spec["weight"], spec["evidence"]) == (weight, evidence)
+
+
+# --- Periodicity: one definition, in net_behavior ------------------------------
+
+def test_a_follow_up_request_does_not_shorten_the_interval(tdc):
+    # A connection 0.3 s after each check-in is part of it. Dropping only the
+    # short interval measured 59.7 s; net_behavior measures 60.0 s.
+    conns = []
+    for i in range(8):
+        conns += [(60.0 * i, "10.0.0.1", 443), (60.0 * i + 0.3, "10.0.0.1", 443)]
+    f = tdc.memory_evidence.beaconing_from_connections(conns, "b.exe")[0]
+    assert f["mean_interval_s"] == 60.0 and "every 60.0s" in f["detail"]
+    assert f["connections"] == 16
+
+
+def test_beaconing_and_net_behavior_report_the_same_numbers(tdc):
+    import net_behavior
+    times = [0.0, 61.0, 118.0, 181.0, 240.0, 302.0, 359.0]
+    p = net_behavior.periodicity(times)
+    f = tdc.memory_evidence.beaconing_from_connections([(t, "10.0.0.1", 443) for t in times])[0]
+    assert (f["mean_interval_s"], f["cov"], f["on_rhythm"]) == (p["interval"], p["cov"], p["on_rhythm"])
+
+
+def test_a_series_with_two_time_scales_is_not_a_sysmon_beacon(tdc):
+    # GET plus POST three seconds later on every check-in: net_behavior
+    # withholds the number, so there is no finding with a wrong one.
+    times = []
+    for i in range(8):
+        times += [60.0 * i, 60.0 * i + 3.0]
+    assert tdc.memory_evidence.beaconing_from_connections([(t, "10.0.0.1", 443) for t in times]) == []
+
+
+def test_sysmon_beaconing_names_its_destination(tdc):
+    conns = [(60.0 * i, "10.0.0.1", 443) for i in range(8)]
+    f = tdc.memory_evidence.beaconing_from_connections(conns, "b.exe")[0]
+    assert f["dest"] == "10.0.0.1" and f["endpoint"] == "10.0.0.1:443"

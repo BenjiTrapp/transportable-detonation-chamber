@@ -43,12 +43,14 @@ together. The assumptions this module refuses to make:
     much there is: 20 random bytes cannot reach 4.4 bits. ``stream_bytes`` is
     reported next to it. It is Shannon entropy over the byte frequencies, bits
     per byte, 8.0 at most.
-  * Regular traffic is a heartbeat. The rhythm is measured as the project does
-    in ``memory_evidence.beaconing_from_connections``, with its constants (four
-    beats at least, robust coefficient of variation up to 0.5 from median and
-    median absolute deviation, half the intervals within 25% of the median), so
-    both feed one evidence model that decides alike. The unit differs: a
-    connection is one event but a send can be several segments, so packets
+  * Regular traffic is a heartbeat. The rhythm is measured by
+    ``net_behavior.periodicity``, the project's one judgement of a rhythm,
+    which ``memory_evidence.beaconing_from_connections`` uses too (four beats
+    at least, robust coefficient of variation up to 0.5 from median and
+    median absolute deviation, half the intervals within 25% of the median,
+    one time scale), so both feed one evidence model that decides alike. The
+    unit differs: a connection is one event but a send can be several
+    segments, so packets
     less than ``BEACON_MIN_INTERVAL_S`` apart are one beat, timed at its first
     packet. A beat is small (``MAX_HEARTBEAT_SIZE``): regular large sends are a
     transfer, not a keep-alive. Times come from ``Flow.packets``, which holds
@@ -70,7 +72,9 @@ import statistics
 from collections import Counter
 from math import log2
 
-from memory_evidence import (
+import net_behavior
+# The thresholds of the one rhythm judgement, kept here under their names.
+from net_behavior import (  # noqa: F401
     BEACON_MAX_COV, BEACON_MIN_CONNECTIONS, BEACON_MIN_INTERVAL_S)
 from net_events import NetEvent, render_bytes
 
@@ -86,7 +90,6 @@ MIN_TEXT_RATIO = 0.85           # printable share for a text delimiter
 MIN_BINARY_DELIMITERS = 6       # a control byte turns up by chance in short random data
 MIN_BINARY_MEAN = 3             # integer arrays and padded records average less
 RANDOM_DELIMITER_FACTOR = 8     # times the count a byte of random data would have
-ON_RHYTHM_SHARE = 0.5           # same as beaconing_from_connections
 
 _PRINTABLE = frozenset(range(0x20, 0x7F)) | {0x09, 0x0A, 0x0D}
 _LENGTH_READINGS = ((2, "big"), (2, "little"), (4, "big"), (4, "little"))
@@ -251,21 +254,12 @@ def _beats(flow, direction):
 def _heartbeat(flow, direction):
     """``(is_heartbeat, median_interval)``; the interval is None unless it is one."""
     beats = _beats(flow, direction)
-    if len(beats) < BEACON_MIN_CONNECTIONS:
-        return False, None
-    intervals = [b[0] - a[0] for a, b in zip(beats, beats[1:])]
-    median = statistics.median(intervals)
-    if median <= 0:
-        return False, None
-    mad = statistics.median(abs(x - median) for x in intervals)
-    # 1.4826 * MAD estimates the standard deviation for normal data.
-    robust_cov = 1.4826 * mad / median
-    on_rhythm = sum(1 for x in intervals if abs(x - median) <= 0.25 * median) / len(intervals)
-    if robust_cov > BEACON_MAX_COV or on_rhythm < ON_RHYTHM_SHARE:
+    rhythm = net_behavior.periodicity([ts for ts, _size in beats])
+    if not rhythm["periodic"]:
         return False, None
     if statistics.median(size for _ts, size in beats) > MAX_HEARTBEAT_SIZE:
         return False, None
-    return True, round(median, 2)
+    return True, rhythm["interval"]
 
 
 # --- events -------------------------------------------------------------------

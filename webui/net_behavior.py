@@ -12,12 +12,14 @@ Several assumptions would make the result wrong:
   * A beacon belongs to a process. A pcap knows no process: every event has
     ``pid`` None, so events are grouped by ``(pid, dest)`` and None is simply
     one more value. Requiring a pid would drop every beacon of the pcap path.
-  * "Regular" can be defined per module. ``memory_evidence`` already judges
-    periodicity (at least four connections, coefficient of variation up to
-    0.5, measured with median and median absolute deviation so that one slow
-    check-in does not hide a rhythm). Both results feed one evidence model, so
-    this module uses the same thresholds and estimator; a second definition
-    would let one sample be periodic by one and irregular by the other.
+  * "Regular" can be defined per module. ``memory_evidence`` judges Sysmon's
+    connection log for beacons too (at least four connections, coefficient of
+    variation up to 0.5, measured with median and median absolute deviation so
+    that one slow check-in does not hide a rhythm). Both results feed one
+    evidence model, and a second definition would let one sample be periodic
+    by one and irregular by the other, or measured at 59.7 s by one and at
+    60.0 s by the other. ``periodicity`` here is the one definition;
+    ``memory_evidence.beaconing_from_connections`` calls it.
   * Every event is a separate connection. One check-in is a connection and
     often several requests. Events less than ``BEACON_MIN_INTERVAL_S`` after
     the one before are one check-in (a connection, its TLS handshake and its
@@ -127,7 +129,7 @@ import statistics
 
 import net_events
 
-# Same thresholds as memory_evidence.beaconing_from_connections.
+# The one definition of a beacon's minimum and spread; memory_evidence uses these.
 BEACON_MIN_CONNECTIONS = 4
 BEACON_MAX_COV = 0.5
 BEACON_MIN_INTERVAL_S = 0.5
@@ -283,7 +285,7 @@ def _single_scale(intervals, median):
             and longest <= SCALE_MAX_RUN)
 
 
-def periodicity(timestamps):
+def periodicity(timestamps, rounded=True):
     """Measure the rhythm of ``timestamps``.
 
     Returns ``interval`` (median seconds between check-ins), ``cov`` (robust
@@ -308,6 +310,12 @@ def periodicity(timestamps):
     ``regular`` is judged on the series as it came, before the join: joining
     may explain short intervals inside a rhythm the series already has, it
     must never be what makes a series look regular.
+
+    The numbers are rounded for a report (interval to 0.01 s, cov and jitter
+    to 0.001, on_rhythm to 0.01). ``rounded=False`` returns them as measured,
+    for a caller that compares them against thresholds of its own
+    (``memory_evidence`` decides from them how much a beacon weighs, and a
+    share of 16/23 must not become 0.70 on the way).
     """
     # sorted() on input that is already in order is a single pass.
     starts = _check_ins(sorted(t for t in timestamps if _usable(t)))
@@ -324,9 +332,10 @@ def periodicity(timestamps):
     joined = _measure(starts)
     result.update(single_scale=joined["single"], regular=raw["regular"])
     if joined["single"]:
+        keep = (lambda value, digits: round(value, digits)) if rounded else (lambda value, _d: value)
         result.update(
-            interval=round(joined["median"], 2), cov=round(joined["cov"], 3),
-            jitter=round(joined["cov"], 3), on_rhythm=round(joined["on_rhythm"], 2),
+            interval=keep(joined["median"], 2), cov=keep(joined["cov"], 3),
+            jitter=keep(joined["cov"], 3), on_rhythm=keep(joined["on_rhythm"], 2),
             periodic=raw["regular"] and joined["regular"])
     return result
 
@@ -458,7 +467,7 @@ def _path_fanout(path, hosts, first_ts):
         dests=list(hosts)[:MAX_LISTED_DESTS])
 
 
-def _housekeeping(name):
+def is_housekeeping(name):
     """Is this a name a resolver or network stack asks for on its own?"""
     name = name.lower().rstrip(".")
     return ("." not in name or name.startswith(HOUSEKEEPING_PREFIXES)
@@ -532,7 +541,7 @@ def analyze(events):
             beacons.setdefault((e.get("pid"), dest), _Group()).add(e, ts, address)
         if failed:
             retries.setdefault(dest, _Group()).add(e, ts, address)
-        if etype == "dns" and e.get("nxdomain") and not _housekeeping(dest):
+        if etype == "dns" and e.get("nxdomain") and not is_housekeeping(dest):
             nx_failures.append((ts, dest))
         path = e.get("path")
         if etype == "http" and isinstance(path, str) and path not in FANOUT_IGNORED_PATHS:

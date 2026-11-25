@@ -38,6 +38,8 @@ PORT = 8766
 FILES = {
     "webui/app.py": r"C:\DetonationChamberUI\app.py",
     "webui/memory_evidence.py": r"C:\DetonationChamberUI\memory_evidence.py",
+    "webui/net_behavior.py": r"C:\DetonationChamberUI\net_behavior.py",
+    "webui/net_events.py": r"C:\DetonationChamberUI\net_events.py",
     "webui/minidump_analysis.py": r"C:\DetonationChamberUI\minidump_analysis.py",
     "webui/pipe_analysis.py": r"C:\DetonationChamberUI\pipe_analysis.py",
     "webui/pipe_signatures.json": r"C:\DetonationChamberUI\pipe_signatures.json",

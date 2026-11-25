@@ -63,7 +63,11 @@ not learn a second notation. Several things are easy to get wrong:
     process, which is also what a correlation needs.
   * The weight of a finding comes from the rule. It does not: a rule may name
     an evidence ``kind``, and the evidence model decides what that kind weighs.
-    There is no weight key, and one is rejected.
+    There is no weight key, and one is rejected. The kind must be one of the
+    network kinds of ``memory_evidence`` (``NETWORK_KINDS``): a misspelt kind
+    would load and score nothing forever, and a host-side kind such as
+    ``thread_start_private`` would let a rule reach a weight no capture can
+    support.
   * ``True == 1``. A flag is not a number: ``nxdomain: true`` does not match
     ``1`` and ``port: 1`` does not match ``True``.
   * A destination is a fact. ``dest`` is what the sample says it talks to (a Host
@@ -100,6 +104,7 @@ try:
 except ImportError:                      # re is used, see the docstring
     _regex_module = None
 
+import memory_evidence
 import net_events
 
 try:                                     # Python 3.11 and later
@@ -979,7 +984,11 @@ class Hits(list):
         self.regex_engine = "regex"
 
 
-class _KnownGood:
+class KnownGood:
+    """The ``known_good`` names of a rule set: ``a.b`` is that name, ``*.a.b``
+    is ``a.b`` and every name under it, compared without case or a final dot.
+    ``net_evidence`` hides by the same list as the rules do."""
+
     def __init__(self, names):
         self.exact, self.suffixes = set(), set()
         for name in names:
@@ -1024,7 +1033,7 @@ class RuleSet:
         self.notes = [] if _regex_module is not None else [
             "the regex module is not installed: regexes run on re with no timeout and "
             "are cut at %d characters; only the load-time checks guard them" % MAX_SUBJECT_UNGUARDED]
-        self._known = _KnownGood(lists.get(KNOWN_GOOD, ()))
+        self._known = KnownGood(lists.get(KNOWN_GOOD, ()))
         self._scan = {}         # event type -> rules to try on every event of it
         self._indexed = {}      # event type -> field -> key -> rules
         self._chains = []
@@ -1280,6 +1289,9 @@ def _build(spec, lists):
     out = {"id": spec["id"], "name": spec["name"], "severity": severity, "attack": attack}
     for key in _TEXT_KEYS:
         out[key] = _text(spec, key)
+    if out["kind"] and out["kind"] not in memory_evidence.NETWORK_KINDS:
+        raise RuleError("unknown evidence kind %r (known: %s)"
+                        % (out["kind"], ", ".join(memory_evidence.NETWORK_KINDS)))
     if "requires" in spec:
         for key in _CORRELATION_FORBIDDEN:
             if key in spec:
