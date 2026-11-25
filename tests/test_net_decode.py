@@ -30,6 +30,13 @@ Regressions covered:
     was: only the named text fields are read, nothing is copied across
   * a decoded event carried raw bytes and could not be serialized; binary
     results are described by kind, size, hash and a ``render_bytes`` preview
+  * HTTP headers were not read, so ``Authorization: Basic`` (user:password in
+    base64) and tokens in ``Cookie`` or a header the malware invented stayed
+    opaque; every header value is read, not an allow-list of names. A ``Basic``
+    credential is only a few characters long ("user:pass" is 12) and fell
+    under the general length floor, so the scheme itself is evidence enough.
+    A decoded credential is marked ``credential`` for the later tasks that
+    mask at the serialization boundary: they can only mask what is marked
   * an event with thousands of encoded values (a WebSocket stream, a huge form)
     made the walk unbounded; the number of values, the scanned size and the
     reported events are capped
@@ -548,6 +555,135 @@ def test_decoded_events_hold_no_secret():
     out = net_decode.decode_event_fields(e)
     assert "password" not in out[0]
     json.dumps(out)
+
+
+# --- headers and credentials ---------------------------------------------------
+
+def test_a_basic_authorization_header_is_decoded_and_marked_as_a_credential():
+    out = net_decode.decode_event_fields(http(headers={
+        "host": "c2.evil.top", "authorization": "Basic dXNlcjpwYXNz"}))
+    assert len(out) == 1
+    d = out[0]
+    assert d["field"] == "headers.authorization" and d["name"] == "Basic"
+    assert d["text"] == "user:pass" and d["scheme"] == "base64" and d["credential"] is True
+
+
+def test_a_basic_credential_with_a_colon_in_the_password_and_non_ascii():
+    out = net_decode.decode_event_fields(http(headers={
+        "proxy-authorization": "basic " + b64("bob:pä:ss".encode())}))
+    assert out[0]["text"] == "bob:pä:ss" and out[0]["credential"] is True
+
+
+def test_basic_that_is_not_a_credential_pair_is_left_to_the_general_rule():
+    plain = net_decode.decode_event_fields(http(headers={"authorization": "Basic aGVsbG8gd29ybGQ="}))
+    assert [(d["text"], d["credential"]) for d in plain] == [("hello world", True)]
+    assert net_decode.decode_event_fields(http(headers={"authorization": "Basic dXNl"})) == []
+    assert net_decode.decode_event_fields(http(headers={"authorization": "Basic !!!!"})) == []
+
+
+def test_a_bearer_token_is_read_segment_by_segment():
+    token = ".".join([b64(b'{"alg":"HS256","typ":"JWT"}').rstrip("="),
+                      b64(b'{"sub":"bob","admin":true}').rstrip("="),
+                      "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"])
+    out = net_decode.decode_event_fields(http(headers={"authorization": "Bearer " + token}))
+    assert [(d["name"], d["text"]) for d in out] == [
+        ("Bearer[0]", '{"alg":"HS256","typ":"JWT"}'), ("Bearer[1]", '{"sub":"bob","admin":true}')]
+    assert all(d["credential"] for d in out)
+
+
+def test_a_custom_header_name_is_read_too():
+    out = net_decode.decode_event_fields(http(headers={
+        "X-Session": b64(b"host=PC01;user=bob;role=admin")}))
+    assert [(d["field"], d["text"], d["credential"]) for d in out] == [
+        ("headers.x-session", "host=PC01;user=bob;role=admin", False)]
+
+
+def test_cookie_values_are_read_one_by_one():
+    cookie = "sid=" + b64(b"host=PC01;user=bob;role=admin") + "; theme=dark; id=17; t=aGVsbG8gd29ybGQ%3D"
+    out = net_decode.decode_event_fields(http(headers={"cookie": cookie}))
+    assert [(d["field"], d["name"], d["text"]) for d in out] == [
+        ("headers.cookie", "sid", "host=PC01;user=bob;role=admin"),
+        ("headers.cookie", "t", "hello world")]
+    assert not any(d["credential"] for d in out)
+
+
+def test_a_set_cookie_value_with_attributes_and_a_quoted_value():
+    out = net_decode.decode_event_fields(http(resp_headers={
+        "set-cookie": 'session="%s"; Path=/; HttpOnly' % b64(b"user=bob;role=admin;exp=999")}))
+    assert [(d["field"], d["name"], d["text"]) for d in out] == [
+        ("resp_headers.set-cookie", "session", "user=bob;role=admin;exp=999")]
+
+
+def test_a_bare_base64_header_value_with_padding_is_not_taken_for_a_cookie():
+    out = net_decode.decode_event_fields(http(headers={"x-data": "aGVsbG8gd29ybGQ="}))
+    assert [(d["name"], d["text"]) for d in out] == [("", "hello world")]
+
+
+def test_ordinary_request_headers_give_nothing():
+    headers = {
+        "host": "www.example.com", "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
+        "accept-encoding": "gzip, deflate", "accept-language": "en-US,en;q=0.9",
+        "connection": "keep-alive", "content-type": "application/x-www-form-urlencoded",
+        "content-length": "1234", "cache-control": "no-cache no-store",
+        "if-none-match": '"33a64df551425fcc55e4d42a148795d9f25f89d4"',
+        "sec-websocket-key": "x3JJHMbDL1EzLkh9GBhXDw==", "referer": "http://example.com/a%20b/c",
+        "cookie": "_ga=GA1.2.123456789.1700000000; sessionid=7f3a9c1e4b2d8f06a5e1c3b9d7f20486",
+        "etag": "W/\"5e1c3b9d7f2048\"", "x-forwarded-for": "203.0.113.9, 198.51.100.4",
+    }
+    assert net_decode.decode_event_fields(http(headers=headers)) == []
+
+
+def test_a_decoded_user_password_pair_is_marked_wherever_it_was_found():
+    body = net_decode.decode_event_fields(http(body_text="d=" + b64(b"admin:hunter2-secret")))
+    assert body[0]["credential"] is True
+    lines = net_decode.decode_event_fields(http(body_text="d=" + b64(b"a@b.example:pw1\nbob:letmein99")))
+    assert lines[0]["credential"] is True
+    cookie = net_decode.decode_event_fields(http(headers={"cookie": "auth=" + b64(b"admin:hunter2-secret")}))
+    assert cookie[0]["credential"] is True
+
+
+@pytest.mark.parametrize("text", [
+    b"192.168.1.5:4444", b"C:\\Users\\bob\\AppData\\x.exe", b"http://evil.top/gate.php?id=7",
+    b"stolen credentials: admin / hunter2", b"user=bob&pass=hunter2&host=PC01",
+    b"first line\nsecond:line", b"hostname: PC01",
+])
+def test_text_that_is_not_a_credential_pair_is_not_marked(text):
+    out = net_decode.decode_event_fields(http(body_text="d=" + b64(text)))
+    assert out and out[0]["credential"] is False
+
+
+def test_credential_is_always_present_and_a_plain_bool():
+    for out in (net_decode.decode_event_fields(http(body_text="d=aGVsbG8gd29ybGQ=")),
+                net_decode.decode_event_fields(http(headers={"x": "68656c6c6f"}))):
+        assert out[0]["credential"] is False
+
+
+def test_odd_headers_do_not_raise():
+    for headers in (None, 5, "x", [("a", "b")], {1: "aGVsbG8gd29ybGQ="}, {"a": None},
+                    {"a": 5}, {"a": b"aGVsbG8gd29ybGQ="}, {"a": ["aGVsbG8gd29ybGQ=", None, 3]}):
+        net_decode.decode_event_fields(http(headers=headers, resp_headers=headers))
+    out = net_decode.decode_event_fields(http(headers={"a": ["aGVsbG8gd29ybGQ=", None]}))
+    assert [d["text"] for d in out] == ["hello world"]
+
+
+def test_a_header_event_with_a_secret_elsewhere_keeps_it_out_of_the_result():
+    e = http(headers={"authorization": "Basic dXNlcjpwYXNz"},
+             password=net_mail_ftp.Secret("hunter2"))
+    out = net_decode.decode_event_fields(e)
+    json.dumps(out)
+    assert "password" not in out[0]
+
+
+def test_headers_are_walked_in_bounded_time_and_count():
+    headers = {"x-%d" % i: b64(b"header number %06d ok" % i) for i in range(3000)}
+    out = net_decode.decode_event_fields(http(headers=headers))
+    assert len(out) == net_decode.MAX_DECODED_PER_EVENT
+    hostile = {"h%d" % i: "a=" * 50 + ";" * 5000 + "." * 5000 for i in range(50)}
+    started = time.time()
+    net_decode.decode_event_fields(http(headers=hostile))
+    assert time.time() - started < 5
 
 
 # --- bounds ------------------------------------------------------------------

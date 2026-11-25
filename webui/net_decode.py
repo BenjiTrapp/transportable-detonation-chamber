@@ -44,6 +44,7 @@ so the event is plain JSON.
 import binascii
 import codecs
 import hashlib
+import ipaddress
 import json
 import re
 import unicodedata
@@ -59,11 +60,13 @@ MAX_INFLATED = 1024 * 1024      # bytes one inflate step may produce
 MAX_EVENT_INFLATE = 4 * 1024 * 1024    # bytes all inflate steps of one event may produce together
 MAX_EVENT_CHARS = 1024 * 1024   # characters of field text scanned per event
 MAX_VALUES_PER_FIELD = 64       # candidate values examined in one field
+MAX_SEGMENTS = 8                # dot-separated segments of a header token read (a JWT has 3)
 MAX_DECODED_PER_EVENT = 200     # decoded events one event may yield
 MAX_EVENT_TEXT = 64 * 1024      # characters of decoded text kept in an event
 PREVIEW_BYTES = 32              # bytes of a binary result shown in an event
 ENCODED_SHOWN = 80              # characters of the encoded value shown in an event
 
+MIN_BASIC = 4       # one base64 quantum: "a:b". Only for a Basic credential, see _decode_basic
 MIN_BASE64 = 16     # 12 bytes: random bytes pass the text test about once in 10^5
 MIN_HEX = 10        # 5 bytes, the shortest word worth reading ("hello")
 MIN_URL_ESCAPES = 2     # one escape is a space or a quote; two is a pattern
@@ -102,6 +105,10 @@ _WHITESPACE = re.compile(r"\s")
 _JSON_PAIR = re.compile(r'"([^"\\\n]{1,64})"\s*:\s*"((?:[^"\\]|\\.)*)"')
 _BLANK_LINE = re.compile(r"\r?\n\r?\n")
 _PART_NAME = re.compile(r'name="([^"]{0,128})"')
+_AUTH_VALUE = re.compile(r"([A-Za-z][A-Za-z0-9_-]*)[ \t]+(\S+)")
+_CREDENTIAL = re.compile(r"[^\s:]{1,64}:\S{1,128}")
+_CREDENTIAL_HEADERS = ("headers.authorization", "headers.proxy-authorization")
+MAX_CREDENTIAL_LINES = 50   # lines of a decoded text checked for the user:password shape
 _BOM8 = b"\xef\xbb\xbf"
 _PLAIN_PUNCTUATION = " \t\r\n_-.:/\\@=&,;|"
 _ONE_SCRIPT = {"HIRAGANA": "CJK", "KATAKANA": "CJK", "BOPOMOFO": "CJK",
@@ -273,7 +280,7 @@ def _join_lines(token):
     return b"".join(lines)
 
 
-def _base64(token, lenient):
+def _base64(token, lenient, minimum=MIN_BASE64):
     if b"\n" in token or b"\r" in token:
         token = _join_lines(token)
         if token is None:
@@ -282,7 +289,7 @@ def _base64(token, lenient):
         token = token[:len(token) & ~3]
     body = token.rstrip(b"=")
     pad = len(token) - len(body)
-    if len(token) < MIN_BASE64 or pad > 2 or (pad and len(token) % 4) or len(body) % 4 == 1:
+    if len(token) < minimum or pad > 2 or (pad and len(token) % 4) or len(body) % 4 == 1:
         return None
     if _B64.fullmatch(body):
         data = body
@@ -504,6 +511,106 @@ def _decode_text(text, work):
     return found
 
 
+def _decode_basic(token):
+    """``Decoded`` for the token of ``Basic <token>``, else None.
+
+    The scheme says what the token is: base64 of ``user:password``. That is
+    evidence the general rule has to get from length and content, so it may be
+    short ("user:pass" is 12 characters) and is accepted when it is printable
+    text with a colon after a non-empty user name.
+    """
+    raw = _base64(token.encode("ascii", "replace"), False, MIN_BASIC)
+    if raw is None:
+        return None
+    for charset in ("utf-8", "latin-1"):
+        try:
+            text = raw.decode(charset)
+        except UnicodeDecodeError:
+            continue
+        if text.isprintable() and text.find(":") > 0:
+            return Decoded(("base64",), raw, _Verdict("text", text, charset, True, False), False)
+    return None
+
+
+def _cookie_pairs(text):
+    """``(name, value)`` of each ``name=value`` piece of a Cookie or Set-Cookie
+    value; ``[]`` when the text is not one (a bare base64 value ends in ``=``)."""
+    pairs = []
+    for piece in text.split(";"):
+        key, equals, value = piece.strip().partition("=")
+        if not equals or not key or len(key) > 128 or _WHITESPACE.search(key) or value.startswith("="):
+            continue
+        value = value.strip('"')
+        if len(value) >= _MIN_VALUE:
+            pairs.append((key, value))
+            if len(pairs) == MAX_VALUES_PER_FIELD:
+                break
+    return pairs
+
+
+def _decode_header(text, work):
+    """``(name, value, Decoded)`` for each encoded value of a header value.
+
+    A header is read whatever its name, since malware names its own. Its
+    value is an authorization (``Scheme token``), a cookie (``a=b; c=d``) or
+    one bare value; a token with dots is also read segment by segment, which
+    is how a JWT carries its header and payload.
+    """
+    text = text.strip()
+    found = []
+    auth = _AUTH_VALUE.fullmatch(text)
+    if auth:
+        scheme, token = auth.groups()
+        if scheme.lower() == "basic":
+            decoded = _decode_basic(token)
+            if decoded is not None:
+                return [(scheme, token, decoded)]
+        pairs = [(scheme, token)]
+    else:
+        pairs = _cookie_pairs(text) or [("", text)]
+    for name, value in pairs:
+        decoded = _decode(_as_bytes(value), work)
+        if decoded is not None:
+            found.append((name, value, decoded))
+            continue
+        if "." not in value or _WHITESPACE.search(value):
+            continue
+        for index, segment in enumerate(value.split(".", MAX_SEGMENTS)[:MAX_SEGMENTS]):
+            decoded = _decode(_as_bytes(segment), work) if len(segment) >= _MIN_VALUE else None
+            if decoded is not None:
+                found.append(("%s[%d]" % (name, index), segment, decoded))
+    return found
+
+
+def _is_credential(field, decoded):
+    """Is a decoded value a credential: it came from an ``Authorization``
+    header, or it reads ``user:password`` (every line of it, if several).
+
+    Over-marking is the safe error, because the marker exists so that a later
+    layer can mask what it names: ``hostname:PC01`` is marked, a path, a URL or
+    ``address:port`` is not.
+    """
+    if field in _CREDENTIAL_HEADERS:
+        return True
+    lines = [line for line in (decoded.text or "").splitlines() if line.strip()]
+    if not lines or len(lines) > MAX_CREDENTIAL_LINES:
+        return False
+    return all(_credential_line(line) for line in lines)
+
+
+def _credential_line(line):
+    if not _CREDENTIAL.fullmatch(line):
+        return False
+    user, _colon, password = line.partition(":")
+    if password.startswith(("//", "\\", "/")) or (len(user) == 1 and user.isalpha()):
+        return False
+    try:
+        ipaddress.ip_address(user)
+    except ValueError:
+        return True
+    return not password.isdigit()
+
+
 def _field_text(value):
     if isinstance(value, str):
         return value[:MAX_INPUT]
@@ -512,17 +619,29 @@ def _field_text(value):
     return None
 
 
+def _header_fields(prefix, headers):
+    if isinstance(headers, dict):
+        for name, value in headers.items():
+            if isinstance(name, str):
+                for one in value if isinstance(value, (list, tuple)) else (value,):
+                    yield "%s.%s" % (prefix, name.lower()), one, True
+
+
 def _fields(event):
+    """``(field, value, is_header)`` for each field of an event worth reading."""
     kind = event.get("type")
     if kind == "http":
-        for field in ("query", "body_text", "resp_text"):
-            yield field, event.get(field)
+        yield "query", event.get("query"), False
+        yield from _header_fields("headers", event.get("headers"))
+        yield "body_text", event.get("body_text"), False
+        yield from _header_fields("resp_headers", event.get("resp_headers"))
+        yield "resp_text", event.get("resp_text"), False
     elif kind == "websocket":
         messages = event.get("messages")
         if isinstance(messages, list):
             for index, message in enumerate(messages):
                 if isinstance(message, dict):
-                    yield "messages[%d].text" % index, message.get("text")
+                    yield "messages[%d].text" % index, message.get("text"), False
 
 
 def _decoded_event(source, field, name, value, decoded):
@@ -537,12 +656,13 @@ def _decoded_event(source, field, name, value, decoded):
         text_capped=text is not None and len(text) > MAX_EVENT_TEXT,
         size=len(decoded.bytes), sha256=hashlib.sha256(decoded.bytes).hexdigest(),
         preview=render_bytes(decoded.bytes[:PREVIEW_BYTES]) if text is None else "",
+        credential=_is_credential(field, decoded),
         encoded=value[:ENCODED_SHOWN], encoded_len=len(value), truncated=decoded.truncated)
 
 
 def decode_event_fields(event):
     """``decoded`` events for the encoded values in an ``http`` or ``websocket``
-    event, in field order; an empty list when there is nothing worth reporting.
+    event (query, headers, body, response; or WebSocket messages), in field order; an empty list when there is nothing worth reporting.
 
     Only the text fields named here are read and nothing of the event is
     copied beyond where it came from (time, process, destination), so the
@@ -553,14 +673,14 @@ def decode_event_fields(event):
     """
     work = _Work()
     found = []
-    for field, raw in _fields(event):
+    for field, raw, is_header in _fields(event):
         text = _field_text(raw)
         if text is None or not text.strip():
             continue
         if work.chars_left <= 0:
             break
         work.chars_left -= len(text)
-        for name, value, decoded in _decode_text(text, work):
+        for name, value, decoded in (_decode_header if is_header else _decode_text)(text, work):
             found.append(_decoded_event(event, field, name, value, decoded))
             if len(found) == MAX_DECODED_PER_EVENT:
                 return found
