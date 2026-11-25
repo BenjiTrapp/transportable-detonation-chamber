@@ -228,15 +228,15 @@ rules:
   - id: net.index_post_without_browser_headers
     name: POST to index.php without browser headers
     description: >-
-      Several stealers and loaders (AZORult, Amadey and others) report to a bare index.php,
-      which ordinary sites use too. What tells them apart is the request: a browser that
-      submits a form sends Origin or Referer, and these clients do not. A script or a
-      command-line tool that posts to an index.php fires this as well; a sample that adds a
-      Referer header does not.
+      Several stealers and loaders (AZORult, Amadey and others) report to a bare index.php
+      (or index.php/route), which ordinary sites use too. What tells them apart is the
+      request: a browser that submits a form sends Origin or Referer, and these clients do
+      not. A script or a command-line tool that posts to an index.php fires this as well; a
+      sample that adds a Referer header does not.
     event: http
     match:
       method: POST
-      path|re: '(?i)(^|/)index\.php$'
+      path|re: '(?i)(^|/)index\.php(/.*)?$'
       not:
         header_order|in: [Origin, Referer]
     severity: medium

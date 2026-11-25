@@ -428,6 +428,25 @@ def test_an_executable_over_http_fires_and_names_the_evidence_art():
     assert hits[0]["count"] == 1 and hits[0]["events"][0]["dest"] == "cdn.evil.top"
 
 
+def _plain_pe(lfanew, pad=0):
+    """A PE written in bytes below 0x80, which reads as text to a text check."""
+    head = bytearray(b"MZ" + b"A" * 0x3A)
+    head[0x3C:0x40] = lfanew.to_bytes(4, "little")
+    return (bytes(head) + b"A" * (lfanew - 0x40) + b"PE\x00\x00" + b"L\x01\x02\x00" + b"B" * 200
+            + b"A" * pad)
+
+
+@pytest.mark.parametrize("body", [_plain_pe(0x10000), _plain_pe(0x80, pad=70000)])
+def test_a_pe_padded_or_written_in_plain_bytes_still_fires_the_download_rules(body):
+    cap = Capture()
+    cap.get(20.0, "cdn.evil.top", "/stage2.exe", body, "application/octet-stream")
+    _checkins(cap, start=100.0)
+    events = cap.read()
+    assert [e["kind"] for e in events if e["type"] == "download"] == ["pe"]
+    fired = _fired(events)
+    assert "net.exe_download" in fired and "net.chain_exe_then_beacon" in fired
+
+
 def test_an_elf_over_http_fires_too():
     cap = Capture()
     cap.get(5.0, "cdn.evil.top", "/a.out", b"\x7fELF" + bytes(300), "application/octet-stream")
@@ -538,6 +557,19 @@ def test_a_post_to_index_php_without_browser_headers_fires_the_index_rule_only()
     hits = _rules().evaluate(cap.read())
     assert [h["rule_id"] for h in hits] == ["net.index_post_without_browser_headers"]
     assert hits[0]["severity"] == "medium" and hits[0]["kind"] == ""
+
+
+@pytest.mark.parametrize("path", ["/index.php/route", "/index.php/api/v1/log", "/x/index.php/y"])
+def test_the_index_rule_reads_a_path_info_route_too(path):
+    cap = Capture()
+    cap.post(5.0, "c2.evil.top", path, b"id=1")
+    assert _fired(cap.read()) == ["net.index_post_without_browser_headers"]
+
+
+def test_a_browser_post_to_an_index_php_route_does_not_fire():
+    cap = Capture()
+    cap.post(5.0, "site.example.org", "/index.php/news/search", b"q=1", headers=_FORM_HEADERS)
+    assert _fired(cap.read()) == []
 
 
 def test_the_index_rule_also_reads_a_hidden_directory_gate():

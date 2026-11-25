@@ -565,21 +565,45 @@ def _payload(wire, decoded, encoding):
     return kind, fields
 
 
+_PDF_OBJECT = re.compile(rb"\d+\s+\d+\s+obj\b")
+
+
+def _has_pe_header(body):
+    """Does ``e_lfanew`` (offset 0x3C) point inside the body at ``PE\\0\\0``?
+
+    Text cannot hold those NUL bytes, so this holds for a PE however it is
+    padded or however plain its other bytes are, and for no sentence.
+    """
+    if len(body) < 0x40:
+        return False
+    offset = int.from_bytes(body[0x3C:0x40], "little")
+    return 0x40 <= offset <= len(body) - 4 and body[offset:offset + 4] == b"PE\x00\x00"
+
+
+def _has_pdf_structure(body):
+    """An object or the end marker: what a PDF has and a paragraph about one has not."""
+    return bool(_PDF_OBJECT.search(body[:65536]) or b"%%EOF" in body[-2048:])
+
+
 def _kind(body):
     """The file type a body starts with, or "".
 
     ``MZ`` and ``%PDF`` are printable ASCII, so a sentence can begin with them
-    ("MZ-Berlin weekly report"). They count as a file only when the bytes are
-    not readable text, the rule ``net_decode`` applies to the same two kinds.
+    ("MZ-Berlin weekly report"). They count as a file when the bytes are not
+    readable text (the rule ``net_decode`` applies to the same two kinds), or
+    when the structure of the format is there: a PE header where ``e_lfanew``
+    says, a PDF object or ``%%EOF``. A payload cannot be hidden from the kind
+    by writing it in plain characters.
     """
     if body[:4] == b"\x7fELF":
         return "elf"
     if body[:4] in (b"PK\x03\x04", b"PK\x05\x06"):
         return "zip"
-    kind = "pe" if body[:2] == b"MZ" else "pdf" if body[:4] == b"%PDF" else ""
-    if kind and is_readable_text(body):
-        return ""
-    return kind
+    if body[:2] == b"MZ":
+        return "pe" if _has_pe_header(body) or not is_readable_text(body) else ""
+    if body[:4] == b"%PDF":
+        return "pdf" if _has_pdf_structure(body) or not is_readable_text(body) else ""
+    return ""
 
 
 def _form_names(content_type, body):

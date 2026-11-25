@@ -669,6 +669,51 @@ def test_a_pe_or_a_pdf_with_binary_content_is_still_a_download():
         assert [x["kind"] for x in _events(_get(), _ok(body), kind="download")] == [kind]
 
 
+def _plain_pe(lfanew, pad=0):
+    """A PE written in bytes below 0x80 (an ASCII stub, an ASCII "code" section)."""
+    head = bytearray(b"MZ" + b"A" * 0x3A)
+    head[0x3C:0x40] = lfanew.to_bytes(4, "little")
+    return (bytes(head) + b"A" * (lfanew - 0x40) + b"PE\x00\x00" + b"L\x01\x02\x00" + b"B" * 200
+            + b"A" * pad)
+
+
+def test_a_pe_cannot_hide_as_text_by_being_written_in_plain_bytes():
+    far = _plain_pe(0x10000)                 # e_lfanew beyond the 64 KiB the text check reads
+    padded = _plain_pe(0x80, pad=70000)      # header right, then 64 KiB of letters
+    for body in (far, padded):
+        assert net_events.is_readable_text(body)          # it does read as text...
+        assert [x["kind"] for x in _events(_get(), _ok(body), kind="download")] == ["pe"]
+
+
+def test_text_beginning_mz_is_not_made_a_pe_by_the_header_check():
+    sentence = b"MZ-Berlin weekly report: the numbers for the week are in the sheet."
+    utf16 = b"MZ" + "Wochenbericht: die Zahlen der Woche stehen im Blatt".encode("utf-16-le")
+    lying = bytearray(sentence * 4)            # a plausible e_lfanew with no PE\0\0 behind it
+    lying[0x3C:0x40] = (0x40).to_bytes(4, "little")
+    for body in (sentence, utf16, sentence * 3, bytes(lying)):
+        assert _events(_get(), _ok(body), kind="download") == [], body
+
+
+def test_an_ordinary_pe_is_still_a_pe():
+    pe = bytearray(b"MZ\x90\x00" + bytes(range(256)) * 4)
+    pe[0x3C:0x40] = (0x80).to_bytes(4, "little")
+    pe[0x80:0x84] = b"PE\x00\x00"
+    assert [x["kind"] for x in _events(_get(), _ok(bytes(pe)), kind="download")] == ["pe"]
+    assert net_http._kind(b"MZ\x90\x00\x03") == "pe"          # a stub with no header at all
+
+
+def test_a_pdf_written_in_ascii_is_still_a_pdf_and_a_paragraph_about_one_is_not():
+    pdf = (b"%PDF-1.4\n1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n"
+           b"2 0 obj\n<< /Type /Pages /Count 0 /Kids [] >>\nendobj\n"
+           b"trailer\n<< /Root 1 0 R >>\n%%EOF\n")
+    cut = pdf[:pdf.index(b"endobj")]                       # capture ended inside an object
+    tail_only = b"%PDF-1.4\n" + b"x" * 3000 + b"\n%%EOF\n"
+    for body in (pdf, cut, tail_only):
+        assert [x["kind"] for x in _events(_get(), _ok(body), kind="download")] == ["pdf"], body
+    prose = b"%PDF is the header of a PDF; an object is introduced by a pair of numbers."
+    assert _events(_get(), _ok(prose), kind="download") == []
+
+
 def test_an_upload_that_begins_like_a_sentence_has_no_file_kind():
     body = b"MZ-Berlin weekly report: " + b"the numbers for the week are in the sheet. " * 20
     up = _events(b"POST /u HTTP/1.1\r\nHost: x.top\r\nContent-Length: %d\r\n\r\n" % len(body) + body,
