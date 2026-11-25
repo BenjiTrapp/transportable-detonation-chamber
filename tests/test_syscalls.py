@@ -2996,8 +2996,12 @@ def target(tdc, monkeypatch, fake_baseline_dir):
     monkeypatch.setattr(tdc, "_syscall_view_for_pid", lambda pid: t.view)
     monkeypatch.setattr(tdc, "_image_path_for_pid", lambda pid: "C:\\Samples\\sample.exe")
     monkeypatch.setattr(tdc, "_open_syscall_reader", opening)
-    monkeypatch.setattr(tdc, "_record_scan",
-                        lambda tool, name, result, status="ok": t.history.append((tool, name, result, status)))
+    # _record_scan hands back the id of the entry it wrote; the syscall stage keeps it to name its measurement
+    def recording(tool, name, result, status="ok"):
+        t.history.append((tool, name, result, status))
+        return f"hist{len(t.history)}"
+
+    monkeypatch.setattr(tdc, "_record_scan", recording)
     t.reader = _reader_from(syscall_baseline.load_baseline(str(fake_baseline_dir / "ntsleuth-26220.5770-arm64.json")),
                             patched={})
     return t
@@ -5491,3 +5495,17 @@ def test_an_unknown_measurement_is_a_404_and_an_id_that_is_not_one_is_refused(cl
     assert client.get("/api/syscalls/measurement?id=deadbeef").status_code == 404
     assert client.get("/api/syscalls/measurement").status_code == 400
     assert client.get("/api/syscalls/measurement?id=" + "x" * 200).status_code == 400
+
+
+def test_the_stage_keeps_the_history_id_so_the_memory_tab_can_name_its_measurement(
+        tdc, pipeline, monkeypatch, fake_baseline_dir, target):
+    """The button in the detonation's memory block hands a measurement to the map, and the map asks for it by the
+    history id. The stage's own result carried no id - the history makes one when it records - so the block had no
+    way to name what it was showing. The stage records first and keeps the id it got."""
+    target.reader = _patched_reader(tdc, fake_baseline_dir, "private")
+    _detonate(tdc)
+    stored = tdc._beacon_results_cache.lookup("syscalls", 4812, SHA_SAMPLE)
+    tool, _name, recorded, _status = next(h for h in target.history if h[0] == "Syscalls")
+    assert tool == "Syscalls"
+    assert stored["history_id"] == "hist1", "the cached stage result names the history entry the map would load"
+    assert "history_id" not in recorded, "the id is not part of what it identifies"

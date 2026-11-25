@@ -527,10 +527,12 @@ def _normalize_scan(tool, result):
 
 
 def _record_scan(tool, filename, result, status="ok"):
-    """Append a scan to the shared history timeline (best-effort).
+    """Append a scan to the shared history timeline (best-effort); the id of the entry, or "".
 
     ``result`` is the full JSON dict returned to the client (stored verbatim
     for the "> more" expander); ``status`` is "ok", "timeout", or "error".
+    The id is what names this measurement afterwards: the syscall stage keeps it
+    so a detonation's memory block can hand its measurement to the map.
     """
     import datetime
     try:
@@ -557,8 +559,9 @@ def _record_scan(tool, filename, result, status="ok"):
             if len(history) > SCAN_HISTORY_MAX:
                 del history[SCAN_HISTORY_MAX:]
             _save_scan_history(history)
+        return entry["id"]
     except Exception:
-        pass  # history must never break a scan
+        return ""  # history must never break a scan
 
 
 # --- Scan <-> process/sample correlation (graph enrichment) ---
@@ -9698,8 +9701,10 @@ def _run_memory_scans_async(pid, sha256, path=None):
                 notes = []
                 syscall_result = _run_syscall_stage(pid, path, notes)
                 if syscall_result:
-                    _beacon_results_cache.put("syscalls", syscall_result, pid=pid, sha256=sha256)
-                    _record_scan("Syscalls", f"PID {pid}", syscall_result)
+                    # recorded first: the id it gets back is how the memory block names this measurement to the map
+                    history_id = _record_scan("Syscalls", f"PID {pid}", syscall_result)
+                    _beacon_results_cache.put("syscalls", {**syscall_result, "history_id": history_id},
+                                              pid=pid, sha256=sha256)
                 else:
                     _beacon_results_cache.put("syscalls", {"tool": "Syscalls", "skipped": "; ".join(notes) or "skipped"},
                                               pid=pid, sha256=sha256)
