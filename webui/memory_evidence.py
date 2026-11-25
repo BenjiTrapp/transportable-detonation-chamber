@@ -1291,6 +1291,15 @@ def collect(results, process=""):
     if isinstance(pipes, dict) and pipes.get("evidence_findings"):
         findings += pipes["evidence_findings"]
 
+    # The network report imported for the sample (net_evidence, source
+    # "network"). It only holds findings of events the network baseline does
+    # not know; one marked baseline anyway stays out. Copies: the report is the
+    # stored one, and scoring must not write into it.
+    report = results.get("network") or {}
+    if isinstance(report, dict) and isinstance(report.get("evidence_findings"), list):
+        findings += [dict(f) for f in report["evidence_findings"]
+                     if isinstance(f, dict) and not f.get("baseline")]
+
     dyn = results.get("litterbox_dynamic") or {}
     if isinstance(dyn, dict):
         findings += from_pe_sieve(dyn.get("pe_sieve") or dyn.get("pe_sieve_results") or {}, process)

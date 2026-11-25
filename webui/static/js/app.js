@@ -4126,6 +4126,35 @@ const RTRACE_DETAIL_TABS = [['verdict', 'VERDICT', false], ['live', 'LIVE', fals
 // The event types of a network report each network sub-tab shows
 const RTRACE_NETWORK_TYPES = { http: ['http'], connections: ['conn', 'conn_failed', 'udp'], dns: ['dns'], tls: ['tls'] };
 
+// The events of the network reports the detonation results send without them:
+// fetched once per report id from /api/network/report and kept for the last few
+const rtraceNetworkFetched = new Map();
+const RTRACE_NETWORK_FETCHED_MAX = 5;
+
+// { events } of a report: its own, the fetched ones, or events null while the
+// fetch is on the way (failed: true when it failed; it is not tried again)
+function rtraceReportEvents(report) {
+    if (Array.isArray(report.events)) return { events: report.events, failed: false };
+    const id = report.id ? String(report.id) : '';
+    if (!id) return { events: [], failed: false };
+    const known = rtraceNetworkFetched.get(id);
+    if (known) return known;
+    const entry = { events: null, failed: false };
+    rtraceNetworkFetched.set(id, entry);
+    while (rtraceNetworkFetched.size > RTRACE_NETWORK_FETCHED_MAX) rtraceNetworkFetched.delete(rtraceNetworkFetched.keys().next().value);
+    fetch(`/api/network/report?id=${encodeURIComponent(id)}`)
+        .then(networkJson)
+        .then(data => { entry.events = Array.isArray(data.events) ? data.events : []; })
+        .catch(() => { entry.failed = true; })
+        .then(() => {
+            if (state.activeTab === 'tracing' && state.rtraceSelectedPid) {
+                showRtraceDetailTabs();
+                showRtraceEventTable();
+            }
+        });
+    return entry;
+}
+
 // What the sub-tabs of the selected process show: its alerts and its
 // children's, its activity counts, the active sub-tab, and the events of a
 // network report - the one the detonation's results carry, else the one open
@@ -4145,7 +4174,9 @@ function rtraceState() {
     const detonation = networkReportOf({ network: state.detonationNetwork });
     const report = detonation || networkReportOf({ network: networkState.report });
     if (report) {
-        view.network = Array.isArray(report.events) ? report.events : [];
+        const got = rtraceReportEvents(report);
+        view.network = got.events || [];
+        if (!got.events) view.networkPending = got.failed ? 'failed' : 'loading';
         view.networkReport = report;
         view.networkSource = detonation ? 'detonation' : 'network-tab';
     }
@@ -4179,7 +4210,11 @@ function renderRtraceDetailTabs(view) {
         } else if (key === 'tls') {
             title = 'TLS handshakes come from a network report: import a capture in the NETWORK tab.';
         }
-        const count = net ? net.length : counts[key];
+        let count = net ? net.length : counts[key];
+        if (net && view.networkPending) {
+            const summary = (view.networkReport && view.networkReport.event_summary) || {};
+            count = RTRACE_NETWORK_TYPES[key].reduce((sum, t) => sum + (Number(summary[t]) || 0), 0);
+        }
         return `<button type="button" class="rtrace-tab${key === active ? ' active' : ''}" data-rtab="${escapeHtml(key)}"${title ? ` title="${escapeHtml(title)}"` : ''}>${escapeHtml(label)}${counted ? ` <span class="rtrace-tab-count">${escapeHtml(String(count))}</span>` : ''}</button>`;
     }).join('');
 }
@@ -4243,6 +4278,11 @@ function rtraceNetworkRows(kind, events, view) {
     const report = (view && view.networkReport) || {};
     const from = view && view.networkSource === 'detonation' ? 'the network report of this detonation' : 'the report open in the NETWORK tab';
     let html = `<div class="net-note">Capture-wide, from ${escapeHtml(from)}${report.filename ? ' (' + escapeHtml(networkText(report.filename)) + ')' : ''}: a capture knows no processes, so these events are not attributed to a process.</div>`;
+    if (view && view.networkPending) {
+        return html + (view.networkPending === 'failed'
+            ? '<div class="net-empty">The events of the network report could not be loaded.</div>'
+            : '<div class="net-empty">Loading the events of the network report&hellip;</div>');
+    }
     if (!events.length) {
         const what = { http: 'HTTP requests', connections: 'connections', dns: 'DNS lookups', tls: 'TLS handshakes' }[kind] || 'events';
         return html + networkEmpty(report, what);
@@ -8765,7 +8805,7 @@ function renderDetonationPanels(data) {
     // Network: the report of an imported or assigned capture, an evidence source of its own
     const networkReport = data.network ? networkReportOf(data) : null;
     if (networkReport) {
-        const events = Array.isArray(networkReport.events) ? networkReport.events.length : 0;
+        const events = networkEventCount(networkReport);
         tabs.push({ id: 'det-tab-network', label: 'Network', count: events, body: renderNetworkPanel(data) });
     }
 
@@ -13148,6 +13188,14 @@ function networkCut(shown, total) {
     return total > shown ? `<div class="net-note">The first ${shown} of ${total} rows are listed.</div>` : '';
 }
 
+// How many events a report has: its events, or the number the detonation
+// results send instead of them (event_count)
+function networkEventCount(report) {
+    if (Array.isArray(report.events)) return report.events.length;
+    const n = Number(report.event_count);
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+}
+
 function networkEventsOf(report, types) {
     return (Array.isArray(report.events) ? report.events : []).filter(e => e && typeof e === 'object' && types.includes(e.type));
 }
@@ -13327,7 +13375,7 @@ function networkStatusHtml(report, findings) {
         html += `<div class="net-banner"><span class="net-banner-title">NO ACTIVE FINDING</span>
             <div>${escapeHtml(allOut)} Every rule was decided and none hit.</div></div>`;
     } else if (quiet) {
-        const count = Array.isArray(report.events) ? report.events.length : 0;
+        const count = networkEventCount(report);
         html += `<div class="net-banner net-banner-clear"><span class="net-banner-title">NOTHING FOUND</span>
             <div>${count} event(s) were evaluated, every rule was decided, and no rule hit or finding came out.</div></div>`;
     }
@@ -13444,7 +13492,7 @@ function networkOverviewPane(report) {
     let html = `<div class="net-meta">${meta.map(([k, v]) => `<span><b>${escapeHtml(k.toUpperCase())}</b> ${escapeHtml(networkText(v))}</span>`).join('')}</div>`;
     html += networkStatusHtml(report);
     html += `<div class="mem-chips">`
-        + `<span class="mem-chip"><span class="mem-chip-val">${count('events')}</span>events</span>`
+        + `<span class="mem-chip"><span class="mem-chip-val">${networkEventCount(report)}</span>events</span>`
         + `<span class="mem-chip"><span class="mem-chip-val">${count('rule_hits')}</span>rule hits</span>`
         + `<span class="mem-chip"><span class="mem-chip-val">${networkFindingGroups(report.evidence_findings).active.length}</span>findings</span>`
         + `<span class="mem-chip"><span class="mem-chip-val">${count('iocs')}</span>indicators</span>`
@@ -13502,7 +13550,7 @@ function renderNetworkPanel(results) {
     const count = key => (Array.isArray(report[key]) ? report[key].length : 0);
     let html = `<div class="det-sub-title" data-info="What the network report of this run holds. Network is an evidence source of its own, apart from live memory.">Network &mdash; report of the capture</div>`;
     html += `<div class="mem-chips">`
-        + `<span class="mem-chip"><span class="mem-chip-val">${count('events')}</span>events</span>`
+        + `<span class="mem-chip"><span class="mem-chip-val">${networkEventCount(report)}</span>events</span>`
         + `<span class="mem-chip"><span class="mem-chip-val">${count('rule_hits')}</span>rule hits</span>`
         + `<span class="mem-chip"><span class="mem-chip-val">${groups.active.length}</span>findings</span>`
         + (groups.superseded.length + groups.baseline.length ? `<span class="mem-chip sev-info"><span class="mem-chip-val">${groups.superseded.length + groups.baseline.length}</span>suppressed or superseded</span>` : '')
@@ -13648,6 +13696,11 @@ async function networkImport() {
     const input = document.getElementById('net-file');
     const file = input && input.files && input.files[0];
     if (!file) { networkMessage('Choose a pcap or pcapng file first.', true); return; }
+    const sample = ((document.getElementById('net-sample') || {}).value || '').trim();
+    if (sample && !/^[0-9a-fA-F]{64}$/.test(sample)) {
+        networkMessage('The sample SHA256 must be 64 hex digits, or empty.', true);
+        return;
+    }
     if (networkState.busy) return;
     networkState.busy = true;
     const button = document.getElementById('net-import-btn');
@@ -13657,12 +13710,14 @@ async function networkImport() {
         const form = new FormData();
         form.append('file', file);
         form.append('mode', (document.getElementById('net-mode') || {}).value || 'online');
+        if (sample) form.append('sha256', sample.toLowerCase());
         const resp = await fetch('/api/network/import', { method: 'POST', body: form });
         const data = await networkJson(resp);
         networkState.seq++;
         networkState.sub = 'overview';
         networkShowReport(data);
-        networkMessage(`Analyzed ${data.filename || file.name}: ${(data.events || []).length} events.`);
+        networkMessage(`Analyzed ${data.filename || file.name}: ${(data.events || []).length} events`
+            + (data.sample_sha256 ? `, tied to the sample ${String(data.sample_sha256).slice(0, 12)}\u2026.` : '.'));
         input.value = '';
         await networkRefreshReports();
     } catch (e) {

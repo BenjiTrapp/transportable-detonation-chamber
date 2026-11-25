@@ -1666,7 +1666,7 @@ All endpoints served on port `9000`. Responses are JSON.
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | POST | `/api/submit` | Submit sample (multipart). Params: `file`, `target` (agent/litterbox/both) |
-| GET | `/api/detonation/results` | Poll results. Params: `sha256`, `pid`, `litterbox_hash`, `filename` |
+| GET | `/api/detonation/results` | Poll results. Params: `sha256`, `pid`, `litterbox_hash`, `filename`. With a network report imported for the sample: `network`, the newest one still kept, without its events (`event_count` instead; fetch them from `/api/network/report`), its findings scored in the verdict |
 
 ### Process Graph
 
@@ -1771,7 +1771,7 @@ One rizin session per opened file and browser tab (RIZIN tab). Addresses are int
 | GET / DELETE | `/api/memory/baseline` | Host memory baseline statistics / clear it. `stale: true` means it was built with an older key scheme and is ignored until captured again |
 | POST | `/api/memory/baseline/capture` | Record findings of named processes as baseline. Params: `names`, `samples` |
 | POST / GET | `/api/memory/sweep` | Background sweep of every process (`aether`, `processdump`, `baseline`) / status + result |
-| POST | `/api/network/import` | Analyze an uploaded pcap or pcapng and keep the report. Form fields: `file`, `mode` (`online` default, or `isolated`), `process`, `sha256` (optional: the SHA256 of the detonated sample the capture belongs to, 64 hex digits, else 400; `/api/detonation/results` of that sample then carries the newest such report as `network`). Returns the report (events, rule hits, findings, IOCs, files; passwords masked) with `id`, `filename`, `timestamp`, `sample_sha256`; 400 for a file that is not a pcap, 413 over 256 MB |
+| POST | `/api/network/import` | Analyze an uploaded pcap or pcapng and keep the report. Form fields: `file`, `mode` (`online` default, or `isolated`), `process`, `sha256` (optional: the SHA256 of the detonated sample the capture belongs to, 64 hex digits, else 400; `/api/detonation/results` of that sample then carries the newest such report as `network`, without its events). Returns the report (events, rule hits, findings, IOCs, files; passwords masked) with `id`, `filename`, `timestamp`, `sample_sha256`; 400 for a file that is not a pcap, 413 over 256 MB |
 | GET | `/api/network/report` | A stored network report. Params: `id` (as returned by the import) |
 | GET | `/api/network/reports` | Stored network reports, newest first: `id`, `filename`, `timestamp`, `mode` and a `summary` (counts, `verdict`, `score`), not the report |
 | GET | `/api/network/baseline` | What the network baseline of this VM holds (`count`, `by_type`; `stale: true` when built with an older key scheme) |

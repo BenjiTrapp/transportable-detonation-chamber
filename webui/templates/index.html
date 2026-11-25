@@ -586,6 +586,8 @@
                             <option value="online" selected>online</option>
                             <option value="isolated">isolated</option>
                         </select></label>
+                    <label class="net-field"><span>Sample SHA256 (optional)</span>
+                        <input type="text" id="net-sample" class="filter-input" maxlength="64" spellcheck="false" autocomplete="off" placeholder="the detonated sample" title="The SHA256 of the detonated sample this capture belongs to: its detonation results then carry this report, and its findings count in the verdict."></label>
                     <button type="button" class="etw-btn" id="net-import-btn" onclick="networkImport()">Import</button>
                     <button type="button" class="btn btn-sm" onclick="networkRefreshReports()">Refresh</button>
                 </div>
@@ -1483,7 +1485,7 @@
                         <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
                         <tbody>
                             <tr><td class="api-post">POST</td><td><code>/api/submit</code></td><td>Submit a sample. Params: <code>file</code>, <code>target</code> (agent/litterbox/both)</td></tr>
-                            <tr><td class="api-get">GET</td><td><code>/api/detonation/results</code></td><td>Combined verdict and results. Params: <code>sha256</code>, <code>pid</code>, <code>filename</code></td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/detonation/results</code></td><td>Combined verdict and results. Params: <code>sha256</code>, <code>pid</code>, <code>filename</code>. Carries <code>network</code> (the sample's newest network report, without its events) when one was imported for the sample</td></tr>
                             <tr><td class="api-get">GET</td><td><code>/api/process-graph</code></td><td>Process tree around a process. Params: <code>pid</code>, <code>at</code>, <code>down_depth</code>, <code>max_nodes</code></td></tr>
                         </tbody>
                     </table>
@@ -1675,6 +1677,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
          in app.js); set as text, never as markup -->
     <div id="info-popover" class="info-popover" role="status" hidden></div>
 
-    <script src="/static/js/app.js?v=105"></script>
+    <script src="/static/js/app.js?v=106"></script>
 </body>
 </html>

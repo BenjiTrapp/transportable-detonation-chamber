@@ -16,6 +16,7 @@ Regressions covered:
 
 import base64
 import io
+import json
 import os
 
 import pytest
@@ -467,7 +468,9 @@ def test_the_detonation_results_carry_the_newest_report_of_the_sample(client, td
     _upload(client, _pcap_with_http_c2(tmp_path), "loose.pcap")
     stored = client.get("/api/network/report?id=" + newest["id"]).get_json()
     got = _poll(client, tdc, monkeypatch, "sha256=%s&pid=4242" % SAMPLE).get_json()
-    assert got["network"] == stored and got["network"]["filename"] == "new.pcap"
+    eventless = {k: v for k, v in stored.items() if k not in ("events", "behavior")}
+    assert got["network"] == dict(eventless, event_count=len(stored["events"]))
+    assert got["network"]["filename"] == "new.pcap" and stored["events"]
     assert _poll(client, tdc, monkeypatch, "sha256=" + SAMPLE.upper()).get_json()["network"]["id"] == newest["id"]
     assert _poll(client, tdc, monkeypatch, "sha256=" + OTHER).get_json()["network"]["filename"] == "other.pcap"
     assert "network" not in _poll(client, tdc, monkeypatch, "sha256=" + "c3" * 32).get_json()
@@ -511,3 +514,112 @@ def test_the_detonation_results_carry_no_password_of_the_report(client, tdc, tmp
     assert b'"network"' in raw
     for secret in secrets:
         assert secret.encode() not in raw, secret
+
+
+def test_the_poll_carries_no_events_of_the_report(client, tdc, tmp_path, monkeypatch):
+    """Regressions covered (Ruling 66): the whole report, events and all, rode
+    along on every 5 s poll. The results carry it without `events` and
+    `behavior`, with their number; ids, counts, findings, indicators, files
+    and the status keys stay, and the stored report keeps its events."""
+    rid = _upload(client, _pcap_with_http_c2(tmp_path), sha256=SAMPLE).get_json()["id"]
+    net = _poll(client, tdc, monkeypatch, "sha256=" + SAMPLE).get_json()["network"]
+    assert "events" not in net and "behavior" not in net
+    for key in ("id", "event_summary", "evidence_findings", "iocs", "files", "observed", "note",
+                "truncated", "errors", "rule_hits", "rule_unevaluated", "rule_budget_spent"):
+        assert key in net, key
+    stored = client.get("/api/network/report?id=" + rid).get_json()
+    assert net["event_count"] == len(stored["events"]) > 0
+
+
+def test_an_evicted_newest_report_falls_back_to_the_newest_still_kept(client, tdc, tmp_path, monkeypatch):
+    """Regressions covered (Ruling 68): the index named only the newest report of
+    a sample, so once the store dropped it the results carried none although an
+    older report of the sample was still kept."""
+    old = _upload(client, _pcap_with_http_c2(tmp_path), "old.pcap", sha256=SAMPLE).get_json()["id"]
+    mid = _upload(client, _pcap_with_http_c2(tmp_path), "mid.pcap", sha256=SAMPLE).get_json()["id"]
+    new = _upload(client, _pcap_with_http_c2(tmp_path), "new.pcap", sha256=SAMPLE).get_json()["id"]
+    assert _poll(client, tdc, monkeypatch, "sha256=" + SAMPLE).get_json()["network"]["id"] == new
+    with tdc._net_reports._lock:
+        tdc._net_reports._mem.pop("netreport_" + new)
+    assert _poll(client, tdc, monkeypatch, "sha256=" + SAMPLE).get_json()["network"]["id"] == mid
+    with tdc._net_reports._lock:
+        tdc._net_reports._mem.pop("netreport_" + mid)
+    assert _poll(client, tdc, monkeypatch, "sha256=" + SAMPLE).get_json()["network"]["id"] == old
+    # an index entry of the first version (one id) still works
+    tdc._net_reports.put("netsample", {"id": old}, sha256=OTHER)
+    assert _poll(client, tdc, monkeypatch, "sha256=" + OTHER).get_json()["network"]["id"] == old
+
+
+def test_the_index_of_a_sample_is_bounded(client, tdc, tmp_path, monkeypatch):
+    monkeypatch.setattr(tdc, "NET_REPORTS_KEEP", 2)
+    ids = [_upload(client, _pcap_with_http_c2(tmp_path), sha256=SAMPLE).get_json()["id"] for _ in range(3)]
+    assert tdc._net_reports.lookup("netsample", sha256=SAMPLE) == {"ids": ids[::-1][:2]}
+
+
+# --- network findings in the combined verdict (Ruling 65) ----------------------------------
+
+def _verdict_with(client, tdc, tmp_path, monkeypatch, path=None):
+    if path is not None:
+        assert _upload(client, path, sha256=SAMPLE).status_code == 200
+    return _poll(client, tdc, monkeypatch, "sha256=%s&filename=evil.exe" % SAMPLE).get_json()
+
+
+def test_without_a_report_the_verdict_is_what_it_was(client, tdc, tmp_path, monkeypatch):
+    """Regressions covered: the network source changes nothing when there is no report."""
+    d = _verdict_with(client, tdc, tmp_path, monkeypatch)
+    assert d["verdict"]["label"] == "CLEAN" and d["verdict"]["score"] == 0
+    assert "memory_evidence" not in d and "network" not in d
+
+
+def test_an_hour_of_ordinary_traffic_keeps_the_verdict_clean(client, tdc, tmp_path, monkeypatch):
+    """Regressions covered: a benign capture must not raise the verdict; it is a
+    source that was looked at (sources_present), and nothing scores."""
+    from test_net_default_rules import _benign_capture
+    monkeypatch.setattr(Capture, "read", lambda self: self)
+    d = _verdict_with(client, tdc, tmp_path, monkeypatch, _write(tmp_path, _benign_capture(), "hour.pcap"))
+    assert d["verdict"]["label"] == "CLEAN" and d["verdict"]["score"] == 0
+    assert d["memory_evidence"]["sources_present"] == ["network"]
+    assert d["memory_evidence"]["label"] == "CLEAN"
+
+
+def test_a_c2_capture_raises_the_combined_verdict(client, tdc, tmp_path, monkeypatch):
+    """Regressions covered: "network findings in the common verdict" was promised
+    for Phase 1 and nothing fed them in. The report's findings score with source
+    "network" in the same memory evidence the verdict folds in."""
+    cap = Capture()
+    na._http_c2(cap)
+    cap.get(50.0, "stage.top", "/a.bin", na._pe(), "application/octet-stream")
+    d = _verdict_with(client, tdc, tmp_path, monkeypatch, _write(tmp_path, cap, "c2.pcap"))
+    ev = d["memory_evidence"]
+    assert ev["sources_present"] == ["network"]
+    assert sorted(f["kind"] for f in ev["findings"]) == ["c2_checkin", "payload_staging"]
+    assert all(f["source"] == "network" for f in ev["findings"])
+    assert ev["label"] == "SUSPICIOUS" and ev["score"] == 5.6
+    assert d["verdict"]["label"] == "SUSPICIOUS" and d["verdict"]["score"] == 2
+
+
+def test_a_lone_check_in_without_a_second_signal_does_not_raise_the_verdict(client, tdc, tmp_path, monkeypatch):
+    """Regressions covered (Ruling 51): a capture knows no process, so a check-in
+    on its own needs a host-side second opinion; uncorroborated it is listed
+    (scored down) but leaves the verdict clean."""
+    d = _verdict_with(client, tdc, tmp_path, monkeypatch, _pcap_with_http_c2(tmp_path))
+    ev = d["memory_evidence"]
+    assert [f["kind"] for f in ev["findings"]] == ["c2_checkin"] and ev["score"] == 1.6
+    assert ev["label"] == "CLEAN" and d["verdict"]["label"] == "CLEAN"
+
+
+def test_scoring_does_not_write_into_the_stored_report(client, tdc, tmp_path, monkeypatch):
+    """Regressions covered: the store hands out its own dicts; the verdict's
+    scoring must work on copies of the findings."""
+    rid = _upload(client, _pcap_with_http_c2(tmp_path), sha256=SAMPLE).get_json()["id"]
+    before = json.dumps(tdc._net_reports.lookup("netreport", sha256=rid), sort_keys=True)
+    _poll(client, tdc, monkeypatch, "sha256=" + SAMPLE)
+    _poll(client, tdc, monkeypatch, "sha256=" + SAMPLE)
+    assert json.dumps(tdc._net_reports.lookup("netreport", sha256=rid), sort_keys=True) == before
+
+
+def test_findings_marked_baseline_stay_out_of_the_verdict(tdc):
+    results = {"network": {"evidence_findings": [
+        {"source": "network", "kind": "exfil_upload", "baseline": "known", "key": "k1"},
+        {"source": "network", "kind": "dga_pattern", "key": "k2"}]}}
+    assert [f["kind"] for f in tdc.memory_evidence.collect(results)] == ["dga_pattern"]

@@ -4263,10 +4263,10 @@ def api_detonation_results():
     if exitcapture_result:
         results["exit_capture_result"] = exitcapture_result
 
-    # --- The network report imported for this sample (stored masked, returned as stored) ---
+    # --- The network report imported for this sample (stored masked, sent without its events) ---
     network_report = _net_report_for_sample(sha256)
     if network_report is not None:
-        results["network"] = network_report
+        results["network"] = _net_poll_copy(network_report)
 
     # --- Network beaconing from Sysmon EID 3 (survives process exit) ---
     if pid:
@@ -4745,6 +4745,10 @@ def _compute_verdict(results, matching_alerts):
         mem_sources.append("network_beaconing")
     if (results.get("named_pipes") or {}).get("evidence_findings"):
         mem_sources.append("named_pipes")
+    # The network report of the sample: a source as soon as there is one, so a
+    # capture that found nothing still says it was looked at
+    if isinstance(results.get("network"), dict):
+        mem_sources.append("network")
     if mem_sources:
         evidence = memory_evidence.score(mem_findings, baseline=_memory_baseline)
 
@@ -7709,6 +7713,7 @@ _NET_REPORT_ID = re.compile(r"[0-9a-f]{32}")
 _NET_SAMPLE_SHA256 = re.compile(r"[0-9a-f]{64}")
 _NET_MODES = ("online", "isolated")
 _NET_PROCESS_MAX = 260
+_net_sample_lock = threading.Lock()
 _net_sequence = itertools.count()
 
 
@@ -7888,24 +7893,51 @@ def api_network_import():
     _net_reports.put("netsummary", summary, sha256=report["id"])
     # after the report: a poll that finds the index finds the report too
     if report["sample_sha256"]:
-        _net_reports.put("netsample", {"id": report["id"]}, sha256=report["sample_sha256"])
+        with _net_sample_lock:
+            ids = _net_sample_ids(_net_reports.lookup("netsample", sha256=report["sample_sha256"]))
+            ids = [report["id"]] + [i for i in ids if i != report["id"]]
+            _net_reports.put("netsample", {"ids": ids[:NET_REPORTS_KEEP]},
+                             sha256=report["sample_sha256"])
     return jsonify(report)
 
 
-def _net_report_for_sample(sha256):
-    """The newest stored network report imported for this sample, as stored, or None.
+def _net_sample_ids(entry):
+    """The report ids of a "netsample_<sha256>" entry, newest first (an entry of the
+    first version held one `id`); anything that is no report id is dropped."""
+    if not isinstance(entry, dict):
+        return []
+    ids = entry.get("ids") if isinstance(entry.get("ids"), list) else [entry.get("id")]
+    return [i for i in ids if isinstance(i, str) and _NET_REPORT_ID.fullmatch(i)]
 
-    /api/detonation/results is polled every 5 s: this is two lookups by key
-    ("netsample_<sha256>" names the report id), never a scan over the reports.
+
+def _net_report_for_sample(sha256):
+    """The newest network report still stored that was imported for this sample,
+    as stored, or None.
+
+    /api/detonation/results is polled every 5 s: "netsample_<sha256>" lists the
+    sample's report ids newest first, so this is a key lookup and a membership
+    test per id until one is still kept (an evicted newest report falls back to
+    the next), never a scan over the reports.
     """
     sample = (sha256 or "").strip().lower()
     if not _NET_SAMPLE_SHA256.fullmatch(sample):
         return None
-    entry = _net_reports.lookup("netsample", sha256=sample)
-    report_id = entry.get("id") if isinstance(entry, dict) else None
-    if not isinstance(report_id, str) or not _NET_REPORT_ID.fullmatch(report_id):
-        return None
-    return _net_reports.lookup("netreport", sha256=report_id)
+    for report_id in _net_sample_ids(_net_reports.lookup("netsample", sha256=sample)):
+        if _net_reports.has("netreport_" + report_id):
+            report = _net_reports.lookup("netreport", sha256=report_id)
+            if report is not None:
+                return report
+    return None
+
+
+def _net_poll_copy(report):
+    """What the detonation results carry of a report: everything but its events
+    (and the behaviour events among them), with their number. The results are
+    polled every 5 s; whoever needs the events fetches them once from
+    /api/network/report."""
+    copy = {k: v for k, v in report.items() if k not in ("events", "behavior")}
+    copy["event_count"] = len(report.get("events") or [])
+    return copy
 
 
 @app.route("/api/network/report", methods=["GET"])

@@ -33,7 +33,7 @@ REPORT_FNS = [
     "renderNetworkReport", "networkOverviewPane", "networkConnectionsPane", "networkDnsPane",
     "networkHttpPane", "networkTlsPane", "networkFilesPane", "networkIocsPane", "networkText",
     "networkTime", "networkHeader", "networkTypeChip", "networkFlags", "networkRowClass",
-    "networkProcess", "networkDetail", "networkEmpty", "networkCut", "networkEventsOf",
+    "networkProcess", "networkDetail", "networkEmpty", "networkCut", "networkEventsOf", "networkEventCount",
     "networkUndecided", "networkStatusHtml", "networkFindingGroups", "networkFindingHtml",
     "networkFindingsHtml", "networkRuleHitsHtml", "networkEventTypesCard",
     "escapeHtml", "cssToken", "sortNumberValue", "severitySortValue", "formatSize",
@@ -868,7 +868,7 @@ def test_the_tracing_functions_take_colours_from_theme_variables_only():
     assert not re.search(r"#[0-9a-fA-F]{3,8}\b|rgba?\(|hsl\(", re.sub(r"&#\d+;", "", src))
 
 
-STATE_FNS = ["rtraceState", "networkReportOf"]
+STATE_FNS = ["rtraceState", "networkReportOf", "rtraceReportEvents", "networkJson"]
 
 
 def _state_of(detonation, network_tab):
@@ -900,3 +900,106 @@ def test_the_detonation_results_hand_their_report_to_tracing():
     for name in ("renderDetonationPanels", "viewDetonationResult"):
         assert re.search(r"state\.detonationNetwork = .*networkReportOf\(data\)", _function_source(name)), name
 
+
+
+# --- the eventless report of the poll, the sample field (Rulings 66, 67) ------------------------
+#
+# Regressions covered:
+#   * the detonation results carried every event of the report on every 5 s poll; they now send
+#     event_count instead, and the Submit panel must count from it
+#   * Tracing needs the events: fetched once per report id, not on every render or poll
+#   * the import had no way to tie a capture to the detonated sample
+
+@needs_node
+def test_the_panel_works_from_the_eventless_copy_of_the_poll():
+    html = _panel({"network": {"id": "a" * 32, "event_count": 7, "observed": True, "event_summary": {"dns": 7},
+                               "evidence_findings": [], "rule_hits": [], "iocs": [], "files": []}})
+    assert '<span class="mem-chip-val">7</span>events' in html
+    assert "NOTHING FOUND" in html and "7 event(s) were evaluated" in html
+
+
+@needs_node
+def test_tracing_fetches_the_events_of_a_report_once_per_id():
+    r = _run_node(STATE_FNS + ["renderRtraceDetailTabs", "renderRtraceEventTable", "rtraceNetworkEvents",
+                               "rtraceNetworkRows", "escapeHtml", "networkText"], r"""
+        (async () => {
+            const fetched = [];
+            const answers = { ['a'.repeat(32)]: { events: [{ type: 'dns', dest: 'evil.top' }, { type: 'dns', dest: 'b.top' }] } };
+            globalThis.fetch = url => {
+                fetched.push(url);
+                const id = new URL(url, 'http://x').searchParams.get('id');
+                return Promise.resolve(answers[id]
+                    ? { ok: true, status: 200, json: async () => answers[id] }
+                    : { ok: false, status: 404, json: async () => ({ error: 'no such report' }) });
+            };
+            const redraws = [];
+            globalThis.showRtraceDetailTabs = () => redraws.push('tabs');
+            globalThis.showRtraceEventTable = () => redraws.push('rows');
+            globalThis.networkEmpty = () => 'EMPTY';
+            const det = id => ({ id, observed: true, event_summary: { dns: 2, http: 1 } });
+            globalThis.state = { processes: { '7': { pid: 7, alerts: [] } }, rtraceSelectedPid: '7', activeTab: 'tracing',
+                                 rtraceActiveDetailTab: 'dns', detonationNetwork: det('a'.repeat(32)) };
+            const first = rtraceState();
+            const r = { pending: first.networkPending, loadingRows: renderRtraceEventTable('dns', first),
+                        pendingTabs: renderRtraceDetailTabs(first) };
+            rtraceState(); rtraceState();
+            await new Promise(res => setImmediate(res));
+            const ready = rtraceState();
+            r.ready = [ready.networkPending || null, ready.network.map(e => e.dest)];
+            r.redraws = redraws.slice();
+            state.detonationNetwork = det('b'.repeat(32));
+            rtraceState();
+            await new Promise(res => setImmediate(res));
+            const failed = rtraceState(); rtraceState();
+            r.failed = [failed.networkPending, renderRtraceEventTable('dns', failed)];
+            state.detonationNetwork = det('a'.repeat(32));
+            rtraceState();
+            r.fetched = fetched;
+            console.log(JSON.stringify(r));
+        })();
+    """, _const("networkState") + "\n" + "\n".join(_const(c) for c in (
+        "rtraceNetworkFetched", "RTRACE_NETWORK_FETCHED_MAX", "RTRACE_DETAIL_TABS", "RTRACE_NETWORK_TYPES"))
+        + "\nconst NETWORK_ROWS_MAX = 1000;")
+    assert r["pending"] == "loading" and "Loading the events" in r["loadingRows"]
+    assert _tab_counts(r["pendingTabs"])["dns"] == "2" and _tab_counts(r["pendingTabs"])["http"] == "1", \
+        "while the events load, the counts come from the event summary"
+    assert r["ready"] == [None, ["evil.top", "b.top"]] and r["redraws"] == ["tabs", "rows"]
+    assert r["failed"][0] == "failed" and "could not be loaded" in r["failed"][1]
+    assert r["fetched"] == ["/api/network/report?id=" + "a" * 32, "/api/network/report?id=" + "b" * 32], \
+        "a report's events were fetched more than once"
+
+
+def test_the_import_form_has_the_optional_sample_field():
+    bar = _tab_block("network")
+    assert re.search(r'<input type="text" id="net-sample"[^>]*maxlength="64"', bar)
+    assert "Sample SHA256 (optional)" in bar
+
+
+@needs_node
+def test_the_import_sends_a_valid_sample_and_refuses_a_malformed_one():
+    r = _run_node(["networkImport"], r"""
+        (async () => {
+            const els = { 'net-file': { files: [{ name: 'c.pcap' }], value: 'c.pcap' }, 'net-mode': { value: 'online' },
+                          'net-sample': { value: '' }, 'net-import-btn': {} };
+            globalThis.document = { getElementById: id => els[id] || null };
+            globalThis.FormData = class { constructor() { this.fields = {}; } append(k, v) { this.fields[k] = v; } };
+            const sent = [], messages = [];
+            globalThis.fetch = (url, opts) => { sent.push(opts.body.fields); return Promise.resolve({}); };
+            globalThis.networkJson = async () => ({ filename: 'c.pcap', events: [], sample_sha256: 'ab'.repeat(32) });
+            globalThis.networkMessage = (text, error) => messages.push([text, !!error]);
+            globalThis.networkShowReport = () => {};
+            globalThis.networkRefreshReports = async () => {};
+            els['net-sample'].value = 'not-a-hash';
+            await networkImport();
+            const refused = [sent.length, messages.pop()];
+            els['net-sample'].value = '  ' + 'AB'.repeat(32) + ' ';
+            await networkImport();
+            const tied = [sent[0], messages.pop()[0]];
+            els['net-sample'].value = '';
+            await networkImport();
+            console.log(JSON.stringify({ refused, tied, loose: sent[1] }));
+        })();
+    """, PRELUDE)
+    assert r["refused"] == [0, ["The sample SHA256 must be 64 hex digits, or empty.", True]]
+    assert r["tied"][0]["sha256"] == "ab" * 32 and "tied to the sample abababababab" in r["tied"][1]
+    assert "sha256" not in r["loose"]
