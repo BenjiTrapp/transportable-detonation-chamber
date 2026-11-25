@@ -604,26 +604,28 @@ def _record_delimiter(line):
 # keep the value, since rules and evidence read it.
 
 MASK = "***"
-# A key is a whole name that begins at the start of the text or after a
-# separator of pairs (whitespace ? & ; , quotes {), so that ``keys.top:8080`` or
-# ``monkey.top`` in a URL is not a key. ``pass`` and the other long words may
-# sit anywhere in that name (``api_key``, ``user.password``).
-_KEY_START = r"(?<![^\s?&;,\"'{])"
-_SECRET_KEY = (_KEY_START + "(?:[A-Za-z0-9_.-]{0,32}" + _SECRET_WORDS + r"[A-Za-z0-9_.-]{0,32}|"
-               + _SHORT_WORDS + ")")
-_SECRET_QUOTED = re.compile(
-    "(" + _SECRET_KEY + r"[\"']?[ \t]*[=:][ \t]*)([\"'])((?:[^\"'\\\n]|\\.)*)\2", re.I)
-_BARE_VALUE = r"[ \t]*)([^\s&;,\"'<>]+)"
-# Outside a body only "=" separates a bare value: "keys.top:8080", a rule's
-# "token_exfil: auth: bearer" and a User-Agent's "key:val" are not pairs.
-_SECRET_BARE = re.compile("(" + _SECRET_KEY + r"[\"']?[ \t]*=" + _BARE_VALUE, re.I)
-_SECRET_BARE_LINES = re.compile("(" + _SECRET_KEY + r"[\"']?[ \t]*[=:]" + _BARE_VALUE, re.I)
-# A key also starts right after a "/" (``/dl/token=abc/file.bin``), where only
-# "=" separates it from its value, in a body as well: ``/key/stage.exe`` and
-# ``keys.top:8080/stage.exe`` are paths and addresses, not pairs.
-_SECRET_SLASH = re.compile(
-    "((?<=/)(?:[A-Za-z0-9_.-]{0,32}" + _SECRET_WORDS + r"[A-Za-z0-9_.-]{0,32}|" + _SHORT_WORDS
-    + r")[\"']?[ \t]*=" + _BARE_VALUE, re.I)
+# A key is a whole name: it begins where a name character ([A-Za-z0-9_.-]) does
+# not come before it, at the start of the text or after any other character
+# (whitespace ? & ; , # | ( [ = / quotes...). The long words may sit anywhere in
+# the name (``api_key``, ``user.password``, ``id_token``). ``keys.top`` is a name
+# too; ``keys.top:8080`` is not a pair because outside bodies and headers only
+# "=" separates a bare value, and even there a colon is no separator for a key
+# right after "/" (``http://keys.top:8080``) or before a port number.
+_NAME_CHARS = "A-Za-z0-9_.-"
+_KEY_BODY = ("(?:[" + _NAME_CHARS + "]{0,32}" + _SECRET_WORDS + "[" + _NAME_CHARS + "]{0,32}|"
+             + _SHORT_WORDS + ")")
+_EQ_START = "(?<![" + _NAME_CHARS + "])"
+_COLON_START = "(?<![" + _NAME_CHARS + "/])"
+_QUOTED_VALUE = r"[ \t]*)([\"'])((?:[^\"'\\\n]|\\.)*)\2"
+_SECRET_QUOTED = re.compile("(" + _EQ_START + _KEY_BODY + r"[\"']?[ \t]*=" + _QUOTED_VALUE, re.I)
+_SECRET_QUOTED_COLON = re.compile(
+    "(" + _COLON_START + _KEY_BODY + r"[\"']?[ \t]*:" + _QUOTED_VALUE, re.I)
+# an authorization value "Bearer <token>" is one value: the scheme and its token
+_BARE_VALUE = r"[ \t]*)((?:(?:basic|bearer|digest|ntlm|negotiate)[ \t]+)?[^\s&;,\"'<>]+)"
+_SECRET_BARE = re.compile("(" + _EQ_START + _KEY_BODY + r"[\"']?[ \t]*=" + _BARE_VALUE, re.I)
+_SECRET_BARE_COLON = re.compile(
+    "(" + _COLON_START + "(" + _KEY_BODY + r")[\"']?[ \t]*:" + _BARE_VALUE, re.I)
+_PORT = re.compile(r"\d{1,5}(?:[/?#]|$)")
 _USERINFO_PASSWORD = re.compile("(" + _URL_SCHEME + r"[^/\s:@]{1,64}:)([^/\s@]{1,128})(@)")
 
 
@@ -673,34 +675,46 @@ def is_secret_name(name):
     return isinstance(name, str) and bool(_SECRET_NAME.search(name))
 
 
-def mask_credentials(text, lines=False):
+def _bare_colon(match):
+    prefix, key, value = match.group(1), match.group(2), match.group(3)
+    if "." in key and _PORT.match(value):
+        return match.group(0)           # host:port, not key:value
+    return prefix + (value if value == MASK else MASK)
+
+
+def mask_credentials(text, lines=False, colons=None):
     """``text`` with every credential value the ``credential`` flag would name
     replaced by ``***``, and everything else kept.
 
     Masked: the value of a key that says secret (``pass``, ``pwd``, ``secret``,
     ``token``, ``key``, ``auth``, ``cred`` anywhere in the name, ``pw`` and
-    ``p`` as whole words; the name begins at the start of the text or after
-    whitespace, ``?``, ``&``, ``;``, ``,``, a quote or ``{``, or, with ``=``
-    only, after a ``/``) in a form, a
-    query or a quoted JSON pair, the password of URL userinfo, and the content
-    of a multipart part with such a name. With ``lines`` (a body, not a query,
-    a URL, a header or other text) ``key: value`` counts as a pair too, every
-    ``name: value`` line loses its value and a credential-dump record keeps
-    only its first field and its URL, as ``_is_credential`` marks both.
-    Outside a body only ``=`` separates a bare value, so ``keys.top:8080`` and
-    a User-Agent's ``key:val`` are left alone. Like that flag
-    it errs towards masking. Not a str: returned as it is.
+    ``p`` as whole words; the name begins wherever no name character
+    ``[A-Za-z0-9_.-]`` precedes it) in a form, a query, a fragment or a quoted
+    pair, the password of URL userinfo, and the content of a multipart part
+    with such a name. With ``colons`` (default: ``lines``) ``key: value``
+    counts as a pair too, unless the key follows a ``/`` or is a host name
+    before a port. With ``lines`` (a body) every ``name: value`` line also
+    loses its value and a credential-dump record keeps only its first field
+    and its URL, so that the mask removes whatever ``_is_credential`` would
+    flag in the same text. Without ``colons`` only ``=`` separates a key from
+    a bare value, so ``keys.top:8080``, a rule's ``token_exfil: auth: bearer``
+    and a User-Agent's ``key:val`` are left alone. Like the flag it errs
+    towards masking. Not a str: returned as it is.
     """
     if not isinstance(text, str) or not text:
         return text
     if text.startswith("--"):
         text = _mask_parts(text)
     text = _USERINFO_PASSWORD.sub(lambda m: m.group(1) + MASK + m.group(3), text)
-    text = _SECRET_QUOTED.sub(lambda m: m.group(1) + m.group(2) + MASK + m.group(2), text)
-    bare = _SECRET_BARE_LINES if lines else _SECRET_BARE
-    for pattern in (bare, _SECRET_SLASH):
-        text = pattern.sub(lambda m: m.group(1) + (m.group(2) if m.group(2) == MASK else MASK),
-                           text)
+    if colons is None:
+        colons = lines
+    quoted = lambda m: m.group(1) + m.group(2) + MASK + m.group(2)   # noqa: E731
+    text = _SECRET_QUOTED.sub(quoted, text)
+    text = _SECRET_QUOTED_COLON.sub(quoted, text)
+    text = _SECRET_BARE.sub(lambda m: m.group(1) + (m.group(2) if m.group(2) == MASK else MASK),
+                            text)
+    if colons:
+        text = _SECRET_BARE_COLON.sub(_bare_colon, text)
     if lines:
         out = []
         for line in text.splitlines(True):

@@ -575,3 +575,10 @@ def test_user_names_keep_their_bytes():
     smtp = _one(25, b"EHLO x\r\nAUTH LOGIN\r\n" + user + b"\r\n" + base64.b64encode(b"pw")
                 + b"\r\nQUIT\r\n", b"220 smtp\r\n250 ok\r\n334 x\r\n334 y\r\n235 ok\r\n")
     assert _wire(smtp["user"]) == b"m\xc3\xa4il\x1b@e.top"
+
+
+def test_ftp_commands_and_file_names_keep_their_bytes():
+    e = _one(21, b"USER b\x1bot\xe9\r\nPASS p\xe4ss\r\nSTOR \xff.txt\r\n", b"220 ftp\r\n")
+    assert [_wire(c) for c in e["commands"]] == [b"USER b\x1bot\xe9", b"PASS ***", b"STOR \xff.txt"]
+    assert [_wire(f) for f in e["files"]] == [b"\xff.txt"]
+    assert e["password"].reveal() == "p\xe4ss"

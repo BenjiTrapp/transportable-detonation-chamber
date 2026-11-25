@@ -63,6 +63,11 @@ Regressions covered:
     ``name: value`` line in an upload) was not marked by anything, because only
     decoded values carry ``credential``; ``mask_credentials`` masks it with the
     same detection, for the report boundary
+  * the mask's allow-list of characters a key may follow let keys after
+    ``#``, ``|``, ``(``, ``[``, ``=``, ``+``, ``*`` or ``!`` through (an OAuth
+    token in a URL fragment); a key now starts wherever no name character
+    precedes it, and a generated test holds the mask to the flag for every
+    secret word, boundary and separator
   * that mask read ``keys.top:8080/stage.exe`` as the key ``keys.top`` and its
     value, cutting host, port and path out of URLs, Host headers and IOCs, and
     rewrote free text (a rule's ``token_exfil: auth: bearer``, a User-Agent
@@ -75,6 +80,7 @@ import gzip
 import hashlib
 import json
 import random
+import re
 import time
 import zlib
 
@@ -993,6 +999,68 @@ def test_masking_agrees_with_the_credential_flag():
         assert net_decode._is_credential("body_text", "", decoded), text
         secret = text.replace("@x.top/", "").split(":")[-1].split("=")[-1].split("|")[-1]
         assert secret not in net_decode.mask_credentials(text, lines=True), text
+
+
+class _Text:
+    """What ``_is_credential`` reads of a decoded value."""
+
+    kind = "text"
+
+    def __init__(self, text):
+        self.text = text
+
+
+_SECRET_KEYS = ("pass", "password", "passwd", "pwd", "secret", "token", "key", "auth", "cred",
+                "api_key", "access_token", "id_token", "mypassword", "user.password", "p", "pw",
+                "PASSWORD", "Token")
+# every printable ASCII character that cannot be part of a key name, plus
+# whitespace, the start of the text and a name character (inside a longer name)
+_BEFORE = ["", " ", "\t", "\n"] + [c for c in map(chr, range(0x21, 0x7F))
+                                    if not (c.isalnum() or c in "_.-")] + ["x"]
+
+
+@pytest.mark.parametrize("separator", ["=", ":", " = ", ": "])
+def test_masking_agrees_with_the_credential_flag_for_every_key_and_boundary(separator):
+    """Whatever the flag marks in a body, the body mask removes; generated over
+    every secret word, every character before it and every separator, so that a
+    change to the mask's anchor cannot drift from the flag unnoticed."""
+    missed = []
+    for key in _SECRET_KEYS:
+        for before in _BEFORE:
+            for quote in ("", '"'):
+                text = "a" + before + key + separator + quote + "Val-9" + quote
+                if not net_decode._is_credential("body_text", "", _Text(text)):
+                    continue
+                if "Val-9" in net_decode.mask_credentials(text, lines=True):
+                    missed.append(text)
+    assert missed == []
+
+
+@pytest.mark.parametrize("text,masked", [
+    ("https://idp.top/x#access_token=Frag-1&token_type=bearer",
+     "https://idp.top/x#access_token=***&token_type=***"),
+    ("https://app.top/cb#id_token=Frag-2", "https://app.top/cb#id_token=***"),
+    ("?cfg=(token=Paren-3)&x=key=Eq-4", "?cfg=(token=***&x=key=***"),
+    ("a=1|password=Pipe-6", "a=1|password=***"),
+    ("[password=Brk-7]", "[password=***"),
+    ("+password=Pl-8 *pwd=St-9 !key=Ex-10", "+password=*** *pwd=*** !key=***"),
+    ("x:password=Co-11", "x:password=***"),
+])
+def test_a_key_after_any_character_that_is_not_part_of_a_name_is_masked(text, masked):
+    assert net_decode.mask_credentials(text) == masked
+    in_body = net_decode.mask_credentials(text, lines=True)
+    assert not [v for v in re.findall(r"[A-Z][a-z]*-\d+", text) if v in in_body], in_body
+
+
+def test_with_colons_a_pair_in_a_value_is_masked_but_a_host_and_port_are_not():
+    assert net_decode.mask_credentials("password:Col-5", colons=True) == "password:***"
+    assert net_decode.mask_credentials("{key: S4}", colons=True) == "{key: ***"
+    assert net_decode.mask_credentials("Authorization: Bearer S5", colons=True) == \
+        "Authorization: ***"
+    assert net_decode.mask_credentials("auth=Basic S6") == "auth=***"
+    for text in ("keys.top:8080", "keys.top:8080/stage.exe", "https://keys.top:8080/x",
+                 "monkey.top:8443"):
+        assert net_decode.mask_credentials(text, colons=True) == text, text
 
 
 def test_masking_a_long_hostile_body_takes_linear_time():

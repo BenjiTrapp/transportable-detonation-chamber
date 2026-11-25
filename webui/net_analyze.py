@@ -87,7 +87,6 @@ import ipaddress
 import math
 import os
 
-import net_baseline
 import net_behavior
 import net_decode
 import net_dns
@@ -110,6 +109,9 @@ MAX_IOCS = 5000
 BEHAVIOR_TYPES = ("beacon", "retry", "fanout")
 NAME_FIELDS = ("dest", "sni", "mail_from", "user", "url")
 NAME_LIST_FIELDS = ("rcpt_to", "hosts")
+# free text from a capture that keeps its spaces: unprintable bytes as \DDD (safe_text)
+TEXT_FIELDS = ("subject",)
+TEXT_LIST_FIELDS = ("commands", "files", "uploaded", "attachments")
 EXECUTABLES = net_evidence.EXECUTABLES
 
 # The fake internet answers from these addresses: a connection to one says
@@ -289,6 +291,13 @@ def _render_names(event):
         values = event.get(field)
         if isinstance(values, list):
             event[field] = [render_name(v) if isinstance(v, str) else v for v in values]
+    for field in TEXT_FIELDS:
+        if isinstance(event.get(field), str):
+            event[field] = safe_text(event[field])
+    for field in TEXT_LIST_FIELDS:
+        values = event.get(field)
+        if isinstance(values, list):
+            event[field] = [safe_text(v) if isinstance(v, str) else v for v in values]
     headers = event.get("headers")
     if isinstance(headers, dict) and isinstance(dict.get(headers, "host"), str):
         headers["host"] = render_name(dict.get(headers, "host"))
@@ -369,7 +378,9 @@ def _mask_header(name, value):
         if lname in ("authorization", "proxy-authorization") and " " in value:
             return value.split(None, 1)[0] + " ***"
         return "***" if value else value
-    return net_decode.mask_credentials(value)
+    # A header value is a value, not prose: "password:x" in it is a pair. The
+    # User-Agent is the exception (a fingerprint, like the event's ua field).
+    return net_decode.mask_credentials(value, colons=lname != "user-agent")
 
 
 def mask_report(value, key=None):
@@ -704,12 +715,6 @@ def analyze_pcap(path, rules=None, baseline=None, process="", mode="online"):
         findings = []
 
     copies = net_mail_ftp.masked(events)
-    for event, copy in zip(events, copies):
-        # computed before masking, so that a baseline fed the report's events
-        # keys them as it keys the raw ones (net_baseline.event_key reads it)
-        key = net_baseline.event_key(event)
-        if key is not None:
-            copy[net_baseline.KEY_FIELD] = key
     _mask_decoded(events, copies, source_of)
     copies = mask_report(copies)
     for event, copy, is_known in zip(events, copies, known):

@@ -27,9 +27,10 @@ Two further points:
   * Keys come from events, before or after serialization. A report holds
     masked copies: ``***`` for a password, for the text of a decoded
     credential, and for a credential in a path or a User-Agent, which are part
-    of a key. So each copy carries the key of its raw event (``baseline_key``,
-    set by ``net_analyze``) and ``event_key`` uses it, and a baseline captured
-    from a report matches the raw events of the next analysis. Nothing secret is stored: a key is a hash, and an entry keeps
+    of a key. Every text of a key goes through the report's mask before it is
+    hashed, so an event and its report copy have the same key, a baseline
+    captured from a report matches the raw events of the next analysis, and no
+    key can be guessed back to a short secret it held. Nothing secret is stored: a key is a hash, and an entry keeps
     the event type, destination and port.
   * A rhythm is not measured twice to the millisecond. A beacon's interval is
     put into a bucket of ``INTERVAL_STEP`` (a factor of 1.25) and a beacon is
@@ -49,8 +50,9 @@ import os
 import threading
 import time
 
+import net_decode
+
 KEY_VERSION = 1
-KEY_FIELD = "baseline_key"     # the key, carried by a report's (masked) copy of an event
 INTERVAL_STEP = 1.25    # ratio between neighbouring beacon interval buckets
 
 
@@ -138,28 +140,28 @@ def _hash(identity):
     return hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()[:32]
 
 
-def _carried(event):
-    key = event.get(KEY_FIELD)
-    if isinstance(key, str) and len(key) == 32 and all(c in "0123456789abcdef" for c in key):
-        return key
-    return None
+def _masked(identity):
+    """The identity as a report shows it: every text through the report's mask.
+
+    A path or a User-Agent may carry a credential, and the mask replaces it in
+    a report. Keyed on the masked text, an event and its report copy have the
+    same key, and the key says nothing about the credential: the hash of
+    ``/dl;token=4821/f.bin`` would give ``4821`` back to ten thousand guesses.
+    """
+    return tuple(net_decode.mask_credentials(v) if isinstance(v, str) else v for v in identity)
 
 
 def event_key(event):
     """The baseline key of an event, or None for something that is not one.
 
-    A report's events are masked copies (a path or a User-Agent may have lost a
-    credential to ``***``), so ``net_analyze`` puts the key of the raw event in
-    ``baseline_key``; it is used when present, and a baseline built from a
-    report matches the raw events of the next analysis.
+    The same for an event and for the report's masked copy of it (see
+    ``_masked``), so a baseline built from a report matches the raw events of
+    the next analysis.
     """
     if not isinstance(event, dict):
         return None
-    carried = _carried(event)
-    if carried is not None:
-        return carried
     identity = _identity(event)
-    return _hash(identity) if identity is not None else None
+    return _hash(_masked(identity)) if identity is not None else None
 
 
 def _candidates(event):
@@ -168,7 +170,8 @@ def _candidates(event):
     identity = _identity(event) if isinstance(event, dict) else None
     if identity is None:
         return []
-    keys = [_carried(event) or _hash(identity)]
+    identity = _masked(identity)
+    keys = [_hash(identity)]
     if identity[0] == "beacon" and isinstance(identity[-1], int):
         keys += [_hash(identity[:-1] + (identity[-1] + step,)) for step in (-1, 1)]
     return keys

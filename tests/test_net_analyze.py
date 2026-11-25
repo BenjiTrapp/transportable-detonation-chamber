@@ -40,6 +40,14 @@ Regressions covered:
   * a second or folded Host header was dropped, so ``Host: <known good>``
     followed by ``Host: evil.top`` hid the request and lost the IOC
   * ``headers.host`` kept raw ESC and NUL
+  * keys after ``#``, ``|``, ``(``, ``[`` or ``=`` (an OAuth token in a URL
+    fragment, a Location header, a pipe-joined body) and a ``password:x`` in a
+    header value leaked through the anchored mask
+  * a report's ``baseline_key`` was the hash of the raw path, so a short
+    secret in it came back to ten thousand guesses
+  * an absolute-form target's host was ignored when a Host header was there,
+    so ``GET http://evil.top/x`` with a known-good Host was hidden
+  * FTP ``commands`` carried raw ESC
   * ``/dl/token=abc/file.bin`` was not masked once keys had to start at a
     boundary; after a ``/`` a key counts with ``=`` only, so ``/key/stage.exe``
     and ``keys.top:8080/stage.exe`` stay whole
@@ -806,3 +814,62 @@ def test_a_credential_in_a_path_segment_is_masked_and_a_secret_looking_path_is_n
     assert "Seg-Tk-1" not in json.dumps(r)
     paths = sorted(e["path"] for e in r["events"] if e["type"] == "http")
     assert paths == ["/dl/token=***", "/key/stage.exe", "/password/x"]
+
+
+# --- review round 3 ----------------------------------------------------------------------
+
+def test_no_credential_leaks_through_fragments_brackets_pipes_or_header_pairs(tmp_path):
+    """The reviewer's probe p8.py, end to end."""
+    cap = Capture()
+    cap.web(5.0, "a.top", b"GET /cb HTTP/1.1\r\nHost: a.top\r\nReferer: https://idp.top/x"
+            b"#access_token=FragTok-1&token_type=bearer\r\n\r\n",
+            b"HTTP/1.1 302 Found\r\nLocation: https://app.top/cb#id_token=FragTok-2\r\n"
+            b"Content-Length: 0\r\n\r\n")
+    cap.web(6.0, "b.top", b"GET /q?cfg=(token=Paren-3)&x=key=Eq-4 HTTP/1.1\r\nHost: b.top\r\n"
+            b"X-Debug: password:Col-5\r\n\r\n", _ok(b"x"))
+    cap.post(7.0, "c.top", "/f", b"a=1|password=Pipe-6\n[password=Brk-7]\nkey=Ok-8")
+    request = (b"GET /ws HTTP/1.1\r\nHost: d.top\r\nUpgrade: websocket\r\n\r\n"
+               + test_net_http._ws_frame(b"{key:Ws-9} |token=Ws-10", masked=True))
+    cap.web(8.0, "d.top", request, b"HTTP/1.1 101 Switching Protocols\r\n\r\n")
+    cap.get(9.0, "e.top", "/a?Q=1&PASSWORD=Up-11&\tpwd=Tab-12", b"x")
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    text = json.dumps(r)
+    leaked = [v for v in ("FragTok-1", "FragTok-2", "Paren-3", "Eq-4", "Col-5", "Pipe-6",
+                          "Brk-7", "Ok-8", "Ws-9", "Ws-10", "Up-11", "Tab-12") if v in text]
+    assert leaked == []
+    http = [e for e in r["events"] if e["type"] == "http" and e["dest"] == "a.top"][0]
+    assert http["resp_headers"]["location"] == "https://app.top/cb#id_token=***"
+
+
+def test_a_baseline_key_cannot_be_guessed_back_to_the_secret_it_held(tmp_path):
+    cap = Capture()
+    cap.get(5.0, "dl.top", "/dl;token=4821/f.bin", b"ok")
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    assert "baseline_key" not in json.dumps(r) and "4821" not in json.dumps(r)
+    http = [e for e in r["events"] if e["type"] == "http"][0]
+    raw = dict(http, path="/dl;token=4821/f.bin")
+    guess = dict(http, path="/dl;token=0000/f.bin")
+    assert net_baseline.event_key(raw) == net_baseline.event_key(guess) == \
+        net_baseline.event_key(http)
+
+
+def test_an_absolute_target_names_its_host_beside_the_host_header(tmp_path):
+    cap = Capture()
+    cap.tcp(5.0, C2, 80, [("c", b"GET http://evil.top/x HTTP/1.1\r\n"
+                                b"Host: www.msftconnecttest.com\r\n\r\n"), ("s", _ok(b"ok"))])
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    http = [e for e in r["events"] if e["type"] == "http"][0]
+    assert http["hosts"] == ["www.msftconnecttest.com", "evil.top"] and http["known_good"] is False
+    assert "evil.top" in [i["value"] for i in r["iocs"] if i["type"] == "domain"]
+    assert "http://evil.top/x" in [i["value"] for i in r["iocs"] if i["type"] == "url"]
+
+
+def test_ftp_commands_and_file_names_are_rendered(tmp_path):
+    cap = Capture()
+    cap.tcp(9.0, C2, 21, [("c", b"USER b\x1bot\xe9\r\nPASS x\r\nSTOR h\x00a rv.zip\r\n"),
+                          ("s", b"220 ftp\r\n331 ok\r\n230 ok\r\n150 ok\r\n")])
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    ftp = [e for e in r["events"] if e["type"] == "ftp"][0]
+    assert ftp["commands"] == ["USER b\\027ot\\233", "PASS ***", "STOR h\\000a rv.zip"]
+    assert ftp["files"] == ["h\\000a rv.zip"] and ftp["user"] == "b\\027ot\\233"
+    assert "\\u001b" not in json.dumps(r) and "\\u0000" not in json.dumps(r)

@@ -1318,6 +1318,13 @@ def test_every_host_name_of_a_request_is_listed(extra):
     assert e["dest"] == "www.msftconnecttest.com"
 
 
+def test_an_absolute_target_adds_its_host_to_the_host_header():
+    e = _events(b"GET http://evil.top/x HTTP/1.1\r\nHost: www.msftconnecttest.com\r\n\r\n", b"")[0]
+    assert e["hosts"] == ["www.msftconnecttest.com", "evil.top"]
+    same = _events(b"GET http://a.top/x HTTP/1.1\r\nHost: a.top\r\n\r\n", b"")[0]
+    assert same["hosts"] == ["a.top"]
+
+
 def test_one_host_or_an_absolute_target_is_one_name_and_none_is_none():
     assert _events(_get(host=b"a.top:81"), b"")[0]["hosts"] == ["a.top"]
     assert _events(b"GET http://b.top/x HTTP/1.1\r\n\r\n", b"")[0]["hosts"] == ["b.top"]

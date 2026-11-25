@@ -376,7 +376,8 @@ def _fields(side, session, codes, ok, bad):
 def _read_ftp(side):
     s = _Session()
     for start, end, raw in _lines(side.client):
-        line = _text(raw).lstrip()
+        # commands and file names keep their bytes like user names (see _name)
+        line = _name(raw).lstrip()
         verb, _sep, arg = line.partition(" ")
         verb = verb.upper()
         if not _VERB.match(verb):
@@ -386,11 +387,11 @@ def _read_ftp(side):
         if verb in ("PASS", "ACCT"):
             shown = verb + " ***"
         if verb == "PASS":
-            s.password = arg
+            s.password = _text(raw).lstrip().partition(" ")[2].strip()
             s.attempts += 1
         _keep(s.capped, "commands", s.commands, _clip(shown))
         if verb == "USER":
-            s.user = _name(raw.lstrip()).partition(" ")[2].strip()
+            s.user = arg
         elif verb == "RETR" or verb in _FTP_STORE:
             if arg:
                 _keep(s.capped, "files", s.files, _clip(arg), unique=True)

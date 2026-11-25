@@ -102,8 +102,8 @@ server address; ``port`` is the TCP port. ``dest`` and ``url`` keep the bytes of
 the request (ASCII, any other byte as a ``surrogateescape`` code point), not a
 guess at their character set: ``net_analyze`` renders every name of every
 protocol from its bytes, so one name has one spelling. ``hosts`` lists every
-distinct name the request gives (each Host header, a folded continuation, or the
-absolute target's), ``dest`` being the first: a sample can send a harmless name
+distinct name the request gives (each Host header, a folded continuation, and
+the absolute target's), ``dest`` being the first: a sample can send a harmless name
 first and its own second, so a reader that took one would be fooled. ``content_type`` and
 ``content_encoding`` are the response's (the response decides whether a
 download happened); the request's are ``headers["content-type"]`` and
@@ -765,12 +765,14 @@ class _Origin:
         # Every name a request gives (a second Host header, a folded one): a
         # sample can put a harmless name first and its own after it.
         self.hosts = list(dict.fromkeys(h for h in (_host_of(t) for t in tokens) if h))
-        if not self.hosts and absolute:
+        if absolute:
+            # an absolute-form target names its host as well, Host header or not
             try:
                 name = (urlsplit(target).hostname or "").lower()
             except ValueError:
                 name = ""
-            self.hosts = [name] if name else []
+            if name and name not in self.hosts:
+                self.hosts.append(name)
         self.dest = self.hosts[0] if self.hosts else ctx.server
         if not req:
             self.url = ""
