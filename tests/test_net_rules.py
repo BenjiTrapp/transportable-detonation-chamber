@@ -944,6 +944,21 @@ def test_ordinary_regexes_are_accepted(pattern):
     assert rs.errors == [] and len(rs.rules) == 1, (pattern, rs.errors)
 
 
+@pytest.mark.parametrize("pattern", [
+    "x[[:digit:]]+y", "[[:alpha:]]", "[[a]", "[a--b]", "[a&&b]", "[a||b]", "[a~~b]",
+])
+def test_a_pattern_the_two_regex_engines_read_differently_is_refused(pattern):
+    """``x[[:digit:]]+y`` matched ``x123y`` under ``regex`` and not under ``re``."""
+    rs = _rules("rules:\n  - {id: h, name: h, event: http, match: {\"path|re\": '%s'}}" % pattern)
+    assert rs.rules == [] and len(rs.errors) == 1 and "h" in rs.errors[0]
+
+
+@pytest.mark.parametrize("pattern", [r"[\[a]", r"[a\-b]", r"[a-z-]", r"[\d\s]", "[^[]"])
+def test_a_bracket_that_means_the_same_in_both_engines_is_accepted(pattern):
+    rs = _rules("rules:\n  - {id: h, name: h, event: http, match: {\"path|re\": '%s'}}" % pattern)
+    assert rs.errors == [] and len(rs.rules) == 1
+
+
 _SUBJECTS = ["a", "1", "a1", "a.", "ab", "a/", " ", "a b ", "x-", "a.b."]
 
 
@@ -1009,15 +1024,54 @@ def test_no_regex_that_is_accepted_is_slow_on_a_field_made_to_hurt_it():
     assert accepted > 300           # the generator is not refused wholesale
 
 
-def test_a_regex_sees_only_the_start_of_a_field_and_not_a_cut_end():
+def test_a_regex_sees_only_the_start_of_a_field_and_a_cut_end_is_not_an_answer():
     rs = _rules("rules:\n  - {id: h, name: h, event: http, match: {\"path|re\": 'x$'}}")
     cut = net_rules.subject_limit()
-    assert rs.evaluate([_http(path="a" * (cut - 1) + "x")]) != []
-    assert rs.evaluate([_http(path="a" * (cut - 1) + "x" + "b" * 50)]) == []
-    assert rs.evaluate([_http(path="a" * (cut + 100) + "x")]) == []
+    assert rs.evaluate([_http(path="a" * (cut - 1) + "x")]) != []        # exactly the cut: whole field
+    for path in ("a" * (cut - 1) + "x" + "b" * 50, "a" * (cut + 100) + "x"):
+        got = rs.evaluate([_http(path=path)])
+        assert got == [] and got.unevaluated == [
+            {"rule_id": "h", "events": 1, "reasons": ["cut"]}]
     late = _rules("rules:\n  - {id: h, name: h, event: http, match: {\"path|re\": 'late'}}")
-    assert late.evaluate([_http(path="a" * (cut + 10) + "late")]) == []
-    assert late.evaluate([_http(path="late" + "a" * (cut + 10))]) != []
+    got = late.evaluate([_http(path="a" * (cut + 10) + "late")])
+    assert got == [] and got.unevaluated[0]["reasons"] == ["cut"]
+    assert late.evaluate([_http(path="late" + "a" * (cut + 10))]) != []     # found in the head
+
+
+def test_padding_a_field_does_not_choose_the_answer_of_a_negated_regex():
+    """The review's case: ``not: {path|re: 'benign$'}`` over a padded path fired."""
+    rs = _rules("rules:\n  - {id: r, name: r, event: http, match: {not: {path|re: 'benign$'}}}")
+    cut = net_rules.subject_limit()
+    short = rs.evaluate([_http(path="/benign")])
+    assert short == [] and short.unevaluated == []                    # decided: no hit
+    padded = rs.evaluate([_http(path="/" + "a" * (cut + 952) + "benign")])
+    assert padded == [] and padded.unevaluated == [{"rule_id": "r", "events": 1, "reasons": ["cut"]}]
+    plain = rs.evaluate([_http(path="/other")])
+    assert len(plain) == 1 and plain.unevaluated == []                # a short field is still decided
+
+
+def test_a_short_field_that_does_not_match_is_a_decided_no():
+    rs = _rules("rules:\n  - {id: r, name: r, event: http, match: {path|re: 'x'}}")
+    got = rs.evaluate([_http(path="abc")])
+    assert got == [] and got.unevaluated == []
+
+
+def test_a_cut_field_matches_when_any_of_several_patterns_matches_in_the_head():
+    rs = _rules("rules:\n  - {id: r, name: r, event: http, match: {path|re: ['^/a', 'zzz$']}}")
+    cut = net_rules.subject_limit()
+    assert len(rs.evaluate([_http(path="/a" + "b" * (cut + 5))])) == 1
+    got = rs.evaluate([_http(path="/b" + "b" * (cut + 5))])
+    assert got == [] and got.unevaluated[0]["reasons"] == ["cut"]
+
+
+def test_a_cut_element_of_a_list_field_is_unknown_unless_another_element_matches():
+    rs = _rules("rules:\n  - {id: r, name: r, event: smtp, match: {rcpt_to|re: 'target'}}")
+    cut = net_rules.subject_limit()
+    both = net_events.NetEvent("smtp", 1.0, rcpt_to=["x" * (cut + 1), "target@d.top"])
+    only = net_events.NetEvent("smtp", 1.0, rcpt_to=["x" * (cut + 1), "y@d.top"])
+    assert len(rs.evaluate([both])) == 1
+    got = rs.evaluate([only])
+    assert got == [] and got.unevaluated[0]["reasons"] == ["cut"]
 
 
 def test_linear_operators_see_the_whole_field():
@@ -1225,6 +1279,21 @@ def test_without_the_regex_module_the_checker_is_the_guard_and_the_cut_is_short(
     cut = net_rules.MAX_SUBJECT_UNGUARDED
     assert len(rs.evaluate([_http(path="a" * (cut - 1) + "x")])) == 1
     assert rs.evaluate([_http(path="a" * cut + "x")]) == []
+
+
+def test_the_unguarded_fallback_is_visible_in_the_rules_and_in_the_result(monkeypatch):
+    monkeypatch.setattr(net_rules, "_regex_module", None)
+    rs = _rules("rules:\n  - {id: r, name: r, event: http, match: {path|re: 'a'}}")
+    assert rs.regex_engine == "re" and len(rs.notes) == 1 and "timeout" in rs.notes[0]
+    assert rs.evaluate([_http(path="a")]).regex_engine == "re"
+
+
+def test_with_the_regex_module_there_is_nothing_to_note():
+    if net_rules._regex_module is None:
+        pytest.skip("no regex module")
+    rs = _rules("rules:\n  - {id: r, name: r, event: http, match: {path|re: 'a'}}")
+    assert rs.regex_engine == "regex" and rs.notes == []
+    assert rs.evaluate([_http(path="a")]).regex_engine == "regex"
 
 
 def test_with_the_regex_module_the_cut_is_longer_and_calls_are_guarded():

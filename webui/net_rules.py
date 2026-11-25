@@ -40,10 +40,11 @@ not learn a second notation. Several things are easy to get wrong:
     known gaps (the cost of a lookahead inside a repeat's body is not priced) and
     is not the thing to rely on. A list field is shown to a regex only up to its
     first ``MAX_REGEX_ELEMENTS`` elements, and one ``evaluate`` may spend only
-    ``REGEX_BUDGET_S`` seconds in regexes. The other string operators are linear
-    and see the whole field.
-  * A regex that was not run is "could not tell", not "no". A timeout, or a spent
-    budget, makes the condition unknown. Unknown is never true and never false:
+    ``REGEX_BUDGET_S`` seconds in regexes, shared by all rules. The other string
+    operators are linear and see the whole field.
+  * A regex that was not run is "could not tell", not "no". A timeout, a spent
+    budget, or a field longer than the cut in which nothing decisive was found
+    (padding a field must not choose the answer) makes the condition unknown. Unknown is never true and never false:
     ``not: {path|re: ...}`` over an unknown is unknown, so an attacker who exhausts
     the budget does not make every negated rule fire. An ``all`` is false if any
     member is false, an ``any`` true if any member is true, and unknown
@@ -51,7 +52,7 @@ not learn a second notation. Several things are easy to get wrong:
     named in ``Hits.unevaluated``; its hits from the events it could decide are
     real, and for a rule listed there the absence of a hit is not an answer. A
     correlation whose required rules are unevaluated and which did not fire is
-    listed too.
+    listed too, but only if it fired for no process at all.
   * Every rule against every event. Rules are filed under the event types they
     name, and a rule whose match has a plain equality or ``in`` condition is
     additionally filed under that field's values, so an event is tried on the
@@ -89,6 +90,7 @@ import os
 import re
 import threading
 import time
+import warnings
 
 import yaml
 
@@ -573,8 +575,14 @@ def _starts(parsed, fold):
 def _compile_regex(pattern):
     if len(pattern) > MAX_PATTERN:
         raise RuleError("regex longer than %d characters" % MAX_PATTERN)
+    if "[[:" in pattern:
+        raise RuleError("a POSIX class like [[:digit:]] means different things in re and in "
+                        "regex; write \\d or [0-9]")
     try:
-        compiled = re.compile(pattern)
+        with warnings.catch_warnings():
+            # "possible nested set" / "possible set difference": the two engines disagree
+            warnings.simplefilter("error", FutureWarning)
+            compiled = re.compile(pattern)
         if compiled.flags & (re.ASCII | re.LOCALE):
             raise RuleError("the ASCII and LOCALE flags are not supported")
         parsed = sre_parse.parse(pattern)
@@ -586,6 +594,9 @@ def _compile_regex(pattern):
                             "them" % (PRICE_LEN, steps, MAX_REGEX_STEPS))
     except RuleError as exc:
         raise RuleError("regex %r refused: %s" % (pattern, exc))
+    except FutureWarning as exc:
+        raise RuleError("regex %r refused: %s (re and regex read this differently; "
+                        "escape the bracket or the operator)" % (pattern, exc))
     except (re.error, RecursionError, OverflowError) as exc:
         raise RuleError("invalid regex %r: %s" % (pattern, exc))
     return _Compiled(pattern)
@@ -842,6 +853,10 @@ class _Compiler:
                         # or have run on, so it counts for nothing
                         if m and not (cut and m.end() == len(head)):
                             return True
+                        if cut:
+                            # nothing decisive in the part that was looked at, and
+                            # the rest was not: "no" would be the padder's answer
+                            unknown = _merge(unknown, _Unknown("cut"))
                 finally:
                     if left is not None:
                         _run.left = left - (time.perf_counter() - started)
@@ -938,12 +953,26 @@ class Hits(list):
     could not be decided never counts as true or as false, in a ``not`` either.
     ``budget_spent`` is True when the regex time ran out during the call, whether
     or not a later condition was then skipped.
+
+    A regex is decided on the first ``subject_limit()`` characters of a field: a
+    match there is a match, but when nothing decisive is found and the field was
+    longer, the answer is "could not tell" (reason ``cut``) and never "no". So a
+    regex rule on a long body that does not match in its head is listed here.
+
+    Limits of the listing: a correlation is listed only when it fired for no
+    process at all (the rule it needed is listed either way); and the regex time
+    budget is shared by all rules, so one slow rule can leave every regex rule
+    undecided for the rest of the call (``budget_spent``, reason ``budget``).
+    ``regex_engine`` is ``"regex"`` (every call has a timeout) or ``"re"`` (the
+    fallback: nothing bounds a call but the load-time checks, so a pattern they
+    miss, such as a lookahead inside a repeated group, can run for hours).
     """
 
     def __init__(self):
         super().__init__()
         self.unevaluated = []
         self.budget_spent = False
+        self.regex_engine = "regex"
 
 
 class _KnownGood:
@@ -979,13 +1008,18 @@ class RuleSet:
 
     ``rules`` holds the rules that loaded, ``errors`` one text per thing that did
     not (with the rule and the reason), ``lists`` the named lists, ``known_good``
-    among them.
+    among them. ``notes`` says what an operator should know about how the rules
+    will run (the unguarded ``re`` fallback), ``regex_engine`` which one it is.
     """
 
     def __init__(self, rules, errors, lists):
         self.rules = rules
         self.errors = errors
         self.lists = lists
+        self.regex_engine = "regex" if _regex_module is not None else "re"
+        self.notes = [] if _regex_module is not None else [
+            "the regex module is not installed: regexes run on re with no timeout and "
+            "are cut at %d characters; only the load-time checks guard them" % MAX_SUBJECT_UNGUARDED]
         self._known = _KnownGood(lists.get(KNOWN_GOOD, ()))
         self._scan = {}         # event type -> rules to try on every event of it
         self._indexed = {}      # event type -> field -> key -> rules
@@ -1040,6 +1074,7 @@ class RuleSet:
                     by_rule.setdefault(rule["id"], {})[process] = hit
         hits.extend(self._correlate(by_rule))
         hits.budget_spent = spent
+        hits.regex_engine = self.regex_engine
         hits.unevaluated = self._unevaluated(unknown, by_rule, hits)
         return hits
 
