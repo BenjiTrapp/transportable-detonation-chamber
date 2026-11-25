@@ -350,13 +350,40 @@ def test_a_hit_with_extra_fields_does_not_carry_them_into_the_finding():
 
 # --- known_good and ordinary traffic -----------------------------------------------------------
 
-def test_known_good_hides_event_findings_but_never_an_executable_download():
+def test_known_good_hides_event_findings_but_never_a_transfer():
+    # As in the rules (net_rules.ALWAYS_VISIBLE): a download or an upload is not
+    # hidden by the name it claims.
     kg = ["*.windowsupdate.com", "ocsp.digicert.com"]
     evs = [_beacon(dest="ctldl.windowsupdate.com"),
            net_events.NetEvent("upload", 1.0, dest="ocsp.digicert.com", size=600),
            net_events.NetEvent("retry", 1.0, dest="x.windowsupdate.com", attempts=6),
            net_events.NetEvent("download", 1.0, dest="download.windowsupdate.com", kind="pe")]
-    assert _kinds(net_evidence.findings_from(evs, [], known_good=kg)) == ["payload_staging"]
+    assert _kinds(net_evidence.findings_from(evs, [], known_good=kg)) == \
+        ["exfil_upload", "payload_staging"]
+
+
+def test_what_known_good_hides_is_exactly_what_the_rules_hide(tmp_path):
+    path = tmp_path / "r.yaml"
+    path.write_text("lists:\n  known_good: [ocsp.digicert.com, ctl.example]\n"
+                    "rules:\n"
+                    "  - {id: up, name: up, event: upload}\n"
+                    "  - {id: bc, name: bc, event: beacon}\n")
+    rs = net_rules.load_rules([str(path)])
+    evs = [net_events.NetEvent("upload", 1.0, dest="ocsp.digicert.com", size=600),
+           _beacon(dest="ctl.example")]
+    fired = {h["rule_id"] for h in rs.evaluate(evs)}
+    kinds = set(_kinds(net_evidence.findings_from(evs, [], known_good=rs)))
+    assert ("up" in fired) == ("exfil_upload" in kinds) is True
+    assert ("bc" in fired) == ("c2_checkin" in kinds) is False
+
+
+def test_the_lists_of_a_rule_set_are_read_for_their_known_good():
+    rs = _rules()
+    events = _benign_capture()
+    via_lists = net_evidence.findings_from(events, [], known_good=rs.lists)
+    assert via_lists == net_evidence.findings_from(events, [], known_good=rs)
+    with pytest.raises(TypeError):
+        net_evidence.findings_from(events, [], known_good={"other": ["x"]})
 
 
 def test_known_good_hides_a_fanout_only_when_every_host_is_known():
@@ -376,7 +403,10 @@ def test_an_hour_of_ordinary_windows_traffic_is_clean():
     hits = rs.evaluate(events)
     findings = net_evidence.findings_from(events, hits, process="a.exe",
                                           known_good=rs.lists["known_good"])
-    assert findings == []
+    # The OCSP POSTs are an upload to a claimed name, which is never hidden:
+    # one host, no process, so it waits for a second signal.
+    assert [(f["kind"], f["dest"], f["needs_corroboration"]) for f in findings] == \
+        [("exfil_upload", "ocsp.digicert.com", True)]
     assert memory_evidence.score(findings)["label"] == "CLEAN"
 
 
@@ -410,8 +440,9 @@ def test_known_good_has_no_default():
 def test_the_rule_set_itself_can_be_passed_as_known_good():
     rs = _rules()
     events = _benign_capture()
-    assert net_evidence.findings_from(events, rs.evaluate(events), process="a.exe",
-                                      known_good=rs) == []
+    out = net_evidence.findings_from(events, rs.evaluate(events), process="a.exe",
+                                     known_good=rs)
+    assert _kinds(out) == ["exfil_upload"] and memory_evidence.score(out)["label"] == "CLEAN"
 
 
 # --- a rule hit is held to what the event is held to --------------------------------------

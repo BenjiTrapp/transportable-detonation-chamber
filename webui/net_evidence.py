@@ -36,8 +36,13 @@ the findings wrong:
   * Everything a machine does is evidence. Connectivity checks, OCSP and the
     update service beacon and upload on every clean Windows box. Events whose
     destination is in the rule set's ``known_good`` give no finding, as they
-    give no rule hit; an executable download is never hidden, because the name
-    it came from is not evidence (``net_rules.ALWAYS_VISIBLE``). The list is a
+    give no rule hit; a download or an upload is never hidden, because the
+    name it claims is not evidence (``net_rules.ALWAYS_VISIBLE``, used here as
+    it is: a sample that sends its harvest with ``Host: ocsp.digicert.com``
+    must not vanish). Ordinary POSTs over 512 bytes to known hosts therefore
+    stay findings. Without a process they need a second signal (below): one
+    host is 1.6 and CLEAN, but two or more reach 3.2 and SUSPICIOUS by
+    saturation, which is the price of not letting a claimed name hide data. The list is a
     required argument: without it an idle machine is MALICIOUS. A retry of a
     name the resolver asks for on its own (``wpad``, reverse lookups) is no
     dead C2.
@@ -64,6 +69,7 @@ the findings wrong:
 
 import ipaddress
 import math
+from collections.abc import Iterable, Mapping
 
 import memory_evidence
 import net_behavior
@@ -296,7 +302,9 @@ _EVENTS = {"beacon": _beacon, "upload": _upload, "download": _download,
 
 
 def _hidden(e, known_good):
-    if not known_good or e.get("type") == "download":
+    # The rules' own exemption, so that the two cannot disagree: a transfer is
+    # never hidden by the name it claims (see net_rules.ALWAYS_VISIBLE).
+    if not known_good or e.get("type") in net_rules.ALWAYS_VISIBLE:
         return False
     if e.get("type") == "fanout":
         names = _names(e.get("dests"))
@@ -453,7 +461,13 @@ def _known_good(value):
         return value
     if isinstance(value, net_rules.RuleSet):
         return net_rules.KnownGood(value.lists.get(net_rules.KNOWN_GOOD, ()))
-    if value is None or isinstance(value, (str, bytes)):
+    if isinstance(value, Mapping):
+        # RuleSet.lists is the easy mistake; iterating it would give list names.
+        if net_rules.KNOWN_GOOD not in value:
+            raise TypeError("known_good is a mapping without a %r list; pass the RuleSet "
+                            "or its list" % net_rules.KNOWN_GOOD)
+        value = value[net_rules.KNOWN_GOOD]
+    if value is None or isinstance(value, (str, bytes)) or not isinstance(value, Iterable):
         raise TypeError("known_good must be the RuleSet, a KnownGood or a list of names "
                         "(pass () to hide nothing), not %r" % (value,))
     return net_rules.KnownGood(value)
