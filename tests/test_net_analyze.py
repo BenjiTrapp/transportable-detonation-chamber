@@ -40,6 +40,9 @@ Regressions covered:
   * a second or folded Host header was dropped, so ``Host: <known good>``
     followed by ``Host: evil.top`` hid the request and lost the IOC
   * ``headers.host`` kept raw ESC and NUL
+  * ``/dl/token=abc/file.bin`` was not masked once keys had to start at a
+    boundary; after a ``/`` a key counts with ``=`` only, so ``/key/stage.exe``
+    and ``keys.top:8080/stage.exe`` stay whole
   * one parser that raised took the whole analysis down
   * an empty capture looked the same as a capture in which nothing was found
 """
@@ -792,3 +795,14 @@ def test_the_host_header_value_is_rendered_like_the_name(tmp_path):
     http = [e for e in r["events"] if e["type"] == "http"][0]
     assert http["headers"]["host"] == _ODD_TEXT
     assert "\\u001b" not in json.dumps(r) and "\\u0000" not in json.dumps(r)
+
+
+def test_a_credential_in_a_path_segment_is_masked_and_a_secret_looking_path_is_not(tmp_path):
+    cap = Capture()
+    cap.get(5.0, "dl.top", "/dl/token=Seg-Tk-1/file.bin", b"data")
+    cap.get(7.0, "keys.top:8080", "/key/stage.exe", b"data")
+    cap.get(9.0, "x.top", "/password/x", b"data")
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    assert "Seg-Tk-1" not in json.dumps(r)
+    paths = sorted(e["path"] for e in r["events"] if e["type"] == "http")
+    assert paths == ["/dl/token=***", "/key/stage.exe", "/password/x"]

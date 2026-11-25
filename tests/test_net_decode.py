@@ -1005,7 +1005,9 @@ def test_masking_a_long_hostile_body_takes_linear_time():
 @pytest.mark.parametrize("text", [
     "keys.top:8080/stage.exe", "http://keys.top:8080/stage.exe", "monkey.top:8443",
     "http://monkey.top:8443/a/b?c=1", "token_exfil: auth: bearer",
-    "Mozilla/5.0 (Windows NT 10.0) Agent/2 key:val", "/dl/token=abc/file.bin",
+    "Mozilla/5.0 (Windows NT 10.0) Agent/2 key:val",
+    "/key/stage.exe", "/password/x", "/dl/token/abc", "http://keys.top:8080/key/x",
+    "/api/pass:word/x",
 ])
 def test_names_urls_and_free_text_are_not_read_as_credentials(text):
     assert net_decode.mask_credentials(text) == text
@@ -1023,6 +1025,22 @@ def test_names_urls_and_free_text_are_not_read_as_credentials(text):
 ])
 def test_a_credential_after_a_boundary_is_still_masked(text, masked):
     assert net_decode.mask_credentials(text) == masked
+
+
+@pytest.mark.parametrize("text,masked", [
+    ("/dl/token=abc/file.bin", "/dl/token=***"),
+    ("/a/b/api_key=Ak-1", "/a/b/api_key=***"),
+    ("http://h.top/x/password=Pw-2?y=1", "http://h.top/x/password=***"),
+    ("/x/p=Pw-3", "/x/p=***"),
+])
+def test_a_credential_after_a_slash_is_masked_only_with_an_equals_sign(text, masked):
+    assert net_decode.mask_credentials(text) == masked
+    assert net_decode.mask_credentials(text, lines=True) == masked
+
+
+def test_a_slash_boundary_does_not_make_a_colon_a_separator_in_a_body():
+    for text in ("http://keys.top:8080/stage.exe", "/key/stage.exe", "/password/x"):
+        assert net_decode.mask_credentials(text, lines=True) == text, text
 
 
 def test_in_a_body_a_colon_still_separates_a_secret_key_from_its_value():

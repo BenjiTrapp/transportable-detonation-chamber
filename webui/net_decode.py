@@ -618,6 +618,12 @@ _BARE_VALUE = r"[ \t]*)([^\s&;,\"'<>]+)"
 # "token_exfil: auth: bearer" and a User-Agent's "key:val" are not pairs.
 _SECRET_BARE = re.compile("(" + _SECRET_KEY + r"[\"']?[ \t]*=" + _BARE_VALUE, re.I)
 _SECRET_BARE_LINES = re.compile("(" + _SECRET_KEY + r"[\"']?[ \t]*[=:]" + _BARE_VALUE, re.I)
+# A key also starts right after a "/" (``/dl/token=abc/file.bin``), where only
+# "=" separates it from its value, in a body as well: ``/key/stage.exe`` and
+# ``keys.top:8080/stage.exe`` are paths and addresses, not pairs.
+_SECRET_SLASH = re.compile(
+    "((?<=/)(?:[A-Za-z0-9_.-]{0,32}" + _SECRET_WORDS + r"[A-Za-z0-9_.-]{0,32}|" + _SHORT_WORDS
+    + r")[\"']?[ \t]*=" + _BARE_VALUE, re.I)
 _USERINFO_PASSWORD = re.compile("(" + _URL_SCHEME + r"[^/\s:@]{1,64}:)([^/\s@]{1,128})(@)")
 
 
@@ -674,7 +680,8 @@ def mask_credentials(text, lines=False):
     Masked: the value of a key that says secret (``pass``, ``pwd``, ``secret``,
     ``token``, ``key``, ``auth``, ``cred`` anywhere in the name, ``pw`` and
     ``p`` as whole words; the name begins at the start of the text or after
-    whitespace, ``?``, ``&``, ``;``, ``,``, a quote or ``{``) in a form, a
+    whitespace, ``?``, ``&``, ``;``, ``,``, a quote or ``{``, or, with ``=``
+    only, after a ``/``) in a form, a
     query or a quoted JSON pair, the password of URL userinfo, and the content
     of a multipart part with such a name. With ``lines`` (a body, not a query,
     a URL, a header or other text) ``key: value`` counts as a pair too, every
@@ -691,7 +698,9 @@ def mask_credentials(text, lines=False):
     text = _USERINFO_PASSWORD.sub(lambda m: m.group(1) + MASK + m.group(3), text)
     text = _SECRET_QUOTED.sub(lambda m: m.group(1) + m.group(2) + MASK + m.group(2), text)
     bare = _SECRET_BARE_LINES if lines else _SECRET_BARE
-    text = bare.sub(lambda m: m.group(1) + (m.group(2) if m.group(2) == MASK else MASK), text)
+    for pattern in (bare, _SECRET_SLASH):
+        text = pattern.sub(lambda m: m.group(1) + (m.group(2) if m.group(2) == MASK else MASK),
+                           text)
     if lines:
         out = []
         for line in text.splitlines(True):
