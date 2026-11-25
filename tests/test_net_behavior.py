@@ -886,6 +886,42 @@ def test_a_gap_on_the_beat_is_a_missed_round_and_one_off_the_beat_is_a_pause():
     assert net_behavior.periodicity(off_beat)["single_scale"] is False
 
 
+def test_a_get_and_post_with_missed_rounds_is_still_two_scales():
+    # 60k + {0, 20} over six rounds with rounds 2 and 4 missing: intervals
+    # 20, 40, 20, 100, 20, 100, 20. 40 and 100 are multiples of 20, but each
+    # follows a short interval: one long interval per round is a second scale.
+    ts = []
+    for k in (0, 1, 3, 5):
+        ts += [60.0 * k, 60.0 * k + 20.0]
+    p = net_behavior.periodicity(ts)
+    assert p["periodic"] is False and p["interval"] is None
+
+
+@pytest.mark.parametrize("d", [10.0, 12.0, 15.0])
+def test_a_get_and_post_d_apart_with_jitter_and_a_missed_round_has_no_interval(d):
+    # d = 20 s is not here: 20 and 40 are within a factor of two once jittered,
+    # the documented P/3 .. 2P/3 window of the module docstring, which the
+    # missed-round rule neither causes nor changes.
+    rng = random.Random(int(d))
+    for _ in range(200):
+        rounds = [k for k in range(rng.randint(5, 16)) if k != 2]
+        ts = []
+        for k in rounds:
+            t = 60.0 * k + rng.uniform(-1.2, 1.2)
+            ts += [t, t + d * rng.uniform(0.98, 1.02)]
+        assert net_behavior.periodicity(ts)["interval"] is None, ts
+
+
+def test_a_change_from_a_ten_to_a_sixty_second_rhythm_is_not_a_ten_second_beacon():
+    rng = random.Random(9)
+    t, ts = 0.0, [0.0]
+    for _ in range(20):
+        t += 10.0 * rng.uniform(0.98, 1.02); ts.append(t)
+    for _ in range(5):
+        t += 60.0 * rng.uniform(0.98, 1.02); ts.append(t)
+    assert net_behavior.periodicity(ts)["periodic"] is False
+
+
 def test_doubled_intervals_on_a_beat_of_their_own_are_a_second_scale():
     # 60, 60, 120, 60, 60, 120, ...: every third interval doubled is a rhythm
     # of 240 s with three check-ins, not a 60 s beacon that keeps missing the
@@ -913,20 +949,25 @@ def test_a_conn_and_an_http_request_per_check_in_stay_one_beacon():
 #
 # Random traffic must not turn into a beacon. The generators are fixed, and
 # each count is taken over NOISE_SEEDS x NOISE_TRIALS series (10 000), because
-# one seed of 2000 scatters widely: uniform random gave 21 to 48 beacon events
-# per 2000 across seeds 1-40 (median 34.5), so a ceiling taken from one seed
-# holds or fails by luck. Measured over these five seeds and over eight other
-# disjoint groups of five (seeds 1-40): any beacon event 160 here, 162-182
-# elsewhere; measured beacons 42 here, 36-55 elsewhere; Poisson with
-# follow-ups 5 (2-7) and 0 (0 in all 80 000). The ceilings leave about a
-# fifth above the highest group (binomial spread of a group is about 13).
+# one seed of 2000 scatters widely, so a ceiling taken from one seed holds or
+# fails by luck. The ceilings come from the distribution over 40 disjoint
+# groups of five seeds (seeds 0-199), measured after the missed-round rule of
+# _single_scale (which reads a gap on a whole multiple of the interval as a
+# missed check-in, and so lets some more noise through as loose beacons):
+#   uniform, measured beacons     47-76, mean 59.1, sd 6.7   -> ceiling 90
+#   uniform, any beacon event   152-205, mean 176.2, sd 13.3 -> ceiling 240
+#   Poisson with follow-ups, any  2-12, mean 5.2, sd 2.4     -> ceiling 20
+#   Poisson with follow-ups, measured: 0 in all 400 000      -> ceiling 0
+# Each ceiling sits at least 4.5 standard deviations above the mean of the
+# groups, and above the largest group by a margin, so a failure means the rate
+# moved, not that the seed was unlucky.
 
 NOISE_TRIALS = 2000
 NOISE_SEEDS = (0, 1, 2, 3, 4)
-NOISE_CEILING_POISSON_ANY = 12
+NOISE_CEILING_POISSON_ANY = 20
 NOISE_CEILING_POISSON = 0
-NOISE_CEILING_UNIFORM_ANY = 220
-NOISE_CEILING_UNIFORM = 65
+NOISE_CEILING_UNIFORM_ANY = 240
+NOISE_CEILING_UNIFORM = 90
 
 
 def _poisson_with_follow_ups(rng):
