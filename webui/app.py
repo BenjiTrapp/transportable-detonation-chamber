@@ -8383,6 +8383,82 @@ def _syscall_measure(pid, modules, allowlist=None):
     return measured, view, build
 
 
+def _syscall_measurements():
+    """The syscall scans the history kept, newest first, as the list that names one.
+
+    The history is where a measurement outlives both its process and a restart of the web UI: the stage's own cache
+    is in memory and keyed by pid. Only what the control needs to name a measurement goes in - never the result,
+    which carries every deviation of some 2,000 stubs.
+    """
+    out = []
+    for entry in _load_scan_history():
+        if not isinstance(entry, dict) or (entry.get("tool") or "") != "Syscalls":
+            continue
+        result = entry.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("counts"), dict):
+            continue
+        process = str(result.get("process") or "")
+        out.append({
+            "id": entry.get("id") or "",
+            "at": entry.get("timestamp") or "",
+            "pid": result.get("pid"),
+            "process": os.path.basename(process.replace("\\", "/")) or (entry.get("filename") or ""),
+            "build": result.get("build") or "",
+            "view": result.get("view") or "",
+            "counts": result.get("counts"),
+            "partial": bool(result.get("partial")),
+        })
+    return out
+
+
+@app.route("/api/syscalls/measurements")
+def api_syscalls_measurements():
+    """The syscall scans the history kept, to put one on the map. The list names them; it does not carry them."""
+    return jsonify({"measurements": _syscall_measurements()})
+
+
+@app.route("/api/syscalls/measurement")
+def api_syscalls_measurement():
+    """One measurement the history kept, shaped like a scan so the map needs no second way to read it.
+
+    `states` is rebuilt from the deviations against the baseline of the measurement's own build and view, and only
+    when the count adds up (syscall_scan.states_from_deviations). Where it cannot be, `states` is null and `problem`
+    says why, while the figures and deviations the scan recorded still travel: they are its own either way. `live`
+    is false and `measured_at` says when, because nothing here may read as a scan of now.
+    """
+    wanted = (request.args.get("id") or "").strip()
+    if not wanted or len(wanted) > 64 or not re.fullmatch(r"[A-Za-z0-9_-]+", wanted):
+        return jsonify({"error": "Provide the id of a measurement"}), 400
+    entry = next((e for e in _load_scan_history()
+                  if isinstance(e, dict) and (e.get("tool") or "") == "Syscalls" and e.get("id") == wanted), None)
+    if entry is None:
+        return jsonify({"error": f"no syscall measurement {wanted} in the scan history"}), 404
+    result = entry.get("result") if isinstance(entry.get("result"), dict) else {}
+    view, build = result.get("view") or "", result.get("build") or ""
+    modules = tuple(m for m in (result.get("modules") or ("ntdll.dll",)) if isinstance(m, str))
+    states, problem = None, None
+    baseline = None
+    if view in SYSCALL_BASELINE_VIEWS and build:
+        path = syscall_baseline.find_baseline(NTSLEUTH_BASELINE_DIR, build, view)
+        if path is None:
+            problem = (f"this system has no syscall baseline for build {build}, view {view}: the stubs of another "
+                       "build are numbered differently, so its map cannot be drawn here")
+        else:
+            try:
+                baseline = _load_syscall_baseline(path)
+            except syscall_baseline.BaselineError as exc:
+                problem = f"the syscall baseline of build {build} ({view}) is unusable: {exc}"
+    else:
+        problem = f"the measurement names no usable build and view (build {build or '?'}, view {view or '?'})"
+    if baseline is not None:
+        states, problem = syscall_scan.states_from_deviations(
+            baseline, modules, result.get("deviations"), result.get("counts") or {})
+        states = states or None
+    return jsonify({**{k: v for k, v in result.items() if k != "states"},
+                    "id": entry.get("id") or "", "measured_at": entry.get("timestamp") or "",
+                    "live": False, "states": states, "problem": problem})
+
+
 def _syscall_stage_enabled():
     """False when the detonation's syscall stage is switched off for the whole web UI: TDC_NO_SYSCALL_STAGE=1."""
     return os.environ.get("TDC_NO_SYSCALL_STAGE") != "1"

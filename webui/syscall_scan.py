@@ -462,6 +462,48 @@ class HookAllowlist:
                         "not applied")
 
 
+def states_from_deviations(baseline: Baseline, modules: tuple[str, ...], deviations, counts) -> tuple[dict, str | None]:
+    """`(states, problem)` of a measurement the history kept: its map, rebuilt, or `({}, why)`.
+
+    The history keeps a scan without `states` - some 2,000 stubs per scan is not what a timeline row expands to -
+    but it keeps `deviations`, and `measure` fills those with *every* state that is not intact. So every syscall
+    that was measured and is not named there was intact, and the map of a past measurement can be rebuilt from the
+    baseline of its build and view.
+
+    What makes that honest is the count: `counts["intact"]` says how many intact stubs the scan saw, and the rebuild
+    must produce exactly that many. It does not when something was measured that the rebuild cannot place - a module
+    loaded twice is not measured at all, a baseline of another build numbers its stubs differently - and then no map
+    is drawn, because a cell in the wrong place is worse than no cell.
+
+    An intact stub is rebuilt from the baseline alone: its name, module, number and rva. Its bytes were never kept,
+    and are not invented here; a reader of the detail panel must not be shown a measurement nobody made.
+    """
+    wanted = {m.lower() for m in modules}
+    by_name = {}
+    for entry in deviations or ():
+        if isinstance(entry, dict) and entry.get("name"):
+            by_name[entry["name"]] = entry
+    states, intact = {}, 0
+    for name, sc in baseline.syscalls.items():
+        if sc.module.lower() not in wanted:
+            continue
+        found = by_name.pop(name, None)
+        if found is not None:
+            states[name] = found
+            continue
+        states[name] = {"name": name, "module": sc.module, "number": sc.number, "rva": sc.rva,
+                        "state": STATE_INTACT}
+        intact += 1
+    want = counts.get(STATE_INTACT) if isinstance(counts, dict) else None
+    if not isinstance(want, int) or want != intact:
+        return {}, (f"the measurement counts {want} intact stubs and this baseline places {intact} of them: "
+                    "its map cannot be drawn from here")
+    if by_name:
+        return {}, (f"{len(by_name)} of its deviations are not in this baseline "
+                    f"({', '.join(sorted(by_name)[:3])}): its map cannot be drawn from here")
+    return states, None
+
+
 def measure(baseline: Baseline, reader: ProcessReader, view: str | None = None,
             build: str | None = None, modules: tuple[str, ...] = ("ntdll.dll",),
             allowlist: HookAllowlist | None = None) -> dict:

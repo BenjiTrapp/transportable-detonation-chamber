@@ -5369,3 +5369,125 @@ def test_the_stage_prefers_the_running_image_over_the_drop_folder(
     monkeypatch.setattr(tdc, "_run_memory_scans_async", lambda *a: seen.append(a))
     _submit(client, tdc, monkeypatch, agent_path=None)
     assert seen and seen[0][2] == str(elsewhere)
+
+
+# --- A past measurement on the map: reconstructing its states from what the history kept -----------------------------
+
+def test_a_past_measurement_rebuilds_its_states_and_proves_it_did(arm64_baseline):
+    """The history keeps a scan without `states` - some 2,000 stubs per scan is not what a timeline row expands to -
+    but it keeps `deviations`, and those are *every* state that is not intact (syscall_scan.measure). So every
+    measured syscall the deviations do not name was intact, and the map of a past measurement is reconstructible.
+
+    What makes it honest is the count. `counts['intact']` says how many there were; the rebuild must produce exactly
+    that many, or something was measured that the rebuild cannot place - a module loaded twice is not measured at
+    all, for instance - and then no map may be drawn from it. The check is the point of the function."""
+    live = syscall_scan.measure(arm64_baseline, _reader_from(
+        arm64_baseline, patched={"NtProtectVirtualMemory": ("0500001400000000", "edrhook.dll")}))
+    states, problem = syscall_scan.states_from_deviations(
+        arm64_baseline, ("ntdll.dll",), live["deviations"], live["counts"])
+    assert problem is None, problem
+    assert set(states) == set(live["states"]), "the same syscalls, no more and no fewer"
+    assert {n: s["state"] for n, s in states.items()} == {n: s["state"] for n, s in live["states"].items()}
+    rebuilt = states["NtProtectVirtualMemory"]
+    assert rebuilt == live["deviations"][0], "a deviation is carried over as the scan recorded it"
+    intact = next(s for n, s in states.items() if s["state"] == "intact")
+    assert intact["number"] == arm64_baseline.syscalls[intact["name"]].number
+    assert "bytes" not in intact and "read" not in intact, \
+        "the bytes of an intact stub were never kept: inventing them would be a measurement nobody made"
+
+
+def test_a_past_measurement_that_does_not_add_up_draws_no_map(arm64_baseline):
+    live = syscall_scan.measure(arm64_baseline, _reader_from(arm64_baseline, patched={}))
+    short = dict(live["counts"], intact=live["counts"]["intact"] - 3)
+    states, problem = syscall_scan.states_from_deviations(
+        arm64_baseline, ("ntdll.dll",), live["deviations"], short)
+    assert states == {} and problem and "3" in problem, problem
+    more = dict(live["counts"], intact=live["counts"]["intact"] + 1)
+    _, problem_more = syscall_scan.states_from_deviations(
+        arm64_baseline, ("ntdll.dll",), live["deviations"], more)
+    assert problem_more, "more intact than the baseline holds is just as unplaceable"
+
+
+def test_a_past_measurement_of_a_module_the_baseline_does_not_hold_is_no_map(arm64_baseline):
+    live = syscall_scan.measure(arm64_baseline, _reader_from(arm64_baseline, patched={}))
+    states, problem = syscall_scan.states_from_deviations(
+        arm64_baseline, ("ntdll.dll", "win32u.dll"), live["deviations"], live["counts"])
+    assert states == {} and problem, "win32u was asked for and this baseline has none: the count cannot match"
+
+
+def _history(tdc, monkeypatch, entries):
+    # the tdc fixture already replaces _load_scan_history with an empty one; this gives it content
+    monkeypatch.setattr(tdc, "_load_scan_history", lambda: entries)
+
+
+def _measurement_entry(live, entry_id="aa11bb22cc33", pid=4812, when="2026-11-25T08:33:12.100000"):
+    return {"id": entry_id, "timestamp": when, "tool": "Syscalls", "filename": f"PID {pid}",
+            "verdict": "clean", "score": 0,
+            "result": {k: v for k, v in {**live, "tool": "Syscalls", "pid": pid,
+                                         "process": r"C:\Users\Public\Downloads\injectsim.exe",
+                                         "modules": ["ntdll.dll"]}.items() if k != "states"}}
+
+
+def test_the_measurements_route_lists_the_syscall_scans_the_history_kept(
+        client, tdc, arm64_baseline, monkeypatch):
+    """The way in that does not come from a detonation: a list of what was measured before, so a scan of a process
+    that is long gone can still be put on the map. Only syscall scans, newest first, and only what the control needs
+    to name one - never the whole result, which carries every deviation."""
+    live = syscall_scan.measure(arm64_baseline, _reader_from(
+        arm64_baseline, patched={"NtProtectVirtualMemory": ("0500001400000000", "edrhook.dll")}))
+    _history(tdc, monkeypatch, [
+        _measurement_entry(live),
+        {"id": "ff00", "timestamp": "2026-11-25T07:00:00", "tool": "Aether", "filename": "PID 1", "result": {}},
+    ])
+    r = client.get("/api/syscalls/measurements")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert [m["id"] for m in body["measurements"]] == ["aa11bb22cc33"], "syscall scans only"
+    one = body["measurements"][0]
+    assert one["pid"] == 4812 and one["process"] == "injectsim.exe" and one["view"] == "arm64"
+    assert one["at"] == "2026-11-25T08:33:12.100000" and one["counts"]["intact"] == live["counts"]["intact"]
+    assert "deviations" not in one and "result" not in one, "the list names a measurement, it does not carry it"
+
+
+def test_one_measurement_comes_back_shaped_like_a_scan_and_says_it_is_not_one(
+        client, tdc, arm64_baseline, fake_baseline_dir, monkeypatch):
+    """The map draws a scan's `states`, so a past measurement is handed over in exactly that shape - otherwise the
+    map would need a second way to read. What it must never do is read as a scan of now: `live` is false and
+    `measured_at` says when, and every caveat the scan recorded travels with it."""
+    live = syscall_scan.measure(arm64_baseline, _reader_from(
+        arm64_baseline, patched={"NtProtectVirtualMemory": ("0500001400000000", "edrhook.dll")}))
+    _history(tdc, monkeypatch, [_measurement_entry(live)])
+    r = client.get("/api/syscalls/measurement?id=aa11bb22cc33")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["live"] is False and body["measured_at"] == "2026-11-25T08:33:12.100000"
+    assert body["pid"] == 4812 and body["view"] == "arm64" and body["problem"] is None
+    assert set(body["states"]) == set(live["states"])
+    assert body["states"]["NtProtectVirtualMemory"] == live["states"]["NtProtectVirtualMemory"], \
+        "a deviation comes back exactly as the scan recorded it"
+    assert body["counts"] == live["counts"] and body["partial"] == live["partial"]
+    assert len(body["deviations"]) == len(live["deviations"])
+
+
+def test_a_measurement_whose_baseline_is_gone_keeps_its_deviations_and_draws_no_map(
+        client, tdc, arm64_baseline, fake_baseline_dir, monkeypatch):
+    """A Windows update leaves the old build's baseline behind, and another build numbers its stubs differently.
+    The answer still carries what was recorded, so the reader sees the deviations and the figures - only `states` is
+    null, with the reason. Drawing those cells against another baseline would put them in the wrong place."""
+    live = syscall_scan.measure(arm64_baseline, _reader_from(arm64_baseline, patched={}))
+    entry = _measurement_entry(live)
+    entry["result"]["build"] = "99999.1"
+    _history(tdc, monkeypatch, [entry])
+    r = client.get("/api/syscalls/measurement?id=aa11bb22cc33")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["states"] is None and body["problem"]
+    assert "99999.1" in body["problem"], body["problem"]
+    assert body["counts"] == live["counts"], "the figures it recorded are still its own"
+
+
+def test_an_unknown_measurement_is_a_404_and_an_id_that_is_not_one_is_refused(client, tdc, monkeypatch):
+    _history(tdc, monkeypatch, [])
+    assert client.get("/api/syscalls/measurement?id=deadbeef").status_code == 404
+    assert client.get("/api/syscalls/measurement").status_code == 400
+    assert client.get("/api/syscalls/measurement?id=" + "x" * 200).status_code == 400
