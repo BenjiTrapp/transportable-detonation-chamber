@@ -35,6 +35,8 @@ TDC, als Python-Module in `webui/`, neben `pipe_proxy.py`, angehängt an
   alles selbst) und online (die VM redet echt, TDC schneidet mit).
 - Ein C2-Listener in zwei Spielarten: fremde Beacons am Leben halten und
   ausmessen; eigene Beacons an den echten Teamserver durchreichen.
+- **Die zweite Stufe eines Loaders sichern**, ohne sie ihm auszuliefern — und
+  sie als eigene, verknüpfte Detonation anbieten.
 - Ein Fingerprint pro Lauf, der über Läufe hinweg vergleichbar bleibt und
   einen Snapshot-Rollback überlebt, weil er exportierbar ist.
 - Die Befunde laufen in **dasselbe** Evidence- und Verdict-System wie Memory
@@ -43,9 +45,11 @@ TDC, als Python-Module in `webui/`, neben `pipe_proxy.py`, angehängt an
 
 ## Nicht-Ziele
 
-- **Keine echte Payload-Auslieferung.** Ein Loader bekommt im abgeschotteten
-  Modus unsere Antwort statt seines zweiten Stadiums. Er bricht dort meist ab —
-  nachdem er die URL verraten hat. Das ist der Preis und wird so angezeigt.
+- **Der Loader bekommt seine Stage nicht ausgeliefert.** Er erhält im
+  abgeschotteten Modus unsere Antwort und bricht dort meist ab. Die Stage
+  selbst ist aber **nicht verloren**: TDC holt sie und sichert sie (siehe
+  *Stage-Sicherung*). Sie im Kontext des Loaders auszuführen bleibt
+  ausgeschlossen — sie wird stattdessen als eigene Detonation angeboten.
 - **Kein Brechen von Certificate Pinning** und keine Zertifikate für Clients
   mit eigenem Truststore (Python `certifi`, Firefox, Go). Für die bleiben SNI,
   JA3 und JA4 übrig.
@@ -310,6 +314,51 @@ liest sie mit und vergleicht erwartete gegen beobachtete Werte: erwarteter
 Host, erwartetes Sleep, erwarteter Jitter gegen das, was tatsächlich auf der
 Leitung passiert. Eine Abweichung ist selbst ein Befund.
 
+### Stage-Sicherung
+
+Das größte Zugeständnis eines Fake-Internets ist, dass ein Loader seine
+zweite Stufe nie bekommt: man sieht die URL und hat nichts in der Hand. Das
+kehrt dieses Feature um.
+
+Fragt ein Prozess eine Datei ab, bekommt er **sofort die Fake-Antwort** —
+und daneben läuft der echte Abruf. Was zurückkommt, landet als `.bin` bei den
+Artefakten des Laufs, mit Hash, Quell-URL, Größe und dem Prozess, der danach
+gefragt hat. Nie geöffnet, nie ausgeführt.
+
+**Asynchron, nicht blockierend.** Erst die echte Datei zu holen und dann zu
+antworten würde die Verbindung des Loaders sekundenlang hängen lassen; manche
+brechen bei Timeout ab, und dann hat man weder Stage noch Verhalten.
+
+**Pro Detonation einschaltbar, Default aus.** Ein abgeschotteter Modus, der
+im Hintergrund doch nach draußen telefoniert, wäre eine böse Überraschung.
+Ist es an, sagt die UI das deutlich — im Submit-Formular und im Report.
+
+**Die Leitung ist einstellbar:** direkter Abruf als Default, optional über
+einen HTTP- oder SOCKS-Proxy, damit Tor oder ein VPN davorhängen kann.
+
+> **Was der Abruf kostet:** Er verrät dem Betreiber, dass sein Sample
+> analysiert wird. Er sieht die Adresse, von der geholt wird, kann sie
+> sperren oder ab sofort etwas Harmloses ausliefern. Deshalb Default aus und
+> die Leitung konfigurierbar.
+
+**Die Kette, Stufe für Stufe.** Eine gesicherte Stage erscheint in den
+Ergebnissen mit einem Knopf, sie als **eigene Detonation** zu starten. Der
+neue Lauf wird mit dem verknüpft, aus dem die Stage kam: die Submission trägt
+die Herkunft (Eltern-Lauf, Quell-URL, welcher Prozess sie geholt hat), und die
+Ergebnisse zeigen die Kette in beide Richtungen.
+
+Das ist bewusst **kein** Durchreichen an den Loader. Jede Stufe läuft für
+sich, mit eigenem Verdict, eigener Prozesszuordnung und eigenen
+Memory-Befunden — im Loader-Kontext ausgeführt wäre beides vermischt und
+schwerer zu lesen. Und es bleibt eine bewusste Handlung: TDC startet nichts
+von selbst nach.
+
+Dazu eine neue Evidence-Art:
+
+| Art | Gewicht | Klasse | Begründung |
+|---|---|---|---|
+| `payload_staging` | 4.0 | strukturell | Ein nachgeladenes ausführbares Objekt, als Datei belegt — nicht bloß eine URL |
+
 ### Analyse, Events und Regeln
 
 Dieselben Event-Typen, wie sie sich aus den Protokollen ergeben: `dns`,
@@ -447,8 +496,10 @@ C:\dumps\network\<zeit>_<sha256-prefix>\
   capture.pcap        selbst geschrieben: was das Sample sendete, wie es auf
                       einem echten Netz aussähe
   events.json         jedes Event mit allen Feldern
-  report.json         Befunde, IOCs, Fingerprint
+  report.json         Befunde, IOCs, Fingerprint, Herkunft der Kette
   files\*.bin         was über die Leitung ging, nie geöffnet, nie ausgeführt
+  stages\*.bin        echt abgeholte zweite Stufen, mit Quell-URL und Hash
+                      in report.json, nie geöffnet, nie ausgeführt
   session.log
 ```
 
@@ -469,13 +520,20 @@ In `renderDetonationPanels()` (`webui/static/js/app.js:8471`) ein Eintrag
 Fingerprint-Vergleich mit einem Link in den Tab. Das ist die Antwort auf „was
 ist passiert?" an der Stelle, wo man nach dem Detonieren sowieso hinschaut.
 
+Dazu die **gesicherten Stages**, wenn es welche gibt: Quell-URL, Hash, Größe,
+der Prozess, der sie geholt hat, und der Knopf, die Stage als eigene
+Detonation zu starten. Kam der Lauf selbst aus einer Stage, steht die Herkunft
+oben — welcher Lauf, welche URL.
+
 ### NETWORK-Tab
 
 Neuer Top-Level-Tab zwischen `PIPES` und `SYSMON`, mit Unterkarten:
 `OVERVIEW`, `CONNECTIONS`, `DNS`, `HTTP`, `TLS`, `FILES`, `IOCs`,
 `FINGERPRINT`. Dort liegt die Tiefe: Streams, TLS im Klartext, dekodierte
 Felder, IOC-Liste, Fingerprint-Vergleich, Im- und Export — und der Import
-eines fremden pcap, der durch dieselbe Analyse läuft.
+eines fremden pcap, der durch dieselbe Analyse läuft. `FILES` trennt dabei,
+was über die Leitung ging, von den **echt abgeholten Stages**, und zeigt die
+Kette der Läufe, die daraus entstanden sind.
 
 ### Tracing
 
@@ -550,8 +608,9 @@ Projekte:
 2. **Das Fake-Internet.** Zuerst der Spike zur Adressvergabe, dann Diverter,
    DNS, Fake-Server, TLS, Prozess-Zuordnung, Modus im Submit-Tab,
    Session-Steuerung, Aufräumen.
-3. **Der C2-Listener.** Am Leben halten, Allowlist zum Durchreichen,
-   Beacon-Config als Eingabe.
+3. **Der C2-Listener und die Stage-Sicherung.** Am Leben halten, Allowlist
+   zum Durchreichen, Beacon-Config als Eingabe — und der echte Abruf der
+   zweiten Stufe samt Verkettung zu einer eigenen Detonation.
 4. **Fingerprint.** Merkmale, Vergleich, Im- und Export als
    passwortgeschütztes ZIP.
 
@@ -579,6 +638,12 @@ Ohne dass danach gefragt wurde, als Vorschlag erkennbar:
 - `online` bleibt der Default, damit niemand ungewollt in einem anderen
   Netzmodell landet.
 - Immer nur eine Netzwerk-Session gleichzeitig.
+- Die Stage-Sicherung ist pro Detonation einschaltbar und standardmäßig
+  **aus**, mit einstellbarer Leitung (direkt oder über Proxy). Der echte
+  Abruf verrät dem Betreiber die Analyse — das darf nicht unbemerkt
+  passieren.
+- Eine gesicherte Stage wird dem Loader nie durchgereicht, sondern als eigene
+  verknüpfte Detonation angeboten; TDC startet sie nicht von selbst.
 - Aufgenommen wird alles, getrennt wird danach: Prozessbaum-Markierung,
   Netzwerk-Baseline, Allowlist für TDCs eigene Dienste.
 - Supersede zwischen Evidence-Arten und ein Confidence-Faktor je Modus, beides
