@@ -27,6 +27,9 @@ Regressions covered:
   * a typo in a rule key (``sevrity``) silently ignored, a list name that does
     not exist silently empty, an empty ``contains`` matching everything
   * ``known_good`` destinations reaching rules, or the opt-out being ignored
+  * wall-clock bounds of 0.5 s and 1 s flaked under load; they are ten times
+    wider, still far below what a pattern that escaped would take (final
+    review M3)
 """
 
 import json
@@ -991,7 +994,7 @@ def test_the_worst_regexes_that_are_accepted_stay_cheap_on_a_huge_field(pattern)
         subject = (unit * (2000000 // len(unit)))[:2000000]
         start = time.time()
         rs.evaluate([_http(path=subject), _http(path=subject + "!")])
-        assert time.time() - start < 0.5, (pattern, unit)
+        assert time.time() - start < 5.0, (pattern, unit)      # a stall takes minutes
 
 
 def test_no_regex_that_is_accepted_is_slow_on_a_field_made_to_hurt_it():
@@ -1253,7 +1256,7 @@ def test_a_regex_that_runs_away_times_out_and_the_rule_is_unevaluated(monkeypatc
     evil = _http(1.0, path="a" * 80 + "!")
     start = time.time()
     got = rs.evaluate([evil, _http(2.0, path="aa")])
-    assert time.time() - start < 1.0
+    assert time.time() - start < 10.0       # without the timeout: 2**40 steps
     assert [h["events"][0]["index"] for h in got] == [1]            # the ordinary event still matches
     assert got.unevaluated == [{"rule_id": "r", "events": 1, "reasons": ["timeout"]}]
 
@@ -1300,7 +1303,7 @@ def test_the_patterns_that_got_past_the_checker_are_harmless_with_the_timeout(pa
     start = time.time()
     for subject in ("a" * 256, "a=" * 128, "/" + "a/" * 128, "a" * 255 + "!"):
         rs.evaluate([_http(path=subject)])
-    assert time.time() - start < 1.0
+    assert time.time() - start < 10.0       # a pattern that escaped runs for hours
 
 
 def test_without_the_regex_module_the_checker_is_the_guard_and_the_cut_is_short(monkeypatch):

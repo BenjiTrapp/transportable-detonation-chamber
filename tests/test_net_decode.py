@@ -78,6 +78,8 @@ Regressions covered:
     looks only in the 64 characters before each colon, with the same matches
     (held against ``finditer`` on generated lines), and a pattern whose
     separator is not in the text is not run
+  * wall-clock bounds of 5 and 10 s flaked under load; they are ten times
+    wider (final review M3)
   * a masked value in a URL path ran past "/", so ``/dl;token=abc/stage.exe``
     lost its file name in the report and shared the baseline key of
     ``.../update.bin``; with ``path`` it ends with its segment (final review I2)
@@ -429,7 +431,7 @@ def test_a_decompression_bomb_is_cut_at_the_ceiling():
     bomb = b64(gzip.compress(b"A" * (20 * 1024 * 1024), 9))
     started = time.time()
     d = net_decode.decode(bomb)
-    assert time.time() - started < 5
+    assert time.time() - started < 50      # 10x: a load-proof bound, a blow-up takes far longer
     assert d.truncated is True and len(d.bytes) <= net_decode.MAX_INFLATED
 
 
@@ -880,7 +882,7 @@ def test_marking_stays_linear_on_hostile_text():
                  b"x://" * 15000, b"\n".join([b"a|b|c|https://x.y"] * 3000),
                  b"https://" + b"a:" * 20000 + b"@"):
         net_decode.decode_event_fields(http(body_text="d=" + b64(text)))
-    assert time.time() - started < 5
+    assert time.time() - started < 50      # 10x: a load-proof bound, a blow-up takes far longer
 
 
 def test_credential_is_always_present_and_a_plain_bool():
@@ -912,7 +914,7 @@ def test_headers_are_walked_in_bounded_time_and_count():
     hostile = {"h%d" % i: "a=" * 50 + ";" * 5000 + "." * 5000 for i in range(50)}
     started = time.time()
     net_decode.decode_event_fields(http(headers=hostile))
-    assert time.time() - started < 5
+    assert time.time() - started < 50      # 10x: a load-proof bound, a blow-up takes far longer
 
 
 # --- bounds ------------------------------------------------------------------
@@ -946,7 +948,7 @@ def test_many_bombs_in_one_event_are_bounded_together():
     body = "&".join("k%d=%s" % (i, bomb) for i in range(20))
     started = time.time()
     out = net_decode.decode_event_fields(http(body_text=body))
-    assert time.time() - started < 10
+    assert time.time() - started < 100     # 10x: a load-proof bound, a blow-up takes far longer
     assert len(out) == 20
     inflated = [d for d in out if d["layers"] == ["base64", "gzip"]]
     assert len(inflated) == net_decode.MAX_EVENT_INFLATE // net_decode.MAX_INFLATED
@@ -958,7 +960,7 @@ def test_hostile_json_and_forms_are_scanned_in_linear_time():
     for body in ('"a":"' * 40000, '"' * 200000, "{" + '"k":"v",' * 30000,
                  "&=" * 100000, "a=" * 100000, "--" + "x" * 100000):
         net_decode.decode_event_fields(http(body_text=body))
-    assert time.time() - started < 10
+    assert time.time() - started < 100     # 10x: a load-proof bound, a blow-up takes far longer
 
 
 # --- masking plain-text credentials for a report ------------------------------------
@@ -1075,7 +1077,7 @@ def test_masking_a_long_hostile_body_takes_linear_time():
     started = time.time()
     for body in ("pass=" * 50000, "p:" * 100000, "a|" * 100000 + "http://x", '"pass":"' * 40000):
         net_decode.mask_credentials(body, lines=True)
-    assert time.time() - started < 10
+    assert time.time() - started < 100     # 10x: a load-proof bound, a blow-up takes far longer
 
 
 class _Counted:

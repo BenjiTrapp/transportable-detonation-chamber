@@ -52,6 +52,8 @@ Regressions covered:
   * a beacon with no jitter that missed a check-in now and then (a gap of
     exactly two or three periods) was refused as two time scales: about one
     in twenty such series lost its tight Sysmon finding
+  * a test's docstring gave 3.7-7.5 % where its own counts are 7.2-11.8 %
+    (final review M4)
 """
 
 import json
@@ -968,7 +970,8 @@ def test_rounds_of_requests_with_one_request_left_out_have_no_interval(offsets):
     Regressions covered: the step rule wanted one constant step, so leaving
     out the last request of one round measured the inner interval (10 s,
     tight for four requests) in 95-99 % of series; anywhere, in about 70 %.
-    Measured with the modal step: 0 % for the last request, 3.7-7.5 % for any.
+    Measured with the modal step: 0 % for the last request, 7.2-11.8 % for any
+    (36, 38 and 59 of 500, below).
     """
     rng = random.Random(len(offsets))
     for _ in range(300):

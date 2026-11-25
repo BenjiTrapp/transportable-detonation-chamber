@@ -26,6 +26,9 @@ Regressions covered:
     different names became one destination
   * many queries sharing one transaction ID, answered in order, were matched by
     scanning every waiting query again for each answer
+  * a wall-clock bound (3 s) on matching 20,000 lookups with one transaction
+    ID failed on a loaded machine; the test counts the entries popped instead
+    (final review M3)
 """
 
 import os
@@ -33,7 +36,6 @@ import random
 import socket
 import struct
 import tempfile
-import time
 
 import dpkt
 
@@ -372,7 +374,7 @@ def test_a_response_with_no_question_still_answers_the_waiting_query():
 
 # --- many lookups sharing a transaction ID ------------------------------------
 
-def test_many_queries_with_one_transaction_id_are_matched_without_rescanning():
+def test_many_queries_with_one_transaction_id_are_matched_without_rescanning(monkeypatch):
     n = 20000
     datagrams = [(1.0 + i * 1e-4, "c",
                   _message("h%d.top" % i, "A", response=False, txid=77))
@@ -382,13 +384,22 @@ def test_many_queries_with_one_transaction_id_are_matched_without_rescanning():
                             txid=77))
                   for i in range(n)]
     flow = _flow_from(datagrams)
-    started = time.monotonic()
+    # work, not wall-clock time (a loaded machine made a 3 s bound flaky): each
+    # lookup sits on two stacks and is popped from each at most once
+    looked_at = []
+    take = net_dns._take
+
+    def counted(stack):
+        before = len(stack)
+        found = take(stack)
+        looked_at.append(before - len(stack))
+        return found
+    monkeypatch.setattr(net_dns, "_take", counted)
     events = net_dns.events_from_flow(flow)
-    elapsed = time.monotonic() - started
     assert len(events) == n
     assert events[1234]["answers"] == ["10.4.210.1"]
     assert all(e["answers"] for e in events)
-    assert elapsed < 3.0
+    assert len(looked_at) == n and sum(looked_at) <= 2 * n
 
 
 # --- is_dns -------------------------------------------------------------------
