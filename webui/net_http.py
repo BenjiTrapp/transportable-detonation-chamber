@@ -70,11 +70,17 @@ intervals (``ts`` of each request), rules (``method``, ``path``, ``body_text``,
     the payload. The text ceiling is far too small for a real file, so a
     download that outgrows it is inflated again into the hash alone: each
     piece is hashed and discarded, which costs time and no memory, and
-    ``MAX_HASHED`` bounds the time. Only a payload beyond that has no hash
-    (``sha256`` and ``size`` None, ``inflate_capped`` True), because the hash
-    of part of a file identifies nothing. Two ceilings, two purposes: the
-    text a body keeps is still capped at ``MAX_INFLATED``. An ``upload`` still
-    describes the wire bytes.
+    ``MAX_HASHED`` bounds the time. A payload that could not be inflated
+    whole has no hash (``sha256`` and ``size`` None), because the hash of
+    part of a file identifies nothing: ``inflate_capped`` says it outgrew
+    ``MAX_HASHED``, ``inflate_failed`` that the stream broke or ended early.
+    The event is still emitted with the ``kind`` read from the start that did
+    inflate, since "a PE was fetched from this URL" is the indicator even
+    when the capture holds only part of the file. Two ceilings, two purposes:
+    the text a body keeps is still capped at ``MAX_INFLATED``, and a
+    character split by any cut (cap, ceiling or broken stream) is not an
+    error. An ``upload`` still describes the wire bytes, and names their
+    ``content_encoding``.
   * Bytes from a capture are inert. Nothing is executed or opened as a file;
     a download is hashed and its first bytes name its kind.
 
@@ -375,15 +381,19 @@ def _time_at(index, offset, default):
 
 # --- bodies -------------------------------------------------------------------
 
-def _text(body):
-    """``(text or None, capped)`` for a body; "" when empty, None when binary."""
+def _text(body, cut=False):
+    """``(text or None, capped)`` for a body; "" when empty, None when binary.
+
+    ``cut`` says the bytes given are the start of something longer or broken
+    off (an inflate stopped at its ceiling, a stream that ended early), as the
+    text cap itself is: a character split by any such cut is not an error.
+    """
     if not body:
         return "", False
     capped = len(body) > MAX_BODY_TEXT
     chunk = body[:MAX_BODY_TEXT]
     try:
-        # a character cut by the cap is not an error
-        text = codecs.getincrementaldecoder("utf-8")().decode(chunk, final=not capped)
+        text = codecs.getincrementaldecoder("utf-8")().decode(chunk, final=not (capped or cut))
     except UnicodeDecodeError:
         text = chunk.decode("latin-1")
     if "\x00" in text or len(_CONTROL.findall(text)) * 20 > len(text):
@@ -522,7 +532,7 @@ def _body_text(body, encoding):
     """
     decoded = _decoded(body, encoding)
     data, inflate_capped, failed, _applied = decoded
-    text, capped = _text(data)
+    text, capped = _text(data, cut=inflate_capped or failed)
     if failed and not data:
         text = None
     return text, capped or inflate_capped, failed, decoded
@@ -552,30 +562,40 @@ def _payload(wire, decoded, encoding):
     wire bytes' hash and size are added beside as ``wire_sha256`` /
     ``wire_size`` when they differ. The inflated bytes kept for text stop at
     ``MAX_INFLATED``, which a real file usually exceeds, so then the payload is
-    inflated a second time into the hash alone, up to ``MAX_HASHED``. Beyond
-    that only a prefix of the file could be hashed, and the hash of a prefix
-    identifies nothing, so ``sha256`` and ``size`` are None (the kind, read
-    from the start, is still known) and ``inflate_capped`` says why. When
-    inflating failed, or no encoding applies, the wire bytes are the payload.
+    inflated a second time into the hash alone, up to ``MAX_HASHED``.
+
+    The hash of part of a file identifies nothing, so when the whole payload
+    could not be inflated there is none: ``sha256`` and ``size`` are None,
+    ``inflate_capped`` (it outgrew ``MAX_HASHED``) or ``inflate_failed`` (the
+    stream broke or ended early) says why, and ``kind`` is still read from the
+    start that did inflate, so the event still records that a file of that
+    type was fetched. A stream that broke before anything readable came out,
+    or no encoding at all, leaves the wire bytes as the payload.
     """
     data, capped, failed, applied = decoded
     wire_sha = hashlib.sha256(wire).hexdigest()
-    wire_only = {"sha256": wire_sha, "size": len(wire), "inflate_capped": False}
-    if not applied or failed:
+    wire_only = {"sha256": wire_sha, "size": len(wire),
+                 "inflate_capped": False, "inflate_failed": False}
+
+    def unhashed(why):
+        return {"sha256": None, "size": None, "inflate_capped": why == "capped",
+                "inflate_failed": why == "failed",
+                "wire_sha256": wire_sha, "wire_size": len(wire)}
+
+    if not applied:
         return _kind(wire), wire_only
     kind = _kind(data)
+    if failed:
+        return (kind, unhashed("failed")) if kind else (_kind(wire), wire_only)
     if not kind:
         return "", {}
     if capped:
         sha, size, status = _file_digest(wire, encoding)
-        if status == "failed":              # broke after the text ceiling
-            return _kind(wire), wire_only
-        if status == "capped":
-            return kind, {"sha256": None, "size": None, "inflate_capped": True,
-                          "wire_sha256": wire_sha, "wire_size": len(wire)}
+        if status != "ok":
+            return kind, unhashed("capped" if status == "capped" else "failed")
     else:
         sha, size = hashlib.sha256(data).hexdigest(), len(data)
-    fields = {"sha256": sha, "size": size, "inflate_capped": False}
+    fields = {"sha256": sha, "size": size, "inflate_capped": False, "inflate_failed": False}
     if sha != wire_sha:
         fields["wire_sha256"] = wire_sha
     if size != len(wire):
@@ -790,8 +810,11 @@ def _ws_messages(frames, direction, index, default):
     if cur is not None:
         cur["truncated"] = True
         messages.append(cur)
-    return [{"direction": direction, "text": _text(bytes(m["data"]))[0], "size": m["size"],
-             "ts": m["ts"], "truncated": m["truncated"]} for m in messages]
+    return [{"direction": direction, "size": m["size"], "ts": m["ts"],
+             "truncated": m["truncated"],
+             "text": _text(bytes(m["data"]),
+                           cut=m["truncated"] or m["size"] > len(m["data"]))[0]}
+            for m in messages]
 
 
 def _websocket_event(ctx, origin, req, resp, ts):
@@ -849,7 +872,8 @@ def _exchange_events(ctx, req, resp):
             "upload", req_ts, dest=origin.dest, port=origin.port, method=origin.method,
             url=origin.url, path=origin.path, size=len(body),
             sha256=hashlib.sha256(body).hexdigest(), kind=_kind(body),
-            content_type=origin.headers.get("content-type", ""), truncated=req.truncated))
+            content_type=origin.headers.get("content-type", ""),
+            content_encoding=request_encoding, truncated=req.truncated))
     if reply:
         kind, identity = _payload(reply, resp_decoded, response_encoding)
         if kind:

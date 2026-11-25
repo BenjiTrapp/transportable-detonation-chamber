@@ -42,6 +42,13 @@ Regressions covered:
   * a compressed body cut by the capture, or corrupt, took the event down or
     passed for an empty one; the event is kept with the raw size and
     ``body_decode_failed`` / ``resp_decode_failed``
+  * text cut by the inflate ceiling (or by a stream that broke) split a
+    multi-byte character, and the whole body was then decoded as Latin-1 and
+    delivered garbled ("aÃ©", "ä¸­"); the cut is not an error, whichever cap
+    made it
+  * a gzipped PE that the capture held only part of produced no ``download``
+    event at all, so the one fact a later phase needs (a PE was fetched from
+    this URL) was lost; it is reported with its kind and no hash
   * an encoding the module cannot undo (br, zstd) was treated as if it had
     been undone, or the body was dropped, instead of being left as it was
 """
@@ -990,11 +997,21 @@ def test_the_hashing_ceiling_is_in_the_tens_of_megabytes_and_above_the_text_ceil
     assert net_http.MAX_HASHED > 8 * net_http.MAX_INFLATED
 
 
-def test_a_big_gzipped_pe_that_breaks_after_the_text_ceiling_falls_back_to_the_wire():
+def test_a_big_gzipped_pe_that_breaks_after_the_text_ceiling_is_reported_without_a_hash():
     wire = gzip.compress(b"MZ" + b"\x00" * (3 * _MIB))
     cut = wire[:len(wire) // 2]
-    evs = net_http.events_from_flow(_http_flow(_get(), _encoded(cut, b"gzip")))
-    assert [e["type"] for e in evs] == ["http"]
+    d = _events(_get(), _encoded(cut, b"gzip"), kind="download")[0]
+    assert d["kind"] == "pe" and d["sha256"] is None and d["size"] is None
+    assert d["inflate_failed"] is True and d["inflate_capped"] is False
+    assert d["wire_sha256"] == _sha(cut)
+
+
+def test_the_flags_that_explain_a_missing_hash_are_false_when_there_is_one():
+    for d in (_events(_get(), _ok(_PE), kind="download")[0],
+              _events(_get(), _encoded(gzip.compress(_PE), b"gzip"), kind="download")[0],
+              _events(_get(), _encoded(_PE, b"gzip"), kind="download")[0]):
+        assert d["inflate_failed"] is False and d["inflate_capped"] is False
+        assert d["sha256"] is not None and d["size"] is not None
 
 
 def test_a_failed_inflate_falls_back_to_the_wire_bytes_for_kind_and_hash():
@@ -1005,9 +1022,22 @@ def test_a_failed_inflate_falls_back_to_the_wire_bytes_for_kind_and_hash():
     assert e["resp_decode_failed"] is True
 
 
-def test_a_gzipped_pe_cut_mid_stream_is_no_download_but_keeps_the_http_event():
-    evs = net_http.events_from_flow(_http_flow(_get(), _encoded(gzip.compress(_PE)[:40], b"gzip")))
-    assert [e["type"] for e in evs] == ["http"] and evs[0]["resp_decode_failed"] is True
+def test_a_gzipped_pe_cut_mid_stream_is_still_reported_as_a_download_without_a_hash():
+    wire = gzip.compress(_PE)
+    for cut in (len(wire) - 20, len(wire) - 5):
+        evs = net_http.events_from_flow(_http_flow(_get(b"/s2"), _encoded(wire[:cut], b"gzip")))
+        d = [e for e in evs if e["type"] == "download"][0]
+        assert d["kind"] == "pe" and d["path"] == "/s2"
+        assert d["sha256"] is None and d["size"] is None
+        assert d["inflate_failed"] is True and d["inflate_capped"] is False
+        assert d["wire_sha256"] == _sha(wire[:cut]) and d["wire_size"] == cut
+        http = [e for e in evs if e["type"] == "http"][0]
+        assert http["resp_decode_failed"] is True
+
+
+def test_a_cut_stream_with_nothing_inflated_yet_has_no_kind_and_no_download():
+    evs = net_http.events_from_flow(_http_flow(_get(), _encoded(gzip.compress(_PE)[:12], b"gzip")))
+    assert [e["type"] for e in evs] == ["http"]
 
 
 def test_an_encoding_that_is_not_understood_is_hashed_as_it_arrived():
@@ -1019,3 +1049,57 @@ def test_an_encoding_that_is_not_understood_is_hashed_as_it_arrived():
 def test_a_gzipped_response_that_is_not_a_file_is_not_a_download():
     assert _events(_get(), _encoded(gzip.compress(_TEXT), b"gzip"), kind="download") == []
     assert _events(_get(), _encoded(gzip.compress(b""), b"gzip"), kind="download") == []
+
+
+# --- text cut by an inflate cap or a break ------------------------------------
+
+def test_utf8_text_cut_by_the_inflate_ceiling_is_not_garbled():
+    two = ("a" + "\u00e9" * (net_http.MAX_INFLATED // 2 + 100)).encode("utf-8")
+    e = _events(_get(), _encoded(gzip.compress(two), b"gzip"))[0]
+    assert e["resp_capped"] is True and e["resp_decode_failed"] is False
+    assert e["resp_text"] == "a" + "\u00e9" * ((net_http.MAX_INFLATED - 1) // 2)
+    three = ("\u4e2d" * (net_http.MAX_INFLATED // 3 + 100)).encode("utf-8")
+    e = _events(_get(), _encoded(zlib.compress(three), b"deflate"))[0]
+    assert e["resp_capped"] is True
+    assert e["resp_text"] == "\u4e2d" * (net_http.MAX_INFLATED // 3)
+
+
+def test_a_gzipped_request_body_cut_by_the_ceiling_is_not_garbled_either():
+    wire = gzip.compress(("\u4e2d" * (net_http.MAX_INFLATED // 3 + 100)).encode("utf-8"))
+    e = _events(b"POST /p HTTP/1.1\r\nHost: x.top\r\nContent-Encoding: gzip\r\n"
+                b"Content-Length: %d\r\n\r\n" % len(wire) + wire, b"")[0]
+    assert e["body_capped"] is True and set(e["body_text"]) == {"\u4e2d"}
+
+
+def test_utf8_text_from_a_stream_that_broke_mid_character_is_not_garbled():
+    original = "".join("\u00e9\u4e2d %d " % i for i in range(300))
+    wire = gzip.compress(original.encode("utf-8"))
+    seen = 0
+    for cut in range(30, len(wire) - 8, 5):
+        e = _events(_get(), _encoded(wire[:cut], b"gzip"))[0]
+        assert e["resp_decode_failed"] is True
+        if e["resp_text"]:
+            seen += 1
+            assert original.startswith(e["resp_text"]), cut
+    assert seen > 10
+
+
+# --- upload encoding ----------------------------------------------------------
+
+def test_an_upload_names_the_encoding_of_the_body_its_hash_describes():
+    wire = gzip.compress(b"exfil " * 400)
+    assert len(wire) < 600
+    body = wire + b"\x00" * (600 - len(wire))
+    u = _events(b"POST /u HTTP/1.1\r\nHost: x.top\r\nContent-Encoding: GZIP\r\n"
+                b"Content-Length: %d\r\n\r\n" % len(body) + body, b"", kind="upload")[0]
+    assert u["content_encoding"] == "gzip" and u["sha256"] == _sha(body)
+    plain = _events(b"POST /u HTTP/1.1\r\nHost: x.top\r\nContent-Length: 600\r\n\r\n" + b"u" * 600,
+                    b"", kind="upload")[0]
+    assert plain["content_encoding"] == ""
+
+
+def test_a_websocket_message_cut_by_the_text_cap_is_not_garbled():
+    text = ("a" + "\u00e9" * (net_http.MAX_BODY_TEXT // 2 + 100)).encode("utf-8")
+    ws = _ws_events(b"", _ws_frame(text))[0]
+    m = ws["messages"][0]
+    assert m["size"] == len(text) and m["text"] == "a" + "\u00e9" * ((net_http.MAX_BODY_TEXT - 1) // 2)
