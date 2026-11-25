@@ -39,6 +39,9 @@ REPORT_FNS = [
     "escapeHtml", "cssToken", "sortNumberValue", "severitySortValue", "formatSize",
     "evidenceClassLabel", "viewToggleHtml", "cardViewAttrs", "isTableView", "jsArg",
 ]
+RACE_FNS = ["networkOpenReport", "networkTabShown", "networkRefreshReports", "networkSelectReport",
+            "networkRefreshBaseline", "networkFillSelect", "networkText", "networkJson", "networkShowReport",
+            "networkFindingGroups"]
 PANEL_FNS = REPORT_FNS + ["renderNetworkPanel", "networkReportOf", "networkEvidenceOf"]
 CONSTS = ["NETWORK_SUBS", "NETWORK_ROWS_MAX", "NETWORK_ERRORS_SHOWN", "NETWORK_CONNECTION_TYPES",
           "networkState", "cardViewState", "ALERT_SEVERITIES"]
@@ -131,11 +134,10 @@ def test_the_help_has_the_tab_and_the_five_routes():
         assert "<code>/api/network/%s</code>" % route in api, route
 
 
-def test_the_style_sheets_and_the_script_are_versioned():
+def test_the_assets_carry_a_version_query():
+    """Only that the four assets have a ?v= (a bump itself is not testable here: it is a diff)."""
     html = _index_html()
-    for href in re.findall(r'(?:href|src)="/static/(?:css|js)/[\w.-]+\?v=(\d+)"', html):
-        assert int(href) >= 1
-    assert len(re.findall(r'\?v=\d+"', html)) == 4
+    assert len(re.findall(r'/static/(?:css|js)/[\w.-]+\?v=\d+"', html)) == 4
 
 
 # --- rendering ----------------------------------------------------------------------------------
@@ -535,3 +537,135 @@ def test_the_tab_loads_its_reports_each_time_and_the_baseline_once():
         console.log(JSON.stringify(calls));
     """, PRELUDE)
     assert r == ["baseline", "reports", "reports"]
+
+
+# --- stale answers, error bodies, counts --------------------------------------------------------
+
+def _race(delays, action, reports=("NEWEST", "RUN"), fail=(), wait=250, html_error=()):
+    """Runs `action` against a fetch whose answers arrive after delays[key] ms; the result is the
+    state after everything arrived and the messages shown."""
+    script = r"""
+        const delays = %s, FAIL = %s, HTML = %s;
+        globalThis.fetch = url => new Promise(resolve => {
+            let key = url, body = {};
+            if (url === '/api/network/reports') body = { reports: %s.map(id => ({ id })) };
+            else if (url === '/api/network/baseline') body = { total: 0 };
+            else { key = decodeURIComponent(url.split('id=')[1]); body = { id: key, events: [] }; }
+            const bad = FAIL.includes(key), html = HTML.includes(key);
+            setTimeout(() => resolve({ ok: !bad && !html, status: html ? 502 : (bad ? 404 : 200),
+                json: async () => { if (html) throw new SyntaxError("Unexpected token '<'");
+                                    return bad ? { error: 'no such report' } : body; } }), delays[key] || 1);
+        });
+        const messages = [];
+        globalThis.document = { getElementById: () => null, querySelectorAll: () => [] };
+        function networkMessage(text, isError) { messages.push([text, !!isError]); }
+        function renderNetworkReport() { return ''; }
+        function networkSetSub() {}
+        function switchTab(name) { if (name === 'network') networkTabShown(); }
+        %s
+        setTimeout(() => console.log(JSON.stringify({ id: networkState.id, want: networkState.want,
+            pending: networkState.pending, messages })), %d);
+    """ % (json.dumps(delays), json.dumps(list(fail)), json.dumps(list(html_error)), json.dumps(list(reports)), action, wait)
+    return _run_node(RACE_FNS, script, PRELUDE)
+
+
+@needs_node
+def test_opening_a_report_from_the_panel_is_not_overwritten_by_the_first_report_of_the_list():
+    """The reproduction: the list arrives first (5 ms), the report asked for next (15 ms), the newest
+    report the list would pick last (30 ms)."""
+    r = _race({"/api/network/reports": 5, "RUN": 15, "NEWEST": 30}, "networkOpenReport('RUN');")
+    assert r["id"] == "RUN" and r["want"] == "RUN" and r["pending"] is False
+
+
+@needs_node
+@pytest.mark.parametrize("list_delay", [1, 5, 25, 60])
+def test_the_report_asked_for_wins_whatever_arrives_when(list_delay):
+    r = _race({"/api/network/reports": list_delay, "RUN": 20, "NEWEST": 10}, "networkOpenReport('RUN');")
+    assert r["id"] == "RUN"
+
+
+@needs_node
+def test_the_first_report_is_picked_when_none_was_asked_for():
+    r = _race({"/api/network/reports": 5}, "networkTabShown();")
+    assert r["id"] == "NEWEST"
+
+
+@needs_node
+@pytest.mark.parametrize("delays", [{"A": 40, "B": 5}, {"A": 5, "B": 40}, {"A": 5, "B": 5}])
+def test_quick_changes_of_the_select_show_the_last_one(delays):
+    r = _race(delays, "networkSelectReport('A'); networkSelectReport('B');", reports=("A", "B"))
+    assert r["id"] == "B" and r["pending"] is False
+
+
+@needs_node
+def test_a_late_failure_of_an_older_request_neither_shows_nor_hides_the_newer_report():
+    r = _race({"A": 40, "B": 5}, "networkSelectReport('A'); networkSelectReport('B');", reports=("A", "B"),
+              fail=("A",))
+    assert r["id"] == "B" and r["messages"] == [["", False]]
+
+
+@needs_node
+def test_a_failed_request_is_said_and_lets_the_list_pick_again():
+    r = _race({}, "networkSelectReport('GONE');", fail=("GONE",))
+    assert r["id"] == "" and r["pending"] is False
+    assert r["messages"][-1] == ["The report could not be loaded: no such report", True]
+
+
+@needs_node
+def test_an_error_body_that_is_no_json_reads_as_its_status():
+    r = _race({}, "networkSelectReport('PROXY');", html_error=("PROXY",))
+    assert r["messages"][-1] == ["The report could not be loaded: HTTP 502", True]
+    assert "Unexpected token" not in json.dumps(r)
+
+
+@needs_node
+def test_every_fetch_of_the_tab_reads_its_answer_through_networkjson():
+    block = "\n".join(_function_source(n) for n in re.findall(r"^(?:async )?function (network\w+)\(", SOURCE, re.M)
+                      if n != "networkJson")
+    assert "resp.json()" not in block and block.count("networkJson(resp)") == 5
+
+
+@needs_node
+def test_events_with_lists_that_are_not_lists_do_not_say_undefined():
+    html = _render(_empty_report(
+        events=[{"type": "ftp", "ts": 1, "dest": "a", "commands": "USER", "files": None},
+                {"type": "websocket", "ts": 2, "dest": "b", "messages": "abc"}],
+        event_summary={"ftp": 1, "websocket": 1}))
+    pane = _pane(html, "connections")
+    assert "0 command(s)" in pane and "0 file(s)" in pane and "0 message(s)" in pane
+    assert "undefined" not in pane and "NaN" not in pane
+
+
+ALL_OUT = [{"source": "network", "kind": "exfil_upload", "label": "KNOWN-ONE", "baseline": "known"},
+           {"source": "network", "kind": "c2_beaconing", "label": "ABSORBED-ONE", "superseded_by": "c2_checkin"}]
+
+
+@needs_node
+def test_the_overview_counts_only_active_findings_and_says_when_all_are_out():
+    html = _render(_empty_report(events=[{"type": "dns", "ts": 1, "dest": "a"}], evidence_findings=ALL_OUT))
+    overview = _pane(html, "overview")
+    assert "NO ACTIVE FINDING" in overview and "All 2 finding(s) are suppressed by the baseline or superseded" in overview
+    assert "NOTHING FOUND" not in overview
+    assert '<span class="mem-chip-val">0</span>findings' in overview
+    assert "FINDINGS (" not in overview
+
+
+@needs_node
+def test_all_findings_out_and_something_undecided_says_both():
+    html = _render(_empty_report(events=[{"type": "dns", "ts": 1, "dest": "a"}], evidence_findings=ALL_OUT,
+                                 rule_budget_spent=True))
+    overview = _pane(html, "overview")
+    assert "COULD NOT DECIDE" in overview and "none counts" in overview and "NOTHING FOUND" not in overview
+
+
+@needs_node
+def test_the_panel_banner_and_chips_use_the_same_findings():
+    results = {"network": _empty_report(events=[{"type": "dns", "ts": 1, "dest": "a"}],
+                                        evidence_findings=[{"source": "network", "label": "RAW-ONE"}]),
+               "memory_evidence": {"findings": [], "suppressed": [dict(f, source="network") for f in ALL_OUT]}}
+    html = _panel(results)
+    assert '<span class="mem-chip-val">0</span>findings' in html
+    assert '<span class="mem-chip-val">2</span>suppressed or superseded' in html
+    assert "NO ACTIVE FINDING" in html and "NOTHING FOUND" not in html and "RAW-ONE" not in html
+    clean = _panel({"network": _empty_report(events=[{"type": "dns", "ts": 1, "dest": "a"}])})
+    assert "NOTHING FOUND" in clean and "suppressed or superseded" not in clean

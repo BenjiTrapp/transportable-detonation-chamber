@@ -12935,7 +12935,9 @@ const NETWORK_SUBS = ['overview', 'connections', 'dns', 'http', 'tls', 'files', 
 const NETWORK_ROWS_MAX = 1000;
 const NETWORK_ERRORS_SHOWN = 10;
 const NETWORK_CONNECTION_TYPES = ['conn', 'conn_failed', 'udp', 'raw', 'ftp', 'smtp', 'websocket', 'beacon', 'retry', 'fanout'];
-const networkState = { loaded: false, reports: [], id: '', report: null, sub: 'overview', busy: false };
+// want: the report asked for last, pending while its response is on the way; seq numbers the
+// requests of networkSelectReport so that only the latest answer is shown
+const networkState = { loaded: false, reports: [], id: '', report: null, sub: 'overview', busy: false, want: '', pending: false, seq: 0 };
 
 // A value as the text of a cell: lists joined, objects as JSON, nothing as ''
 function networkText(value) {
@@ -12982,6 +12984,7 @@ function networkProcess(e) {
 // The one line of detail of an event of the CONNECTIONS pane
 function networkDetail(e) {
     const size = n => (Number.isFinite(Number(n)) && n !== null && n !== '' ? formatSize(Number(n)) : '?');
+    const count = list => (Array.isArray(list) ? list.length : 0);
     switch (e.type) {
         case 'conn':
             return `${networkText(e.proto || 'tcp')}${e.app ? ' ' + networkText(e.app) : ''} · out ${size(e.client_bytes)} · in ${size(e.server_bytes)}`
@@ -12993,11 +12996,11 @@ function networkDetail(e) {
         case 'raw':
             return `${networkText(e.direction)} · ${networkText(e.framing)} · ${networkText(e.message_count)} message(s) · entropy ${networkText(e.entropy)}`;
         case 'ftp':
-            return `user ${networkText(e.user) || '?'} · ${(e.commands || []).length} command(s) · ${(e.files || []).length} file(s)`;
+            return `user ${networkText(e.user) || '?'} · ${count(e.commands)} command(s) · ${count(e.files)} file(s)`;
         case 'smtp':
             return `${networkText(e.mail_from)} → ${networkText(e.rcpt_to)}${e.subject ? ' · ' + networkText(e.subject) : ''}`;
         case 'websocket':
-            return `${(e.messages || []).length} message(s)${e.messages_capped ? ' (capped)' : ''}`;
+            return `${count(e.messages)} message(s)${e.messages_capped ? ' (capped)' : ''}`;
         case 'beacon':
             return `every ${networkText(e.interval)}s · jitter ${networkText(e.jitter)} · ${networkText(e.connections)} connection(s)`
                 + (e.periodic === false ? ' · rhythm not measured' : '');
@@ -13173,11 +13176,19 @@ function networkUndecided(report) {
     return out;
 }
 
-// The banner of OVERVIEW: not observed, could not decide, or nothing found
-function networkStatusHtml(report) {
+// The banner of OVERVIEW: not observed, could not decide, or nothing found.
+// `findings` are those the page lists (the report's own unless a scored list is given);
+// only the active ones count: findings the baseline knows or another finding
+// absorbed are no finding of this report.
+function networkStatusHtml(report, findings) {
     const hits = Array.isArray(report.rule_hits) ? report.rule_hits.length : 0;
-    const findings = Array.isArray(report.evidence_findings) ? report.evidence_findings.length : 0;
+    const groups = networkFindingGroups(findings === undefined ? report.evidence_findings : findings);
+    const active = groups.active.length;
+    const total = active + groups.superseded.length + groups.baseline.length;
     const undecided = networkUndecided(report);
+    const quiet = report.observed !== false && !hits && !active;
+    const allOut = quiet && total > 0
+        ? `All ${total} finding(s) are suppressed by the baseline or superseded by another finding: none counts.` : '';
     let html = '';
     if (report.observed === false) {
         html += `<div class="net-banner net-banner-unobserved"><span class="net-banner-title">NOT OBSERVED</span>
@@ -13188,9 +13199,12 @@ function networkStatusHtml(report) {
     if (undecided.length) {
         html += `<div class="net-banner net-banner-undecided"><span class="net-banner-title">COULD NOT DECIDE</span>
             <ul>${undecided.map(text => `<li>${escapeHtml(text)}</li>`).join('')}</ul>`
-            + (report.observed !== false && !hits && !findings ? `<div>No rule hit and no finding came out, but that is not &ldquo;nothing found&rdquo;: see above.</div>` : '')
+            + (quiet ? `<div>${allOut ? escapeHtml(allOut) + ' ' : ''}No rule hit and no active finding came out, but that is not &ldquo;nothing found&rdquo;: see above.</div>` : '')
             + `</div>`;
-    } else if (report.observed !== false && !hits && !findings) {
+    } else if (allOut) {
+        html += `<div class="net-banner"><span class="net-banner-title">NO ACTIVE FINDING</span>
+            <div>${escapeHtml(allOut)} Every rule was decided and none hit.</div></div>`;
+    } else if (quiet) {
         const count = Array.isArray(report.events) ? report.events.length : 0;
         html += `<div class="net-banner net-banner-clear"><span class="net-banner-title">NOTHING FOUND</span>
             <div>${count} event(s) were evaluated, every rule was decided, and no rule hit or finding came out.</div></div>`;
@@ -13310,7 +13324,7 @@ function networkOverviewPane(report) {
     html += `<div class="mem-chips">`
         + `<span class="mem-chip"><span class="mem-chip-val">${count('events')}</span>events</span>`
         + `<span class="mem-chip"><span class="mem-chip-val">${count('rule_hits')}</span>rule hits</span>`
-        + `<span class="mem-chip"><span class="mem-chip-val">${count('evidence_findings')}</span>findings</span>`
+        + `<span class="mem-chip"><span class="mem-chip-val">${networkFindingGroups(report.evidence_findings).active.length}</span>findings</span>`
         + `<span class="mem-chip"><span class="mem-chip-val">${count('iocs')}</span>indicators</span>`
         + `<span class="mem-chip"><span class="mem-chip-val">${count('files')}</span>files</span>`
         + (report.suppressed_count ? `<span class="mem-chip sev-info"><span class="mem-chip-val">${escapeHtml(networkText(report.suppressed_count))}</span>events known to the baseline</span>` : '')
@@ -13361,18 +13375,20 @@ function renderNetworkPanel(results) {
     const report = networkReportOf(results);
     if (!report) return '';
     const findings = networkEvidenceOf(results, report);
+    const groups = networkFindingGroups(findings);
     const iocs = (Array.isArray(report.iocs) ? report.iocs : []).filter(i => i && typeof i === 'object');
     const count = key => (Array.isArray(report[key]) ? report[key].length : 0);
     let html = `<div class="det-sub-title" data-info="What the network report of this run holds. Network is an evidence source of its own, apart from live memory.">Network &mdash; report of the capture</div>`;
     html += `<div class="mem-chips">`
         + `<span class="mem-chip"><span class="mem-chip-val">${count('events')}</span>events</span>`
         + `<span class="mem-chip"><span class="mem-chip-val">${count('rule_hits')}</span>rule hits</span>`
-        + `<span class="mem-chip"><span class="mem-chip-val">${findings.length}</span>findings</span>`
+        + `<span class="mem-chip"><span class="mem-chip-val">${groups.active.length}</span>findings</span>`
+        + (groups.superseded.length + groups.baseline.length ? `<span class="mem-chip sev-info"><span class="mem-chip-val">${groups.superseded.length + groups.baseline.length}</span>suppressed or superseded</span>` : '')
         + `<span class="mem-chip"><span class="mem-chip-val">${iocs.length}</span>indicators</span>`
         + `<span class="mem-chip"><span class="mem-chip-val">${count('files')}</span>files</span>`
         + (report.suppressed_count ? `<span class="mem-chip sev-info"><span class="mem-chip-val">${escapeHtml(networkText(report.suppressed_count))}</span>known to the baseline</span>` : '')
         + `</div>`;
-    html += networkStatusHtml(report);
+    html += networkStatusHtml(report, findings);
     html += networkFindingsHtml(findings);
     if (iocs.length) {
         html += `<div class="net-section-label">INDICATORS (${iocs.length})</div>
@@ -13410,15 +13426,27 @@ function networkSetSub(name) {
     });
 }
 
+// The JSON body of a response of /api/network/*; an error body that is no JSON (a proxy's
+// HTML page) reads as its status
+async function networkJson(resp) {
+    let data = null;
+    try { data = await resp.json(); } catch (e) { data = null; }
+    if (!resp.ok) throw new Error((data && typeof data === 'object' && data.error) || `HTTP ${resp.status}`);
+    if (data === null || typeof data !== 'object') throw new Error(`HTTP ${resp.status}: the answer is not JSON`);
+    return data;
+}
+
 function networkShowReport(report) {
     networkState.report = report;
     networkState.id = report && report.id ? String(report.id) : '';
+    networkState.want = networkState.id;
+    networkState.pending = false;
     const target = document.getElementById('net-report');
     if (target) target.innerHTML = renderNetworkReport(report);
     const summary = document.getElementById('net-summary');
     if (summary && report) {
         const n = key => (Array.isArray(report[key]) ? report[key].length : 0);
-        summary.textContent = `${n('events')} events · ${n('rule_hits')} rule hits · ${n('evidence_findings')} findings · ${n('iocs')} indicators`;
+        summary.textContent = `${n('events')} events · ${n('rule_hits')} rule hits · ${networkFindingGroups(report.evidence_findings).active.length} findings · ${n('iocs')} indicators`;
     }
     networkSetSub(networkState.sub);
     networkFillSelect();
@@ -13434,19 +13462,30 @@ function networkFillSelect() {
     select.innerHTML = networkState.reports.map(r => {
         const s = r && r.summary && typeof r.summary === 'object' ? r.summary : {};
         const label = `${networkText(r.filename)} · ${networkText(r.timestamp)} · ${networkText(r.mode)} · ${networkText(s.events)} events`;
-        return `<option value="${escapeHtml(networkText(r.id))}"${networkText(r.id) === networkState.id ? ' selected' : ''}>${escapeHtml(label)}</option>`;
+        const shown = networkState.pending ? networkState.want : networkState.id;
+        return `<option value="${escapeHtml(networkText(r.id))}"${networkText(r.id) === shown ? ' selected' : ''}>${escapeHtml(label)}</option>`;
     }).join('');
 }
 
+// Shows the report `id`. Only the latest request is answered: a response that is not
+// of the latest call (a quick change of the select, the first report of the list that
+// networkRefreshReports picks) is dropped, whatever the order it arrives in.
 async function networkSelectReport(id) {
     if (!id) return;
+    const mine = ++networkState.seq;
+    networkState.want = String(id);
+    networkState.pending = true;
     try {
         const resp = await fetch('/api/network/report?id=' + encodeURIComponent(id));
-        const data = await resp.json();
-        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        const data = await networkJson(resp);
+        if (mine !== networkState.seq) return;
         networkMessage('');
         networkShowReport(data);
     } catch (e) {
+        if (mine !== networkState.seq) return;
+        networkState.pending = false;
+        networkState.want = networkState.id;
+        networkFillSelect();
         networkMessage(`The report could not be loaded: ${e.message}`, true);
     }
 }
@@ -13454,11 +13493,12 @@ async function networkSelectReport(id) {
 async function networkRefreshReports() {
     try {
         const resp = await fetch('/api/network/reports');
-        const data = await resp.json();
-        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        const data = await networkJson(resp);
         networkState.reports = Array.isArray(data.reports) ? data.reports : [];
         networkFillSelect();
-        if (!networkState.report && networkState.reports.length) await networkSelectReport(networkState.reports[0].id);
+        if (!networkState.report && !networkState.pending && networkState.reports.length) {
+            await networkSelectReport(networkState.reports[0].id);
+        }
     } catch (e) {
         networkMessage(`The reports could not be listed: ${e.message}`, true);
     }
@@ -13469,8 +13509,7 @@ async function networkRefreshBaseline() {
     if (!text) return;
     try {
         const resp = await fetch('/api/network/baseline');
-        const data = await resp.json();
-        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        const data = await networkJson(resp);
         if (data.stale) {
             text.textContent = `Baseline: ignored (${networkText(data.note) || 'built with an older key scheme'}).`;
         } else {
@@ -13497,8 +13536,8 @@ async function networkImport() {
         form.append('file', file);
         form.append('mode', (document.getElementById('net-mode') || {}).value || 'online');
         const resp = await fetch('/api/network/import', { method: 'POST', body: form });
-        const data = await resp.json();
-        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        const data = await networkJson(resp);
+        networkState.seq++;
         networkState.sub = 'overview';
         networkShowReport(data);
         networkMessage(`Analyzed ${data.filename || file.name}: ${(data.events || []).length} events.`);
@@ -13523,8 +13562,7 @@ async function networkCaptureBaseline() {
         const form = new FormData();
         form.append('file', file);
         const resp = await fetch('/api/network/baseline/capture', { method: 'POST', body: form });
-        const data = await resp.json();
-        if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+        const data = await networkJson(resp);
         const cut = [];
         if (data.truncated) cut.push('the capture was cut, so part of it is not learned');
         if (Array.isArray(data.errors) && data.errors.length) cut.push(`${data.errors.length} step(s) failed`);
@@ -13540,6 +13578,9 @@ async function networkCaptureBaseline() {
 
 // From the Submit panel: the NETWORK tab with this report
 function networkOpenReport(id) {
+    // asked for before the tab loads its list: the list must not pick another report meanwhile
+    networkState.want = String(id || '');
+    networkState.pending = !!networkState.want;
     switchTab('network');
     networkSelectReport(String(id || ''));
 }
