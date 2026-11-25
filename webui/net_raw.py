@@ -21,8 +21,11 @@ together. The assumptions this module refuses to make:
         needs six occurrences, must be the commonest non-printable byte and
         eight times as frequent as a byte of random data is, because random
         data ends in a control byte most of the time and has every byte in it
-        somewhere. Short random data still gets there now and then, so this
-        reduces false claims rather than excluding them.
+        somewhere. Its messages must also never be empty, average three bytes
+        or more and not all be the same size (a fixed-width layout): integer
+        arrays and NUL-padded fixed records end in 0x00 and are full of it,
+        and are not messages. Short random data still gets there now and
+        then, so this reduces false claims rather than excluding them.
       - ``fixed``: at least three equal sends that make up the whole stream.
   * A TCP segment is a message. It is not: Nagle joins sends and the MSS cuts
     them, so equal segments near the MSS say nothing about records (``fixed`` is
@@ -81,6 +84,7 @@ MIN_PREFIXED = 2                # a chain that fits is hard to get by chance
 MIN_MESSAGES = 3                # delimited and fixed have nothing but repetition
 MIN_TEXT_RATIO = 0.85           # printable share for a text delimiter
 MIN_BINARY_DELIMITERS = 6       # a control byte turns up by chance in short random data
+MIN_BINARY_MEAN = 3             # integer arrays and padded records average less
 RANDOM_DELIMITER_FACTOR = 8     # times the count a byte of random data would have
 ON_RHYTHM_SHARE = 0.5           # same as beaconing_from_connections
 
@@ -91,7 +95,7 @@ _LENGTH_READINGS = ((2, "big"), (2, "little"), (4, "big"), (4, "little"))
 # --- the byte profile ---------------------------------------------------------
 
 def _entropy(counts, total):
-    return -sum(n / total * log2(n / total) for n in counts.values())
+    return 0.0 - sum(n / total * log2(n / total) for n in counts.values())
 
 
 def _printable_ratio(counts, total):
@@ -138,6 +142,13 @@ def _length_prefixed(stream):
     return list(sizes[:MAX_REPORTED]), len(sizes)
 
 
+def _every_message_the_same_size(stream, delimiter, found):
+    """True when the delimiter sits at every ``size + 1``-th byte: a fixed-width layout."""
+    size = stream.find(delimiter)
+    return (len(stream) == found * (size + 1)
+            and stream[size::size + 1] == delimiter * found)
+
+
 def _delimiter_of(stream, counts, window):
     """The delimiter the stream ends with, or None when it does not prove one."""
     if len(stream) < 2:
@@ -159,6 +170,12 @@ def _delimiter_of(stream, counts, window):
         return delimiter if _printable_ratio(counts, window) >= MIN_TEXT_RATIO else None
     seen = counts.get(last, 0)
     if found < MIN_BINARY_DELIMITERS or seen < RANDOM_DELIMITER_FACTOR * window / 256:
+        return None
+    # u16/u32 integer arrays and NUL-padded fixed records end in 0x00 and are
+    # full of it, but they are not messages: theirs are empty or a byte or two
+    if (stream.startswith(delimiter) or delimiter * 2 in stream
+            or len(stream) - found < MIN_BINARY_MEAN * found
+            or _every_message_the_same_size(stream, delimiter, found)):
         return None
     if any(n > seen for byte, n in counts.items() if byte not in _PRINTABLE):
         return None

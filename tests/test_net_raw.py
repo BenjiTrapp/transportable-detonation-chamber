@@ -21,6 +21,17 @@ Regressions covered:
   * TCP segments are not messages (Nagle joins sends, the MSS cuts them), so
     "fixed" is only said for small equal segments that account for the whole
     stream; a bulk transfer cut at the MSS is not fixed-size records
+  * integer arrays and zero-padded fixed records are an extremely common shape
+    for custom protocols and are not delimited messages: u16/u32 little-endian
+    ints and 16-byte records padded with NULs end in 0x00, hold many of them
+    and have NUL as the commonest control byte, so they were reported as NUL
+    delimited with sizes like [1, 1, 1] or [9, 0, 0, 0, 0, 0, 0, 9]; a
+    non-text delimiter now needs messages that are never empty, are not all
+    the same size (that is a fixed-width layout) and average at least three
+    bytes, and two unrelated implants that both pad with NULs are
+    not filed as one shape
+  * the entropy of one repeated byte was ``-0.0``, which ``json.dumps`` writes
+    as a different text from ``0.0`` and would split one fingerprint in two
   * a UDP datagram is a message, so its sizes are reported as they are
   * a heartbeat is judged from the capture time of each send (``Flow.packets``),
     with the thresholds of ``memory_evidence.beaconing_from_connections`` (the
@@ -46,6 +57,7 @@ import json
 import os
 import random
 import socket
+import struct
 import tempfile
 
 import dpkt
@@ -238,6 +250,7 @@ def test_a_flow_cut_at_a_hole_reports_the_gap_and_still_profiles_what_came_first
 
 def test_entropy_is_shannon_bits_per_byte():
     assert _profile(b"\x41" * 100)["entropy"] == 0.0
+    assert str(_profile(b"\x41" * 100)["entropy"]) == "0.0"
     assert _profile(bytes(range(256)))["entropy"] == 8.0
     assert _profile(b"ab" * 50)["entropy"] == 1.0
 
@@ -319,8 +332,10 @@ def test_two_byte_orders_that_cut_the_same_messages_are_not_a_conflict():
 
 
 def test_a_stream_two_detectors_both_fit_is_unknown():
-    # a 2-byte prefix chain of "\x02a\x00" bodies, and also \x00 delimited
-    data = b"\x00\x02a\x00" * 3
+    # a 2-byte little endian chain of "abcdef\x00" bodies ([7, 7, 7]), and also
+    # \x00 delimited into "\x07", "abcdef", "\x07", "abcdef", ...
+    data = b"\x07\x00abcdef\x00" * 3
+    assert net_raw._length_prefixed(data) == ([7, 7, 7], 3)
     e = _profile(data)
     assert e["framing"] == "unknown" and e["delimiter"] is None
 
@@ -354,6 +369,49 @@ def test_a_binary_delimiter_needs_six_occurrences_and_text_lines_three():
     assert _profile(b"\x01ab\x00\x02cde\x00\x03f\x00")["framing"] == "unknown"
 
 
+def test_integer_arrays_are_not_nul_delimited_messages():
+    for pack in ("<H", "<I", ">H", ">I", "<Q"):
+        for n in (2, 6, 39, 200):
+            data = b"".join(struct.pack(pack, i) for i in range(1, n))
+            assert _profile(data)["framing"] != "delimited", (pack, n)
+    e = _profile(b"".join(struct.pack("<H", i) for i in range(1, 40)))
+    assert e["framing"] == "unknown" and e["delimiter"] is None and e["message_sizes"] == []
+
+
+def test_nul_padded_fixed_records_are_not_nul_delimited_messages():
+    record = b"id:\x07abcde" + b"\x00" * 7
+    assert len(record) == 16
+    for n in (2, 6, 40):
+        e = _profile(record * n)
+        assert e["framing"] == "unknown" and e["delimiter"] is None, n
+
+
+def test_equal_sized_fields_ending_in_a_control_byte_are_not_delimited_messages():
+    # u32 little endian values below 2**24: three bytes and a NUL, every time
+    data = b"".join(struct.pack("<I", 0x112233 + i * 0x010101) for i in range(10))
+    assert _profile(data)["framing"] == "unknown"
+    assert _profile(b"abcd\x00" * 7)["framing"] == "unknown"
+    assert _profile(b"abcd\x00" * 6 + b"abcde\x00")["framing"] == "delimited"
+
+
+def test_a_binary_delimiter_needs_messages_that_are_never_empty():
+    two = b"abcd\x00abcde\x00"
+    assert _profile(two * 4)["delimiter"] == "\\000"
+    assert _profile(two * 3 + b"\x00" + two * 3)["framing"] == "unknown"
+    assert _profile(b"\x00" + two * 4)["framing"] == "unknown"
+
+
+def test_a_binary_delimiter_needs_messages_of_three_bytes_on_average():
+    assert _profile(b"ab\x00abc\x00" * 7)["framing"] == "unknown"
+    assert _profile(b"abc\x00abcd\x00" * 7)["framing"] == "delimited"
+    assert _profile(b"a\x00" * 7 + b"abcdefghijklmnopq\x00" * 2 + b"b\x00" * 7)["framing"] == "delimited"
+
+
+def test_text_lines_may_still_include_blank_lines():
+    e = _profile(b"HELO a\n\nMAIL b\n\nQUIT\n")
+    assert e["framing"] == "delimited" and e["message_sizes"] == [6, 0, 6, 0, 4]
+
+
 def test_a_run_of_delimiters_is_padding_not_messages():
     assert _profile(b"\x00" * 6)["framing"] == "unknown"
     assert _profile(b"\n" * 10)["framing"] == "unknown"
@@ -371,8 +429,8 @@ def test_random_data_that_happens_to_end_in_a_control_byte_is_not_delimited():
 
 
 def test_a_control_byte_that_is_not_the_most_common_one_is_not_the_delimiter():
-    assert _profile(b"\x01" * 10 + b"a\x03" * 6)["framing"] == "unknown"
-    assert _profile(b"\x01" * 5 + b"a\x03" * 6)["framing"] == "delimited"
+    assert _profile(b"\x01" * 10 + b"abc\x03" * 6)["framing"] == "unknown"
+    assert _profile(b"\x01" * 5 + b"abc\x03" * 6)["framing"] == "delimited"
 
 
 def test_the_delimiter_scan_and_the_report_are_bounded():
@@ -518,7 +576,7 @@ def test_the_thresholds_are_the_ones_of_the_beaconing_judgement():
 def test_the_delimiter_is_written_by_the_shared_byte_rendering():
     assert _profile(b"a\nb\nc\n")["delimiter"] == "\\010"
     assert _profile(b"a\r\nb\r\nc\r\n")["delimiter"] == "\\013\\010"
-    assert _profile(b"\x01a\xff" * 8)["delimiter"] == "\\255"
+    assert _profile(b"\x01ab\xff\x01abc\xff" * 4)["delimiter"] == "\\255"
 
 
 _EVERY_FRAMING = {
