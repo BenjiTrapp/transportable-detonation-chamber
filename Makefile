@@ -306,8 +306,20 @@ deploy:
 		vagrant upload webui/static/js/app.js C:\\DetonationChamberUI\\static\\js\\app.js; \
 		vagrant upload webui/app.py C:\\DetonationChamberUI\\app.py; \
 		vagrant upload webui/memory_evidence.py C:\\DetonationChamberUI\\memory_evidence.py; \
+		vagrant upload webui/net_analyze.py C:\\DetonationChamberUI\\net_analyze.py; \
+		vagrant upload webui/net_baseline.py C:\\DetonationChamberUI\\net_baseline.py; \
 		vagrant upload webui/net_behavior.py C:\\DetonationChamberUI\\net_behavior.py; \
+		vagrant upload webui/net_decode.py C:\\DetonationChamberUI\\net_decode.py; \
+		vagrant upload webui/net_dns.py C:\\DetonationChamberUI\\net_dns.py; \
 		vagrant upload webui/net_events.py C:\\DetonationChamberUI\\net_events.py; \
+		vagrant upload webui/net_evidence.py C:\\DetonationChamberUI\\net_evidence.py; \
+		vagrant upload webui/net_flows.py C:\\DetonationChamberUI\\net_flows.py; \
+		vagrant upload webui/net_http.py C:\\DetonationChamberUI\\net_http.py; \
+		vagrant upload webui/net_mail_ftp.py C:\\DetonationChamberUI\\net_mail_ftp.py; \
+		vagrant upload webui/net_raw.py C:\\DetonationChamberUI\\net_raw.py; \
+		vagrant upload webui/net_rules.py C:\\DetonationChamberUI\\net_rules.py; \
+		vagrant upload webui/net_tls.py C:\\DetonationChamberUI\\net_tls.py; \
+		vagrant upload rules/network C:\\DetonationChamberUI\\rules\\network; \
 		vagrant upload webui/minidump_analysis.py C:\\DetonationChamberUI\\minidump_analysis.py; \
 		vagrant upload webui/pipe_analysis.py C:\\DetonationChamberUI\\pipe_analysis.py; \
 		vagrant upload webui/pipe_signatures.json C:\\DetonationChamberUI\\pipe_signatures.json; \
@@ -333,8 +345,20 @@ deploy-app:
 	else \
 		vagrant upload webui/app.py C:\\DetonationChamberUI\\app.py; \
 		vagrant upload webui/memory_evidence.py C:\\DetonationChamberUI\\memory_evidence.py; \
+		vagrant upload webui/net_analyze.py C:\\DetonationChamberUI\\net_analyze.py; \
+		vagrant upload webui/net_baseline.py C:\\DetonationChamberUI\\net_baseline.py; \
 		vagrant upload webui/net_behavior.py C:\\DetonationChamberUI\\net_behavior.py; \
+		vagrant upload webui/net_decode.py C:\\DetonationChamberUI\\net_decode.py; \
+		vagrant upload webui/net_dns.py C:\\DetonationChamberUI\\net_dns.py; \
 		vagrant upload webui/net_events.py C:\\DetonationChamberUI\\net_events.py; \
+		vagrant upload webui/net_evidence.py C:\\DetonationChamberUI\\net_evidence.py; \
+		vagrant upload webui/net_flows.py C:\\DetonationChamberUI\\net_flows.py; \
+		vagrant upload webui/net_http.py C:\\DetonationChamberUI\\net_http.py; \
+		vagrant upload webui/net_mail_ftp.py C:\\DetonationChamberUI\\net_mail_ftp.py; \
+		vagrant upload webui/net_raw.py C:\\DetonationChamberUI\\net_raw.py; \
+		vagrant upload webui/net_rules.py C:\\DetonationChamberUI\\net_rules.py; \
+		vagrant upload webui/net_tls.py C:\\DetonationChamberUI\\net_tls.py; \
+		vagrant upload rules/network C:\\DetonationChamberUI\\rules\\network; \
 		vagrant upload webui/minidump_analysis.py C:\\DetonationChamberUI\\minidump_analysis.py; \
 		vagrant upload webui/pipe_analysis.py C:\\DetonationChamberUI\\pipe_analysis.py; \
 		vagrant upload webui/pipe_signatures.json C:\\DetonationChamberUI\\pipe_signatures.json; \

@@ -46,6 +46,9 @@ def tdc(app_module, monkeypatch, tmp_path):
     monkeypatch.setattr(m, "_beacon_results_cache", m._ResultStore(str(tmp_path / "results")))
     monkeypatch.setattr(m, "_memory_baseline",
                         m.memory_evidence.MemoryBaseline(str(tmp_path / "baseline.json")))
+    monkeypatch.setattr(m, "_net_reports", m._ResultStore(str(tmp_path / "net_results")))
+    monkeypatch.setattr(m, "_net_baseline", m.net_baseline.NetBaseline(str(tmp_path / "net_baseline.json")))
+    monkeypatch.setattr(m, "_net_upload_dir", lambda: str(tmp_path / "net_uploads"))
     m._alerts_body_cache["entry"] = None
     m.set_log_store(m.log_store.LogStore(persist_dir=str(tmp_path / "logs")))
     yield m

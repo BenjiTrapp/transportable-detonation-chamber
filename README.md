@@ -1770,6 +1770,11 @@ One rizin session per opened file and browser tab (RIZIN tab). Addresses are int
 | GET / DELETE | `/api/memory/baseline` | Host memory baseline statistics / clear it. `stale: true` means it was built with an older key scheme and is ignored until captured again |
 | POST | `/api/memory/baseline/capture` | Record findings of named processes as baseline. Params: `names`, `samples` |
 | POST / GET | `/api/memory/sweep` | Background sweep of every process (`aether`, `processdump`, `baseline`) / status + result |
+| POST | `/api/network/import` | Analyze an uploaded pcap or pcapng and keep the report. Form fields: `file`, `mode` (`online` default, or `isolated`), `process`. Returns the report (events, rule hits, findings, IOCs, files; passwords masked) with `id`, `filename`, `timestamp`; 400 for a file that is not a pcap, 413 over 256 MB |
+| GET | `/api/network/report` | A stored network report. Params: `id` (as returned by the import) |
+| GET | `/api/network/reports` | Stored network reports, newest first: `id`, `filename`, `timestamp`, `mode` and a `summary` (counts, `verdict`, `score`), not the report |
+| GET | `/api/network/baseline` | What the network baseline of this VM holds (`count`, `by_type`; `stale: true` when built with an older key scheme) |
+| POST | `/api/network/baseline/capture` | Record what a pcap of the clean VM holds as the network baseline (it is analyzed without the baseline). Form field: `file`. Returns `added`, `count` and what was `learned` |
 | GET / POST | `/api/processdump/baseline` | Process Dump clean-hash database status / build it (`mode`: `gen`, `genquick`) |
 | GET | `/api/process/lookup` | Running PIDs by image name. Params: `name` |
 | GET | `/api/file/visualize` | File map planes + structure + import/export trees. Params: `path`, `cols`, `rows` |

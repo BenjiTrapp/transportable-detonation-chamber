@@ -38,8 +38,19 @@ PORT = 8766
 FILES = {
     "webui/app.py": r"C:\DetonationChamberUI\app.py",
     "webui/memory_evidence.py": r"C:\DetonationChamberUI\memory_evidence.py",
+    "webui/net_analyze.py": r"C:\DetonationChamberUI\net_analyze.py",
+    "webui/net_baseline.py": r"C:\DetonationChamberUI\net_baseline.py",
     "webui/net_behavior.py": r"C:\DetonationChamberUI\net_behavior.py",
+    "webui/net_decode.py": r"C:\DetonationChamberUI\net_decode.py",
+    "webui/net_dns.py": r"C:\DetonationChamberUI\net_dns.py",
     "webui/net_events.py": r"C:\DetonationChamberUI\net_events.py",
+    "webui/net_evidence.py": r"C:\DetonationChamberUI\net_evidence.py",
+    "webui/net_flows.py": r"C:\DetonationChamberUI\net_flows.py",
+    "webui/net_http.py": r"C:\DetonationChamberUI\net_http.py",
+    "webui/net_mail_ftp.py": r"C:\DetonationChamberUI\net_mail_ftp.py",
+    "webui/net_raw.py": r"C:\DetonationChamberUI\net_raw.py",
+    "webui/net_rules.py": r"C:\DetonationChamberUI\net_rules.py",
+    "webui/net_tls.py": r"C:\DetonationChamberUI\net_tls.py",
     "webui/minidump_analysis.py": r"C:\DetonationChamberUI\minidump_analysis.py",
     "webui/pipe_analysis.py": r"C:\DetonationChamberUI\pipe_analysis.py",
     "webui/pipe_signatures.json": r"C:\DetonationChamberUI\pipe_signatures.json",
@@ -55,6 +66,8 @@ FILES = {
     "webui/static/css/theme-cyberpunk.css": r"C:\DetonationChamberUI\static\css\theme-cyberpunk.css",
     "webui/templates/index.html": r"C:\DetonationChamberUI\templates\index.html",
     "webui/static/icon.png": r"C:\DetonationChamberUI\static\icon.png",
+    # network analysis rules, read from <app dir>\rules\network
+    "rules/network/default.yaml": r"C:\DetonationChamberUI\rules\network\default.yaml",
 }
 
 # The install scripts the tool updates re-run, kept next to the provisioning copy
@@ -147,6 +160,8 @@ def do_deploy(sess, args):
     try:
         ps = f'New-Item -ItemType Directory -Path "{SCRIPTS_REMOTE_DIR}" -Force | Out-Null'
         run_ps(sess, ps, label="scripts dir")
+        run_ps(sess, 'New-Item -ItemType Directory -Path "C:\\DetonationChamberUI\\rules\\network" -Force | Out-Null',
+               label="rules dir")
         for local, remote in {**FILES, **SCRIPT_FILES}.items():
             if not os.path.isfile(os.path.join(REPO, local)):
                 print(f"  [-] skip {local} (not found)")

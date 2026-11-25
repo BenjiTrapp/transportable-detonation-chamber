@@ -28,6 +28,13 @@ def test_readme_documents_every_api_route_and_nothing_else():
     assert documented - ROUTES == set(), "README documents routes that do not exist"
 
 
+def test_readme_documents_each_network_route_exactly_once():
+    for route in sorted(r for r in ROUTES if r.startswith("/api/network/")):
+        rows = [line for line in README.splitlines() if re.match(r"\|\s*[A-Z /]+\s*\|\s*`" + re.escape(route) + "`", line)]
+        assert len(rows) == 1, (route, rows)
+    assert len([r for r in ROUTES if r.startswith("/api/network/")]) == 5
+
+
 def test_help_modal_only_mentions_existing_routes():
     mentioned = {_norm(p) for p in re.findall(r"<code>(/api/[^<]+)</code>", HELP)}
     assert mentioned and mentioned <= ROUTES, mentioned - ROUTES
@@ -76,6 +83,9 @@ def test_every_deploy_path_uploads_the_web_ui_modules():
     utm = open(os.path.join(ROOT, "scripts", "deploy-utm.py"), encoding="utf-8").read()
     modules = set(re.findall(r'"webui/([\w.]+\.(?:py|json))"', utm))
     assert {"app.py", "pipe_proxy.py", "pipe_backends.py", "pipe_signatures.json"} <= modules
+    # the network analysis: every net_*.py on disk (app.py imports them) and its rules
+    on_disk = {n for n in os.listdir(os.path.join(ROOT, "webui")) if re.match(r"net_\w+\.py$", n)}
+    assert len(on_disk) >= 13 and on_disk <= modules, on_disk - modules
     make = open(os.path.join(ROOT, "Makefile"), encoding="utf-8").read()
     ps1 = open(os.path.join(ROOT, "make.ps1"), encoding="utf-8").read()
     vagrant = make[make.index("\ndeploy:"):make.index("\n.PHONY: deploy-app")]
@@ -85,6 +95,11 @@ def test_every_deploy_path_uploads_the_web_ui_modules():
         assert f'"webui/{name}": r"C:\\DetonationChamberUI\\{win}"' in utm, name
         assert f"webui/{name} C:\\\\DetonationChamberUI\\\\" + win.replace("\\", "\\\\") in vagrant, name
         assert f"'webui\\{win}' -Destination 'C:\\DetonationChamberUI\\{win}'" in hyperv, name
+    for rule in sorted(n for n in os.listdir(os.path.join(ROOT, "rules", "network"))):
+        win = "rules\\network\\" + rule
+        assert f'"rules/network/{rule}": r"C:\\DetonationChamberUI\\{win}"' in utm, rule
+        assert f"'{win}' -Destination 'C:\\DetonationChamberUI\\{win}'" in hyperv, rule
+    assert "vagrant upload rules/network C:\\\\DetonationChamberUI\\\\rules\\\\network" in vagrant
 
 
 def test_readme_rizin_rows_say_what_the_server_answers():

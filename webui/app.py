@@ -21,11 +21,13 @@ import stat
 import tempfile
 import time
 import hashlib
+import itertools
 import math
 import struct
 import threading
 import subprocess
 import sys
+import uuid
 import weakref
 from pathlib import Path
 from flask import Flask, render_template, jsonify, request, send_from_directory, g
@@ -46,6 +48,9 @@ import tool_updates
 # LOGS tab: event store, source parsers and the search language.
 import log_search
 import log_store
+# NETWORK analysis: a pcap to a report, and the baseline of the clean VM.
+import net_analyze
+import net_baseline
 
 app = Flask(__name__)
 
@@ -288,6 +293,8 @@ SCAN_HISTORY_MAX = 200
 # is considered clean, then subtracted from later scans - the memory-side
 # counterpart to Process Dump's clean-hash database.
 MEMORY_BASELINE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory_baseline.json")
+# The same for the network: what a clean VM does on the wire (net_baseline).
+NET_BASELINE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "net_baseline.json")
 
 
 def _decode_console(raw):
@@ -6117,6 +6124,16 @@ class _ResultStore:
             self._index.pop(key, None)
         return doc["meta"], doc["value"]
 
+    def keys(self, prefix=""):
+        """Keys of every stored entry that start with `prefix`."""
+        with self._lock:
+            names = list(self._mem) + list(self._index)
+        return sorted({k for k in names if k.startswith(prefix)})
+
+    def has(self, key):
+        with self._lock:
+            return key in self._mem or key in self._index
+
     def lookup(self, tool, pid=None, sha256=None, max_pid_age=6 * 3600):
         """Newest matching result, or None.
 
@@ -6149,6 +6166,16 @@ _beacon_cache_lock = threading.Lock()
 
 # Per-host baseline of benign memory findings, shared by every scanner.
 _memory_baseline = memory_evidence.MemoryBaseline(MEMORY_BASELINE_FILE)
+
+# Network reports, one entry per imported capture (a restart keeps them), and the
+# network baseline. Both are module objects so the tests can point them elsewhere.
+# Every report has two entries: "netreport_<id>" (the report) and "netsummary_<id>"
+# (what the list shows); the limit therefore holds twice the reports kept.
+NET_REPORTS_KEEP = 100
+_net_reports = _ResultStore(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "net_results"),
+    limit=2 * NET_REPORTS_KEEP)
+_net_baseline = net_baseline.NetBaseline(NET_BASELINE_FILE)
 
 
 # --- Exit capture (dump-on-exit via Windows Silent Process Exit) -----------
@@ -7659,6 +7686,217 @@ def api_memory_baseline_clear():
     """Forget the host baseline (every finding counts as evidence again)."""
     _memory_baseline.clear()
     return jsonify({"ok": True, "baseline": _memory_baseline.stats()})
+
+
+# --- Network analysis: pcap import, stored reports, baseline ---------------
+#
+# A capture is only ever read by net_analyze (which parses bytes, never opens or
+# runs anything in them). The upload is stored under a name the server makes up,
+# so nothing of the client's file name reaches a path.
+
+NET_UPLOADS_KEEP = 20
+NET_UPLOAD_MAX = 256 * 1024 * 1024
+_NET_REPORT_ID = re.compile(r"^[0-9a-f]{32}$")
+_NET_MODES = ("online", "isolated")
+_NET_PROCESS_MAX = 260
+_net_sequence = itertools.count()
+
+
+def _net_rules_file():
+    """The default network rules: in the repository, or next to the deployed app."""
+    for base in (os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                 os.path.dirname(os.path.abspath(__file__)),
+                 r"C:\vagrant"):
+        path = os.path.join(base, "rules", "network", "default.yaml")
+        if os.path.isfile(path):
+            return path
+    return net_analyze.DEFAULT_RULES
+
+
+def _net_upload_dir():
+    return os.path.join(tempfile.gettempdir(), "net_uploads")
+
+
+def _save_net_upload(file, report_id):
+    """Store an uploaded capture as <report id>.pcap, at most NET_UPLOAD_MAX bytes.
+
+    Returns the path, or None when the upload is larger than that (nothing stays).
+    Older uploads are pruned like those of _save_scan_upload.
+    """
+    base = _net_upload_dir()
+    os.makedirs(base, exist_ok=True)
+    try:
+        old = sorted((os.path.join(base, n) for n in os.listdir(base)),
+                     key=os.path.getmtime, reverse=True)
+        for path in [p for p in old if os.path.isfile(p)][NET_UPLOADS_KEEP:]:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    path = os.path.join(base, report_id + ".pcap")
+    size = 0
+    try:
+        with open(path, "wb") as out:
+            while True:
+                chunk = file.stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > NET_UPLOAD_MAX:
+                    raise OverflowError
+                out.write(chunk)
+    except OverflowError:
+        os.remove(path)
+        return None
+    return path
+
+
+def _net_mode(data):
+    mode = (data.get("mode") or "online").strip().lower()
+    return mode if mode in _NET_MODES else None
+
+
+def _net_analyze_upload(data, baseline):
+    """Analyze the uploaded capture of this request against `baseline` (or None).
+
+    Returns (report, error response). The response is a ready (json, status)
+    when the request is wrong; the report comes from net_analyze unchanged (it is
+    already masked and JSON-safe) with `id` and `filename` added.
+    """
+    if (request.content_length or 0) > NET_UPLOAD_MAX + 1024 * 1024:
+        return None, (jsonify({"error": "the capture is larger than %d MB"
+                                           % (NET_UPLOAD_MAX // (1024 * 1024))}), 413)
+    upload = request.files.get("file")
+    if upload is None:
+        return None, (jsonify({"error": "no pcap file uploaded (field 'file')"}), 400)
+    mode = _net_mode(data)
+    if mode is None:
+        return None, (jsonify({"error": "mode must be one of %s"
+                                           % ", ".join(_NET_MODES)}), 400)
+    process = (data.get("process") or "")[:_NET_PROCESS_MAX]
+    report_id = uuid.uuid4().hex
+    path = _save_net_upload(upload, report_id)
+    if path is None:
+        return None, (jsonify({"error": "the capture is larger than %d MB"
+                                           % (NET_UPLOAD_MAX // (1024 * 1024))}), 413)
+    filename = secure_filename(upload.filename or "") or "capture.pcap"
+    try:
+        report = net_analyze.analyze_pcap(path, rules=_net_rules_file(), baseline=baseline,
+                                          process=process, mode=mode)
+    except Exception as e:
+        return None, (jsonify({"error": "the capture could not be analyzed (%s)"
+                                           % type(e).__name__}), 500)
+    if not report.get("format"):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return None, (jsonify({
+            "error": "not a pcap or pcapng file: %s" % (report.get("note") or "unreadable")}), 400)
+    report["id"] = report_id
+    report["filename"] = net_analyze.mask_report(filename)
+    return report, None
+
+
+def _net_summary(report):
+    """What the reports list shows of a report: counts and the verdict, not the events."""
+    findings = report.get("evidence_findings") or []
+    verdict, score = None, None
+    try:
+        scored = memory_evidence.score(findings)
+        verdict, score = scored.get("label"), scored.get("score")
+    except Exception:
+        pass
+    return {
+        "events": len(report.get("events") or []),
+        "event_summary": report.get("event_summary") or {},
+        "rule_hits": len(report.get("rule_hits") or []),
+        "findings": len(findings),
+        "iocs": len(report.get("iocs") or []),
+        "files": len(report.get("files") or []),
+        "suppressed_count": report.get("suppressed_count", 0),
+        "observed": bool(report.get("observed")),
+        "truncated": bool(report.get("truncated")),
+        "errors": len(report.get("errors") or []),
+        "verdict": verdict,
+        "score": score,
+    }
+
+
+@app.route("/api/network/import", methods=["POST"])
+def api_network_import():
+    """Analyze an uploaded pcap and keep the report. Params: `file`, `mode` (online|isolated), `process`"""
+    report, error = _net_analyze_upload(request.form, _net_baseline)
+    if error:
+        return error
+    report["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    summary = {"id": report["id"], "filename": report["filename"],
+               "timestamp": report["timestamp"], "mode": report.get("mode"),
+               "seq": next(_net_sequence), "summary": _net_summary(report)}
+    _net_reports.put("netreport", report, sha256=report["id"])
+    _net_reports.put("netsummary", summary, sha256=report["id"])
+    return jsonify(report)
+
+
+@app.route("/api/network/report", methods=["GET"])
+def api_network_report():
+    """A stored network report. Params: `id`"""
+    report_id = request.args.get("id", "")
+    if not _NET_REPORT_ID.match(report_id):
+        return jsonify({"error": "invalid report id"}), 400
+    report = _net_reports.lookup("netreport", sha256=report_id)
+    if report is None:
+        return jsonify({"error": "no such report"}), 404
+    return jsonify(report)
+
+
+@app.route("/api/network/reports", methods=["GET"])
+def api_network_reports():
+    """Stored network reports, newest first: id, filename, timestamp, mode and a summary"""
+    rows = []
+    for key in _net_reports.keys("netsummary_"):
+        report_id = key[len("netsummary_"):]
+        summary = _net_reports.lookup("netsummary", sha256=report_id)
+        if summary is not None and _net_reports.has("netreport_" + report_id):
+            rows.append(summary)
+    rows.sort(key=lambda r: (r.get("timestamp", ""), r.get("seq", 0)), reverse=True)
+    for r in rows:
+        r.pop("seq", None)
+    return jsonify({"reports": rows})
+
+
+@app.route("/api/network/baseline", methods=["GET"])
+def api_network_baseline():
+    """What the network baseline of this VM holds"""
+    stats = _net_baseline.stats()
+    stats["count"] = _net_baseline.count
+    return jsonify(stats)
+
+
+@app.route("/api/network/baseline/capture", methods=["POST"])
+def api_network_baseline_capture():
+    """Record what a capture of the clean VM holds as the network baseline. Params: `file`"""
+    # the capture is analyzed without the baseline: all of it is learned
+    report, error = _net_analyze_upload(request.form, None)
+    if error:
+        return error
+    events = report.get("events") or []
+    before = _net_baseline.count
+    added = _net_baseline.add(events)
+    learned = []
+    seen = set()
+    for e in events:
+        if not isinstance(e, dict):
+            continue
+        item = (e.get("type"), e.get("dest"), e.get("port"))
+        if item not in seen and len(learned) < 200:
+            seen.add(item)
+            learned.append({"type": item[0], "dest": item[1], "port": item[2]})
+    return jsonify(net_analyze.mask_report({
+        "added": added, "count": _net_baseline.count, "previous_count": before,
+        "events_seen": len(events), "learned": learned, "baseline": _net_baseline.stats()}))
 
 
 @app.route("/api/memory/evidence", methods=["POST"])

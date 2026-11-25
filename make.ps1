@@ -319,8 +319,21 @@ switch ($Target) {
         try {
             Copy-Item 'webui\app.py' -Destination 'C:\DetonationChamberUI\app.py' -ToSession $s -Force
             Copy-Item 'webui\memory_evidence.py' -Destination 'C:\DetonationChamberUI\memory_evidence.py' -ToSession $s -Force
+            Copy-Item 'webui\net_analyze.py' -Destination 'C:\DetonationChamberUI\net_analyze.py' -ToSession $s -Force
+            Copy-Item 'webui\net_baseline.py' -Destination 'C:\DetonationChamberUI\net_baseline.py' -ToSession $s -Force
             Copy-Item 'webui\net_behavior.py' -Destination 'C:\DetonationChamberUI\net_behavior.py' -ToSession $s -Force
+            Copy-Item 'webui\net_decode.py' -Destination 'C:\DetonationChamberUI\net_decode.py' -ToSession $s -Force
+            Copy-Item 'webui\net_dns.py' -Destination 'C:\DetonationChamberUI\net_dns.py' -ToSession $s -Force
             Copy-Item 'webui\net_events.py' -Destination 'C:\DetonationChamberUI\net_events.py' -ToSession $s -Force
+            Copy-Item 'webui\net_evidence.py' -Destination 'C:\DetonationChamberUI\net_evidence.py' -ToSession $s -Force
+            Copy-Item 'webui\net_flows.py' -Destination 'C:\DetonationChamberUI\net_flows.py' -ToSession $s -Force
+            Copy-Item 'webui\net_http.py' -Destination 'C:\DetonationChamberUI\net_http.py' -ToSession $s -Force
+            Copy-Item 'webui\net_mail_ftp.py' -Destination 'C:\DetonationChamberUI\net_mail_ftp.py' -ToSession $s -Force
+            Copy-Item 'webui\net_raw.py' -Destination 'C:\DetonationChamberUI\net_raw.py' -ToSession $s -Force
+            Copy-Item 'webui\net_rules.py' -Destination 'C:\DetonationChamberUI\net_rules.py' -ToSession $s -Force
+            Copy-Item 'webui\net_tls.py' -Destination 'C:\DetonationChamberUI\net_tls.py' -ToSession $s -Force
+            Invoke-Command -Session $s -ScriptBlock { New-Item -ItemType Directory -Path 'C:\DetonationChamberUI\rules\network' -Force | Out-Null }
+            Copy-Item 'rules\network\default.yaml' -Destination 'C:\DetonationChamberUI\rules\network\default.yaml' -ToSession $s -Force
             Copy-Item 'webui\minidump_analysis.py' -Destination 'C:\DetonationChamberUI\minidump_analysis.py' -ToSession $s -Force
             Copy-Item 'webui\pipe_analysis.py' -Destination 'C:\DetonationChamberUI\pipe_analysis.py' -ToSession $s -Force
             Copy-Item 'webui\pipe_signatures.json' -Destination 'C:\DetonationChamberUI\pipe_signatures.json' -ToSession $s -Force
@@ -353,8 +366,21 @@ switch ($Target) {
         try {
             Copy-Item 'webui\app.py' -Destination 'C:\DetonationChamberUI\app.py' -ToSession $s -Force
             Copy-Item 'webui\memory_evidence.py' -Destination 'C:\DetonationChamberUI\memory_evidence.py' -ToSession $s -Force
+            Copy-Item 'webui\net_analyze.py' -Destination 'C:\DetonationChamberUI\net_analyze.py' -ToSession $s -Force
+            Copy-Item 'webui\net_baseline.py' -Destination 'C:\DetonationChamberUI\net_baseline.py' -ToSession $s -Force
             Copy-Item 'webui\net_behavior.py' -Destination 'C:\DetonationChamberUI\net_behavior.py' -ToSession $s -Force
+            Copy-Item 'webui\net_decode.py' -Destination 'C:\DetonationChamberUI\net_decode.py' -ToSession $s -Force
+            Copy-Item 'webui\net_dns.py' -Destination 'C:\DetonationChamberUI\net_dns.py' -ToSession $s -Force
             Copy-Item 'webui\net_events.py' -Destination 'C:\DetonationChamberUI\net_events.py' -ToSession $s -Force
+            Copy-Item 'webui\net_evidence.py' -Destination 'C:\DetonationChamberUI\net_evidence.py' -ToSession $s -Force
+            Copy-Item 'webui\net_flows.py' -Destination 'C:\DetonationChamberUI\net_flows.py' -ToSession $s -Force
+            Copy-Item 'webui\net_http.py' -Destination 'C:\DetonationChamberUI\net_http.py' -ToSession $s -Force
+            Copy-Item 'webui\net_mail_ftp.py' -Destination 'C:\DetonationChamberUI\net_mail_ftp.py' -ToSession $s -Force
+            Copy-Item 'webui\net_raw.py' -Destination 'C:\DetonationChamberUI\net_raw.py' -ToSession $s -Force
+            Copy-Item 'webui\net_rules.py' -Destination 'C:\DetonationChamberUI\net_rules.py' -ToSession $s -Force
+            Copy-Item 'webui\net_tls.py' -Destination 'C:\DetonationChamberUI\net_tls.py' -ToSession $s -Force
+            Invoke-Command -Session $s -ScriptBlock { New-Item -ItemType Directory -Path 'C:\DetonationChamberUI\rules\network' -Force | Out-Null }
+            Copy-Item 'rules\network\default.yaml' -Destination 'C:\DetonationChamberUI\rules\network\default.yaml' -ToSession $s -Force
             Copy-Item 'webui\minidump_analysis.py' -Destination 'C:\DetonationChamberUI\minidump_analysis.py' -ToSession $s -Force
             Copy-Item 'webui\pipe_analysis.py' -Destination 'C:\DetonationChamberUI\pipe_analysis.py' -ToSession $s -Force
             Copy-Item 'webui\pipe_signatures.json' -Destination 'C:\DetonationChamberUI\pipe_signatures.json' -ToSession $s -Force
