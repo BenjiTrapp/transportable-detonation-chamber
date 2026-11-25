@@ -5973,6 +5973,12 @@ def _rizin_export_note(session, original_sha, copy_name, copy_sha, placed, skipp
     The comparison decides, not the row's ``over_run`` mark: the mark rests on the session's mirror of
     its own writes, and a note that said nothing after a restart lost that mirror would be wrong about
     the file. A row is named where either says so.
+
+    What the three ways into the block have in common is the one thing the predicate tests: rizin's write
+    cache already held a write at that address when the patch was made -- a run's (or the console's) byte
+    that is not the file's, an **earlier hand patch** at the same address (no run involved), or a run's
+    write of the file's own byte back (the bytes replaced then *are* the file's). The header says that
+    and no more.
     """
     over = [(row, paddr, was) for row, paddr, was in placed
             if was != row["before"].lower() or row.get("over_run")]
@@ -5991,10 +5997,11 @@ def _rizin_export_note(session, original_sha, copy_name, copy_sha, placed, skipp
     lines += [f"  {row['addr']:#x}  file {paddr:#x}  {_rizin_note_bytes(was)} -> {_rizin_note_bytes(row['after'])}"
               for row, paddr, was in placed]
     if over:
-        lines += ["", f"The bytes these patches replaced are not the file's ({len(over)}): rizin's write cache held",
-                  "other bytes there when the patch was made -- a patch set over bytes an emulation run had",
-                  "changed. Everywhere else the copy has the file's own bytes, so such a patch sits in bytes that",
-                  "are still encrypted on disk:"]
+        lines += ["", f"rizin's write cache already held a write at the address of these patches when they were made ({len(over)}):",
+                  "a write by an emulation run (or the console), or an earlier patch of yours at the same address. Each",
+                  "line gives what rizin says the patch replaced and what the file holds there; the two are the same",
+                  "where that write was the file's own byte. The copy has the file's own bytes everywhere else, so such",
+                  "a patch sits in bytes as they are on disk -- still encrypted, where a run had decrypted them:"]
         lines += [f"  {row['addr']:#x}  file {paddr:#x}  the patch replaced {_rizin_note_bytes(row['before'])}; "
                   f"in the file they are {_rizin_note_bytes(was)}" for row, paddr, was in over]
     if skipped:

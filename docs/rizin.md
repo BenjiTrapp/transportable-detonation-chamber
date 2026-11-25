@@ -213,7 +213,7 @@ that rizin itself does not tell apart (it has one cache):
 - **SET BY HAND** is what the menu wrote, kept with the project and the only
   thing an export takes; each row has a ✕ that takes that write back. A row
   set over bytes a run changed carries a ⚠: rizin's "before" for it is the
-  run's byte and not the file's, the group says so, and the export's note
+  run's byte, which need not be the file's, the group says so, and the export's note
   names the row with what the file really holds there. Taking such a row back
   drops the run's whole write with it -- rizin removes a write whole -- and
   the pane names the writes that went, with their byte total.
@@ -335,11 +335,13 @@ rename of it.
 path, the SHA-256 of the original and of the copy, the time in UTC and one line
 per patch (address, offset in the file, the file's own bytes there → the copy's).
 Those bytes are read from the original, not from rizin's cache: where a patch
-was set over bytes a run had changed, rizin reports as "before" what the run
-wrote, and the note would otherwise say the file held it. Every such patch is
-named in a block of its own, with both bytes, because the copy carries the
-file's own bytes everywhere else -- so the patch sits in bytes that are still
-encrypted on disk. The copy is
+was set over a write the cache already held (a run's, or an earlier patch of
+yours at the same address), rizin reports as "before" that write's byte, and
+the note would otherwise say the file held it. Every such patch is named in a
+block of its own, with both bytes (the same where a run wrote the file's own
+byte back), because the copy carries the file's own bytes everywhere else --
+so the patch sits in bytes as they are on disk, still encrypted where a run
+had decrypted them. The copy is
 built in Python, not by rizin: the original is copied and each patch is written
 at its **offset in the file**, which is not its address, because sections are
 page-aligned in memory and not on disk. Only patches set by hand are exported.

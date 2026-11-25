@@ -6468,11 +6468,12 @@ def test_rizin_emulation_pane_marks_a_patch_set_over_bytes_a_run_wrote():
     assert marked["plain"] is False and marked["runRow"] is False, "every row is marked: " + str(marked)
     assert marked["glyph"] == "⚠", marked["glyph"]
     assert "written over bytes a run changed" in marked["title"], marked["title"]
-    assert "not the file's" in marked["title"] and "export" in marked["title"], marked["title"]
+    assert "which need not be the file's" in marked["title"] and "not the file's" not in marked["title"] \
+        and "export" in marked["title"], marked["title"]  # a run may have written the file's own byte back
     assert "written over" not in marked["plainTitle"], marked["plainTitle"]
     assert marked["bytes"].startswith("1 B · ⚠42 → 90"), marked["bytes"]
     assert len(r["groupWarn"]) == 1 and "One of these was set over bytes a run changed" in r["groupWarn"][0], r["groupWarn"]
-    assert "still encrypted" in r["groupWarn"][0] and "note names them" in r["groupWarn"][0], r["groupWarn"]
+    assert "may still be encrypted" in r["groupWarn"][0] and "may be different" in r["groupWarn"][0] and "note names them" in r["groupWarn"][0], r["groupWarn"]
     took = r["took"]
     assert "Took the patch at 0x140001501 back" in took["said"], took["said"]
     assert "1 write the run made went with it" in took["said"] and "4 bytes" in took["said"] \
@@ -7206,6 +7207,7 @@ def test_rizin_emulation_pane_styles_and_markup():
         "asset versions not raised for the waiting patches and the restore button"
     assert "app.js?v=133" not in html, "app.js changed again (Apply now is drawn from the server's flag), its version did not"
     assert "app.js?v=134" not in html, "app.js changed again (the exit of a waiting row, a restore that broke), its version did not"
+    assert "app.js?v=135" not in html, "the pane's words and the help changed (the ⚠ no longer says the run's byte is not the file's), its version did not"
 
 
 # --- Task 6: the waiting patches, the restore button and its notice ----------------------------------------------

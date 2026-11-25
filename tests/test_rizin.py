@@ -6730,7 +6730,7 @@ def test_export_writes_a_copy_with_the_patches_applied(rz):
     # (The fake's byte model and the sample on disk are independent by construction -- the one case
     # real rizin reaches is a patch over bytes a run changed, which the real-rizin test below pins.)
     assert row["before"] != original[paddr:paddr + 2].hex()
-    assert "The bytes these patches replaced are not the file's (1)" in note
+    assert "rizin's write cache already held a write at the address of these patches when they were made (1)" in note
     assert f"the patch replaced {row['before']}; in the file they are {original[paddr:paddr + 2].hex()}" in note
 
 
@@ -6996,16 +6996,23 @@ def test_the_note_names_a_row_the_mirror_says_was_over_a_runs_bytes(tdc):
     row = {"addr": 0x140001001, "size": 1, "before": "31", "after": "90", "mine": True, "over_run": True}
     note = tdc._rizin_export_note(session, "a" * 64, "copy.exe", "b" * 64, [(row, 0x401, "31")], [])
     assert "  0x140001001  file 0x401  31 -> 90" in note
-    assert "The bytes these patches replaced are not the file's (1)" in note, note
+    assert "rizin's write cache already held a write at the address of these patches when they were made (1)" in note, note
     assert "the patch replaced 31; in the file they are 31" in note, note
+    # the run wrote the file's own byte back, so the bytes replaced *are* the file's: the header says nothing else
+    assert "not the file's" not in note, note
+    # an earlier hand patch at the same address (no mark: no run was involved) is named too, for the same reason
+    second = dict(row, over_run=False, before="91")
+    note_b = tdc._rizin_export_note(session, "a" * 64, "copy.exe", "b" * 64, [(second, 0x401, "31")], [])
+    assert "write cache already held a write at the address of these patches when they were made (1)" in note_b, note_b
+    assert "an earlier patch of yours" in note_b and "the patch replaced 91; in the file they are 31" in note_b, note_b
     # the same row without the mark and with the same bytes is not named
     plain = tdc._rizin_export_note(session, "a" * 64, "copy.exe", "b" * 64,
                                    [(dict(row, over_run=False), 0x401, "31")], [])
-    assert "are not the file's" not in plain, plain
+    assert "rizin's write cache already held a write at the address of these patches when they were made" not in plain and "the patch replaced" not in plain, plain
     # and rizin's upper case, which 0.9.1 never writes, is no difference either
     upper = tdc._rizin_export_note(session, "a" * 64, "copy.exe", "b" * 64,
                                    [(dict(row, over_run=False, before="AB"), 0x401, "ab")], [])
-    assert "are not the file's" not in upper, upper
+    assert "rizin's write cache already held a write at the address of these patches when they were made" not in upper and "the patch replaced" not in upper, upper
 
 
 def test_the_note_shortens_a_long_patch_to_a_line_that_can_be_read(rz):
@@ -7201,7 +7208,7 @@ def test_real_rizin_the_note_says_what_the_file_holds_under_a_patch(tdc, tmp_pat
         assert f"  {main + 1:#x}  file {paddr + 1:#x}  {was} -> 90" in note, note
         assert f"{patch_row['before']} -> 90" not in note, "the run's byte is not called the file's"
         # and it names the row, with both bytes, so the copy's state is knowable from the note alone
-        assert "The bytes these patches replaced are not the file's (1)" in note, note
+        assert "rizin's write cache already held a write at the address of these patches when they were made (1)" in note, note
         assert f"  {main + 1:#x}  file {paddr + 1:#x}  the patch replaced {patch_row['before']}; " \
                f"in the file they are {was}" in note, note
 
@@ -7212,6 +7219,68 @@ def test_real_rizin_the_note_says_what_the_file_holds_under_a_patch(tdc, tmp_pat
         assert copy[paddr + 1] == 0x90
         assert copy[paddr:paddr + 4] == original[paddr:paddr + 1] + b"\x90" + original[paddr + 2:paddr + 4]
         assert exe.read_bytes() == original, "the original is never written"
+    finally:
+        mgr.shutdown()
+
+
+@pytest.mark.skipif(not REAL_RIZIN, reason="rizin not installed")
+@pytest.mark.skipif(not MINGW, reason="mingw (x86_64-w64-mingw32-gcc) not installed")
+def test_real_rizin_the_note_header_is_true_in_all_three_cases_that_name_a_row(tdc, tmp_path, monkeypatch):
+    """The note names a row where rizin's write cache already held a write at the address when the patch was
+    made. Three ways to get there, and the header must be true of every one (rizin 0.9.1, measured):
+
+    a. a run wrote a byte other than the file's, then the patch went over it;
+    b. an **earlier hand patch** at the same address, no run involved (the pane shows no mark for it);
+    c. a run wrote the file's **own** byte back, then the patch went over it -- the bytes replaced *are*
+       the file's, so a header saying they are not would be false.
+    """
+    import rizin_sessions
+
+    allowed, uploads = tmp_path / "allowed", tmp_path / "uploads"
+    allowed.mkdir()
+    exe = allowed / "pipesim.exe"
+    shutil.copy(_build_pipesim(tmp_path), exe)
+    original = exe.read_bytes()
+    monkeypatch.setattr(rizin_sessions, "RIZIN_EXE", REAL_RIZIN)
+    monkeypatch.setattr(tdc, "_readable_roots", lambda: [str(allowed), str(uploads)])
+    monkeypatch.setattr(tdc, "RIZIN_UPLOAD_DIR", str(uploads))
+    mgr = rizin_sessions.RizinSessions(exe=REAL_RIZIN, projects_dir=str(tmp_path / "projects"))
+    monkeypatch.setattr(tdc, "_rizin_manager", mgr)
+    monkeypatch.setattr(tdc, "_rizin_install", {"key": None, "value": None})
+    api = _Api(tdc, None, mgr, tmp_path)
+    try:
+        sid = api.open(str(exe))["session"]
+        api.wait_done(sid, timeout=120)
+        session = mgr.get(sid)
+        main = next(f for f in api.read(f"/api/rizin/{sid}/functions") if f["name"] == "sym.main")["offset"]
+        paddr = api.read(f"/api/rizin/{sid}/hex?addr={main}&len=1")["paddr"]
+        a_at, b_at, c_at = main, main + 1, main + 2
+        api.send(f"/api/rizin/{sid}/emulation/start", {"addr": main})
+        session.text(f"wx {original[paddr] ^ 0xFF:02x} @ {a_at:#x}")       # a: a run's byte, not the file's
+        api.send(f"/api/rizin/{sid}/patch", {"addr": a_at, "bytes": "90"})
+        api.send(f"/api/rizin/{sid}/patch", {"addr": b_at, "bytes": "91"})   # b: an earlier hand patch ...
+        api.send(f"/api/rizin/{sid}/patch", {"addr": b_at, "bytes": "92"})   # ... and a second thought
+        session.text(f"wx {original[paddr + 2]:02x} @ {c_at:#x}")           # c: the run writes the file's own byte
+        api.send(f"/api/rizin/{sid}/patch", {"addr": c_at, "bytes": "93"})
+
+        rows = api.read(f"/api/rizin/{sid}/patches")["patches"]
+        mine = {r["addr"]: r for r in rows if r["mine"]}
+        assert mine[a_at]["over_run"] is True and mine[a_at]["before"] != original[paddr:paddr + 1].hex()
+        assert mine[b_at]["over_run"] is False, "case b: no run was involved, and the pane shows no mark"
+        assert mine[c_at]["over_run"] is True and mine[c_at]["before"] == original[paddr + 2:paddr + 3].hex(), \
+            "case c: the run's byte *is* the file's"
+
+        note = api.send(f"/api/rizin/{sid}/export", {})["note"]
+        assert "not the file's" not in note, "case c's bytes are the file's: " + note
+        assert "rizin's write cache already held a write at the address of these patches when they were made (3)" in note, note
+        assert "a write by an emulation run (or the console), or an earlier patch of yours at the same address" in note, \
+            "the header names both writers it can be (the note's first line mentions a run too, so the whole phrase is pinned): " + note
+        was = lambda at: original[paddr + at - main:paddr + at - main + 1].hex()
+        for at in (a_at, b_at, c_at):
+            replaced = next(r for r in mine.values() if r["addr"] == at)["before"]
+            assert f"  {at:#x}  file {paddr + at - main:#x}  the patch replaced {replaced}; " \
+                   f"in the file they are {was(at)}" in note, note
+        assert mine[c_at]["before"] == was(c_at), "case c's own line says the two are the same"
     finally:
         mgr.shutdown()
 

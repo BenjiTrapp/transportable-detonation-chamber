@@ -25359,7 +25359,7 @@ function rizinEmuPatchesHtml(patches, functions, options) {
         const before = rizinEmuBytes(patch.before), after = rizinEmuBytes(patch.after);
         const over = own && patch.over_run === true;
         const title = `${addr || 'an address that cannot be shown exactly'} · ${size} byte${size === 1 ? '' : 's'}${fn ? ` · ${fn}` : ''} · ${before} → ${after}`
-            + (over ? ' · written over bytes a run changed: the bytes on the left are the run\'s, not the file\'s, and the export\'s note says what the file holds there' : '');
+            + (over ? ' · written over bytes a run changed: the bytes on the left are the run\'s, which need not be the file\'s, and the export\'s note says what the file holds there' : '');
         return `<div class="rizin-row rizin-emu-row rizin-emu-patch${addr ? '' : ' rizin-row-none'}"${addr ? ` data-addr="${addr}"` : ''} title="${escapeHtml(title)}">`
             + `<span class="rz-addr">${escapeHtml(addr || '?')}</span><span class="rizin-emu-fn">${escapeHtml(fn || '—')}</span>`
             + `<span class="rizin-emu-bytes">${size} B · ${over ? '<span class="rizin-emu-over-mark">⚠</span>' : ''}${escapeHtml(before)} → ${escapeHtml(after)}</span>`
@@ -25387,12 +25387,12 @@ function rizinEmuPatchesHtml(patches, functions, options) {
             + `<pre>${escapeHtml(exported.note)}</pre></div>`;
     }
     const written = run.reduce((sum, patch) => sum + (Number.isSafeInteger(patch.size) ? patch.size : 0), 0);
-    // A patch set over bytes a run changed: rizin's "before" for such a row is the run's byte, not the file's, so the
+    // A patch set over bytes a run changed: rizin's "before" for such a row is the run's byte, which need not be the file's, so the
     // row alone would read as if the file held it. The glyph marks the row, this line says what follows from it.
     const over = hand.filter(patch => patch.over_run === true).length;
     const overLine = over ? `<div class="rizin-emu-warn" role="note">${over === 1 ? 'One of these was' : `${over} of these were`}`
-        + ' set over bytes a run changed: in the file those bytes are different, and the export writes the file\'s own'
-        + ' bytes around the patch — so the copy has it inside bytes that are still encrypted. The note names them.</div>' : '';
+        + ' set over bytes a run changed: in the file those bytes may be different, and the export writes the file\'s own'
+        + ' bytes around the patch — so the copy has it inside bytes that may still be encrypted. The note names them.</div>' : '';
     return `<div class="rizin-emu-group rizin-emu-hand" data-rizin-group="hand"><div class="rizin-emu-subhead">`
         + `<span class="rizin-emu-group-title">SET BY HAND · ${hand.length}</span><span class="rizin-emu-fate">kept with the project</span>`
         + `<span class="rizin-emu-actions"><button type="button" class="rizin-tool" data-rizin-act="export"${off(!hand.length || busy)} `
