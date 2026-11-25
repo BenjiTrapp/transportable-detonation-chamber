@@ -174,16 +174,26 @@ SCALE_MAX_RUN = 2
 # more than one short interval between two long ones, however a missed round
 # or jitter changes their lengths and their factors. A rhythm that switches
 # to a slower one puts its long intervals in a block. Missed rounds of one
-# rhythm fall at random positions and spread out. So the missed-round reading
-# is refused when the long intervals (MISSED_LONG_BAND times the median or
-# more, multiples or not) are packed (no gap of more than one short interval
-# between any two of them) and either make up MISSED_PACKED_SHARE of the
-# intervals or follow each other without a short one between.
+# rhythm fall at random positions and spread out. The long intervals are those
+# of MISSED_LONG_BAND times the median or more, multiples or not, and the
+# missed-round reading is refused when they show one of three patterns:
+#   * packed: no two more than one short interval apart, and together at
+#     least MISSED_PACKED_SHARE of the intervals (rounds of two requests);
+#   * at one constant step, MISSED_STEP_MIN of them or more: rounds of n
+#     requests put a long interval at every n-th position (0/10/20 every 60 s
+#     is 10, 10, 40, 10, 10, 40), whatever n is;
+#   * one block: every long interval follows the one before it directly, and
+#     the block touches the start or the end of the series (a rhythm that
+#     changes, or one that begins slowly) or is MISSED_RUN_MIN long. Two
+#     missed rounds one check-in apart in the middle of a beacon are such a
+#     block of two and stay missed rounds.
 MISSED_TOLERANCE = 0.1
 MISSED_MAX_SHARE = 0.5
 MISSED_PATTERN_MIN = 4
 MISSED_LONG_BAND = 1.8
 MISSED_PACKED_SHARE = 0.35
+MISSED_STEP_MIN = 3
+MISSED_RUN_MIN = 3
 
 # Intervals taken into the measurement of one group. A beacon is established
 # long before this; the cap keeps the cost of one huge group bounded.
@@ -295,9 +305,10 @@ def _forgiven(intervals, median):
 
     Empty when they are too many (``MISSED_MAX_SHARE``), come on a beat of
     their own (evenly spaced, ``MISSED_PATTERN_MIN`` or more) or when the long
-    intervals are packed the way a second time scale packs them (see
-    ``MISSED_PACKED_SHARE``): that is a second rhythm, not check-ins that
-    happened not to happen.
+    intervals sit the way a second time scale puts them (packed, at one
+    constant step, or in one block at an edge or of ``MISSED_RUN_MIN``; see
+    the constants): that is a second rhythm, not check-ins that happened not to
+    happen.
     """
     positions = [i for i, x in enumerate(intervals)
                  if x >= SCALE_BAND * median and _missed_rounds(x, median)]
@@ -308,8 +319,14 @@ def _forgiven(intervals, median):
         return set()
     longs = [i for i, x in enumerate(intervals) if x >= MISSED_LONG_BAND * median]
     gaps = [b - a for a, b in zip(longs, longs[1:])]
-    if len(longs) >= 2 and all(g <= 2 for g in gaps):
-        if len(longs) >= MISSED_PACKED_SHARE * len(intervals) or all(g == 1 for g in gaps):
+    if (len(longs) >= 2 and all(g <= 2 for g in gaps)
+            and len(longs) >= MISSED_PACKED_SHARE * len(intervals)):
+        return set()
+    if len(longs) >= MISSED_STEP_MIN and len(set(gaps)) == 1:
+        return set()
+    if len(longs) >= 2 and all(g == 1 for g in gaps):
+        if (len(longs) >= MISSED_RUN_MIN or longs[0] == 0
+                or longs[-1] == len(intervals) - 1):
             return set()
     return set(positions)
 

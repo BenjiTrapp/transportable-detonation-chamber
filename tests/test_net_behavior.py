@@ -874,7 +874,9 @@ def test_a_steady_beacon_with_one_outage_keeps_its_interval():
 def test_an_exact_beacon_that_misses_check_ins_keeps_its_interval():
     # Zero jitter is a common default, and a reused connection is one Sysmon
     # EID 3: gaps of exactly two and three periods are missed rounds.
-    ts = [0.0, 60.0, 180.0, 240.0, 300.0, 480.0, 540.0, 600.0, 720.0, 780.0]
+    # (The misses are not at one constant step: three at every third position
+    # are what rounds of three requests look like; see the test after next.)
+    ts = [0.0, 60.0, 180.0, 240.0, 300.0, 480.0, 540.0, 660.0, 720.0, 780.0]
     p = net_behavior.periodicity(ts)
     assert p["periodic"] is True and p["single_scale"] is True and p["interval"] == 60.0
 
@@ -922,6 +924,36 @@ def test_a_change_from_a_ten_to_a_sixty_second_rhythm_is_not_a_ten_second_beacon
     assert net_behavior.periodicity(ts)["periodic"] is False
 
 
+@pytest.mark.parametrize("offsets", [(0.0, 10.0, 20.0), (0.0, 12.0, 24.0),
+                                     (0.0, 10.0, 20.0, 30.0)])
+@pytest.mark.parametrize("missing", [(), (3,)])
+def test_rounds_of_three_or_four_requests_have_no_interval(offsets, missing):
+    # Fetch a task, post the result, acknowledge: one long interval at every
+    # n-th position, a constant step, whether or not a round is missing.
+    rng = random.Random(len(offsets) * 10 + len(missing))
+    for _ in range(100):
+        ts = []
+        for k in range(rng.randint(6, 16)):
+            if k in missing:
+                continue
+            t = 60.0 * k + rng.uniform(-1.2, 1.2)
+            ts += [t + o * rng.uniform(0.98, 1.02) for o in offsets]
+        assert net_behavior.periodicity(ts)["interval"] is None, ts
+
+
+def test_two_missed_rounds_one_check_in_apart_in_the_middle_stay_missed_rounds():
+    ts = [60.0 * k for k in range(14) if k not in (5, 7)]
+    p = net_behavior.periodicity(ts)
+    assert p["periodic"] is True and p["interval"] == 60.0
+
+
+def test_consecutive_long_intervals_at_the_end_are_a_change_of_rhythm():
+    # Six 10 s intervals, then two of 20 s: as missed rounds the two would be
+    # forgiven; at the end of the series they are the start of a slower rhythm.
+    ts = [10.0 * k for k in range(7)] + [80.0, 100.0]
+    assert net_behavior.periodicity(ts)["interval"] is None
+
+
 def test_doubled_intervals_on_a_beat_of_their_own_are_a_second_scale():
     # 60, 60, 120, 60, 60, 120, ...: every third interval doubled is a rhythm
     # of 240 s with three check-ins, not a 60 s beacon that keeps missing the
@@ -951,23 +983,22 @@ def test_a_conn_and_an_http_request_per_check_in_stay_one_beacon():
 # each count is taken over NOISE_SEEDS x NOISE_TRIALS series (10 000), because
 # one seed of 2000 scatters widely, so a ceiling taken from one seed holds or
 # fails by luck. The ceilings come from the distribution over 40 disjoint
-# groups of five seeds (seeds 0-199), measured after the missed-round rule of
-# _single_scale (which reads a gap on a whole multiple of the interval as a
-# missed check-in, and so lets some more noise through as loose beacons):
-#   uniform, measured beacons     47-76, mean 59.1, sd 6.7   -> ceiling 90
-#   uniform, any beacon event   152-205, mean 176.2, sd 13.3 -> ceiling 240
-#   Poisson with follow-ups, any  2-12, mean 5.2, sd 2.4     -> ceiling 20
+# groups of five seeds (seeds 0-199), measured with the missed-round rule of
+# _single_scale (which lets some more noise through as loose beacons):
+#   uniform, measured beacons     48-78, mean 60.0, sd 6.7   -> ceiling 80
+#   uniform, any beacon event   152-205, mean 176.2, sd 13.3 -> ceiling 215
+#   Poisson with follow-ups, any  2-12, mean 5.2, sd 2.4     -> ceiling 14
 #   Poisson with follow-ups, measured: 0 in all 400 000      -> ceiling 0
-# Each ceiling sits at least 4.5 standard deviations above the mean of the
-# groups, and above the largest group by a margin, so a failure means the rate
-# moved, not that the seed was unlucky.
+# The seeds here are fixed, so a failure cannot be luck: each ceiling sits
+# just above the largest group seen (about 3 standard deviations above the
+# mean), close enough that a real rise of a fifth or more fails the test.
 
 NOISE_TRIALS = 2000
 NOISE_SEEDS = (0, 1, 2, 3, 4)
-NOISE_CEILING_POISSON_ANY = 20
+NOISE_CEILING_POISSON_ANY = 14
 NOISE_CEILING_POISSON = 0
-NOISE_CEILING_UNIFORM_ANY = 240
-NOISE_CEILING_UNIFORM = 90
+NOISE_CEILING_UNIFORM_ANY = 215
+NOISE_CEILING_UNIFORM = 80
 
 
 def _poisson_with_follow_ups(rng):
