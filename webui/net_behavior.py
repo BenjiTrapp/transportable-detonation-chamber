@@ -31,6 +31,15 @@ Several assumptions would make the result wrong:
   * All traffic that has a path is a signal. ``/`` on many hosts is browsing,
     and NXDOMAIN answers hours apart are typing mistakes, so neither counts as
     fanout; a failure burst has to fall within ``NXDOMAIN_WINDOW_S``.
+  * Every destination is a name. A check-in is often a connection to an address
+    plus an HTTP request to the name, and the same C2 would be counted as two
+    beacons; a fingerprint built on endpoints and intervals would then depend
+    on whether the DNS lookup happened to be inside the capture. An address
+    that a ``dns`` answer in the same list resolved joins the name's group, and
+    the event keeps ``addresses`` so the contact is still visible. A name is
+    only credible when it is unambiguous: an address answered for two names, or
+    contacted at or before the first lookup that returned it, stays on its own.
+    An address with no lookup at all is itself a finding and is never named.
   * The cost may grow with the size of the capture. The events are read once,
     grouped in dictionaries, and each group is measured from at most
     ``MAX_INTERVALS`` intervals, so the work is linear in the number of events
@@ -41,6 +50,7 @@ Timestamps are Unix seconds as float, as in ``net_events``. An event with a
 timestamp that is not a finite number is ignored: it cannot be placed in time.
 """
 
+import ipaddress
 import math
 import statistics
 
@@ -130,19 +140,60 @@ def periodicity(timestamps):
     return result
 
 
+def _address(text):
+    """The canonical form of an IP address, or None."""
+    try:
+        return str(ipaddress.ip_address(text))
+    except ValueError:
+        return None
+
+
+def _resolutions(events):
+    """Address -> (name, time of the first lookup that returned it).
+
+    The name is None when the address was answered for more than one name, in
+    any order, anywhere in the list: that is a shared host and no name is
+    right. The time is that of the query (the time a ``dns`` event carries),
+    the earliest instant at which anything could have used the answer.
+    """
+    table = {}
+    for e in events:
+        if e.get("type") != "dns" or not _usable(e.get("ts")):
+            continue
+        name = e.get("dest")
+        answers = e.get("answers")
+        if (not isinstance(name, str) or not name or not answers
+                or e.get("query_type") not in (None, "A", "AAAA")):
+            continue
+        for answer in answers:
+            address = _address(answer) if isinstance(answer, str) else None
+            if address is None:
+                continue
+            known = table.get(address)
+            if known is None:
+                table[address] = (name, e["ts"])
+            else:
+                table[address] = (known[0] if known[0] == name else None,
+                                  min(known[1], e["ts"]))
+    return table
+
+
 class _Group:
     """What one destination (or path) did: times, event types, a process name."""
 
-    __slots__ = ("times", "types", "process", "pids")
+    __slots__ = ("times", "types", "process", "pids", "addresses")
 
     def __init__(self):
         self.times = []
         self.types = set()
         self.process = ""
         self.pids = set()
+        self.addresses = set()
 
-    def add(self, event, ts):
+    def add(self, event, ts, address=None):
         self.times.append(ts)
+        if address:
+            self.addresses.add(address)
         self.types.add(event["type"])
         self.pids.add(event.get("pid"))
         if not self.process:
@@ -158,7 +209,7 @@ def _beacon(pid, dest, group):
         interval=p["interval"], jitter=p["jitter"], cov=p["cov"],
         on_rhythm=p["on_rhythm"], connections=p["connections"],
         first_ts=min(group.times), last_ts=max(group.times),
-        via=sorted(group.types))
+        via=sorted(group.types), addresses=sorted(group.addresses))
 
 
 def _retry(dest, group):
@@ -168,7 +219,8 @@ def _retry(dest, group):
     return net_events.NetEvent(
         "retry", min(group.times), process=group.process, pid=pid, dest=dest,
         attempts=len(group.times), first_ts=min(group.times),
-        last_ts=max(group.times), via=sorted(group.types))
+        last_ts=max(group.times), via=sorted(group.types),
+        addresses=sorted(group.addresses))
 
 
 def _path_fanout(path, hosts, first_ts):
@@ -213,10 +265,13 @@ def _nxdomain_fanout(failures):
 def analyze(events):
     """``beacon``, ``retry`` and ``fanout`` events for a capture's events.
 
-    One pass groups the events: check-ins by (pid, dest), failures by dest,
-    HTTP requests by path and NXDOMAIN answers in one list. Each group is then
-    measured once. The result is in time order and the input is not changed.
+    A first pass reads the ``dns`` answers. A second groups the events:
+    check-ins by (pid, name), failures by name, HTTP requests by path and
+    NXDOMAIN answers in one list, where an address that a lookup before it
+    resolved is replaced by its name. Each group is then measured once. The
+    result is in time order and the input is not changed.
     """
+    resolved = _resolutions(events)
     beacons = {}
     retries = {}
     paths = {}
@@ -230,11 +285,15 @@ def analyze(events):
         dest = e.get("dest")
         if not isinstance(dest, str) or not dest:
             continue
+        address = None
+        known = resolved.get(dest) if etype != "dns" else None
+        if known is not None and known[0] is not None and ts > known[1]:
+            address, dest = dest, known[0]
         failed = etype == "conn_failed" or (etype == "dns" and e.get("nxdomain"))
         if etype in BEACON_TYPES:
-            beacons.setdefault((e.get("pid"), dest), _Group()).add(e, ts)
+            beacons.setdefault((e.get("pid"), dest), _Group()).add(e, ts, address)
         if failed:
-            retries.setdefault(dest, _Group()).add(e, ts)
+            retries.setdefault(dest, _Group()).add(e, ts, address)
         if etype == "dns" and e.get("nxdomain"):
             nx_failures.append((ts, dest))
         path = e.get("path")

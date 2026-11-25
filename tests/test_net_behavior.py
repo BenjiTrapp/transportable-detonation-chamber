@@ -22,6 +22,12 @@ Regressions covered:
   * NXDOMAIN answers spread over hours were counted as one burst
   * a NaN or missing timestamp raised, or poisoned the sort
   * the cost grew faster than the number of events
+  * one C2 became two beacons when its check-ins were a connection to an
+    address plus an HTTP request to the name: the same sample fingerprinted
+    differently depending on whether its DNS lookup was inside the capture
+  * that merge went too far: an address answered for two names, or looked up
+    only after the connection, was claimed by a name, and the address a
+    connection really used disappeared from the event
 """
 
 import json
@@ -314,6 +320,156 @@ def test_answered_lookups_are_not_an_nxdomain_burst():
     assert of_type(net_behavior.analyze(evs), "fanout") == []
 
 
+# --- Names and addresses ------------------------------------------------------
+
+IP = "203.0.113.9"
+
+
+def lookup(ts, name, *answers, **kw):
+    return ev("dns", ts, dest=name, query_type="A", answers=list(answers), **kw)
+
+
+def check_ins(dest_name=None, dest_ip=None, count=6, start=0.0, step=60.0, **kw):
+    """HTTP requests to a name and/or connections to an address, same instants."""
+    out = []
+    for k in range(count):
+        t = start + k * step
+        if dest_name:
+            out.append(ev("http", t, dest=dest_name, **kw))
+        if dest_ip:
+            out.append(ev("conn", t + 0.1, dest=dest_ip, **kw))
+    return out
+
+
+def test_http_to_a_name_and_connections_to_its_address_are_one_beacon():
+    evs = [lookup(-0.2, "c2.top", IP)] + check_ins("c2.top", IP)
+    beacons = of_type(net_behavior.analyze(evs), "beacon")
+    assert len(beacons) == 1
+    b = beacons[0]
+    assert b["dest"] == "c2.top" and b["interval"] == 60.0 and b["connections"] == 6
+    assert {"conn", "http"} <= set(b["via"])
+
+
+def test_the_address_actually_contacted_stays_on_the_event():
+    evs = [lookup(-0.2, "c2.top", IP)] + check_ins("c2.top", IP)
+    b = of_type(net_behavior.analyze(evs), "beacon")[0]
+    assert b["addresses"] == [IP]
+
+
+def test_connections_alone_to_a_resolved_address_are_reported_under_the_name():
+    evs = [lookup(-0.2, "c2.top", IP)] + check_ins(dest_ip=IP)
+    b = of_type(net_behavior.analyze(evs), "beacon")
+    assert len(b) == 1 and b[0]["dest"] == "c2.top" and b[0]["addresses"] == [IP]
+
+
+def test_the_name_group_works_with_pid_none():
+    evs = [lookup(-0.2, "c2.top", IP)] + check_ins("c2.top", IP)
+    assert all(e["pid"] is None for e in evs)
+    assert len(of_type(net_behavior.analyze(evs), "beacon")) == 1
+
+
+def test_an_address_nobody_resolved_groups_alone():
+    evs = [lookup(-0.2, "c2.top", "198.51.100.1")]
+    evs += check_ins("c2.top") + check_ins(dest_ip=IP)
+    beacons = of_type(net_behavior.analyze(evs), "beacon")
+    assert sorted(b["dest"] for b in beacons) == [IP, "c2.top"]
+    by_dest = {b["dest"]: b for b in beacons}
+    assert by_dest[IP]["addresses"] == [] and by_dest["c2.top"]["addresses"] == []
+
+
+def test_an_address_answered_for_two_names_is_not_merged():
+    evs = [lookup(-9.0, "a.top", IP), lookup(-8.0, "b.top", IP)]
+    evs += check_ins("a.top", IP)
+    beacons = of_type(net_behavior.analyze(evs), "beacon")
+    assert sorted(b["dest"] for b in beacons) == [IP, "a.top"]
+
+
+def test_two_names_for_one_address_stay_apart_whichever_lookup_came_first():
+    evs = [lookup(-9.0, "b.top", IP), lookup(-8.0, "a.top", IP)] + check_ins(dest_ip=IP)
+    beacons = of_type(net_behavior.analyze(evs), "beacon")
+    assert [b["dest"] for b in beacons] == [IP]
+
+
+def test_a_lookup_after_the_connections_does_not_claim_them():
+    evs = check_ins(dest_ip=IP) + [lookup(1000.0, "c2.top", IP)]
+    beacons = of_type(net_behavior.analyze(evs), "beacon")
+    assert [b["dest"] for b in beacons] == [IP]
+    assert beacons[0]["addresses"] == []
+
+
+def test_a_lookup_in_the_middle_claims_only_the_connections_after_it():
+    # The lookup at 119.9 is part of the 120 s check-in. Connections at 0.1 and
+    # 60.1 precede it and stay on the address (two, so no beacon of their own);
+    # the ones from 120.1 on join the name's HTTP check-ins.
+    evs = [lookup(119.9, "c2.top", IP)] + check_ins("c2.top", IP)
+    beacons = of_type(net_behavior.analyze(evs), "beacon")
+    assert [b["dest"] for b in beacons] == ["c2.top"]
+    assert beacons[0]["interval"] == 60.0 and beacons[0]["connections"] == 6
+    assert beacons[0]["addresses"] == [IP]
+
+
+def test_a_lookup_at_the_same_instant_does_not_claim_the_connection():
+    # The answer is not known before the lookup, so a failure stamped with the
+    # lookup's own time cannot have used it: five of the six are claimed.
+    evs = [lookup(40.0, "dead.top", IP)]
+    evs += [ev("conn_failed", 40.0 + t * 10.0, dest=IP) for t in range(6)]
+    r = of_type(net_behavior.analyze(evs), "retry")
+    assert [(x["dest"], x["attempts"]) for x in r] == [("dead.top", 5)]
+
+
+def test_the_lookup_may_come_later_in_the_list_than_the_connections():
+    evs = check_ins("c2.top", IP) + [lookup(-0.2, "c2.top", IP)]
+    beacons = of_type(net_behavior.analyze(evs), "beacon")
+    assert len(beacons) == 1 and beacons[0]["dest"] == "c2.top"
+
+
+def test_answers_that_are_not_addresses_claim_nothing():
+    evs = [lookup(-0.2, "c2.top", "alias.example", "not an address")]
+    evs += check_ins(dest_ip="alias.example")
+    assert [b["dest"] for b in of_type(net_behavior.analyze(evs), "beacon")] == ["alias.example"]
+
+
+def test_a_txt_record_that_reads_like_an_address_claims_nothing():
+    evs = [ev("dns", -5.0, dest="c2.top", query_type="TXT", answers=[IP])]
+    evs += check_ins(dest_ip=IP)
+    assert [b["dest"] for b in of_type(net_behavior.analyze(evs), "beacon")] == [IP]
+
+
+def test_a_cname_chain_still_resolves_the_address_to_the_asked_name():
+    evs = [lookup(-0.2, "www.c2.top", "edge.cdn.example", IP)] + check_ins(dest_ip=IP)
+    b = of_type(net_behavior.analyze(evs), "beacon")
+    assert [x["dest"] for x in b] == ["www.c2.top"]
+
+
+def test_failures_to_a_resolved_address_are_retries_of_the_name():
+    evs = [lookup(-0.2, "dead.top", IP)]
+    evs += [ev("conn_failed", t * 10.0, dest=IP) for t in range(5)]
+    r = of_type(net_behavior.analyze(evs), "retry")
+    assert len(r) == 1 and r[0]["dest"] == "dead.top"
+    assert r[0]["attempts"] == 5 and r[0]["addresses"] == [IP]
+
+
+def test_a_host_reached_by_name_and_by_address_counts_once_for_fanout():
+    evs = [lookup(-0.2, "h0.top", IP)]
+    evs += [ev("http", 0.0, dest="h0.top", path="/gate.php"),
+            ev("http", 1.0, dest=IP, path="/gate.php")]
+    evs += [ev("http", 2.0 + i, dest="h%d.top" % i, path="/gate.php") for i in range(1, 4)]
+    assert of_type(net_behavior.analyze(evs), "fanout") == []
+
+
+def test_fanout_still_counts_five_hosts_when_some_are_addresses():
+    evs = [lookup(-0.2, "h0.top", IP)]
+    evs += [ev("http", 1.0, dest=IP, path="/gate.php")]
+    evs += [ev("http", 2.0 + i, dest="h%d.top" % i, path="/gate.php") for i in range(1, 5)]
+    f = of_type(net_behavior.analyze(evs), "fanout")
+    assert len(f) == 1 and f[0]["hosts"] == 5 and "h0.top" in f[0]["dests"]
+
+
+def test_beacon_to_a_bare_address_without_any_lookup_keeps_its_address():
+    b = of_type(net_behavior.analyze(check_ins(dest_ip=IP)), "beacon")[0]
+    assert b["dest"] == IP and b["dest_is_ip"] is True
+
+
 # --- Shape, robustness, cost -----------------------------------------------
 
 def test_no_events_produce_no_behavior():
@@ -377,6 +533,33 @@ def test_cost_grows_linearly_with_the_number_of_events():
 
     ratio = best(large) / best(small)
     # 4x the events: linear is about 4, quadratic about 16.
+    assert ratio < 9, ratio
+
+
+def _resolving_workload(n):
+    out = []
+    for i in range(n):
+        name = "h%d.top" % (i % 500)
+        ip = "10.%d.%d.%d" % ((i % 500) // 65536, ((i % 500) // 256) % 256, (i % 500) % 256)
+        if i % 4 == 0:
+            out.append(lookup(i * 0.7, name, ip))
+        else:
+            out.append(ev("conn", i * 0.7, dest=ip))
+    return out
+
+
+def test_resolving_addresses_costs_linear_time_too():
+    small, large = _resolving_workload(20000), _resolving_workload(80000)
+
+    def best(events):
+        times = []
+        for _ in range(3):
+            t0 = time.perf_counter()
+            net_behavior.analyze(events)
+            times.append(time.perf_counter() - t0)
+        return min(times)
+
+    ratio = best(large) / best(small)
     assert ratio < 9, ratio
 
 
