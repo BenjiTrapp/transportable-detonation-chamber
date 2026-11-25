@@ -1260,8 +1260,16 @@ def score(findings, baseline=None):
     }
 
 
-def collect(results, process=""):
-    """Pull every supported scanner result out of a detonation result dict."""
+def collect(results, process="", network_process=None):
+    """Pull every supported scanner result out of a detonation result dict.
+
+    A capture knows no process, so the findings of the network report come
+    without one; they are the sample's traffic (the report was imported for
+    it), so they are attributed to ``network_process`` (default ``process``).
+    Supersede and corroboration match by process: without this a capture's
+    check-in and Sysmon's beaconing of the same loop never met and counted
+    twice. A finding that already names a process keeps it.
+    """
     findings = []
     aether = results.get("aether") or {}
     if isinstance(aether, dict):
@@ -1297,7 +1305,8 @@ def collect(results, process=""):
     # stored one, and scoring must not write into it.
     report = results.get("network") or {}
     if isinstance(report, dict) and isinstance(report.get("evidence_findings"), list):
-        findings += [dict(f) for f in report["evidence_findings"]
+        owner = _process_identity(process if network_process is None else network_process)[0]
+        findings += [dict(f, process=f.get("process") or owner) for f in report["evidence_findings"]
                      if isinstance(f, dict) and not f.get("baseline")]
 
     dyn = results.get("litterbox_dynamic") or {}

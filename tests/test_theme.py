@@ -3814,7 +3814,7 @@ def test_inline_file_map_ignores_a_stale_load():
 
 
 RTRACE_EVENT_FUNCTIONS = ["renderRtraceEventTable", "showRtraceEventTable", "rtraceState", "networkReportOf",
-                          "rtraceReportEvents", "networkJson",
+                          "rtraceReportEvents", "rtraceFetchReportEvents", "networkJson",
                           "rtraceNetworkEvents", "rtraceNetworkRows", "rtraceNetworkDetail", "rtraceNetworkSortValue",
                           "networkText", "networkTime", "networkHeader", "networkDetail", "networkFlags", "networkEmpty",
                           "networkCut", "formatSize", "sortNumberValue", "compareSortValues", "renderRtraceVerdictView",
@@ -3823,7 +3823,8 @@ RTRACE_EVENT_FUNCTIONS = ["renderRtraceEventTable", "showRtraceEventTable", "rtr
                           "getActionBadgeClass", "getEventDetails", "formatRelativeTime", "formatTime", "escapeHtml", "jsArg",
                           "cssToken", "severitySortValue", "sortTimeValue", "alertSeverity"]
 RTRACE_EVENT_CONSTS = ("ALERT_SEVERITIES", "RTRACE_EVENT_SORT_ID", "RTRACE_DETAIL_TABS", "RTRACE_NETWORK_TYPES",
-                       "NETWORK_ROWS_MAX", "networkState", "rtraceNetworkFetched", "RTRACE_NETWORK_FETCHED_MAX")
+                       "NETWORK_ROWS_MAX", "networkState", "rtraceNetworkFetched", "RTRACE_NETWORK_FETCHED_MAX",
+                       "RTRACE_NETWORK_RETRY_MS")
 
 
 @needs_node

@@ -868,7 +868,7 @@ def test_the_tracing_functions_take_colours_from_theme_variables_only():
     assert not re.search(r"#[0-9a-fA-F]{3,8}\b|rgba?\(|hsl\(", re.sub(r"&#\d+;", "", src))
 
 
-STATE_FNS = ["rtraceState", "networkReportOf", "rtraceReportEvents", "networkJson"]
+STATE_FNS = ["rtraceState", "networkReportOf", "rtraceReportEvents", "rtraceFetchReportEvents", "networkJson"]
 
 
 def _state_of(detonation, network_tab):
@@ -958,7 +958,8 @@ def test_tracing_fetches_the_events_of_a_report_once_per_id():
             console.log(JSON.stringify(r));
         })();
     """, _const("networkState") + "\n" + "\n".join(_const(c) for c in (
-        "rtraceNetworkFetched", "RTRACE_NETWORK_FETCHED_MAX", "RTRACE_DETAIL_TABS", "RTRACE_NETWORK_TYPES"))
+        "rtraceNetworkFetched", "RTRACE_NETWORK_FETCHED_MAX", "RTRACE_NETWORK_RETRY_MS", "RTRACE_DETAIL_TABS",
+        "RTRACE_NETWORK_TYPES"))
         + "\nconst NETWORK_ROWS_MAX = 1000;")
     assert r["pending"] == "loading" and "Loading the events" in r["loadingRows"]
     assert _tab_counts(r["pendingTabs"])["dns"] == "2" and _tab_counts(r["pendingTabs"])["http"] == "1", \
@@ -971,7 +972,8 @@ def test_tracing_fetches_the_events_of_a_report_once_per_id():
 
 def test_the_import_form_has_the_optional_sample_field():
     bar = _tab_block("network")
-    assert re.search(r'<input type="text" id="net-sample"[^>]*maxlength="64"', bar)
+    tag = re.search(r'<input type="text" id="net-sample"[^>]*>', bar).group(0)
+    assert "maxlength" not in tag, "a pasted hash with spaces around it is cut (the script trims)"
     assert "Sample SHA256 (optional)" in bar
 
 
@@ -1003,3 +1005,44 @@ def test_the_import_sends_a_valid_sample_and_refuses_a_malformed_one():
     assert r["refused"] == [0, ["The sample SHA256 must be 64 hex digits, or empty.", True]]
     assert r["tied"][0]["sha256"] == "ab" * 32 and "tied to the sample abababababab" in r["tied"][1]
     assert "sha256" not in r["loose"]
+
+
+@needs_node
+def test_a_failed_events_fetch_is_tried_again_after_a_while():
+    """Regressions covered: one transient error left Tracing on "could not be
+    loaded" for that report until it fell out of the cache. A failed fetch is
+    tried again on a render once RTRACE_NETWORK_RETRY_MS have passed (not on
+    every render before that, and never twice at once)."""
+    r = _run_node(STATE_FNS, r"""
+        (async () => {
+            let now = 1000, fail = true;
+            Date.now = () => now;
+            const fetched = [];
+            globalThis.fetch = url => {
+                fetched.push(now);
+                return Promise.resolve(fail ? { ok: false, status: 503, json: async () => ({ error: 'busy' }) }
+                                            : { ok: true, status: 200, json: async () => ({ events: [{ type: 'dns', dest: 'a.top' }] }) });
+            };
+            globalThis.showRtraceDetailTabs = () => {};
+            globalThis.showRtraceEventTable = () => {};
+            globalThis.state = { processes: {}, rtraceSelectedPid: null, activeTab: 'tracing',
+                                 detonationNetwork: { id: 'c'.repeat(32), observed: true } };
+            const tick = () => new Promise(res => setImmediate(res));
+            rtraceState(); await tick();
+            const r = { failed: rtraceState().networkPending };
+            now += RTRACE_NETWORK_RETRY_MS - 1; rtraceState(); rtraceState(); await tick();
+            r.early = fetched.length;
+            fail = false; now += 1;
+            const retrying = rtraceState(); rtraceState();
+            r.retrying = [retrying.networkPending, fetched.length];
+            await tick();
+            const done = rtraceState();
+            r.done = [done.networkPending || null, done.network.map(e => e.dest), fetched.length];
+            console.log(JSON.stringify(r));
+        })();
+    """, _const("networkState") + "\n" + "\n".join(_const(c) for c in (
+        "rtraceNetworkFetched", "RTRACE_NETWORK_FETCHED_MAX", "RTRACE_NETWORK_RETRY_MS")))
+    assert r["failed"] == "failed"
+    assert r["early"] == 1, "tried again before the delay"
+    assert r["retrying"] == ["loading", 2], "the retry was not made, or made twice"
+    assert r["done"] == [None, ["a.top"], 2]

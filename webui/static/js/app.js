@@ -4127,31 +4127,44 @@ const RTRACE_DETAIL_TABS = [['verdict', 'VERDICT', false], ['live', 'LIVE', fals
 const RTRACE_NETWORK_TYPES = { http: ['http'], connections: ['conn', 'conn_failed', 'udp'], dns: ['dns'], tls: ['tls'] };
 
 // The events of the network reports the detonation results send without them:
-// fetched once per report id from /api/network/report and kept for the last few
+// fetched once per report id from /api/network/report and kept for the last
+// few; a failed fetch is tried again on a render after RTRACE_NETWORK_RETRY_MS
 const rtraceNetworkFetched = new Map();
 const RTRACE_NETWORK_FETCHED_MAX = 5;
+const RTRACE_NETWORK_RETRY_MS = 10000;
 
-// { events } of a report: its own, the fetched ones, or events null while the
-// fetch is on the way (failed: true when it failed; it is not tried again)
-function rtraceReportEvents(report) {
-    if (Array.isArray(report.events)) return { events: report.events, failed: false };
-    const id = report.id ? String(report.id) : '';
-    if (!id) return { events: [], failed: false };
-    const known = rtraceNetworkFetched.get(id);
-    if (known) return known;
-    const entry = { events: null, failed: false };
-    rtraceNetworkFetched.set(id, entry);
-    while (rtraceNetworkFetched.size > RTRACE_NETWORK_FETCHED_MAX) rtraceNetworkFetched.delete(rtraceNetworkFetched.keys().next().value);
+function rtraceFetchReportEvents(id, entry) {
+    entry.events = null;
+    entry.failed = false;
+    entry.loading = true;
     fetch(`/api/network/report?id=${encodeURIComponent(id)}`)
         .then(networkJson)
         .then(data => { entry.events = Array.isArray(data.events) ? data.events : []; })
-        .catch(() => { entry.failed = true; })
+        .catch(() => { entry.failed = true; entry.retryAt = Date.now() + RTRACE_NETWORK_RETRY_MS; })
         .then(() => {
+            entry.loading = false;
             if (state.activeTab === 'tracing' && state.rtraceSelectedPid) {
                 showRtraceDetailTabs();
                 showRtraceEventTable();
             }
         });
+}
+
+// { events } of a report: its own, the fetched ones, or events null while the
+// fetch is on the way (failed: true after a failure, until the retry is due)
+function rtraceReportEvents(report) {
+    if (Array.isArray(report.events)) return { events: report.events, failed: false };
+    const id = report.id ? String(report.id) : '';
+    if (!id) return { events: [], failed: false };
+    const known = rtraceNetworkFetched.get(id);
+    if (known) {
+        if (known.failed && !known.loading && Date.now() >= known.retryAt) rtraceFetchReportEvents(id, known);
+        return known;
+    }
+    const entry = { events: null, failed: false, loading: false, retryAt: 0 };
+    rtraceNetworkFetched.set(id, entry);
+    while (rtraceNetworkFetched.size > RTRACE_NETWORK_FETCHED_MAX) rtraceNetworkFetched.delete(rtraceNetworkFetched.keys().next().value);
+    rtraceFetchReportEvents(id, entry);
     return entry;
 }
 
@@ -4280,7 +4293,7 @@ function rtraceNetworkRows(kind, events, view) {
     let html = `<div class="net-note">Capture-wide, from ${escapeHtml(from)}${report.filename ? ' (' + escapeHtml(networkText(report.filename)) + ')' : ''}: a capture knows no processes, so these events are not attributed to a process.</div>`;
     if (view && view.networkPending) {
         return html + (view.networkPending === 'failed'
-            ? '<div class="net-empty">The events of the network report could not be loaded.</div>'
+            ? '<div class="net-empty">The events of the network report could not be loaded; they are fetched again shortly.</div>'
             : '<div class="net-empty">Loading the events of the network report&hellip;</div>');
     }
     if (!events.length) {

@@ -623,3 +623,58 @@ def test_findings_marked_baseline_stay_out_of_the_verdict(tdc):
         {"source": "network", "kind": "exfil_upload", "baseline": "known", "key": "k1"},
         {"source": "network", "kind": "dga_pattern", "key": "k2"}]}}
     assert [f["kind"] for f in tdc.memory_evidence.collect(results)] == ["dga_pattern"]
+
+
+def _verdict_with_sysmon_beacon(client, tdc, monkeypatch, beacon_process="evil.exe", ip="198.51.100.100"):
+    """/api/detonation/results for PID 4242 whose Sysmon connection log beacons
+    8 x 60 s to ip:80 from beacon_process (None: no Sysmon beacon at all)."""
+    from test_api_payloads import _results_without_the_vm
+    _results_without_the_vm(tdc, monkeypatch)
+    if beacon_process is not None:
+        conns = [(1000.0 + 60 * i, ip, 80) for i in range(8)]
+        findings = tdc.memory_evidence.beaconing_from_connections(conns, process=beacon_process)
+        monkeypatch.setattr(tdc, "_network_beaconing_for_pid",
+                            lambda pid: {"available": True, "evidence_findings": findings})
+    r = client.get("/api/detonation/results?sha256=%s&pid=4242&filename=evil.exe" % SAMPLE)
+    assert r.status_code == 200
+    return r.get_json()
+
+
+def test_a_sysmon_beacon_and_the_captures_check_in_count_once_and_corroborate(client, tdc, tmp_path, monkeypatch):
+    """Regressions covered: the capture's findings came without a process, while
+    supersede and corroboration match by process, so the Sysmon beacon of the
+    sample and the check-in of its capture - one loop - were both counted
+    (3.0 + 1.6, nothing superseded). They are attributed to the sample's
+    process (the one Sysmon saw for its PID): the check-in absorbs the beacon
+    and is corroborated by it."""
+    assert _upload(client, _pcap_with_http_c2(tmp_path), sha256=SAMPLE).status_code == 200
+    d = _verdict_with_sysmon_beacon(client, tdc, monkeypatch)
+    ev = d["memory_evidence"]
+    assert [(f["kind"], f["process"]) for f in ev["findings"]] == [("c2_checkin", "evil.exe")]
+    checkin = ev["findings"][0]
+    assert checkin["corroborated_by"] == ["sysmon-network"]
+    assert [(f["kind"], f.get("superseded_by") is not None) for f in ev["suppressed"]] == [("c2_beaconing", True)]
+    assert ev["score"] == 4.0
+    # the stored report keeps its findings as they were imported
+    stored = client.get("/api/network/reports").get_json()["reports"][0]["id"]
+    assert all(f["process"] == "" for f in
+               client.get("/api/network/report?id=" + stored).get_json()["evidence_findings"])
+
+
+def test_without_a_host_side_signal_the_check_in_still_needs_one(client, tdc, tmp_path, monkeypatch):
+    """Ruling 51 is not loosened: with nothing of the sample's own on the host,
+    the attributed check-in stays uncorroborated (1.6) and the verdict clean."""
+    assert _upload(client, _pcap_with_http_c2(tmp_path), sha256=SAMPLE).status_code == 200
+    d = _verdict_with_sysmon_beacon(client, tdc, monkeypatch, beacon_process=None)
+    ev = d["memory_evidence"]
+    assert [f["kind"] for f in ev["findings"]] == ["c2_checkin"] and ev["score"] == 1.6
+    assert d["verdict"]["label"] == "CLEAN"
+
+
+def test_a_finding_that_names_its_process_keeps_it(tdc):
+    results = {"network": {"evidence_findings": [
+        {"source": "network", "kind": "dga_pattern", "key": "k", "process": "other.exe"},
+        {"source": "network", "kind": "dga_pattern", "key": "k2", "process": ""}]}}
+    got = tdc.memory_evidence.collect(results, process="", network_process="evil.exe")
+    assert [f["process"] for f in got] == ["other.exe", "evil.exe"]
+    assert [f["process"] for f in tdc.memory_evidence.collect(results, process="Evil.exe")] == ["other.exe", "Evil.exe"]

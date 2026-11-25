@@ -4738,7 +4738,19 @@ def _compute_verdict(results, matching_alerts):
     if not process_name:
         process_name = (results.get("file_info") or {}).get("name") or ""
 
-    mem_findings = memory_evidence.collect(results, process=process_name)
+    # The capture's findings carry no process: they are the sample's, so they go
+    # to its process - the one named above, else the one the host-side tools saw
+    # for this PID (Sysmon's image), so they meet those tools' findings
+    network_process = process_name
+    for key in ("network_beaconing", "named_pipes"):
+        if network_process:
+            break
+        block = results.get(key)
+        for f in (block.get("evidence_findings") or []) if isinstance(block, dict) else []:
+            if isinstance(f, dict) and f.get("process"):
+                network_process = f["process"]
+                break
+    mem_findings = memory_evidence.collect(results, process=process_name, network_process=network_process)
     mem_sources = [k for k in ("aether", "process_dump", "hunt_sleeping_beacons",
                                "beaconeye", "exit_capture_result") if results.get(k)]
     if (results.get("network_beaconing") or {}).get("evidence_findings"):
