@@ -44,6 +44,12 @@ Regressions covered:
     (``Chrome|https://bank.com|bob|Passw0rd!``) all went unmarked. The marker
     errs towards True: a false mark costs a reader one ``***``, a missed one
     puts a password in a report for good
+  * ``pw`` and a bare ``p`` (``u=bob&p=hunter2``, ``?pw=...``, ``{"pw": ...}``)
+    were not secret words, two of the commonest field names in real logins and
+    in minimal exfil forms; they count as whole words only, so ``map=3`` and
+    ``page`` stay unmarked
+  * a password that is itself a URL (``bob:https://x.com/zzz``) was cut out
+    before the colon check and went unmarked
   * a 12-character base64 value (``password``, ``root:toor``, ``hostname``) was
     under the floor although it is 25 times less likely to fool the decoder
     than the 10-character hex floor that is accepted
@@ -780,6 +786,13 @@ def test_a_decoded_user_password_pair_is_marked_wherever_it_was_found():
     b"api_key=0123456789abcdef&v=1",
     b"client_secret: abcdefghij",
     b"X-Auth-Token: abcdefghij",
+    b"u=bob&p=hunter2&host=PC01",
+    b"http://evil.top/l?pw=hunter2xx",
+    b'{"u":"bob","pw":"hunter2xx"}',
+    b"user_pw = hunter2xx and more",
+    b"P: hunter2xx",
+    b"bob:https://x.com/zzz",
+    b"bob: https://x.com/zzz?a=b:c",
 ])
 def test_credential_bearing_text_is_marked(text):
     assert marked(text) is True
@@ -812,6 +825,18 @@ def test_a_name_that_says_secret_marks_what_it_holds():
     assert out[0]["credential"] is False
 
 
+def test_pw_and_p_are_names_when_whole_not_when_part_of_a_word():
+    plain = b"correct horse battery staple"
+    for name in ("p", "P", "pw", "PW", "user_pw", "x-p"):
+        out = net_decode.decode_event_fields(http(body_text="%s=%s" % (name, b64(plain))))
+        assert out[0]["credential"] is True, name
+    out = net_decode.decode_event_fields(http(headers={"x-pw": b64(plain)}))
+    assert out[0]["credential"] is True
+    for name in ("page", "up", "pwn", "map", "ppp", "help"):
+        out = net_decode.decode_event_fields(http(body_text="%s=%s" % (name, b64(plain))))
+        assert out[0]["credential"] is False, name
+
+
 @pytest.mark.parametrize("text", [
     b"192.168.1.5:4444", b"C:\\Users\\bob\\AppData\\x.exe", b"http://evil.top/gate.php?id=7",
     b"http://evil.top:8080/gate.php?id=7 and more text",
@@ -819,6 +844,8 @@ def test_a_name_that_says_secret_marks_what_it_holds():
     b"id,name\n1,bob\n2,alice", b'{"id":4,"ok":true,"name":"abcdefgh","count":12}',
     b"the quick brown fox jumps over the lazy dog",
     b"https://bank.com|bob", b"os=Windows 10;host=PC01;av=none",
+    b"the map=3 and the grape=red, up=down, tap=on, stop=now, ppp=7",
+    b"https://evil.top:8080/a/b and then http://10.0.0.5:8080/x",
 ])
 def test_text_that_is_not_credential_shaped_is_not_marked(text):
     assert marked(text) is False

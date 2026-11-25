@@ -114,13 +114,17 @@ _AUTH_VALUE = re.compile(r"([A-Za-z][A-Za-z0-9_-]*)[ \t]+(\S+)")
 _CREDENTIAL_HEADERS = ("headers.authorization", "headers.proxy-authorization")
 MAX_CREDENTIAL_LINES = 200  # lines of a decoded text checked for credential shapes
 MAX_CREDENTIAL_CHARS = 64 * 1024    # characters of a decoded text checked
-_SECRET_NAME = re.compile(r"pass|pwd|secret|token|key|auth|cred", re.I)
+# "pass", "key" and the rest count anywhere in a name; "pw" and a bare "p" (the
+# commonest login field names after "password") only as a whole word, so that
+# "map" and "page" are not secrets.
+_SECRET_WORDS = r"(?:pass|pwd|secret|token|key|auth|cred)"
+_SHORT_WORDS = r"(?<![A-Za-z0-9])(?:pw|p)(?![A-Za-z0-9])"
+_SECRET_NAME = re.compile(_SECRET_WORDS + "|" + _SHORT_WORDS, re.I)
 _SECRET_PAIR = re.compile(
-    r"(?:pass|pwd|secret|token|key|auth|cred)[A-Za-z0-9_.-]{0,32}[\"']?[ \t]*[=:][ \t]*[\"']?\S", re.I)
+    "(?:" + _SECRET_WORDS + r"[A-Za-z0-9_.-]{0,32}|" + _SHORT_WORDS + r")[\"']?[ \t]*[=:][ \t]*[\"']?\S", re.I)
 _URL_SCHEME = r"[A-Za-z][A-Za-z0-9+.-]{0,20}://"
 _URL_USERINFO = re.compile(_URL_SCHEME + r"[^/\s:@]{1,64}:[^/\s@]{1,128}@")
-_URL_TOKEN = re.compile(_URL_SCHEME + r"\S*")
-_COLON_PAIR = re.compile(r"([^\s:]{1,64}):[ \t]*(\S{0,8})")
+_COLON_PAIR = re.compile(r"([^\s:]{1,64}):[ \t]*(?=(\S{0,8}))")
 _URL_FIELD = re.compile("(?:" + _URL_SCHEME + r"|www\.)\S+")
 _RECORD_DELIMITERS = ("|", "\t", ";", ",")
 _BOM8 = b"\xef\xbb\xbf"
@@ -638,12 +642,15 @@ def _is_credential(field, name, decoded):
 def _colon_pair(line):
     """Does a line hold ``name:value`` with something after the colon?
 
-    URLs are cut out first (their colons are not pairs; userinfo is looked for
-    separately), as are drive letters, ``ip:port`` and clock times.
+    The colons of a URL (the scheme's, a port's) are not pairs, nor are drive
+    letters, ``ip:port`` and clock times; a URL as the *value* is
+    (``bob:https://x.com/zzz``). URL userinfo is looked for separately.
     """
-    for match in _COLON_PAIR.finditer(_URL_TOKEN.sub(" ", line)):
+    for match in _COLON_PAIR.finditer(line):
         left, head = match.groups()
-        if not head or not (left[-1].isalnum() or left[-1] in "._-@!$#"):
+        if not head or head.startswith("//") or left.startswith("//"):
+            continue
+        if not (left[-1].isalnum() or left[-1] in "._-@!$#"):
             continue
         if head.startswith(("\\", "/")) and len(left) == 1:
             continue
