@@ -30,6 +30,14 @@ Regressions covered:
   * the event took the flow's first time (the SYN) instead of the hello's
   * a second ClientHello after a HelloRetryRequest produced a second event
   * a flow that is not TLS (HTTP, UDP) produced an event
+  * a hello cut after its server name (a lost segment, the end of the capture)
+    dropped the event and with it the name, which is the one indicator left
+    when the client refuses our certificate; the event is kept with ``sni``
+    and ``dest`` and ``hello_incomplete``, and its fingerprint fields are
+    empty because a fingerprint of half a hello would split one client over
+    several database entries
+  * a hello cut before its server name is readable, or inconsistent rather
+    than cut, still gives no event
 """
 
 import datetime
@@ -589,3 +597,117 @@ def test_a_server_stream_of_hostile_records_leaves_the_event_intact():
     assert e["sni"] == "a.top" and e["cert_subject"] == ""
     empties = b"\x16\x03\x03\x00\x00" * 50000
     assert _one(_tls_flow(sni="a.top", flight=empties))["cert_subject"] == ""
+
+
+# --- a hello that is cut after its server name -------------------------------
+
+_FINGERPRINT_FIELDS = ("ja3", "ja3_hash", "ja4", "version")
+
+
+def _name_end(stream, name=b"a.top"):
+    return stream.index(name) + len(name)
+
+
+def test_a_hello_cut_after_the_name_keeps_the_name_and_no_fingerprint():
+    stream = _records(_hello(sni="a.top"))
+    e = _one(_tls_flow(sni="a.top", truncate=_name_end(stream)))
+    assert e["type"] == "tls" and e["sni"] == "a.top" and e["dest"] == "a.top"
+    assert e["port"] == 443 and e["ts"] == 10.0
+    assert e["hello_incomplete"] is True
+    for field in _FINGERPRINT_FIELDS:
+        assert e[field] == "", field
+    assert e["ciphers"] == [] and e["extensions"] == [] and e["alpn"] == []
+
+
+def test_a_hello_cut_before_the_name_is_complete_still_gives_no_event():
+    stream = _records(_hello(sni="a.top"))
+    end = _name_end(stream)
+    for n in (20, end - 5, end - 1):
+        assert net_tls.events_from_flow(_tls_flow(sni="a.top", truncate=n)) == [], n
+
+
+def test_the_name_is_kept_at_exactly_the_cuts_that_leave_it_readable():
+    stream = _records(_chrome_hello())
+    end = _name_end(stream, b"example.com")
+    for n in range(len(stream)):
+        assert (net_tls.cut_server_name(stream[:n]) == "example.com") == (n >= end), n
+    assert net_tls.cut_server_name(stream) is None          # not cut: there is a hello
+
+
+def test_the_same_holds_when_the_hello_is_spread_over_records():
+    stream = _records(_chrome_hello(), split=70)
+    found = [n for n in range(len(stream)) if net_tls.cut_server_name(stream[:n])]
+    assert found == list(range(found[0], len(stream))) and found[0] > 106
+
+
+def test_the_hello_is_complete_once_nothing_is_missing():
+    e = _one(_tls_flow(sni="a.top"))
+    assert e["hello_incomplete"] is False
+    assert e["ja3"] and e["ja3_hash"] and e["ja4"] and e["version"]
+
+
+def test_a_lost_segment_after_the_name_keeps_the_name_and_reports_the_hole():
+    flow = _tls_flow(hello=_chrome_hello(), segment=110, drop=(1,))
+    e = _one(flow)
+    assert e["sni"] == "example.com" and e["dest"] == "example.com"
+    assert e["hello_incomplete"] is True and e["ja3"] == "" and e["ja4"] == ""
+    assert e["stream_gaps"]
+
+
+def test_a_cut_hello_still_reports_the_servers_certificate():
+    stream = _records(_hello(sni="a.top"))
+    e = _one(_tls_flow(sni="a.top", truncate=_name_end(stream), cert=("CN=a.top", "CN=a.top")))
+    assert e["hello_incomplete"] is True and e["self_signed"] is True
+
+
+def test_a_cut_hello_is_found_when_the_capture_begins_with_the_server():
+    stream = _records(_hello(sni="a.top"))[:_name_end(_records(_hello(sni="a.top")))]
+    flow = _flow_from([(1.0, "s", _server_flight(None)), (2.0, "c", stream)], syn=False)
+    e = _one(flow)
+    assert e["sni"] == "a.top" and e["hello_incomplete"] is True and e["ts"] == 2.0
+
+
+def test_a_hello_cut_before_the_name_does_not_borrow_the_one_beside_it():
+    cut = _records(_hello(sni="a.top"))[:30]
+    flow = _flow_from([(1.0, "s", _server_flight(None)), (2.0, "c", cut)], syn=False)
+    assert net_tls.events_from_flow(flow) == []
+
+
+def test_a_complete_but_inconsistent_hello_gives_no_event_even_with_a_name():
+    # not cut: every byte is there and a length contradicts the rest
+    body = (b"\x03\x03" + bytes(32) + b"\x00" + _list16([0x1301]) + b"\x01\x00"
+            + _u(20, 2) + _sni_ext("a.top") + _u(8, 2) + _u(0xFFFF, 2))
+    wrapped = b"\x01" + _u(len(body), 3) + body
+    assert net_tls.cut_server_name(_records(wrapped)) is None
+    assert net_tls.events_from_flow(_flow_from([(1.0, "c", _records(wrapped))])) == []
+
+
+def test_a_cut_hello_whose_name_extension_is_cut_or_lies_gives_no_name():
+    sni = _sni_ext("a.top")
+    prefix = b"\x03\x03" + bytes(32) + b"\x00" + _list16([0x1301]) + b"\x01\x00"
+    for tail in (_u(300, 2) + sni[:-1],                 # the name extension itself is cut
+                 _u(300, 2) + _ext(0, b"\xff\xff\x00\xff\xff"[:3]),   # no host name inside
+                 _u(300, 2) + _ext(0, b"\x00\x00"),   # an empty list
+                 _u(300, 2) + _ext(0xFFFF - 1)[:3]):    # a header cut inside
+        stream = _records(b"\x01" + _u(500, 3) + prefix + tail)
+        assert net_tls.cut_server_name(stream) is None, tail.hex()
+
+
+def test_a_cut_hello_that_claims_megabytes_gives_no_name():
+    body = b"\x03\x03" + bytes(32) + b"\x00" + _list16([0x1301]) + b"\x01\x00" + _u(60000, 2) + _sni_ext("a.top")
+    over = _records(b"\x01" + _u(net_tls.MAX_HELLO + 1, 3) + body)
+    assert net_tls.cut_server_name(over) is None
+    huge = _records(b"\x01\xff\xff\xff" + body)
+    assert net_tls.cut_server_name(huge) is None
+
+
+def test_cutting_a_hello_anywhere_never_raises_and_never_invents_a_name():
+    rng = random.Random(11)
+    stream = bytearray(_records(_chrome_hello(), split=300))
+    for _ in range(3000):
+        damaged = bytearray(stream)
+        for _flip in range(rng.randint(0, 4)):
+            damaged[rng.randrange(len(damaged))] = rng.randrange(256)
+        del damaged[rng.randrange(len(damaged)):]
+        name = net_tls.cut_server_name(bytes(damaged))
+        assert name is None or isinstance(name, str)

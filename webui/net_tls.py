@@ -17,9 +17,14 @@ module refuses to make:
     before it is used, every loop consumes at least one byte, and the amount
     read is capped (``MAX_RECORDS``, ``MAX_HANDSHAKE``, ``MAX_HELLO``), so a
     field that claims megabytes costs nothing and a record chain that never
-    ends is cut short. A hello that is cut or inconsistent gives no event at
-    all: a fingerprint of half a hello is not the client's, and would put the
-    same client into two database entries.
+    ends is cut short. A hello that is inconsistent gives no event. A hello that is
+    cut gives no fingerprint: one of half a hello is not the client's, and
+    would put the same client into two database entries. But the server name
+    is the one indicator left when a client refuses our certificate or pins
+    its own, so when the cut falls after the name has been read, the event is
+    kept with ``sni`` and ``dest``, ``hello_incomplete`` True and every field
+    that needs the rest of the hello empty (not partial). A cut before the
+    name is readable gives no event.
   * Two sightings of one client have the same fields. Chrome and others put
     GREASE values (``0x0a0a``, ``0x1a1a`` ... ``0xfafa``) at random places in
     the cipher, extension and group lists, so a fingerprint that kept them
@@ -292,6 +297,41 @@ def parse_client_hello(stream):
     return None
 
 
+def cut_server_name(stream):
+    """The server name of a ClientHello that the stream ends inside, or None.
+
+    For a hello that is cut (a lost segment, the end of the capture): the name
+    is the one indicator a refused or pinned connection still has, and it can
+    be read as soon as its extension is complete, however much of the rest is
+    missing. The name alone is returned and nothing else is taken from the
+    partial hello. None when the hello is complete (``parse_client_hello``
+    reads those, and one that is complete but inconsistent is not read at
+    all), when it is too large, or when the cut falls before the name.
+    """
+    data = _handshake_bytes(stream)
+    if len(data) < 4 or data[0] != _CLIENT_HELLO:
+        return None
+    size = int.from_bytes(data[1:4], "big")
+    if size > MAX_HELLO or len(data) >= 4 + size:
+        return None
+    cur = _Cursor(data[4:])
+    try:
+        cur.take(2 + 32)                            # version, random
+        cur.take(cur.number(1))                     # session id
+        cur.take(cur.number(2))                     # cipher suites
+        cur.take(cur.number(1))                     # compression methods
+        declared = cur.number(2)
+        block = _Cursor(cur.data[cur.pos:cur.pos + declared])
+        while block.left:
+            kind = block.number(2)
+            body = block.take(block.number(2))
+            if kind == _EXT_SNI:
+                return _name(body) or None
+    except _Malformed:
+        return None
+    return None
+
+
 # --- fingerprints -------------------------------------------------------------
 
 def ja3(hello):
@@ -401,34 +441,64 @@ def _first_time(flow, direction, default):
     return default
 
 
+def _find_hello(flow):
+    """``(hello, cut_name, swapped)``: a complete hello wins over a cut one.
+
+    The server's stream is only tried when the capture began mid-connection
+    and the first sender is a guess.
+    """
+    sides = [(flow.client_stream(), False)]
+    if flow.client_guessed:
+        sides.append((flow.server_stream(), True))
+    for stream, swapped in sides:
+        hello = parse_client_hello(stream)
+        if hello is not None:
+            return hello, None, swapped
+    for stream, swapped in sides:
+        name = cut_server_name(stream)
+        if name:
+            return None, name, swapped
+    return None, None, False
+
+
 def events_from_flow(flow):
-    """The ``tls`` event of a TCP flow, as a list; empty when the flow holds no
-    complete ClientHello."""
+    """The ``tls`` event of a TCP flow, as a list.
+
+    Empty when the flow holds neither a complete ClientHello nor the server
+    name of a cut one. For a cut hello the event has ``sni`` and ``dest`` and
+    ``hello_incomplete`` True, and every field that comes from the rest of the
+    hello (``version``, ``ciphers``, ``extensions``, ``alpn``, ``ja3``,
+    ``ja3_hash``, ``ja4``) is empty: no partial fingerprint is made.
+    """
     if flow.proto != "tcp":
         return []
-    client, server = flow.client_stream(), flow.server_stream()
-    hello = parse_client_hello(client)
-    swapped = False
-    if hello is None and flow.client_guessed:
-        hello = parse_client_hello(server)
-        swapped = hello is not None
-    if hello is None:
+    hello, cut_name, swapped = _find_hello(flow)
+    if hello is None and cut_name is None:
         return []
     if swapped:
         client_dir, address, port = "s", flow.src, flow.sport
         gaps = list(flow.server_gaps) + list(flow.client_gaps)
-        reply = client
+        reply = flow.client_stream()
     else:
         client_dir, address, port = "c", flow.dst, flow.dport
         gaps = list(flow.client_gaps) + list(flow.server_gaps)
-        reply = server
+        reply = flow.server_stream()
     subject, issuer, not_after, self_signed = _certificate(reply)
-    sni = hello.sni or ""
+    if hello is not None:
+        sni = hello.sni or ""
+        fields = dict(
+            version=_VERSION_NAMES.get(hello.effective_version,
+                                       "0x%04x" % hello.effective_version),
+            ciphers=_without_grease(hello.ciphers),
+            extensions=_without_grease(hello.extensions),
+            alpn=list(hello.alpn), ja3=ja3(hello), ja3_hash=ja3_hash(hello), ja4=ja4(hello),
+            hello_incomplete=False)
+    else:
+        sni = cut_name
+        fields = dict(version="", ciphers=[], extensions=[], alpn=[], ja3="", ja3_hash="",
+                      ja4="", hello_incomplete=True)
     return [NetEvent(
         "tls", _first_time(flow, client_dir, flow.first_ts), dest=sni or address, port=port,
-        sni=sni, version=_VERSION_NAMES.get(hello.effective_version,
-                                            "0x%04x" % hello.effective_version),
-        ciphers=_without_grease(hello.ciphers), extensions=_without_grease(hello.extensions),
-        alpn=list(hello.alpn), ja3=ja3(hello), ja3_hash=ja3_hash(hello), ja4=ja4(hello),
-        cert_subject=subject, cert_issuer=issuer, cert_not_after=not_after,
-        self_signed=self_signed, stream_gaps=gaps, stream_capped=bool(flow.capped))]
+        sni=sni, cert_subject=subject, cert_issuer=issuer, cert_not_after=not_after,
+        self_signed=self_signed, stream_gaps=gaps, stream_capped=bool(flow.capped),
+        **fields)]
