@@ -57,6 +57,11 @@ Regressions covered:
     boundary; after a ``/`` a key counts with ``=`` only, so ``/key/stage.exe``
     and ``keys.top:8080/stage.exe`` stay whole
   * one parser that raised took the whole analysis down
+  * the baseline hid an upload to a spoofed known host: its key had no size
+    and no address, so 200 KB with the OCSP Host header sent to the sample's
+    own address was the clean machine's 600-byte OCSP POST; and
+    ``/dl;token=abc/stage.exe`` was keyed (and shown) as ``/dl;token=***``
+    like ``.../update.bin`` (final review I2)
   * an empty capture looked the same as a capture in which nothing was found
 """
 
@@ -837,12 +842,73 @@ def test_a_baseline_from_a_report_matches_a_path_the_mask_changed(tmp_path):
             b"User-Agent: Agent/1.0 token=Tk-2\r\n\r\n", _ok(b"data"))
     first = net_analyze.analyze_pcap(_write(tmp_path, cap))
     http = [e for e in first["events"] if e["type"] == "http"][0]
-    assert http["path"] == "/dl;token=***" and http["ua"] == "Agent/1.0 token=***"
+    assert http["path"] == "/dl;token=***/file.bin" and http["ua"] == "Agent/1.0 token=***"
     assert "Tk-1" not in json.dumps(first) and "Tk-2" not in json.dumps(first)
     bl = net_baseline.NetBaseline(str(tmp_path / "bl.json"))
     bl.add(first["events"])
     again = net_analyze.analyze_pcap(_write(tmp_path, cap, "again.pcap"), baseline=bl)
     assert again["suppressed_count"] == len(again["events"])
+
+
+def _ocsp(cap, ts, size, address=None):
+    """An OCSP request: looked up and sent (``address`` None), or sent straight
+    to ``address`` with the same Host header and no lookup."""
+    body = os.urandom(size)
+    if address is None:
+        cap.post(ts, "ocsp.digicert.com", "/", body, "application/ocsp-request")
+        return
+    cap.tcp(ts, address, 80, [("c", b"POST / HTTP/1.1\r\nHost: ocsp.digicert.com\r\nUser-Agent: x\r\n"
+                                    b"Content-Type: application/ocsp-request\r\nContent-Length: %d"
+                                    b"\r\n\r\n" % size + body), ("s", _ok(b"ok"))])
+
+
+def _ocsp_baseline(tmp_path):
+    clean = Capture()
+    _ocsp(clean, 5.0, 600)
+    bl = net_baseline.NetBaseline(str(tmp_path / "ocsp-bl.json"))
+    bl.add(net_analyze.analyze_pcap(_write(tmp_path, clean, "clean.pcap"))["events"])
+    return bl
+
+
+def _uploads(report):
+    return [(e["size"], e.get("baseline")) for e in report["events"] if e["type"] == "upload"]
+
+
+def test_the_baseline_does_not_hide_an_upload_to_a_spoofed_known_host(tmp_path):
+    """Regressions covered (final review I2): the upload key was the claimed
+    name, method, path, content type and file kind, so a 200 KB POST with the
+    clean machine's OCSP Host header and type, sent to the sample's own address
+    without a lookup, was suppressed and its exfil_upload with it."""
+    bl = _ocsp_baseline(tmp_path)
+    for name, size, address in (("spoofed", 200000, "203.0.113.66"), ("spoofed-small", 600, "203.0.113.66"),
+                                ("big", 200000, None)):
+        cap = Capture()
+        _ocsp(cap, 10.0, size, address)
+        r = net_analyze.analyze_pcap(_write(tmp_path, cap, name + ".pcap"), baseline=bl)
+        assert _uploads(r) == [(size, None)], name
+        assert "exfil_upload" in _kinds(r), name
+    # the clean machine's own request, looked up again, is still what it was
+    cap = Capture()
+    _ocsp(cap, 10.0, 640)
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap, "again.pcap"), baseline=bl)
+    assert _uploads(r) == [(640, "known")] and "exfil_upload" not in _kinds(r)
+
+
+def test_a_file_after_a_masked_value_in_a_path_keeps_its_own_key(tmp_path):
+    """Regressions covered (final review I2): the masked value ran past "/", so
+    ``/dl;token=abc/update.bin`` and ``/dl;token=abc/stage.exe`` were one
+    ``/dl;token=***`` with one key, and the report lost the file name."""
+    clean = Capture()
+    clean.get(5.0, "dl.top", "/dl;token=abc/update.bin", b"data")
+    bl = net_baseline.NetBaseline(str(tmp_path / "bl.json"))
+    bl.add(net_analyze.analyze_pcap(_write(tmp_path, clean, "clean.pcap"))["events"])
+    sample = Capture()
+    sample.get(5.0, "dl.top", "/dl;token=abc/stage.exe", b"data")
+    r = net_analyze.analyze_pcap(_write(tmp_path, sample, "sample.pcap"), baseline=bl)
+    http = [e for e in r["events"] if e["type"] == "http"][0]
+    assert http["path"] == "/dl;token=***/stage.exe" and http.get("baseline") is None
+    assert http["url"] == "http://dl.top/dl;token=***/stage.exe"
+    assert "abc" not in json.dumps(r)
 
 
 def _two_hosts(cap, second):
@@ -881,7 +947,7 @@ def test_a_credential_in_a_path_segment_is_masked_and_a_secret_looking_path_is_n
     r = net_analyze.analyze_pcap(_write(tmp_path, cap))
     assert "Seg-Tk-1" not in json.dumps(r)
     paths = sorted(e["path"] for e in r["events"] if e["type"] == "http")
-    assert paths == ["/dl/token=***", "/key/stage.exe", "/password/x"]
+    assert paths == ["/dl/token=***/file.bin", "/key/stage.exe", "/password/x"]
 
 
 # --- review round 3 ----------------------------------------------------------------------

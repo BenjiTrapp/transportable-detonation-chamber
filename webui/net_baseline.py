@@ -36,6 +36,19 @@ Two further points:
     put into a bucket of ``INTERVAL_STEP`` (a factor of 1.25) and a beacon is
     known when a neighbouring bucket is: a 45 s poller matches at 44.6 s and
     at 45.3 s, and a sample beaconing every 13 s to the same name does not.
+  * An upload is its name, method, path and type. A sample that sends its
+    harvest as ``POST /`` with ``Host: ocsp.digicert.com`` and
+    ``application/ocsp-request`` to its own address had the key of the clean
+    machine's 600-byte OCSP request and vanished. The size is part of the key
+    (buckets of ``SIZE_STEP``, a factor of two, neighbours count: 600 bytes
+    match 400 to 2,400, 200 KB do not), and ``net_analyze`` lets the baseline
+    know an upload only when every address it went to is one a DNS answer in
+    the same capture gave for its name (``upload_resolved``): a claimed name
+    is not where the data went.
+  * A masked value in a path hides the file after it. ``/dl;token=abc/update.bin``
+    and ``/dl;token=abc/stage.exe`` were both ``/dl;token=***`` and had one
+    key; a path is masked segment by segment (``net_decode.mask_credentials``
+    with ``path``), so the file name stays in the key and in the report.
 
 A file of another ``KEY_VERSION`` is ignored (its keys were built by other
 rules and would match the wrong things or nothing) and replaced on the next
@@ -52,8 +65,11 @@ import time
 
 import net_decode
 
-KEY_VERSION = 1
+# 1: first scheme. 2: an upload's key holds its size bucket, and a path's
+#    masked value ends at "/" (net_decode.mask_credentials path mode).
+KEY_VERSION = 2
 INTERVAL_STEP = 1.25    # ratio between neighbouring beacon interval buckets
+SIZE_STEP = 2.0         # ratio between neighbouring upload size buckets
 
 
 def _name(value):
@@ -75,11 +91,11 @@ def _number(value):
     return value if math.isfinite(value) else None
 
 
-def _bucket(interval):
+def _bucket(interval, step=INTERVAL_STEP):
     interval = _number(interval)
     if interval is None or interval <= 0:
         return None
-    return int(math.floor(math.log(interval) / math.log(INTERVAL_STEP)))
+    return int(math.floor(math.log(interval) / math.log(step)))
 
 
 def _names(values):
@@ -91,7 +107,8 @@ def _identity(event):
     """What an event did, as a tuple of plain values, without its time.
 
     The first element is the event type and the second its destination; a
-    beacon's interval bucket is the last element (see ``_candidates``).
+    beacon's interval bucket and an upload's size bucket are the last element
+    (see ``_candidates``).
     """
     etype = event.get("type")
     dest = _name(event.get("dest"))
@@ -118,8 +135,10 @@ def _identity(event):
         return (etype, dest, _text(get("path")), _text(get("kind")),
                 _text(get("sha256")) or _text(get("wire_sha256")), _number(get("size")))
     if etype == "upload":
+        bucket = _bucket(get("size"), SIZE_STEP)
         return (etype, dest, _text(get("method")), _text(get("path")),
-                _text(get("content_type")).split(";")[0].strip().lower(), _text(get("kind")))
+                _text(get("content_type")).split(";")[0].strip().lower(), _text(get("kind")),
+                "unsized" if bucket is None else bucket)
     if etype == "decoded":
         # A credential is masked in a report, its hash with it; its key is where it went.
         content = "credential" if get("credential") else _text(get("sha256"))
@@ -148,7 +167,8 @@ def _masked(identity):
     same key, and the key says nothing about the credential: the hash of
     ``/dl;token=4821/f.bin`` would give ``4821`` back to ten thousand guesses.
     """
-    return tuple(net_decode.mask_credentials(v) if isinstance(v, str) else v for v in identity)
+    return tuple(net_decode.mask_credentials(v, path=v.startswith("/")) if isinstance(v, str)
+                 else v for v in identity)
 
 
 def event_key(event):
@@ -166,13 +186,13 @@ def event_key(event):
 
 def _candidates(event):
     """Keys under which an event counts as known: its own, and for a measured
-    beacon those of the neighbouring interval buckets."""
+    beacon or a sized upload those of the neighbouring buckets."""
     identity = _identity(event) if isinstance(event, dict) else None
     if identity is None:
         return []
     identity = _masked(identity)
     keys = [_hash(identity)]
-    if identity[0] == "beacon" and isinstance(identity[-1], int):
+    if identity[0] in ("beacon", "upload") and isinstance(identity[-1], int):
         keys += [_hash(identity[:-1] + (identity[-1] + step,)) for step in (-1, 1)]
     return keys
 
@@ -297,3 +317,32 @@ class NetBaseline:
             out["note"] = ("Baseline was captured with key scheme v%s and is ignored; capture "
                            "it again on a clean system." % stored_version)
         return out
+
+
+def resolved_addresses(events):
+    """Name -> the addresses the A/AAAA answers of a capture gave for it."""
+    table = {}
+    for e in events:
+        if not isinstance(e, dict) or e.get("type") != "dns":
+            continue
+        if e.get("query_type") not in (None, "A", "AAAA"):
+            continue
+        for answer in e.get("answers") or ():
+            address = _name(answer) if isinstance(answer, str) else ""
+            try:
+                ipaddress.ip_address(address)
+            except ValueError:
+                continue
+            table.setdefault(_name(e.get("dest")), set()).add(address)
+    return table
+
+
+def upload_resolved(event, resolved):
+    """Did an upload go only to addresses this capture's DNS gave for its name?
+
+    ``resolved`` is what ``resolved_addresses`` returned for the capture. An
+    upload without an address, or with one no answer for its name gave, is
+    not: its name is the sample's claim (see the module docstring)."""
+    addresses = [_name(a) for a in event.get("addresses") or () if isinstance(a, str)]
+    known = resolved.get(_name(event.get("dest")), set())
+    return bool(addresses) and all(a in known for a in addresses)

@@ -59,7 +59,9 @@ module is that order, in ``analyze_pcap``. The false assumptions it avoids:
     every Windows machine does. Events the ``net_baseline.NetBaseline`` knows
     are suppressed: kept in the report and counted (``suppressed_count``,
     ``baseline`` "known" on the event) but invisible to the rules and the
-    findings. The rhythm of a check-in is measured over every event first, so
+    findings. An upload is suppressed only when it went to an address a DNS
+    answer in this capture gave for its name: a sample's ``Host:
+    ocsp.digicert.com`` sent to its own address is no OCSP request. The rhythm of a check-in is measured over every event first, so
     a beacon whose requests the baseline knows is still measured, and is
     suppressed only when the baseline knows that rhythm too.
   * An event may be serialized as it is. ``ftp`` and ``smtp`` events hold a
@@ -95,6 +97,7 @@ import ipaddress
 import math
 import os
 
+import net_baseline
 import net_behavior
 import net_decode
 import net_dns
@@ -374,6 +377,8 @@ _SECRET_HEADERS = frozenset(("authorization", "proxy-authorization", "cookie", "
 _HEADER_FIELDS = frozenset(("headers", "resp_headers"))
 # Fields of free text read line by line ("name: value" lines, dump records).
 _LINE_FIELDS = frozenset(("body_text", "resp_text", "text"))
+# Fields that hold a URL path or a URL: a value in a path segment ends at "/".
+_PATH_FIELDS = frozenset(("path", "url"))
 
 
 def _scrub_text(text, prefix, length):
@@ -437,7 +442,8 @@ def mask_report(value, key=None):
     if isinstance(value, list):
         return [mask_report(v, key or "") for v in value]
     if isinstance(value, str):
-        return net_decode.mask_credentials(value, lines=key in _LINE_FIELDS)
+        return net_decode.mask_credentials(value, lines=key in _LINE_FIELDS,
+                                           path=key in _PATH_FIELDS)
     return value
 
 
@@ -726,9 +732,11 @@ def analyze_pcap(path, rules=None, baseline=None, process="", mode="online"):
 
     known = [False] * len(events)
     if baseline is not None:
+        resolved = net_baseline.resolved_addresses(events)
         for i, e in enumerate(events):
             try:
-                known[i] = bool(baseline.knows_event(e))
+                known[i] = bool(baseline.knows_event(e)) and (
+                    e.get("type") != "upload" or net_baseline.upload_resolved(e, resolved))
             except Exception as exc:
                 errors.append(_failure("net_baseline", exc))
                 break

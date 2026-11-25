@@ -78,6 +78,9 @@ Regressions covered:
     looks only in the 64 characters before each colon, with the same matches
     (held against ``finditer`` on generated lines), and a pattern whose
     separator is not in the text is not run
+  * a masked value in a URL path ran past "/", so ``/dl;token=abc/stage.exe``
+    lost its file name in the report and shared the baseline key of
+    ``.../update.bin``; with ``path`` it ends with its segment (final review I2)
 """
 
 import base64
@@ -1168,6 +1171,31 @@ def test_a_credential_after_a_boundary_is_still_masked(text, masked):
 def test_a_credential_after_a_slash_is_masked_only_with_an_equals_sign(text, masked):
     assert net_decode.mask_credentials(text) == masked
     assert net_decode.mask_credentials(text, lines=True) == masked
+
+
+@pytest.mark.parametrize("text,masked", [
+    ("/dl;token=abc/stage.exe", "/dl;token=***/stage.exe"),
+    ("/dl/token=abc/file.bin", "/dl/token=***/file.bin"),
+    ("http://h.top/x/password=Pw-2?y=1&token=a/b", "http://h.top/x/password=***?y=1&token=***"),
+    ("/a/b/api_key=Ak-1", "/a/b/api_key=***"),
+    ("/x;p=Pw-3#frag", "/x;p=***#frag"),
+    ("http://bob:Pw?4@h.top/x", "http://bob:***@h.top/x"),
+    ("/x;token='Q/1'/y", "/x;token='***'/y"),
+])
+def test_in_a_path_a_masked_value_ends_with_its_segment(text, masked):
+    """Final review I2: the file after a masked path value is kept, and masking
+    the result again, as a path or not, changes nothing."""
+    out = net_decode.mask_credentials(text, path=True)
+    assert out == masked
+    assert net_decode.mask_credentials(out, path=True) == out
+    assert net_decode.mask_credentials(out) == out
+
+
+def test_path_mode_masks_everything_before_the_first_slash_that_the_plain_mask_does():
+    for key in _SECRET_KEYS:
+        for before in ("/", ";", "&", "?"):
+            text = "/a" + before + key + "=Val-9/next"
+            assert "Val-9" not in net_decode.mask_credentials(text, path=True), text
 
 
 def test_a_slash_boundary_does_not_make_a_colon_a_separator_in_a_body():

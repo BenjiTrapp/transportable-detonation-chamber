@@ -643,9 +643,19 @@ _QUOTED_VALUE = r"[ \t]*)([\"'])((?:[^\"'\\\n]|\\.)*)\2"
 _SECRET_QUOTED = re.compile("(" + _EQ_START + _KEY_BODY + r"[\"']?[ \t]*=" + _QUOTED_VALUE, re.I)
 _SECRET_QUOTED_COLON = re.compile(
     "(" + _COLON_START + _KEY_BODY + r"[\"']?[ \t]*:" + _QUOTED_VALUE, re.I)
-# an authorization value "Bearer <token>" is one value: the scheme and its token
-_BARE_VALUE = r"[ \t]*)((?:(?:basic|bearer|digest|ntlm|negotiate)[ \t]+)?[^\s&;,\"'<>]+)"
+# an authorization value "Bearer <token>" is one value: the scheme and its token.
+# A mask already in place before "/" stays as it is, so the file name a URL
+# path kept after it (``/dl;token=***/stage.exe``, see ``path``) is not taken
+# by a second pass that does not know it is a path.
+_MASKED_SEGMENT = r"\*\*\*(?=[/?#])|"
+_BARE_VALUE = (r"[ \t]*)(" + _MASKED_SEGMENT
+               + r"(?:(?:basic|bearer|digest|ntlm|negotiate)[ \t]+)?[^\s&;,\"'<>]+)")
+# In a URL path a value ends where its segment does.
+_SEGMENT_VALUE = r"[ \t]*)(" + _MASKED_SEGMENT + r"[^\s&;,\"'<>/?#]+)"
 _SECRET_BARE = re.compile("(" + _EQ_START + _KEY_BODY + r"[\"']?[ \t]*=" + _BARE_VALUE, re.I)
+_SECRET_SEGMENT = re.compile("(" + _EQ_START + _KEY_BODY + r"[\"']?[ \t]*=" + _SEGMENT_VALUE,
+                             re.I)
+_QUERY_START = re.compile(r"[?#]")
 _SECRET_BARE_COLON = re.compile(
     "(" + _COLON_START + "(" + _KEY_BODY + r")[\"']?[ \t]*:" + _BARE_VALUE, re.I)
 _PORT = re.compile(r"\d{1,5}(?:[/?#]|$)")
@@ -705,7 +715,7 @@ def _bare_colon(match):
     return prefix + (value if value == MASK else MASK)
 
 
-def mask_credentials(text, lines=False, colons=None):
+def mask_credentials(text, lines=False, colons=None, path=False):
     """``text`` with every credential value the ``credential`` flag would name
     replaced by ``***``, and everything else kept.
 
@@ -723,6 +733,11 @@ def mask_credentials(text, lines=False, colons=None):
     a bare value, so ``keys.top:8080``, a rule's ``token_exfil: auth: bearer``
     and a User-Agent's ``key:val`` are left alone. Like the flag it errs
     towards masking. Not a str: returned as it is.
+
+    With ``path`` the text is a URL path or a URL (a report's ``path`` and
+    ``url``): before the first ``?`` or ``#`` a bare value ends at ``/``, as a
+    path segment does, so ``/dl;token=abc/stage.exe`` keeps its file name
+    (``/dl;token=***/stage.exe``) and differs from ``.../update.bin``.
     """
     if not isinstance(text, str) or not text:
         return text
@@ -735,13 +750,18 @@ def mask_credentials(text, lines=False, colons=None):
     if colons is None:
         colons = lines
     quoted = lambda m: m.group(1) + m.group(2) + MASK + m.group(2)   # noqa: E731
+    bare = lambda m: m.group(1) + (m.group(2) if m.group(2) == MASK else MASK)   # noqa: E731
     if "=" in text:
         text = _SECRET_QUOTED.sub(quoted, text)
     if ":" in text:
         text = _SECRET_QUOTED_COLON.sub(quoted, text)
     if "=" in text:
-        text = _SECRET_BARE.sub(
-            lambda m: m.group(1) + (m.group(2) if m.group(2) == MASK else MASK), text)
+        if path:
+            query = _QUERY_START.search(text)
+            cut = query.start() if query else len(text)
+            text = _SECRET_SEGMENT.sub(bare, text[:cut]) + _SECRET_BARE.sub(bare, text[cut:])
+        else:
+            text = _SECRET_BARE.sub(bare, text)
     if colons and ":" in text:
         text = _SECRET_BARE_COLON.sub(_bare_colon, text)
     if lines:
