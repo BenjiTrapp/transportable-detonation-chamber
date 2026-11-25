@@ -19,11 +19,21 @@ Regressions covered:
   * a malformed or looping message raised, or took the good messages next to
     it down with it
   * the same name in different letter case was two different destinations
+  * a label with bytes that are not UTF-8 (DNS allows any byte, tunnelling and
+    C2 lookups use it) made the whole message unreadable, so the lookup the
+    tool exists to catch produced no event
+  * a dot inside a label rendered the same as a label separator, so two
+    different names became one destination
+  * many queries sharing one transaction ID, answered in order, were matched by
+    scanning every waiting query again for each answer
 """
 
 import os
+import random
 import socket
+import struct
 import tempfile
+import time
 
 import dpkt
 
@@ -270,12 +280,115 @@ def test_a_message_with_no_question_is_skipped():
     assert net_dns.events_from_flow(_raw_udp_flow(53, empty)) == []
 
 
-def test_a_response_cut_short_leaves_the_query_unanswered_without_raising():
-    cut = _message("c2.top", "TXT", ["abcdef"], txid=4)[:-14]
-    datagrams = [(1.0, "c", _message("c2.top", "TXT", response=False, txid=4)),
-                 (1.1, "s", cut)]
+def test_a_response_cut_inside_a_record_keeps_the_complete_records_before_it():
+    full = _message("c2.top", "A", ["203.0.113.1", "203.0.113.2"], txid=4)
+    datagrams = [(1.0, "c", _message("c2.top", "A", response=False, txid=4)),
+                 (1.1, "s", full[:-3])]
     events = net_dns.events_from_flow(_flow_from(datagrams))
-    assert len(events) == 1 and events[0]["answers"] == []
+    assert len(events) == 1
+    assert events[0]["answers"] == ["203.0.113.1"] and events[0]["rcode"] == "NOERROR"
+
+
+def test_a_response_cut_inside_its_question_does_not_answer_and_does_not_raise():
+    full = _message("c2.top", "A", ["203.0.113.1"], txid=4)
+    datagrams = [(1.0, "c", _message("c2.top", "A", response=False, txid=4)),
+                 (1.1, "s", full[:16])]
+    events = net_dns.events_from_flow(_flow_from(datagrams))
+    assert len(events) == 1 and events[0]["answers"] == [] and events[0]["rcode"] == ""
+
+
+def test_random_damage_to_a_message_never_raises():
+    rng = random.Random(53)
+    good = _message("www.evil.top", "A", [("CNAME", "edge.cdn.example"),
+                                          ("A", "203.0.113.9")], txid=8)
+    damaged = []
+    for i in range(3000):
+        data = bytearray(good)
+        for _ in range(rng.randint(1, 4)):
+            data[rng.randrange(len(data))] = rng.randrange(256)
+        if rng.random() < 0.3:
+            del data[rng.randrange(len(data)):]
+        damaged.append((1.0 + i * 1e-3, "c" if i % 2 else "s", bytes(data)))
+    assert isinstance(net_dns.events_from_flow(_flow_from(damaged)), list)
+
+
+# --- names that are not text --------------------------------------------------
+
+def _wire_name(*labels):
+    return b"".join(bytes([len(label)]) + label for label in labels) + b"\x00"
+
+
+def _raw_query(txid, *labels, qtype=1):
+    return (struct.pack("!6H", txid, 0x0100, 1, 0, 0, 0)
+            + _wire_name(*labels) + struct.pack("!HH", qtype, 1))
+
+
+def _raw_response(txid, rcode, labels, rdata=b"\x01\x02\x03\x04", qtype=1):
+    """A response whose one answer names its owner by pointer to the question."""
+    head = struct.pack("!6H", txid, 0x8180 | rcode, 1, 1, 0, 0)
+    question = _wire_name(*labels) + struct.pack("!HH", qtype, 1)
+    answer = b"\xc0\x0c" + struct.pack("!HHIH", qtype, 1, 60, len(rdata)) + rdata
+    return head + question + answer
+
+
+def test_a_label_that_is_not_utf8_still_yields_the_lookup():
+    flow = _flow_from([(1.0, "c", _raw_query(1, b"\xff\xfe\xfd", b"top"))])
+    e = net_dns.events_from_flow(flow)[0]
+    assert e["query"] == "\\255\\254\\253.top" and e["dest"] == e["query"]
+
+
+def test_a_binary_lookup_and_its_answer_are_paired():
+    labels = (b"\x00\x80tunnel", b"top")
+    flow = _flow_from([(1.0, "c", _raw_query(2, *labels)),
+                       (1.1, "s", _raw_response(2, 0, labels))])
+    events = net_dns.events_from_flow(flow)
+    assert len(events) == 1
+    assert events[0]["dest"] == "\\000\\128tunnel.top"
+    assert events[0]["answers"] == ["1.2.3.4"]
+
+
+def test_a_dot_inside_a_label_is_not_a_label_separator():
+    one = net_dns.events_from_flow(_flow_from([(1.0, "c", _raw_query(1, b"a.b", b"top"))]))
+    two = net_dns.events_from_flow(_flow_from([(1.0, "c", _raw_query(1, b"a", b"b", b"top"))]))
+    assert one[0]["dest"] == "a\\.b.top" and two[0]["dest"] == "a.b.top"
+
+
+def test_a_backslash_in_a_label_is_escaped_so_the_rendering_is_unambiguous():
+    flow = _flow_from([(1.0, "c", _raw_query(1, b"a\\b", b"top"))])
+    assert net_dns.events_from_flow(flow)[0]["dest"] == "a\\\\b.top"
+
+
+def test_a_space_or_control_byte_in_a_label_is_written_as_its_number():
+    flow = _flow_from([(1.0, "c", _raw_query(1, b"a b\x01", b"top"))])
+    assert net_dns.events_from_flow(flow)[0]["dest"] == "a\\032b\\001.top"
+
+
+def test_a_response_with_no_question_still_answers_the_waiting_query():
+    refused = struct.pack("!6H", 6, 0x8100 | 1, 0, 0, 0, 0)       # FORMERR, qdcount 0
+    flow = _flow_from([(1.0, "c", _raw_query(6, b"odd", b"top")), (1.1, "s", refused)])
+    events = net_dns.events_from_flow(flow)
+    assert len(events) == 1 and events[0]["rcode"] == "FORMERR"
+
+
+# --- many lookups sharing a transaction ID ------------------------------------
+
+def test_many_queries_with_one_transaction_id_are_matched_without_rescanning():
+    n = 20000
+    datagrams = [(1.0 + i * 1e-4, "c",
+                  _message("h%d.top" % i, "A", response=False, txid=77))
+                 for i in range(n)]
+    datagrams += [(20.0 + i * 1e-4, "s",
+                   _message("h%d.top" % i, "A", ["10.%d.%d.1" % (i // 256, i % 256)],
+                            txid=77))
+                  for i in range(n)]
+    flow = _flow_from(datagrams)
+    started = time.monotonic()
+    events = net_dns.events_from_flow(flow)
+    elapsed = time.monotonic() - started
+    assert len(events) == n
+    assert events[1234]["answers"] == ["10.4.210.1"]
+    assert all(e["answers"] for e in events)
+    assert elapsed < 3.0
 
 
 # --- is_dns -------------------------------------------------------------------
@@ -294,11 +407,3 @@ def test_a_tcp_flow_is_not_claimed():
     flow = _raw_udp_flow(53, b"x")
     flow.proto = "tcp"
     assert net_dns.is_dns(flow) is False
-
-
-def test_a_record_cut_inside_its_data_keeps_the_bytes_that_exist():
-    cut = _message("c2.top", "TXT", ["abcdef"], txid=4)[:-3]
-    datagrams = [(1.0, "c", _message("c2.top", "TXT", response=False, txid=4)),
-                 (1.1, "s", cut)]
-    events = net_dns.events_from_flow(_flow_from(datagrams))
-    assert len(events) == 1 and events[0]["answers"] == ["abc"]
