@@ -65,7 +65,8 @@ def test_a_file_that_is_not_a_pcap_is_refused_with_a_reason(client, tmp_path):
     p = tmp_path / "x.pcap"
     p.write_bytes(b"nope")
     r = _upload(client, str(p), "x.pcap")
-    assert r.status_code == 400 and "pcap" in r.get_json()["error"].lower()
+    assert r.status_code == 400
+    assert r.get_json()["error"] == "not a pcap or pcapng file: unrecognised header"
     assert client.get("/api/network/reports").get_json()["reports"] == []
 
 
@@ -88,7 +89,8 @@ def test_an_unknown_mode_is_refused_and_isolated_is_kept(client, tmp_path):
 
 
 @pytest.mark.parametrize("rid", ["../../etc/passwd", "..%2f..%2fx", "a" * 32 + "/../x", "",
-                                 "A" * 32, "0" * 31, "0" * 33, "g" * 32])
+                                 "A" * 32, "0" * 31, "0" * 33, "g" * 32,
+                                 "0" * 32 + "\n", "\n" + "0" * 32, "0" * 32 + "\r\n"])
 def test_a_report_id_that_is_not_one_of_ours_is_refused(client, rid):
     assert client.get("/api/network/report", query_string={"id": rid}).status_code == 400
 
@@ -285,3 +287,124 @@ def test_a_password_in_the_process_field_is_masked_too(client, tmp_path):
     raw = r.data + client.get("/api/network/reports").data + client.get(
         "/api/network/report?id=" + rid).data
     assert b"Proc-Pw-9" not in raw
+
+
+# --- the size is settled before the body is parsed ------------------------------------------
+
+@pytest.fixture
+def parsed(monkeypatch):
+    """The multipart parser, spied on: how many bodies Werkzeug parsed."""
+    from werkzeug.formparser import FormDataParser
+    calls = []
+    real = FormDataParser.parse
+
+    def spy(self, *args, **kwargs):
+        calls.append(1)
+        return real(self, *args, **kwargs)
+    monkeypatch.setattr(FormDataParser, "parse", spy)
+    return calls
+
+
+@pytest.mark.parametrize("url", ["/api/network/import", "/api/network/baseline/capture"])
+def test_a_large_content_length_is_refused_before_the_body_is_parsed(client, tdc, tmp_path,
+                                                                     monkeypatch, parsed, url):
+    monkeypatch.setattr(tdc, "NET_UPLOAD_MAX", 1000)
+    monkeypatch.setattr(tdc, "_NET_FORM_ALLOWANCE", 100)
+    saved = []
+    monkeypatch.setattr(tdc, "_save_net_upload", lambda *a: saved.append(a))
+    r = client.post(url, data={"file": (io.BytesIO(b"x" * 50000), "big.pcap")},
+                    content_type=MULTIPART)
+    assert r.status_code == 413 and "larger" in r.get_json()["error"]
+    assert parsed == [] and saved == []
+
+
+class _Counting(io.BytesIO):
+    def __init__(self, data):
+        super().__init__(data)
+        self.read_bytes = 0
+
+    def read(self, size=-1):
+        chunk = super().read(size)
+        self.read_bytes += len(chunk)
+        return chunk
+
+    readinto = None
+
+
+def _chunked(client, url, size):
+    boundary = "xBOUNDARYx"
+    body = (("--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"big.pcap\"\r\n"
+             "Content-Type: application/octet-stream\r\n\r\n" % boundary).encode()
+            + b"x" * size + ("\r\n--%s--\r\n" % boundary).encode())
+    stream = _Counting(body)
+    r = client.post(url, input_stream=stream, content_type=MULTIPART + "; boundary=" + boundary,
+                    environ_overrides={"wsgi.input_terminated": True})
+    return r, stream, len(body)
+
+
+@pytest.mark.parametrize("url", ["/api/network/import", "/api/network/baseline/capture"])
+def test_a_body_without_a_content_length_is_bounded_too(client, tdc, tmp_path, monkeypatch, url):
+    monkeypatch.setattr(tdc, "NET_UPLOAD_MAX", 1000)
+    monkeypatch.setattr(tdc, "_NET_FORM_ALLOWANCE", 100)
+    r, stream, total = _chunked(client, url, 200000)
+    assert r.status_code == 413 and "larger" in r.get_json()["error"]
+    assert stream.read_bytes < total / 4, (stream.read_bytes, total)
+    assert not os.path.isdir(tdc._net_upload_dir()) or os.listdir(tdc._net_upload_dir()) == []
+
+
+def test_a_body_without_a_content_length_within_the_limit_is_analyzed(client, tmp_path):
+    with open(_pcap_with_http_c2(tmp_path), "rb") as fh:
+        pcap = fh.read()
+    boundary = "xBOUNDARYx"
+    body = (("--%s\r\nContent-Disposition: form-data; name=\"file\"; filename=\"c.pcap\"\r\n"
+             "Content-Type: application/octet-stream\r\n\r\n" % boundary).encode()
+            + pcap + ("\r\n--%s--\r\n" % boundary).encode())
+    r = client.post("/api/network/import", input_stream=io.BytesIO(body),
+                    content_type=MULTIPART + "; boundary=" + boundary,
+                    environ_overrides={"wsgi.input_terminated": True})
+    assert r.status_code == 200 and r.get_json()["event_summary"]["http"] >= 1
+
+
+# --- follow-up details ----------------------------------------------------------------------
+
+def test_a_password_in_the_client_file_name_is_masked_before_the_name_is_cleaned(client, tmp_path):
+    r = _upload(client, _pcap_with_http_c2(tmp_path), "password=Hunter2.pcap")
+    rid = r.get_json()["id"]
+    raw = r.data + client.get("/api/network/reports").data + client.get(
+        "/api/network/report?id=" + rid).data
+    assert b"Hunter2" not in raw
+    assert r.get_json()["filename"].startswith("password")
+
+
+def test_a_baseline_capture_says_when_its_capture_was_cut_short(client, tmp_path):
+    whole = _upload(client, _pcap_with_http_c2(tmp_path), url="/api/network/baseline/capture")
+    assert whole.get_json()["truncated"] is False
+    cut = _upload(client, na._truncated_pcap(tmp_path), url="/api/network/baseline/capture")
+    body = cut.get_json()
+    assert cut.status_code == 200 and body["truncated"] is True
+    assert body["added"] <= body["events_seen"] and "errors" in body and body["note"]
+
+
+def test_the_rules_next_to_the_app_win_over_the_parent_directory(tdc):
+    app_dir = os.path.dirname(os.path.abspath(tdc.__file__))
+    candidates = tdc._net_rules_candidates()
+    assert candidates[0] == os.path.join(app_dir, "rules", "network", "default.yaml")
+    assert candidates[1] == os.path.join(os.path.dirname(app_dir), "rules", "network",
+                                         "default.yaml")
+    assert candidates[2].startswith("C:\\vagrant")
+
+
+def test_the_first_rules_file_that_exists_is_used(tdc, tmp_path, monkeypatch):
+    first, second = tmp_path / "a.yaml", tmp_path / "b.yaml"
+    second.write_text("x")
+    monkeypatch.setattr(tdc, "_net_rules_candidates", lambda: [str(first), str(second)])
+    assert tdc._net_rules_file() == str(second)
+    first.write_text("y")
+    assert tdc._net_rules_file() == str(first)
+
+
+def test_missing_rules_are_named_in_the_report_errors(client, tdc, tmp_path, monkeypatch):
+    monkeypatch.setattr(tdc, "_net_rules_candidates", lambda: [str(tmp_path / "none.yaml")])
+    report = _upload(client, _pcap_with_http_c2(tmp_path)).get_json()
+    assert any(e.startswith("rules:") and "none.yaml" in e for e in report["errors"])
+    assert report["rule_hits"] == [] and report["events"]

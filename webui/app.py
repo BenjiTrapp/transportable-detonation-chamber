@@ -32,6 +32,7 @@ import weakref
 from pathlib import Path
 from flask import Flask, render_template, jsonify, request, send_from_directory, g
 from werkzeug.utils import secure_filename
+from werkzeug.exceptions import RequestEntityTooLarge
 import requests
 
 # Tool-agnostic scoring layer for live-memory findings. Scanners are plugged in
@@ -7696,21 +7697,30 @@ def api_memory_baseline_clear():
 
 NET_UPLOADS_KEEP = 20
 NET_UPLOAD_MAX = 256 * 1024 * 1024
-_NET_REPORT_ID = re.compile(r"^[0-9a-f]{32}$")
+_NET_FORM_ALLOWANCE = 1024 * 1024    # the other form fields and the multipart framing
+_NET_REPORT_ID = re.compile(r"[0-9a-f]{32}")
 _NET_MODES = ("online", "isolated")
 _NET_PROCESS_MAX = 260
 _net_sequence = itertools.count()
 
 
+def _net_rules_candidates():
+    """Where the default network rules may be: the deployed copy next to the app first,
+    then the repository, then the Vagrant share. (The parent of the app directory is
+    C:\\ on the VM and must not shadow the deployed copy.)"""
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    return [os.path.join(base, "rules", "network", "default.yaml")
+            for base in (app_dir, os.path.dirname(app_dir), r"C:\vagrant")]
+
+
 def _net_rules_file():
-    """The default network rules: in the repository, or next to the deployed app."""
-    for base in (os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                 os.path.dirname(os.path.abspath(__file__)),
-                 r"C:\vagrant"):
-        path = os.path.join(base, "rules", "network", "default.yaml")
+    """The default network rules file. When none exists the first candidate is returned,
+    and net_analyze lists the unreadable file in the report's `errors`."""
+    candidates = _net_rules_candidates()
+    for path in candidates:
         if os.path.isfile(path):
             return path
-    return net_analyze.DEFAULT_RULES
+    return candidates[0]
 
 
 def _net_upload_dir():
@@ -7758,45 +7768,64 @@ def _net_mode(data):
     return mode if mode in _NET_MODES else None
 
 
-def _net_analyze_upload(data, baseline):
+def _net_too_large():
+    return jsonify({"error": "the capture is larger than %d MB"
+                    % (NET_UPLOAD_MAX // (1024 * 1024))}), 413
+
+
+def _net_analyze_upload(baseline):
     """Analyze the uploaded capture of this request against `baseline` (or None).
 
     Returns (report, error response). The response is a ready (json, status)
     when the request is wrong; the report comes from net_analyze unchanged (it is
     already masked and JSON-safe) with `id` and `filename` added.
+
+    The size is settled before the body is parsed: reading request.form parses
+    (and spools) the whole multipart body, so a Content-Length over the limit is
+    refused first, and a body without one (chunked) is bounded by the request's
+    max_content_length, which Werkzeug enforces while it reads.
     """
-    if (request.content_length or 0) > NET_UPLOAD_MAX + 1024 * 1024:
-        return None, (jsonify({"error": "the capture is larger than %d MB"
-                                           % (NET_UPLOAD_MAX // (1024 * 1024))}), 413)
-    upload = request.files.get("file")
+    limit = NET_UPLOAD_MAX + _NET_FORM_ALLOWANCE
+    if (request.content_length or 0) > limit:
+        return None, _net_too_large()
+    request.max_content_length = limit
+    try:
+        data = request.form
+        upload = request.files.get("file")
+    except RequestEntityTooLarge:
+        return None, _net_too_large()
     if upload is None:
         return None, (jsonify({"error": "no pcap file uploaded (field 'file')"}), 400)
     mode = _net_mode(data)
     if mode is None:
         return None, (jsonify({"error": "mode must be one of %s"
-                                           % ", ".join(_NET_MODES)}), 400)
+                               % ", ".join(_NET_MODES)}), 400)
     process = (data.get("process") or "")[:_NET_PROCESS_MAX]
     report_id = uuid.uuid4().hex
     path = _save_net_upload(upload, report_id)
     if path is None:
-        return None, (jsonify({"error": "the capture is larger than %d MB"
-                                           % (NET_UPLOAD_MAX // (1024 * 1024))}), 413)
-    filename = secure_filename(upload.filename or "") or "capture.pcap"
+        return None, _net_too_large()
+    # masked before secure_filename drops the '=' that the mask looks for
+    filename = secure_filename(net_analyze.mask_report(upload.filename or "")) or "capture.pcap"
     try:
         report = net_analyze.analyze_pcap(path, rules=_net_rules_file(), baseline=baseline,
                                           process=process, mode=mode)
     except Exception as e:
         return None, (jsonify({"error": "the capture could not be analyzed (%s)"
-                                           % type(e).__name__}), 500)
+                               % type(e).__name__}), 500)
     if not report.get("format"):
         try:
             os.remove(path)
         except OSError:
             pass
-        return None, (jsonify({
-            "error": "not a pcap or pcapng file: %s" % (report.get("note") or "unreadable")}), 400)
+        # the note is "<what is wrong>; <the capture holds nothing>": the first part is the reason
+        reason = (report.get("note") or "").split(";")[0].strip()
+        if not reason.lower().startswith("not a pcap"):
+            reason = "not a pcap or pcapng file (%s)" % reason if reason else \
+                "not a pcap or pcapng file"
+        return None, (jsonify({"error": reason}), 400)
     report["id"] = report_id
-    report["filename"] = net_analyze.mask_report(filename)
+    report["filename"] = filename
     return report, None
 
 
@@ -7828,7 +7857,7 @@ def _net_summary(report):
 @app.route("/api/network/import", methods=["POST"])
 def api_network_import():
     """Analyze an uploaded pcap and keep the report. Params: `file`, `mode` (online|isolated), `process`"""
-    report, error = _net_analyze_upload(request.form, _net_baseline)
+    report, error = _net_analyze_upload(_net_baseline)
     if error:
         return error
     report["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
@@ -7844,7 +7873,7 @@ def api_network_import():
 def api_network_report():
     """A stored network report. Params: `id`"""
     report_id = request.args.get("id", "")
-    if not _NET_REPORT_ID.match(report_id):
+    if not _NET_REPORT_ID.fullmatch(report_id):
         return jsonify({"error": "invalid report id"}), 400
     report = _net_reports.lookup("netreport", sha256=report_id)
     if report is None:
@@ -7879,7 +7908,7 @@ def api_network_baseline():
 def api_network_baseline_capture():
     """Record what a capture of the clean VM holds as the network baseline. Params: `file`"""
     # the capture is analyzed without the baseline: all of it is learned
-    report, error = _net_analyze_upload(request.form, None)
+    report, error = _net_analyze_upload(None)
     if error:
         return error
     events = report.get("events") or []
@@ -7896,7 +7925,9 @@ def api_network_baseline_capture():
             learned.append({"type": item[0], "dest": item[1], "port": item[2]})
     return jsonify(net_analyze.mask_report({
         "added": added, "count": _net_baseline.count, "previous_count": before,
-        "events_seen": len(events), "learned": learned, "baseline": _net_baseline.stats()}))
+        "events_seen": len(events), "learned": learned, "baseline": _net_baseline.stats(),
+        "truncated": bool(report.get("truncated")), "errors": report.get("errors") or [],
+        "note": report.get("note") or ""}))
 
 
 @app.route("/api/memory/evidence", methods=["POST"])
