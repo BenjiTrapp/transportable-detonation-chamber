@@ -54,7 +54,7 @@ behaviour analysis group by); the resolver that answered is ``server``.
 import socket
 import struct
 
-from net_events import NetEvent
+from net_events import NetEvent, render_bytes
 
 DNS_PORT = 53
 
@@ -92,18 +92,6 @@ def _rcode_name(code):
     return _RCODES.get(code, "RCODE%d" % code)
 
 
-def _label(raw):
-    out = []
-    for byte in raw:
-        if byte in (0x2E, 0x5C):                    # "." and "\\"
-            out.append("\\" + chr(byte))
-        elif 0x21 <= byte <= 0x7E:
-            out.append(chr(byte))
-        else:
-            out.append("\\%03d" % byte)
-    return "".join(out)
-
-
 def _read_name(buf, pos):
     """``(name, position after it)``; follows compression pointers."""
     labels = []
@@ -135,7 +123,7 @@ def _read_name(buf, pos):
         size += length + 1
         if size > _MAX_NAME:
             raise _Bad("name too long")
-        labels.append(_label(raw))
+        labels.append(render_bytes(raw, escape=b"."))
         pos += 1 + length
     name = ".".join(labels).lower() or "."
     return name, (after if after is not None else pos)

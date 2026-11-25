@@ -36,6 +36,38 @@ EVENT_TYPES = (
 )
 
 
+def render_bytes(raw, escape=b""):
+    """Bytes as readable text in which no two different byte strings look alike.
+
+    Anything a capture hands over as bytes (a DNS label, a delimiter, a server
+    name) may hold a NUL, a newline or a byte above 0x7F, and none of those can
+    be left raw in a report or an API response. The text is written as a zone
+    file writes a name: a printable ASCII byte (``!`` to ``~``) stands for
+    itself, a backslash is ``\\\\``, any byte listed in ``escape`` is preceded
+    by a backslash, and every other byte (control characters, space, bytes
+    above 0x7E) is ``\\DDD`` with its decimal value, three digits. A backslash
+    always starts an escape, so the text can be read back and two different
+    inputs never give the same text: ``a.b`` and ``a\\.b`` stay apart when
+    ``escape`` holds ``.``. DNS names pass ``escape=b"."`` so that a dot inside
+    a label is not mistaken for the dot between labels; text where a dot is
+    ordinary (a server name) does not. ``escape`` may only name printable,
+    non-digit ASCII bytes: a digit after a backslash would read as the start of
+    ``\\DDD``.
+    """
+    for byte in escape:
+        if not 0x21 <= byte <= 0x7E or 0x30 <= byte <= 0x39:
+            raise ValueError("cannot escape byte %d: not printable non-digit ASCII" % byte)
+    out = []
+    for byte in raw:
+        if byte == 0x5C or byte in escape:
+            out.append("\\" + chr(byte))
+        elif 0x21 <= byte <= 0x7E:
+            out.append(chr(byte))
+        else:
+            out.append("\\%03d" % byte)
+    return "".join(out)
+
+
 def _is_ip(text):
     try:
         ipaddress.ip_address(text)

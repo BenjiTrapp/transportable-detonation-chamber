@@ -35,10 +35,10 @@ Regressions covered:
   * entropy of a few bytes is low however random they are; ``stream_bytes``
     travels with it so a consumer can tell
   * the delimiter was a ``bytes`` value, so ``json.dumps`` of a ``raw`` event
-    raised at the report and API boundary; it is text now, written as net_dns
-    writes a DNS label (a printable byte as itself, any other as ``\\DDD``
-    with its decimal value, so a newline is ``\\010``), and every event of every
-    framing kind goes through ``json.dumps``
+    raised at the report and API boundary; it is text now, written by
+    ``net_events.render_bytes``, as DNS names are (a printable byte as itself,
+    any other as ``\\DDD`` with its decimal value, so a newline is ``\\010``),
+    and every event of every framing kind goes through ``json.dumps``
   * an empty stream, or one whose first segment was lost, produces no event
 """
 
@@ -515,11 +515,10 @@ def test_the_thresholds_are_the_ones_of_the_beaconing_judgement():
 
 # --- the event is JSON --------------------------------------------------------
 
-def test_the_delimiter_is_written_the_way_dns_writes_a_label():
+def test_the_delimiter_is_written_by_the_shared_byte_rendering():
     assert _profile(b"a\nb\nc\n")["delimiter"] == "\\010"
     assert _profile(b"a\r\nb\r\nc\r\n")["delimiter"] == "\\013\\010"
     assert _profile(b"\x01a\xff" * 8)["delimiter"] == "\\255"
-    assert net_raw.net_dns._label(b"\xff\x00") == "\\255\\000"
 
 
 _EVERY_FRAMING = {

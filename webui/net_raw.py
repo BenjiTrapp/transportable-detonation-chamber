@@ -51,8 +51,8 @@ together. The assumptions this module refuses to make:
     transfer, not a keep-alive. Times come from ``Flow.packets``, which holds
     one entry per message with retransmissions folded in, so a retransmit is
     not a beat.
-  * A delimiter is a byte string. It is reported as text, written as ``net_dns``
-    writes a DNS label (a printable byte as itself, any other as ``\\DDD`` with
+  * A delimiter is a byte string. It is reported as text, written by
+    ``net_events.render_bytes``, as DNS names are (a printable byte as itself, any other as ``\\DDD`` with
     its decimal value: newline is ``\\010``), so an event is plain JSON. Every
     other field is a string, number, bool, None or a list of numbers.
   * The two directions look alike. A request and its reply do not, so each
@@ -67,10 +67,9 @@ import statistics
 from collections import Counter
 from math import log2
 
-import net_dns
 from memory_evidence import (
     BEACON_MAX_COV, BEACON_MIN_CONNECTIONS, BEACON_MIN_INTERVAL_S)
-from net_events import NetEvent
+from net_events import NetEvent, render_bytes
 
 MAX_CHAIN = 20000               # messages walked in a length chain
 MAX_REPORTED = 256              # sizes listed in an event
@@ -255,14 +254,14 @@ def _heartbeat(flow, direction):
 # --- events -------------------------------------------------------------------
 
 def _written(delimiter):
-    """The delimiter as text, the way ``net_dns`` writes a DNS label.
+    """The delimiter as text, by ``net_events.render_bytes``.
 
     A printable byte stands for itself and any other is ``\\DDD`` (decimal), so a
     newline is ``\\010`` and CRLF ``\\013\\010``. The event has to go through
     ``json.dumps`` (report, API), which refuses ``bytes``; one escaping style
     for the whole project keeps the output readable and reversible.
     """
-    return None if delimiter is None else net_dns._label(delimiter)
+    return None if delimiter is None else render_bytes(delimiter)
 
 
 def _event(flow, direction, stream):
