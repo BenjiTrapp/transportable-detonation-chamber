@@ -751,6 +751,22 @@ def test_an_upload_event_describes_the_request_body():
     assert u["url"] == "http://x.top/u?x=1" and u["dest"] == "x.top" and u["ts"] == 1.0
 
 
+def test_a_transfer_names_the_address_it_was_sent_to_whatever_its_host_header_says():
+    """The Host header is the sample's claim; the connection is where the bytes went.
+
+    Regressions covered: an upload with ``Host: ocsp.digicert.com`` to a C2
+    address carried only the claimed name, so nothing about the C2 address
+    (Sysmon's beacon to it) could ever be matched to it.
+    """
+    body = b"u" * 600
+    u = _events(b"POST /u HTTP/1.1\r\nHost: ocsp.digicert.com\r\nContent-Length: %d\r\n\r\n"
+                % len(body) + body, b"", kind="upload")[0]
+    assert u["dest"] == "ocsp.digicert.com" and u["addresses"] == [SERVER]
+    pe = b"MZ\x90\x00\x03\x00\x00\x00\x04" + bytes(range(256)) * 4
+    d = _events(_get(host=b"ocsp.digicert.com"), _ok(pe), kind="download")[0]
+    assert d["dest"] == "ocsp.digicert.com" and d["addresses"] == [SERVER]
+
+
 def test_an_upload_cut_short_is_still_reported_and_flagged():
     request = b"POST /u HTTP/1.1\r\nHost: x.top\r\nContent-Length: 900\r\n\r\n" + b"u" * 700
     u = _events(request, b"", kind="upload")[0]

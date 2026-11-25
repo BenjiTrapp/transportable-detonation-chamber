@@ -42,7 +42,10 @@ the findings wrong:
     must not vanish). Ordinary POSTs over 512 bytes to known hosts therefore
     stay findings, but they are marked ``known_good`` with the corroboration
     scope ``endpoint``: such a finding is corroborated only by a finding about
-    the same endpoint, and vouches only for one. Every event of a capture is
+    the same endpoint, and vouches only for one. The endpoint includes the
+    address the connection went to (the events' ``addresses``), not only the
+    claimed name, so a spoofed ``Host`` upload to a C2 address is still
+    corroborated by Sysmon's beacon to that address. Every event of a capture is
     the sample's process, so without the scope any host-side finding (a
     reflective PE, 3.0) would turn the machine's OCSP POSTs into 4.0 of
     exfiltration, two unrelated facts counted as one. Without a process and
@@ -170,6 +173,14 @@ class _Collector:
         return finding
 
 
+def _merge_addresses(finding, e):
+    """The connection addresses of every transfer behind one finding."""
+    addresses = finding["addresses"]
+    for address in _names(e.get("addresses")):
+        if address not in addresses:
+            addresses.append(address)
+
+
 def _pid(e):
     pid = e.get("pid")
     return pid if isinstance(pid, int) and not isinstance(pid, bool) else None
@@ -258,10 +269,12 @@ def _upload(c, e, process):
         known["size"] += size
         known["detail"] = "%d uploads to %s, %d bytes" % (known["count"], dest, known["size"])
         _merge_pid(known, e)
+        _merge_addresses(known, e)
         return
     c.add("exfil_upload", process, dest, "Upload to %s, %d bytes" % (dest, size), pid=_pid(e),
           size=size, sha256=_plain(e.get("sha256")), file_kind=_plain(e.get("kind")),
-          method=_plain(e.get("method")), path=_plain(e.get("path")), count=1, **c.scope(e))
+          method=_plain(e.get("method")), path=_plain(e.get("path")), count=1,
+          addresses=_names(e.get("addresses")), **c.scope(e))
 
 
 def _download(c, e, process):
@@ -271,11 +284,13 @@ def _download(c, e, process):
     known = c.get("payload_staging", process, dest)
     if known is not None:
         known["count"] += 1
+        _merge_addresses(known, e)
         return
     c.add("payload_staging", process, dest,
           "%s file downloaded from %s" % (str(e["kind"]).upper(), dest), pid=_pid(e),
           sha256=_plain(e.get("sha256")), size=_plain(e.get("size")),
-          file_kind=e["kind"], url=_plain(e.get("url")), count=1, **c.scope(e))
+          file_kind=e["kind"], url=_plain(e.get("url")), count=1,
+          addresses=_names(e.get("addresses")), **c.scope(e))
 
 
 def _retry(c, e, process):

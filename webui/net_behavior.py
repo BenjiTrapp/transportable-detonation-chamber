@@ -123,6 +123,7 @@ Timestamps are Unix seconds as float, as in ``net_events``. An event with a
 timestamp that is not a finite number is ignored: it cannot be placed in time.
 """
 
+import collections
 import ipaddress
 import math
 import statistics
@@ -179,9 +180,13 @@ SCALE_MAX_RUN = 2
 # missed-round reading is refused when they show one of three patterns:
 #   * packed: no two more than one short interval apart, and together at
 #     least MISSED_PACKED_SHARE of the intervals (rounds of two requests);
-#   * at one constant step, MISSED_STEP_MIN of them or more: rounds of n
-#     requests put a long interval at every n-th position (0/10/20 every 60 s
-#     is 10, 10, 40, 10, 10, 40), whatever n is;
+#   * on one step, MISSED_STEP_MIN of them or more: rounds of n requests put
+#     a long interval at every n-th position (0/10/20 every 60 s is 10, 10,
+#     40, 10, 10, 40), whatever n is. One request left out (a round without a
+#     task has no result to post) shortens or lengthens one step, so the step
+#     need not be constant: the most common step between long intervals, if
+#     it is 2 or more, has to cover MISSED_STEP_SHARE of them. Step 1 is the
+#     next pattern's;
 #   * one block: every long interval follows the one before it directly, and
 #     the block touches the start or the end of the series (a rhythm that
 #     changes, or one that begins slowly) or is MISSED_RUN_MIN long. Two
@@ -193,6 +198,7 @@ MISSED_PATTERN_MIN = 4
 MISSED_LONG_BAND = 1.8
 MISSED_PACKED_SHARE = 0.35
 MISSED_STEP_MIN = 3
+MISSED_STEP_SHARE = 2.0 / 3.0
 MISSED_RUN_MIN = 3
 
 # Intervals taken into the measurement of one group. A beacon is established
@@ -305,8 +311,8 @@ def _forgiven(intervals, median):
 
     Empty when they are too many (``MISSED_MAX_SHARE``), come on a beat of
     their own (evenly spaced, ``MISSED_PATTERN_MIN`` or more) or when the long
-    intervals sit the way a second time scale puts them (packed, at one
-    constant step, or in one block at an edge or of ``MISSED_RUN_MIN``; see
+    intervals sit the way a second time scale puts them (packed, mostly on one
+    step of 2 or more, or in one block at an edge or of ``MISSED_RUN_MIN``; see
     the constants): that is a second rhythm, not check-ins that happened not to
     happen.
     """
@@ -322,8 +328,10 @@ def _forgiven(intervals, median):
     if (len(longs) >= 2 and all(g <= 2 for g in gaps)
             and len(longs) >= MISSED_PACKED_SHARE * len(intervals)):
         return set()
-    if len(longs) >= MISSED_STEP_MIN and len(set(gaps)) == 1:
-        return set()
+    if len(longs) >= MISSED_STEP_MIN:
+        step, count = collections.Counter(gaps).most_common(1)[0]
+        if step >= 2 and count >= MISSED_STEP_SHARE * len(gaps):
+            return set()
     if len(longs) >= 2 and all(g == 1 for g in gaps):
         if (len(longs) >= MISSED_RUN_MIN or longs[0] == 0
                 or longs[-1] == len(intervals) - 1):
@@ -345,9 +353,9 @@ def _single_scale(intervals, median):
     rhythm with check-ins missing, and a beacon that misses one in five rounds
     (or reuses a connection, which Sysmon logs once) is still that beacon,
     unless the multiples come on a beat of their own (``_forgiven``). Known
-    limitation: fewer than ``MISSED_PATTERN_MIN`` evenly spaced multiples
+    limitation: fewer than ``MISSED_STEP_MIN`` long intervals on one step
     are not recognised as a beat, so 60, 60, 120, 60, 60, 120, 60 measures
-    60 s; a longer series of that shape is refused.
+    60 s; with a third 120 on the same step the series is refused.
     GET plus POST (1 s, 59 s alternating), several requests per check-in, a
     duty cycle and a change of rhythm all fail one of the three; a jittered
     beacon, missed check-ins, an outage and a periodic re-register pass.

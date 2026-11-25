@@ -537,3 +537,48 @@ def test_an_upload_to_an_unlisted_host_is_corroborated_as_before():
     pe = memory_evidence.MemoryFinding("aether", "reflective_pe", "a.exe")
     assert "known_good" not in up[0]
     assert memory_evidence.score([pe] + up)["score"] == 7.0
+
+
+def _spoofed_upload(address, count=1):
+    return [net_events.NetEvent("upload", 1.0 + i, dest="ocsp.digicert.com", size=4000,
+                                addresses=[address]) for i in range(count)]
+
+
+def test_a_spoofed_host_upload_is_corroborated_by_a_beacon_to_its_real_address():
+    """An upload claiming a known-good host is matched on the address it went to.
+
+    Regressions covered: the upload's endpoints were only its Host header and
+    the DNS answers for it, so ``Host: ocsp.digicert.com`` sent to a C2 address
+    with a tight Sysmon beacon to that address scored 4.6 SUSPICIOUS (upload
+    1.6, uncorroborated); before the endpoint scope it was 7.0 MALICIOUS.
+    """
+    c2 = "203.0.113.7"
+    sysmon = memory_evidence.beaconing_from_connections(
+        [(60.0 * k, c2, 443) for k in range(20)], "a.exe")
+    spoofed = net_evidence.findings_from(_spoofed_upload(c2), [], process="a.exe",
+                                         known_good=["ocsp.digicert.com"])
+    assert spoofed[0]["known_good"] is True and spoofed[0]["addresses"] == [c2]
+    out = memory_evidence.score(spoofed + sysmon)
+    assert (out["score"], out["label"]) == (7.0, "MALICIOUS")
+    upload = [f for f in out["findings"] if f["kind"] == "exfil_upload"][0]
+    assert upload["factors"]["corroboration"] == 1.0
+    # A real OCSP POST to the CDN's own address is still not vouched for.
+    real = net_evidence.findings_from(_spoofed_upload("192.0.2.80"), [], process="a.exe",
+                                      known_good=["ocsp.digicert.com"])
+    out = memory_evidence.score(real + sysmon)
+    assert (out["score"], out["label"]) == (4.6, "SUSPICIOUS")
+
+
+def test_the_addresses_of_every_transfer_behind_one_finding_are_kept():
+    """Regressions covered: a finding merged from several transfers named only
+    the address of the first, so a beacon to the second could not match it."""
+    events = (_spoofed_upload("192.0.2.80")
+              + [net_events.NetEvent("upload", 5.0, dest="ocsp.digicert.com", size=4000,
+                                     addresses=["203.0.113.7"])])
+    downloads = [net_events.NetEvent("download", 6.0 + i, dest="cdn.top", kind="pe",
+                                     addresses=[a]) for i, a in
+                 enumerate(("198.51.100.1", "198.51.100.2", "198.51.100.1"))]
+    out = net_evidence.findings_from(events + downloads, [], process="a.exe", known_good=())
+    by_kind = {f["kind"]: f for f in out}
+    assert by_kind["exfil_upload"]["addresses"] == ["192.0.2.80", "203.0.113.7"]
+    assert by_kind["payload_staging"]["addresses"] == ["198.51.100.1", "198.51.100.2"]

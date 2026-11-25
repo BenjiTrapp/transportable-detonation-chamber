@@ -947,6 +947,87 @@ def test_two_missed_rounds_one_check_in_apart_in_the_middle_stay_missed_rounds()
     assert p["periodic"] is True and p["interval"] == 60.0
 
 
+def _rounds_with_a_request_left_out(rng, offsets, which):
+    """Rounds of ``offsets`` with one request of one round missing."""
+    n = rng.randint(5, 16)
+    left_out = rng.randint(1, n - 2)
+    ts = []
+    for k in range(n):
+        t = 60.0 * k + rng.uniform(-1.0, 1.0)
+        drop = which if which >= 0 else rng.randint(1, len(offsets) - 1)
+        ts += [t + o * rng.uniform(0.98, 1.02) for i, o in enumerate(offsets)
+               if not (k == left_out and i == drop)]
+    return ts
+
+
+@pytest.mark.parametrize("offsets", [(0.0, 10.0, 20.0), (0.0, 12.0, 24.0),
+                                     (0.0, 10.0, 20.0, 30.0)])
+def test_rounds_of_requests_with_one_request_left_out_have_no_interval(offsets):
+    """One request missing breaks the step of rounds only once, not the pattern.
+
+    Regressions covered: the step rule wanted one constant step, so leaving
+    out the last request of one round measured the inner interval (10 s,
+    tight for four requests) in 95-99 % of series; anywhere, in about 70 %.
+    Measured with the modal step: 0 % for the last request, 3.7-7.5 % for any.
+    """
+    rng = random.Random(len(offsets))
+    for _ in range(300):
+        ts = _rounds_with_a_request_left_out(rng, offsets, len(offsets) - 1)
+        assert net_behavior.periodicity(ts)["interval"] is None, ts
+    measured = sum(net_behavior.periodicity(
+        _rounds_with_a_request_left_out(rng, offsets, -1))["interval"] is not None
+        for _ in range(500))
+    # Measured with these seeds: 36 / 38 / 59 of 500; on 21b9b12 478 / 493 / 494.
+    assert measured <= 75
+
+
+def test_follow_ups_on_most_rounds_only_are_mostly_not_a_beacon():
+    """Regressions covered: result and ack only on tasked rounds (90 %) measured
+    0/10/20/30 at 10 s in 91 % of series (80 % tight); now about a quarter."""
+    rng = random.Random(90)
+    measured = 0
+    for _ in range(500):
+        ts = []
+        for k in range(rng.randint(6, 20)):
+            t = 60.0 * k + rng.uniform(-1.0, 1.0)
+            for i, o in enumerate((0.0, 10.0, 20.0, 30.0)):
+                if i and rng.random() >= 0.9:
+                    break
+                ts.append(t + o * rng.uniform(0.98, 1.02))
+        measured += net_behavior.periodicity(ts)["interval"] is not None
+    assert measured <= 175                  # measured 136 of 500; on 21b9b12 453
+
+
+def test_exact_beacons_with_missed_rounds_keep_their_interval_under_the_modal_step():
+    """The price of the modal step on real beacons stays small (measured over
+    10 000: 20 % missed 96.98 -> 95.56 %, 30 % missed 93.44 -> 91.25 %)."""
+    rng = random.Random(20)
+    measured = 0
+    for _ in range(500):
+        t, ts = 0.0, [0.0]
+        n = rng.randint(4, 40)
+        while len(ts) < n:
+            t += 60.0
+            if rng.random() >= 0.2:
+                ts.append(t)
+        p = net_behavior.periodicity(ts)
+        measured += p["interval"] == 60.0
+    assert measured >= 465                  # measured 478 of 500; on 21b9b12 483
+
+
+def test_three_missed_rounds_in_a_row_in_the_middle_are_a_change_of_rhythm(monkeypatch):
+    """Regressions covered: ``MISSED_RUN_MIN`` was dead code, because the
+    constant-step rule refused every block of three first. With the modal step
+    of 2 or more it is the rule that refuses this block."""
+    ts, t = [0.0], 0.0
+    for x in [60.0] * 5 + [120.0] * 3 + [60.0] * 5:
+        t += x
+        ts.append(t)
+    assert net_behavior.periodicity(ts)["interval"] is None
+    monkeypatch.setattr(net_behavior, "MISSED_RUN_MIN", 99)
+    assert net_behavior.periodicity(ts)["interval"] == 60.0
+
+
 def test_consecutive_long_intervals_at_the_end_are_a_change_of_rhythm():
     # Six 10 s intervals, then two of 20 s: as missed rounds the two would be
     # forgiven; at the end of the series they are the start of a slower rhythm.

@@ -869,17 +869,30 @@ def _exchange_events(ctx, req, resp):
             url=origin.url, path=origin.path, size=len(body),
             sha256=hashlib.sha256(body).hexdigest(), kind=_kind(body),
             content_type=origin.headers.get("content-type", ""),
-            content_encoding=request_encoding, truncated=req.truncated))
+            content_encoding=request_encoding, truncated=req.truncated,
+            addresses=_connected(ctx)))
     if reply:
         kind, identity = _payload(reply, resp_decoded, response_encoding)
         if kind:
             events.append(NetEvent(
                 "download", resp_ts, dest=origin.dest, port=origin.port, url=origin.url,
                 path=origin.path, kind=kind, content_type=ctype,
-                content_encoding=response_encoding, truncated=resp.truncated, **identity))
+                content_encoding=response_encoding, truncated=resp.truncated,
+                addresses=_connected(ctx), **identity))
     if req and resp and resp.status == 101 and _is_upgrade(req):
         events.append(_websocket_event(ctx, origin, req, resp, req_ts))
     return events
+
+
+def _connected(ctx):
+    """The address a transfer really went to, whatever its Host header says.
+
+    ``dest`` is the Host header, which the sample writes: an upload to a C2
+    address with ``Host: ocsp.digicert.com`` names a known-good host. The
+    connection's address is what a host-side finding (Sysmon's connection
+    log) names, so it is the endpoint they can be matched on.
+    """
+    return [ctx.server] if ctx.server else []
 
 
 def _reversed(client, server):
