@@ -29,6 +29,10 @@ Regressions covered:
     by a crafted capture, and one message appeared as several in ``packets``
   * a capture that begins mid-connection looked as certain about who the
     client is as one that begins with the SYN
+  * the time of a byte in a stream (a request, a command) was the flow's
+    first time, and segments that arrived out of order or lie beyond a hole
+    were placed at the wrong offset or not at all; ``stream_time_index`` and
+    ``time_at_offset`` give each stream offset the time of its own segment
 """
 
 import socket
@@ -648,3 +652,49 @@ def test_a_syn_ack_first_capture_is_not_a_guess(tmp_path):
 def test_a_udp_flow_always_has_a_guessed_client(tmp_path):
     f = net_flows.read_pcap(_pcap(tmp_path, _udp_packet(53, b"x"))).flows[0]
     assert f.client_guessed is True
+
+
+# --- time of a byte in a stream ---------------------------------------------
+
+def _first_flow(tmp_path, packets):
+    return net_flows.read_pcap(_pcap(tmp_path, packets)).flows[0]
+
+
+def test_stream_offsets_get_the_time_of_their_segment(tmp_path):
+    f = _first_flow(tmp_path, _tcp_segments([(1, b"abc"), (2, b"def")]))
+    index = net_flows.stream_time_index(f.packets, "c", f.client_stream())
+    assert index == ([0, 3], [1.0, 1.1])
+    assert [net_flows.time_at_offset(index, n, 0.0) for n in (0, 2, 3, 5)] == [
+        1.0, 1.0, 1.1, 1.1]
+
+
+def test_segments_that_arrived_out_of_order_are_found_by_content(tmp_path):
+    f = _first_flow(tmp_path, _tcp_segments([(2, b"world"), (1, b"hello ")]))
+    assert f.client_stream() == b"hello world"
+    index = net_flows.stream_time_index(f.packets, "c", f.client_stream())
+    assert index == ([0, 6], [1.1, 1.0])
+    assert net_flows.time_at_offset(index, 7, 0.0) == 1.0
+
+
+def test_only_the_asked_direction_is_indexed(tmp_path):
+    f = _first_flow(tmp_path, _tcp_exchange(b"ab", b"b", client_ts=10.0, server_ts=11.5))
+    assert net_flows.stream_time_index(f.packets, "c", f.client_stream()) == ([0], [10.0])
+    assert net_flows.stream_time_index(f.packets, "s", f.server_stream()) == ([0], [11.5])
+
+
+def test_a_segment_beyond_a_hole_is_not_in_the_index(tmp_path):
+    f = _first_flow(tmp_path, _tcp_segments([(1, b"aaa"), (3, b"ccc")]))
+    assert f.client_stream() == b"aaa"
+    assert net_flows.stream_time_index(f.packets, "c", f.client_stream()) == ([0], [1.0])
+
+
+def test_an_offset_before_the_first_segment_gets_the_default():
+    assert net_flows.time_at_offset(([4], [2.0]), 3, 9.0) == 9.0
+    assert net_flows.time_at_offset(([], []), 0, 9.0) == 9.0
+
+
+def test_the_content_search_budget_bounds_the_work(tmp_path, monkeypatch):
+    f = _first_flow(tmp_path, _tcp_segments([(2, b"world"), (1, b"hello ")]))
+    monkeypatch.setattr(net_flows, "MAX_OFFSET_SEARCHES", 0)
+    index = net_flows.stream_time_index(f.packets, "c", f.client_stream())
+    assert index == ([0], [1.1])          # the late segment was not searched for

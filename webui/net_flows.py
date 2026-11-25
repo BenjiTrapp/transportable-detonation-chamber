@@ -34,6 +34,11 @@ packet, and cannot tell a cut block from a short one, so a capture with a
 second interface would be decoded with the wrong clock or the wrong link layer.
 Here each packet carries the link type and resolution of its own interface.
 
+Parsers that need the time of a byte in a stream (the request that began at
+offset N, the command at offset M) use ``stream_time_index`` and
+``time_at_offset``, which map the reassembled stream back onto the captured
+segments of ``Flow.packets``.
+
 Two inherent guesses are visible in the output rather than hidden. A capture
 that starts mid-connection has no SYN, so the first sender is taken as the
 client (``Flow.client_guessed``). UDP has no connection at all and the same rule
@@ -41,6 +46,7 @@ applies, so a UDP flow is always a guess.
 """
 
 import struct
+from bisect import bisect_right
 
 import dpkt
 
@@ -52,6 +58,7 @@ MAX_STREAM_BYTES = 4 * 1024 * 1024
 MAX_SEGMENTS = 50000
 MAX_TOTAL_BYTES = 128 * 1024 * 1024
 MAX_FLOWS = 50000
+MAX_OFFSET_SEARCHES = 256   # content searches allowed to place out-of-order segments
 
 _MAX_RECORD = 1 << 24           # larger than any real frame: the header is corrupt
 _MASK32 = 0xFFFFFFFF
@@ -213,6 +220,52 @@ def _assemble(half, capped):
         if fin_rel > cursor:
             gaps.append(fin_rel - cursor)
     return b"".join(out), gaps
+
+
+def stream_time_index(packets, direction, stream):
+    """``(starts, times)``: where each captured segment begins in ``stream``.
+
+    ``packets`` is ``Flow.packets`` and ``stream`` the reassembled stream of
+    ``direction`` ("c" or "s"). The segments are in arrival order and the stream
+    is in sequence order. They agree unless something arrived out of order, was
+    repeated or lies beyond a hole; those segments are found in the stream by
+    their content (at most ``MAX_OFFSET_SEARCHES`` searches), and a segment that
+    is not in it contributes nothing. ``starts`` is ascending; ``times`` are the
+    segments' capture times in the same order. Look an offset up with
+    ``time_at_offset``.
+    """
+    found = []
+    used = set()
+    cursor = 0
+    budget = MAX_OFFSET_SEARCHES
+    for ts, d, payload in packets:
+        n = len(payload)
+        if d != direction or not n:
+            continue
+        pos = cursor if stream[cursor:cursor + n] == payload else -1
+        if pos < 0 and budget > 0:
+            budget -= 1
+            pos = stream.find(payload)
+            while pos in used:
+                pos = stream.find(payload, pos + 1)
+        if pos < 0:
+            continue
+        used.add(pos)
+        found.append((pos, ts))
+        cursor = max(cursor, pos + n)
+    found.sort(key=lambda item: item[0])
+    return [p for p, _t in found], [t for _p, t in found]
+
+
+def time_at_offset(index, offset, default):
+    """The capture time of the segment that holds byte ``offset`` of a stream.
+
+    ``index`` comes from ``stream_time_index``; ``default`` is returned for an
+    offset before the first known segment (or when none is known).
+    """
+    starts, times = index
+    i = bisect_right(starts, offset) - 1
+    return times[i] if i >= 0 else default
 
 
 class _Reader:

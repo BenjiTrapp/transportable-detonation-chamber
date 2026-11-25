@@ -9,12 +9,18 @@ refuses to make:
   * A credential is harmless to carry around. The password is kept in the event
     because the evidence needs it, but as a ``Secret``: a ``str`` whose repr,
     ``str()`` and format all give ``***``, so it does not reach a log or a
-    traceback by accident. ``password_captured`` says whether there is one
-    without showing it, and survives a JSON round trip, which a ``Secret`` does
-    not (``json.dumps`` writes the real value); ``masked(event)`` is the copy to
-    render or serialize for a reader. The ``commands`` list of an FTP session
-    holds ``PASS ***``, never the argument. ``Secret.reveal()`` returns the
-    plain text for the one consumer that must have it.
+    traceback by accident. That protects ``print``, logging and ``repr``
+    only: ``json.dumps(event)`` (and so ``flask.jsonify``) writes the REAL
+    password, because the encoder reads the string's content and never calls
+    ``str()``. Anything that puts an event into a report, an API response, a
+    file or any other serialized form MUST serialize ``masked(event)``, never
+    the event itself. ``masked`` returns a plain copy with ``password`` set to
+    ``***`` (or ``""`` when none was captured); ``password_captured`` is the
+    bool that says whether there is one without showing it, and it survives
+    serialization. The ``commands`` list of an FTP session holds ``PASS ***``,
+    never the argument. ``Secret.reveal()`` returns the plain text for the one
+    consumer that must have it, and nothing else should
+    call it.
   * A stream is a whole session. It is routinely cut: a hole ends it
     (``Flow.client_stream`` stops at the first gap), the capture can stop, the
     retention cap shortens it. A line that has no line end is never used (half
@@ -80,8 +86,8 @@ import re
 from email.header import decode_header, make_header
 from email.parser import HeaderParser
 
+import net_flows
 from net_events import NetEvent
-from net_http import _offsets, _time_at
 
 MAX_ITEMS = 500             # entries of any kept list
 MAX_ITEM_CHARS = 512        # characters of one kept entry
@@ -210,11 +216,11 @@ class _Side:
         self.capped = bool(flow.capped)
         self.cut = bool(self.gaps) or self.capped
         self.server_cut = bool(server_gaps) or self.capped
-        self._index = _offsets(flow.packets, self.client_dir, self.client)
+        self._index = net_flows.stream_time_index(flow.packets, self.client_dir, self.client)
         self._first_ts = flow.first_ts
 
     def at(self, offset):
-        return _time_at(self._index, offset, self._first_ts)
+        return net_flows.time_at_offset(self._index, offset, self._first_ts)
 
 
 def _textual(stream, first):

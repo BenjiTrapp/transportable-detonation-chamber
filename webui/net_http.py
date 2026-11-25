@@ -99,9 +99,9 @@ import hashlib
 import heapq
 import re
 import zlib
-from bisect import bisect_right
 from urllib.parse import parse_qsl, urlsplit
 
+import net_flows
 from net_events import NetEvent
 
 MAX_BODY_TEXT = 256 * 1024       # text kept per body or message; the size is still exact
@@ -113,7 +113,6 @@ MAX_WS_FRAMES = 20000            # frames read per direction
 MAX_WS_MESSAGES = 5000           # messages kept per event
 
 _CHUNK = 64 * 1024               # decompressor output taken at a time
-_MATCH_BUDGET = 256              # searches allowed to place out-of-order segments
 
 _METHODS = frozenset(
     "GET HEAD POST PUT DELETE CONNECT OPTIONS TRACE PATCH PROPFIND PROPPATCH "
@@ -337,46 +336,6 @@ def _read_messages(stream, request, cut, methods=()):
         if not request and (msg.status == 101 or tunnel):
             break
     return messages
-
-
-# --- time ---------------------------------------------------------------------
-
-def _offsets(packets, direction, stream):
-    """``(starts, times)``: where each captured segment begins in the stream.
-
-    The segments of ``Flow.packets`` are in arrival order and the stream is in
-    sequence order. They agree unless something arrived out of order, was
-    repeated or lies beyond a hole; those segments are found in the stream by
-    their content (a limited number of searches), and a segment that is not
-    in it contributes nothing.
-    """
-    found = []
-    used = set()
-    cursor = 0
-    budget = _MATCH_BUDGET
-    for ts, d, payload in packets:
-        n = len(payload)
-        if d != direction or not n:
-            continue
-        pos = cursor if stream[cursor:cursor + n] == payload else -1
-        if pos < 0 and budget > 0:
-            budget -= 1
-            pos = stream.find(payload)
-            while pos in used:
-                pos = stream.find(payload, pos + 1)
-        if pos < 0:
-            continue
-        used.add(pos)
-        found.append((pos, ts))
-        cursor = max(cursor, pos + n)
-    found.sort(key=lambda item: item[0])
-    return [p for p, _t in found], [t for _p, t in found]
-
-
-def _time_at(index, offset, default):
-    starts, times = index
-    i = bisect_right(starts, offset) - 1
-    return times[i] if i >= 0 else default
 
 
 # --- bodies -------------------------------------------------------------------
@@ -688,8 +647,10 @@ class _Context:
         self.client_cut = bool(client_gaps) or self.capped
         self.server_cut = bool(server_gaps) or self.capped
         self.first_ts = flow.first_ts
-        self.client_time = _offsets(flow.packets, self.client_dir, self.client_stream)
-        self.server_time = _offsets(flow.packets, self.server_dir, self.server_stream)
+        self.client_time = net_flows.stream_time_index(
+            flow.packets, self.client_dir, self.client_stream)
+        self.server_time = net_flows.stream_time_index(
+            flow.packets, self.server_dir, self.server_stream)
 
 
 class _Origin:
@@ -803,7 +764,8 @@ def _ws_messages(frames, direction, index, default):
             cur["truncated"] = cur["truncated"] or f["truncated"]
         else:
             cur = {"data": bytearray(f["payload"]), "size": f["size"],
-                   "truncated": f["truncated"], "ts": _time_at(index, f["offset"], default)}
+                   "truncated": f["truncated"],
+                   "ts": net_flows.time_at_offset(index, f["offset"], default)}
         if f["fin"] or f["truncated"]:
             messages.append(cur)
             cur = None
@@ -839,8 +801,10 @@ def _is_upgrade(req):
 
 def _exchange_events(ctx, req, resp):
     origin = _Origin(ctx, req)
-    req_ts = _time_at(ctx.client_time, req.start, ctx.first_ts) if req else None
-    resp_ts = _time_at(ctx.server_time, resp.start, ctx.first_ts) if resp else None
+    req_ts = (net_flows.time_at_offset(ctx.client_time, req.start, ctx.first_ts)
+              if req else None)
+    resp_ts = (net_flows.time_at_offset(ctx.server_time, resp.start, ctx.first_ts)
+               if resp else None)
     ts = req_ts if req else resp_ts
     resp_headers = _headers_of(resp.headers if resp else ())[0]
     body = req.body if req else b""
