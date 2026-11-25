@@ -4832,18 +4832,22 @@ def _detonate(tdc, path=None):
     assert _until(lambda: tdc._scans_running() == 0)
 
 
-def test_a_detonation_runs_the_stage_after_aether_and_before_process_dump(tdc, pipeline, monkeypatch,
+def test_a_detonation_runs_the_stage_first_so_a_short_lived_sample_is_still_there(tdc, pipeline, monkeypatch,
                                                                          fake_baseline_dir, target):
     target.reader = _patched_reader(tdc, fake_baseline_dir, "private")
     real = tdc._run_syscall_stage
     monkeypatch.setattr(tdc, "_run_syscall_stage",
                         lambda pid, path, notes=None: pipeline.append("syscalls") or real(pid, path, notes))
     _detonate(tdc)
-    assert pipeline == ["hsb", "aether", "syscalls", "processdump"]
+    # Measured on the chamber: injectsim.exe lives 4.2s and shortlived.exe 6.7s, while the stage itself takes under
+    # 2s (a scan of 0.12-0.41s and a stub search of 1.3-1.5s). Behind hsb, beaconeye and aether - which samples three
+    # times - it reached neither and skipped with "the process is gone". It reads only, so among the read-only
+    # scanners its place is free, and first is where it can still measure. Process Dump stays last: it writes files.
+    assert pipeline == ["syscalls", "hsb", "aether", "processdump"]
     stored = tdc._beacon_results_cache.lookup("syscalls", 4812, SHA_SAMPLE)
     assert stored["tool"] == "Syscalls" and stored["evidence"]["score"] > 0
-    assert [t for t, *_ in target.history] == ["Aether", "Syscalls", "Process Dump"]
-    assert target.history[1][1] == "PID 4812"
+    assert [t for t, *_ in target.history] == ["Syscalls", "Aether", "Process Dump"]
+    assert target.history[0][1] == "PID 4812"
 
 
 def test_the_stage_is_given_the_path_of_the_sample(tdc, pipeline, monkeypatch):
@@ -4918,13 +4922,17 @@ def _submit(client, tdc, monkeypatch, installed=(), pid=4812, agent_path="C:\\Us
                        content_type="multipart/form-data")
 
 
-def test_submit_starts_the_stage_with_the_sample_it_ran(client, tdc, fake_baseline_dir, monkeypatch):
+def test_submit_starts_the_stage_with_the_sample_it_ran(client, tdc, fake_baseline_dir, monkeypatch, tmp_path):
+    # the path has to exist: _sample_path_for drops one it cannot read, and on the chamber the web UI runs on the
+    # same machine the agent wrote to. This suite does not, so the agent's path is a real file here.
+    sample = tmp_path / "a.exe"
+    sample.write_bytes(b"MZ")
     seen = []
     monkeypatch.setattr(tdc, "_run_memory_scans_async", lambda *a: seen.append(a))
-    r = _submit(client, tdc, monkeypatch)
+    r = _submit(client, tdc, monkeypatch, agent_path=str(sample))
     body = r.get_json()
     assert r.status_code == 200 and body["beacon_scan"] == {"triggered": True, "tools": ["Syscalls"]}
-    assert seen == [(4812, hashlib.sha256(b"MZ").hexdigest(), "C:\\Users\\Public\\Downloads\\a.exe")]
+    assert seen == [(4812, hashlib.sha256(b"MZ").hexdigest(), str(sample))]
 
 
 def test_submit_names_the_stage_after_the_tools_it_runs_with(client, tdc, fake_baseline_dir, monkeypatch, tmp_path):
@@ -5324,3 +5332,40 @@ def test_the_sweep_alone_with_the_syscall_scan_unasked_has_no_tool(client, tdc, 
     monkeypatch.setattr(tdc, "_sweep_state", {})
     r = client.post("/api/memory/sweep", json={})
     assert r.status_code == 400
+
+
+def test_the_stage_gets_the_sample_path_even_though_the_agent_reports_none(
+        client, tdc, fake_baseline_dir, monkeypatch, tmp_path):
+    """Measured on the chamber: the DetonatorAgent answers `{"pid": N, "status": "ok", "message": null}` and reports
+    no path at all, so `agent_file_path` was None and every detonation's stage read
+    `"file": {"skipped": "the path of the sample is not known"}`. The file search is the only half that can prove a
+    bypass - the process half cannot attribute private memory - so the proof never ran in a detonation.
+
+    `_record_submission` already solves this, 30 lines later in the same request: the running process's image, else
+    the agent's drop folder. The stage must get the same path. The old test for this passed only because its fake
+    agent reported a path the real one never does."""
+    sample = tmp_path / "a.exe"
+    sample.write_bytes(b"MZ")
+    monkeypatch.setattr(tdc, "SAMPLE_DROP_DIR", str(tmp_path))
+    monkeypatch.setattr(tdc, "_image_path_for_pid", lambda pid: "")        # the process is already gone
+    seen = []
+    monkeypatch.setattr(tdc, "_run_memory_scans_async", lambda *a: seen.append(a))
+    r = _submit(client, tdc, monkeypatch, agent_path=None)
+    assert r.status_code == 200
+    assert seen and seen[0][2] == str(sample), \
+        "the stage was started without the sample it ran: its file search can never prove a bypass"
+
+
+def test_the_stage_prefers_the_running_image_over_the_drop_folder(
+        client, tdc, fake_baseline_dir, monkeypatch, tmp_path):
+    """The order `_record_submission` uses, and for its reason: the process knows where it was run from, the drop
+    folder is only where the agent usually writes. A sample run from somewhere else is still searched."""
+    elsewhere = tmp_path / "elsewhere.exe"
+    elsewhere.write_bytes(b"MZ")
+    (tmp_path / "a.exe").write_bytes(b"MZ")
+    monkeypatch.setattr(tdc, "SAMPLE_DROP_DIR", str(tmp_path))
+    monkeypatch.setattr(tdc, "_image_path_for_pid", lambda pid: str(elsewhere))
+    seen = []
+    monkeypatch.setattr(tdc, "_run_memory_scans_async", lambda *a: seen.append(a))
+    _submit(client, tdc, monkeypatch, agent_path=None)
+    assert seen and seen[0][2] == str(elsewhere)
