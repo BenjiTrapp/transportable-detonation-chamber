@@ -19,6 +19,8 @@ Regressions covered:
   * without dpkt, PyYAML or cryptography (a deploy to an existing VM runs no
     pip) the whole web UI failed to import; now the capture routes are a 503
     naming the fix and everything else works (final review I3)
+  * ``flask>=3.0`` allowed a Flask whose ``request.max_content_length`` cannot
+    be set, so every import was a 500; the requirement is 3.1 (final review I4)
 """
 
 import base64
@@ -855,3 +857,22 @@ def test_without_the_network_packages_the_web_ui_still_runs(blocked, tmp_path):
     assert out["/api/network/reports"] == 200 and out["/api/network/baseline"] == 200
     assert out["/api/detonation/results?sha256=" + "a1" * 32] == 200
     assert out["/"] == 200
+
+
+def test_the_flask_the_requirements_allow_lets_a_request_set_its_own_limit():
+    """Regressions covered (final review I4): ``flask>=3.0`` allowed Flask 3.0,
+    where ``request.max_content_length`` is a read-only property (the setter
+    came with 3.1), and every import then answered 500."""
+    import re
+    from importlib.metadata import version
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, "webui", "requirements.txt")) as fh:
+        pins = dict(re.match(r"([A-Za-z0-9_-]+)\s*>=\s*([0-9.]+)", line).groups()
+                    for line in fh if line.strip() and not line.startswith("#"))
+    assert tuple(int(p) for p in pins["flask"].split(".")[:2]) >= (3, 1)
+    assert tuple(int(p) for p in version("flask").split(".")[:2]) >= (3, 1)
+    from flask import Flask, request
+    app = Flask("limit")
+    with app.test_request_context("/", method="POST"):
+        request.max_content_length = 10
+        assert request.max_content_length == 10
