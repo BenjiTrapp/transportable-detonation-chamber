@@ -37,6 +37,19 @@ Regressions covered:
     under the general length floor, so the scheme itself is evidence enough.
     A decoded credential is marked ``credential`` for the later tasks that
     mask at the serialization boundary: they can only mask what is marked
+  * ``credential`` was False for plainly credential-bearing text, the direction
+    that leaks: a password with a space, ``name=value`` and JSON pairs with a
+    ``password`` key, URL userinfo, a second line that was not credential-
+    shaped, a long password, and the line format of a browser-credential dump
+    (``Chrome|https://bank.com|bob|Passw0rd!``) all went unmarked. The marker
+    errs towards True: a false mark costs a reader one ``***``, a missed one
+    puts a password in a report for good
+  * a 12-character base64 value (``password``, ``root:toor``, ``hostname``) was
+    under the floor although it is 25 times less likely to fool the decoder
+    than the 10-character hex floor that is accepted
+  * a text that begins with ``MZ`` or ``GIF89a`` was reported as a PE or GIF
+    with its text dropped; those magics (and ``%PDF-``, ``Rar!``) count only
+    when the bytes are not readable text
   * an event with thousands of encoded values (a WebSocket stream, a huge form)
     made the walk unbounded; the number of values, the scanned size and the
     reported events are capped
@@ -176,6 +189,50 @@ def test_plain_url_encoding_of_a_sentence_is_not_a_finding():
 
 def test_text_without_letters_or_digits_is_not_a_finding():
     assert net_decode.decode("2d2d2d2d2d2d2d2d2d2d") is None      # twenty hyphens
+
+
+# --- the base64 floor -------------------------------------------------------
+
+@pytest.mark.parametrize("word", [b"password", b"root:toor", b"hostname", b"Administrator1", b"cmd /c dir"])
+def test_a_twelve_character_base64_value_is_decoded(word):
+    token = b64(word)
+    assert len(token) >= net_decode.MIN_BASE64 == 12
+    assert net_decode.decode(token).text == word.decode()
+
+
+def test_below_the_floor_base64_is_left_alone():
+    assert net_decode.decode(b64(b"whoami")) is None      # 8 characters
+    assert net_decode.decode("aGVsbG8=") is None
+
+
+def test_twelve_character_random_base64_is_almost_never_read_as_text():
+    """Measured about 0.006 % by review (12 in 200000), 25 times below the hex floor."""
+    rng = random.Random(31)
+    hits = sum(1 for _ in range(30000)
+               if net_decode.decode(b64(bytes(rng.randrange(256) for _ in range(9)))))
+    assert hits / 30000 < 0.0005
+
+
+# --- readable text that starts like a file -------------------------------------
+
+@pytest.mark.parametrize("text", [
+    b"MZ-Berlin weekly report: all quiet this week, nothing to add for the board, see you Monday",
+    b"GIF89a is the image format we use in the report",
+    b"GIF87a and friends: a list of formats",
+    b"%PDF-1.4 is what the printer driver writes, see the manual",
+    b"Rar!\x1a\x07 is how the archive starts, as plain text",
+])
+def test_readable_text_that_starts_like_a_file_is_text(text):
+    for token in (b64(text), text.hex()):
+        d = net_decode.decode(token)
+        assert d.kind == "text" and d.text == text.decode()
+
+
+def test_a_real_file_is_still_a_file_not_text():
+    for kind in ("pe", "pdf", "png", "elf", "zip"):
+        assert net_decode.decode(b64(FILES[kind])).kind == kind
+    pe = b"MZ\x90\x00\x03\x00\x00\x00\x04\x00" + bytes(range(256)) * 2
+    assert net_decode.decode(b64(pe)).kind == "pe"
 
 
 # --- what is decoded ---------------------------------------------------------
@@ -657,7 +714,7 @@ def test_request_and_response_headers_of_a_real_exchange_are_both_read():
     assert [(d["field"], d["text"], d["credential"]) for d in out] == [
         ("headers.authorization", "user:pass", True),
         ("headers.cookie", "user=bob;role=admin;exp=999", False),
-        ("resp_headers.x-token", "issued-to=bob;scope=all;n=7", False)]
+        ("resp_headers.x-token", "issued-to=bob;scope=all;n=7", True)]
 
 
 def test_an_ordinary_real_exchange_decodes_nothing():
@@ -690,23 +747,90 @@ def test_ordinary_request_headers_give_nothing():
     assert net_decode.decode_event_fields(http(headers=headers)) == []
 
 
+def marked(text, **event):
+    """``credential`` of the first thing found in a body field holding ``text``."""
+    out = net_decode.decode_event_fields(http(body_text="d=" + b64(text), **event))
+    assert out and out[0]["text"] == text.decode()
+    return out[0]["credential"]
+
+
 def test_a_decoded_user_password_pair_is_marked_wherever_it_was_found():
-    body = net_decode.decode_event_fields(http(body_text="d=" + b64(b"admin:hunter2-secret")))
-    assert body[0]["credential"] is True
-    lines = net_decode.decode_event_fields(http(body_text="d=" + b64(b"a@b.example:pw1\nbob:letmein99")))
-    assert lines[0]["credential"] is True
+    assert marked(b"admin:hunter2-secret") is True
+    assert marked(b"a@b.example:pw1\nbob:letmein99") is True
     cookie = net_decode.decode_event_fields(http(headers={"cookie": "auth=" + b64(b"admin:hunter2-secret")}))
     assert cookie[0]["credential"] is True
 
 
 @pytest.mark.parametrize("text", [
-    b"192.168.1.5:4444", b"C:\\Users\\bob\\AppData\\x.exe", b"http://evil.top/gate.php?id=7",
-    b"stolen credentials: admin / hunter2", b"user=bob&pass=hunter2&host=PC01",
-    b"first line\nsecond:line", b"hostname: PC01",
+    b"login=bob&password=hunter2&x=1",
+    b"Chrome|https://bank.com|bob|Passw0rd!",
+    b"https://bob:hunter2@evil.top/",
+    b"admin:correct horse battery",
+    b"John Smith:pw12345",
+    b"admin:hunter2\nnote: x",
+    b"bob:" + b"p" * 130,
+    b"pass: hunter2 user: bob",
+    b"stolen credentials: admin / hunter2",
+    b"user=bob&pass=hunter2&host=PC01",
+    b"first line\nsecond:line",
+    b"hostname: PC01",
+    b"ftp://bob:s3cret!@files.evil.top/in",
+    b'{"user":"bob","password":"hunter2 and more"}',
+    b"{'username': 'bob', 'Passwd': 'x'}",
+    b"api_key=0123456789abcdef&v=1",
+    b"client_secret: abcdefghij",
+    b"X-Auth-Token: abcdefghij",
 ])
-def test_text_that_is_not_a_credential_pair_is_not_marked(text):
-    out = net_decode.decode_event_fields(http(body_text="d=" + b64(text)))
-    assert out and out[0]["credential"] is False
+def test_credential_bearing_text_is_marked(text):
+    assert marked(text) is True
+
+
+@pytest.mark.parametrize("text", [
+    b"Chrome|https://bank.com|bob|Passw0rd!\nEdge|https://mail.example|alice|pw",
+    b"https://bank.com\tbob\tPassw0rd!",
+    b"https://bank.com;bob;Passw0rd!",
+    b"name,url,username,password\nbank,https://bank.com,bob,Passw0rd!",
+    b"URL: https://bank.com\nUSER: bob\nPASS: hunter2",
+    b"Firefox,www.bank.com,bob,Passw0rd!",
+    b"android://abc@com.bank.app|bob|Passw0rd!",
+])
+def test_the_lines_of_a_browser_credential_dump_are_marked(text):
+    assert marked(text) is True
+
+
+def test_a_name_that_says_secret_marks_what_it_holds():
+    plain = b"correct horse battery staple"
+    assert marked(plain) is False
+    for name in ("password", "pwd", "client_secret", "access_token", "apikey", "auth", "cred", "PassPhrase"):
+        out = net_decode.decode_event_fields(http(body_text="%s=%s" % (name, b64(plain))))
+        assert out[0]["credential"] is True, name
+    out = net_decode.decode_event_fields(http(headers={"x-api-key": b64(plain)}))
+    assert out[0]["credential"] is True
+    out = net_decode.decode_event_fields(http(headers={"cookie": "sessiontoken=" + b64(plain)}))
+    assert out[0]["credential"] is True
+    out = net_decode.decode_event_fields(http(body_text="note=" + b64(plain)))
+    assert out[0]["credential"] is False
+
+
+@pytest.mark.parametrize("text", [
+    b"192.168.1.5:4444", b"C:\\Users\\bob\\AppData\\x.exe", b"http://evil.top/gate.php?id=7",
+    b"http://evil.top:8080/gate.php?id=7 and more text",
+    b"12:30:45 the nightly backup finished",
+    b"id,name\n1,bob\n2,alice", b'{"id":4,"ok":true,"name":"abcdefgh","count":12}',
+    b"the quick brown fox jumps over the lazy dog",
+    b"https://bank.com|bob", b"os=Windows 10;host=PC01;av=none",
+])
+def test_text_that_is_not_credential_shaped_is_not_marked(text):
+    assert marked(text) is False
+
+
+def test_marking_stays_linear_on_hostile_text():
+    started = time.time()
+    for text in (b":" * 60000, b"a:" * 30000, b"pass" * 15000, b"pass" + b" " * 60000 + b"x",
+                 b"x://" * 15000, b"\n".join([b"a|b|c|https://x.y"] * 3000),
+                 b"https://" + b"a:" * 20000 + b"@"):
+        net_decode.decode_event_fields(http(body_text="d=" + b64(text)))
+    assert time.time() - started < 5
 
 
 def test_credential_is_always_present_and_a_plain_bool():

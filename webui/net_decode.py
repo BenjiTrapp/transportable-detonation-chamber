@@ -67,7 +67,7 @@ PREVIEW_BYTES = 32              # bytes of a binary result shown in an event
 ENCODED_SHOWN = 80              # characters of the encoded value shown in an event
 
 MIN_BASIC = 4       # one base64 quantum: "a:b". Only for a Basic credential, see _decode_basic
-MIN_BASE64 = 16     # 12 bytes: random bytes pass the text test about once in 10^5
+MIN_BASE64 = 12     # 9 bytes; random ones read as text about 0.006 % (8 chars: 0.14 %, too loose)
 MIN_HEX = 10        # 5 bytes, the shortest word worth reading ("hello")
 MIN_URL_ESCAPES = 2     # one escape is a space or a quote; two is a pattern
 MIN_URL_SHARE = 0.5     # share of the value that is escapes; prose and URLs stay below
@@ -96,6 +96,10 @@ _SIGNATURES = (
     ("gif", b"GIF87a", 10), ("gif", b"GIF89a", 10),
     ("sqlite", b"SQLite format 3\x00", 16),
 )
+# Kinds whose magic is printable ASCII: ``MZ-Berlin weekly report`` and
+# ``GIF89a is the format`` start the same way. They count as files only when the
+# bytes are not readable text; a real PE, GIF or RAR never is.
+_PRINTABLE_MAGIC = frozenset(("pe", "pdf", "gif", "rar"))
 
 _HEX = re.compile(rb"[0-9A-Fa-f]+")
 _B64 = re.compile(rb"[A-Za-z0-9+/]*")
@@ -107,9 +111,18 @@ _JSON_PAIR = re.compile(r'"([^"\\\n]{1,64})"\s*:\s*"((?:[^"\\]|\\.)*)"')
 _BLANK_LINE = re.compile(r"\r?\n\r?\n")
 _PART_NAME = re.compile(r'name="([^"]{0,128})"')
 _AUTH_VALUE = re.compile(r"([A-Za-z][A-Za-z0-9_-]*)[ \t]+(\S+)")
-_CREDENTIAL = re.compile(r"[^\s:]{1,64}:\S{1,128}")
 _CREDENTIAL_HEADERS = ("headers.authorization", "headers.proxy-authorization")
-MAX_CREDENTIAL_LINES = 50   # lines of a decoded text checked for the user:password shape
+MAX_CREDENTIAL_LINES = 200  # lines of a decoded text checked for credential shapes
+MAX_CREDENTIAL_CHARS = 64 * 1024    # characters of a decoded text checked
+_SECRET_NAME = re.compile(r"pass|pwd|secret|token|key|auth|cred", re.I)
+_SECRET_PAIR = re.compile(
+    r"(?:pass|pwd|secret|token|key|auth|cred)[A-Za-z0-9_.-]{0,32}[\"']?[ \t]*[=:][ \t]*[\"']?\S", re.I)
+_URL_SCHEME = r"[A-Za-z][A-Za-z0-9+.-]{0,20}://"
+_URL_USERINFO = re.compile(_URL_SCHEME + r"[^/\s:@]{1,64}:[^/\s@]{1,128}@")
+_URL_TOKEN = re.compile(_URL_SCHEME + r"\S*")
+_COLON_PAIR = re.compile(r"([^\s:]{1,64}):[ \t]*(\S{0,8})")
+_URL_FIELD = re.compile("(?:" + _URL_SCHEME + r"|www\.)\S+")
+_RECORD_DELIMITERS = ("|", "\t", ";", ",")
 _BOM8 = b"\xef\xbb\xbf"
 _PLAIN_PUNCTUATION = " \t\r\n_-.:/\\@=&,;|"
 _ONE_SCRIPT = {"HIRAGANA": "CJK", "KATAKANA": "CJK", "BOPOMOFO": "CJK",
@@ -252,11 +265,13 @@ def _read_text(raw, cut):
 
 def _verdict(raw, work):
     kind = _sniff(raw)
-    if kind:
+    if kind and kind not in _PRINTABLE_MAGIC:
         return _Verdict(kind, None, None, True, kind == "gzip")
     read = _read_text(raw, work.truncated)
     if read is not None:
         return _Verdict("text", read[0], read[1], True, True)
+    if kind:
+        return _Verdict(kind, None, None, True, False)
     return _Verdict("", None, None, False, _is_zlib(raw))
 
 
@@ -585,33 +600,77 @@ def _decode_header(text, work):
     return found
 
 
-def _is_credential(field, decoded):
-    """Is a decoded value a credential: it came from an ``Authorization``
-    header, or it reads ``user:password`` (every line of it, if several).
+def _is_credential(field, name, decoded):
+    """Is a decoded value (or might it be) a credential?
 
-    Over-marking is the safe error, because the marker exists so that a later
-    layer can mask what it names: ``hostname:PC01`` is marked, a path, a URL or
-    ``address:port`` is not.
+    True when any of these holds:
+      * it came from an ``Authorization`` or ``Proxy-Authorization`` header;
+      * the name it was found under (form key, cookie, header) says secret:
+        ``pass``, ``pwd``, ``secret``, ``token``, ``key``, ``auth`` or ``cred``;
+      * any line of the text has ``name:value`` shape, the value running to the
+        end of the line (spaces allowed), or ``name=value`` / a JSON pair whose
+        key says secret, or URL userinfo (``scheme://user:pw@host``);
+      * any line is a delimited record (``|``, tab, ``;``, ``,``) with a URL
+        field and at least two other fields: the line format of a browser
+        credential dump, ``Chrome|https://bank.com|bob|Passw0rd!``.
+
+    **This errs towards True, on purpose.** The flag exists so that a later
+    layer can mask what it names: a false mark costs a reader one ``***``, a
+    missed mark leaves a password in a report for good. So ``hostname: PC01``
+    and ``stolen credentials: admin / hunter2`` are marked as well. What is
+    left unmarked is text with no such shape: ``address:port``, a drive path, a
+    URL without userinfo, a clock time, JSON without a secret key, prose.
     """
     if field in _CREDENTIAL_HEADERS:
         return True
-    lines = [line for line in (decoded.text or "").splitlines() if line.strip()]
-    if not lines or len(lines) > MAX_CREDENTIAL_LINES:
-        return False
-    return all(_credential_line(line) for line in lines)
-
-
-def _credential_line(line):
-    if not _CREDENTIAL.fullmatch(line):
-        return False
-    user, _colon, password = line.partition(":")
-    if password.startswith(("//", "\\", "/")) or (len(user) == 1 and user.isalpha()):
-        return False
-    try:
-        ipaddress.ip_address(user)
-    except ValueError:
+    header = field.partition(".")[2] if field.startswith(("headers.", "resp_headers.")) else ""
+    if _SECRET_NAME.search(name) or _SECRET_NAME.search(header):
         return True
-    return not password.isdigit()
+    text = (decoded.text or "")[:MAX_CREDENTIAL_CHARS]
+    if _SECRET_PAIR.search(text) or _URL_USERINFO.search(text):
+        return True
+    for line in text.splitlines()[:MAX_CREDENTIAL_LINES]:
+        if _colon_pair(line) or _credential_record(line):
+            return True
+    return False
+
+
+def _colon_pair(line):
+    """Does a line hold ``name:value`` with something after the colon?
+
+    URLs are cut out first (their colons are not pairs; userinfo is looked for
+    separately), as are drive letters, ``ip:port`` and clock times.
+    """
+    for match in _COLON_PAIR.finditer(_URL_TOKEN.sub(" ", line)):
+        left, head = match.groups()
+        if not head or not (left[-1].isalnum() or left[-1] in "._-@!$#"):
+            continue
+        if head.startswith(("\\", "/")) and len(left) == 1:
+            continue
+        if left.isdigit() and len(left) <= 2 and head[:2].isdigit():
+            continue
+        if head.isdigit() and len(head) <= 5:
+            try:
+                ipaddress.ip_address(left)
+                continue
+            except ValueError:
+                pass
+        return True
+    return False
+
+
+def _credential_record(line):
+    """A delimited line with a URL field and at least two other fields."""
+    if "://" not in line and "www." not in line:
+        return False
+    for delimiter in _RECORD_DELIMITERS:
+        fields = [field.strip() for field in line.split(delimiter)]
+        if len(fields) < 3:
+            continue
+        urls = [field for field in fields if _URL_FIELD.fullmatch(field)]
+        if urls and sum(1 for field in fields if field) - len(urls) >= 2:
+            return True
+    return False
 
 
 def _field_text(value):
@@ -659,7 +718,7 @@ def _decoded_event(source, field, name, value, decoded):
         text_capped=text is not None and len(text) > MAX_EVENT_TEXT,
         size=len(decoded.bytes), sha256=hashlib.sha256(decoded.bytes).hexdigest(),
         preview=render_bytes(decoded.bytes[:PREVIEW_BYTES]) if text is None else "",
-        credential=_is_credential(field, decoded),
+        credential=_is_credential(field, name, decoded),
         encoded=value[:ENCODED_SHOWN], encoded_len=len(value), truncated=decoded.truncated)
 
 
