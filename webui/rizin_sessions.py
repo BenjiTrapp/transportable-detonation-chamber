@@ -2644,7 +2644,8 @@ class RizinSession:
         (measured). ``mine`` is this session's own patch, row by row, as against what an emulation run
         or the console wrote into the same cache -- also where that write lies inside a range this
         session patched. ``over_run`` is a ``mine`` row set over bytes such a foreign write changed
-        before it: rizin's ``before`` is then the run's byte and not the file's, so the pane marks the
+        before it: rizin's ``before`` is then the run's byte, which need not be the file's (a run may have
+        written the file's own byte back), so the pane marks the
         row and the export reads the file itself (see rizin_emulation.patch_rows). rizin's own ``idx``
         and ``written`` are left out: the index changes with every removal, and nothing here ever
         commits the cache, so ``written`` is always false.

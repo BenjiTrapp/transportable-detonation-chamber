@@ -9759,9 +9759,14 @@ table[data-sortable] > thead > tr > th:focus-visible {
    edge, the current line's solid bar. DECOMPILER's gutter (.rizin-dec-gutter, before the C of a line with an
    address) is this same cell, so it shares each rule.
    The hit area is 10px + 2ch (~24px): left of the glyph's room it takes the row's own 10px of padding (a click there
-   jumped), and the ○ stays where it was. box-sizing is content-box because the global border-box would let the padding
-   eat the 2ch the glyph is centred in; the negative margin gives back what the padding took, so the margin box is
-   still 2ch and the ≠ cell and the C start where they did. The 10px is the left padding of .rizin-op and .rizin-dec-line. */
+   jumped), and the glyph stays where it was, centred (text-align) in the 2ch. box-sizing is content-box because the
+   global border-box would take the padding out of the width: the whole cell would collapse to 2ch, its room to 4.4px
+   (the ○ ~3.6px left of its column), and the margin box (-10px + that) would pull the ≠ cell and the C 10px left. With
+   content-box the content is still 2ch and where it was, and the negative margin gives back what the padding took, so
+   the margin box is 2ch and what follows starts where it did. The 10px is the left padding of .rizin-op and
+   .rizin-dec-line (a test keeps the three equal).
+   The cell is user-select: none and now covers the row's first 10px, so a drag that begins there selects nothing
+   (the row's first 10px was a place to begin a selection); a click there toggles instead of jumping. */
 .rizin-gutter,
 .rizin-dec-gutter {
     display: inline-block;
@@ -10608,7 +10613,7 @@ table[data-sortable] > thead > tr > th:focus-visible {
 .rizin-emu-urgent::before {
     content: "⚠ ";
 }
-/* A patch set over bytes a run changed: its "before" is the run's byte, not the file's */
+/* A patch set over bytes a run wrote: its "before" is the run's byte, which need not be the file's */
 .rizin-emu-over-mark {
     margin-right: 3px;
     font-weight: 600;

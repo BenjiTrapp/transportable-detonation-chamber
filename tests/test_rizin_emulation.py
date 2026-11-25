@@ -283,7 +283,7 @@ def test_patch_rows_mark_only_what_this_session_wrote():
 
 
 def test_patch_rows_mark_a_patch_set_over_bytes_a_run_wrote():
-    """R72. rizin's ``before`` for such a row is the run's byte, not the file's -- measured on rizin
+    """R72. rizin's ``before`` for such a row is the run's byte, which need not be the file's -- measured on rizin
     0.9.1: a file holding 73317331, a run's ``wx 41 @ 1`` and then ``wx 90 @ 1`` gave a second row with
     ``before: "41"`` while the file still had ``31``, and ``p8`` showed 73907331. The pane marks the row
     and the export reads the file, so the mark has to be on the row and nowhere else."""

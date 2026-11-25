@@ -212,7 +212,7 @@ that rizin itself does not tell apart (it has one cache):
 
 - **SET BY HAND** is what the menu wrote, kept with the project and the only
   thing an export takes; each row has a ✕ that takes that write back. A row
-  set over bytes a run changed carries a ⚠: rizin's "before" for it is the
+  set over bytes a run wrote carries a ⚠: rizin's "before" for it is the
   run's byte, which need not be the file's, the group says so, and the export's note
   names the row with what the file really holds there. Taking such a row back
   drops the run's whole write with it -- rizin removes a write whole -- and
@@ -336,10 +336,10 @@ path, the SHA-256 of the original and of the copy, the time in UTC and one line
 per patch (address, offset in the file, the file's own bytes there → the copy's).
 Those bytes are read from the original, not from rizin's cache: where a patch
 was set over a write the cache already held (a run's, or an earlier patch of
-yours at the same address), rizin reports as "before" that write's byte, and
+yours that covers it), rizin reports as "before" that write's byte, and
 the note would otherwise say the file held it. Every such patch is named in a
 block of its own, with both bytes (the same where a run wrote the file's own
-byte back), because the copy carries the file's own bytes everywhere else --
+byte back), and says whether a run wrote there first, because the copy carries the file's own bytes everywhere else --
 so the patch sits in bytes as they are on disk, still encrypted where a run
 had decrypted them. The copy is
 built in Python, not by rizin: the original is copied and each patch is written

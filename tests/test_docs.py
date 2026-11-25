@@ -1461,7 +1461,7 @@ def test_the_help_and_the_guide_say_the_same_where_they_say_it_twice():
         "esil.timeout",
         "no watchpoint",
         "ignore esil.timeout",                                        # R74: the three unbounded ESIL commands
-        "over bytes a run changed",                                   # R72: a hand patch over run-written bytes
+        "set over bytes a run wrote carries a ⚠",                     # R72: a hand patch over run-written bytes
         "on the lowest address of the line",                          # the gutter of DECOMPILER: where a click sets one
         "belongs to several lines of C marks all of them",            # and that each of those lines shows it
         "To stop at a call in the middle of a line, set the breakpoint in DISASSEMBLY",   # the one cost of that: where to go

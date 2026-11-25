@@ -5962,7 +5962,7 @@ def _rizin_export_note(session, original_sha, copy_name, copy_sha, placed, skipp
     """The note beside the copy. ``placed`` is [(row, file offset, the **original's** bytes there, hex)].
 
     A row's ``before`` is rizin's: what stood at the address when the patch was written, which is a
-    **run's** byte where the patch went over bytes an emulation run had changed (measured on rizin
+    **run's** byte where the patch went over bytes an emulation run had written (measured on rizin
     0.9.1: a file holding 73317331, a run's `wx 41 @ 1` and then a patch `wx 90 @ 1` give a second row
     with `before: "41"`, and the copy came out 73907331 against an original 73317331). The note is
     about the copy on disk, so the bytes it shows as replaced are the file's own -- and every row where
@@ -5976,9 +5976,12 @@ def _rizin_export_note(session, original_sha, copy_name, copy_sha, placed, skipp
 
     What the three ways into the block have in common is the one thing the predicate tests: rizin's write
     cache already held a write at that address when the patch was made -- a run's (or the console's) byte
-    that is not the file's, an **earlier hand patch** at the same address (no run involved), or a run's
-    write of the file's own byte back (the bytes replaced then *are* the file's). The header says that
-    and no more.
+    that is not the file's, an **earlier hand patch** that covers the address (no run involved: the same
+    address, or one inside a longer patch -- measured: ``wx 90909090 @ 1`` then ``wx ab @ 3`` gives a row
+    at 3 with ``before: "90"``), or a run's write of the file's own byte back (the bytes replaced then
+    *are* the file's). The header says that and no more; each row's own line says which of the two it is
+    as far as the session knows (``over_run``): a run wrote there first -- the copy then holds the patch in
+    bytes still as they are on disk -- or no run is known to have, which is an earlier patch of yours.
     """
     over = [(row, paddr, was) for row, paddr, was in placed
             if was != row["before"].lower() or row.get("over_run")]
@@ -5998,12 +6001,14 @@ def _rizin_export_note(session, original_sha, copy_name, copy_sha, placed, skipp
               for row, paddr, was in placed]
     if over:
         lines += ["", f"rizin's write cache already held a write at the address of these patches when they were made ({len(over)}):",
-                  "a write by an emulation run (or the console), or an earlier patch of yours at the same address. Each",
+                  "a write by an emulation run (or the console), or an earlier patch of yours that covers it. Each",
                   "line gives what rizin says the patch replaced and what the file holds there; the two are the same",
                   "where that write was the file's own byte. The copy has the file's own bytes everywhere else, so such",
                   "a patch sits in bytes as they are on disk -- still encrypted, where a run had decrypted them:"]
         lines += [f"  {row['addr']:#x}  file {paddr:#x}  the patch replaced {_rizin_note_bytes(row['before'])}; "
-                  f"in the file they are {_rizin_note_bytes(was)}" for row, paddr, was in over]
+                  f"in the file they are {_rizin_note_bytes(was)}; "
+                  + ("a run wrote there first" if row.get("over_run") else "no run is known to have written there")
+                  for row, paddr, was in over]
     if skipped:
         lines += ["", f"Patches that could not be placed in the file, so the copy does not have them ({len(skipped)}):",
                   "(there is no byte of the file at such an address: memory the emulation created, a section's "

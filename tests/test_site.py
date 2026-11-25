@@ -2572,7 +2572,10 @@ def test_the_index_is_fetched_not_inlined(real_site):
         html = real_site.read(rel)
         assert '"records"' not in html, rel
         assert middle not in html, rel
-        assert len(html) < 100000, "%s is %d bytes" % (rel, len(html))
+        assert len(html) < 100000, (
+            "%s is %d characters (len of the decoded page, not bytes) and the cap is 100000: a page carries the whole "
+            "text of its docs, and docs/api.md's one-row-per-route table is the one that grows -- shorten the row you "
+            "just wrote (the /export, /patches and /restore rows are long) rather than raise the cap" % (rel, len(html)))
     js = real_site.read(site.SITE_SCRIPT)
     assert site.SITE_SEARCH in js, "assets/site.js does not name the index"
     assert "fetch(" in js, "assets/site.js does not fetch anything"

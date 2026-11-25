@@ -6876,7 +6876,8 @@ def test_export_does_not_write_what_a_run_wrote(rz):
     file_byte = EXPORT_SAMPLE[0x840:0x841].hex()
     assert [l for l in result["note"].splitlines() if l.startswith("  0x")] == [
         f"  0x140001440  file 0x840  {file_byte} -> 90",
-        f"  0x140001440  file 0x840  the patch replaced 00; in the file they are {file_byte}"], \
+        f"  0x140001440  file 0x840  the patch replaced 00; in the file they are {file_byte}; "
+        "no run is known to have written there"], \
         "one patch line, for the one patch and none for the run's row, and the row named once"
 
 
@@ -6997,14 +6998,16 @@ def test_the_note_names_a_row_the_mirror_says_was_over_a_runs_bytes(tdc):
     note = tdc._rizin_export_note(session, "a" * 64, "copy.exe", "b" * 64, [(row, 0x401, "31")], [])
     assert "  0x140001001  file 0x401  31 -> 90" in note
     assert "rizin's write cache already held a write at the address of these patches when they were made (1)" in note, note
-    assert "the patch replaced 31; in the file they are 31" in note, note
+    assert "the patch replaced 31; in the file they are 31; a run wrote there first" in note, note
     # the run wrote the file's own byte back, so the bytes replaced *are* the file's: the header says nothing else
     assert "not the file's" not in note, note
     # an earlier hand patch at the same address (no mark: no run was involved) is named too, for the same reason
     second = dict(row, over_run=False, before="91")
     note_b = tdc._rizin_export_note(session, "a" * 64, "copy.exe", "b" * 64, [(second, 0x401, "31")], [])
     assert "write cache already held a write at the address of these patches when they were made (1)" in note_b, note_b
-    assert "an earlier patch of yours" in note_b and "the patch replaced 91; in the file they are 31" in note_b, note_b
+    assert "an earlier patch of yours that covers it" in note_b, note_b
+    assert "the patch replaced 91; in the file they are 31; no run is known to have written there" in note_b, note_b
+    assert "a run wrote there first" not in note_b, note_b
     # the same row without the mark and with the same bytes is not named
     plain = tdc._rizin_export_note(session, "a" * 64, "copy.exe", "b" * 64,
                                    [(dict(row, over_run=False), 0x401, "31")], [])
@@ -7232,7 +7235,10 @@ def test_real_rizin_the_note_header_is_true_in_all_three_cases_that_name_a_row(t
     a. a run wrote a byte other than the file's, then the patch went over it;
     b. an **earlier hand patch** at the same address, no run involved (the pane shows no mark for it);
     c. a run wrote the file's **own** byte back, then the patch went over it -- the bytes replaced *are*
-       the file's, so a header saying they are not would be false.
+       the file's, so a header saying they are not would be false;
+    d. an earlier hand patch that only **covers** the address (a 4-byte patch, then one byte inside it): rizin
+       reports its byte as ``before`` (measured: ``90`` against the file's own byte), and the earlier patch is
+       at another address, so "an earlier patch at the same address" would be false of it.
     """
     import rizin_sessions
 
@@ -7254,7 +7260,7 @@ def test_real_rizin_the_note_header_is_true_in_all_three_cases_that_name_a_row(t
         session = mgr.get(sid)
         main = next(f for f in api.read(f"/api/rizin/{sid}/functions") if f["name"] == "sym.main")["offset"]
         paddr = api.read(f"/api/rizin/{sid}/hex?addr={main}&len=1")["paddr"]
-        a_at, b_at, c_at = main, main + 1, main + 2
+        a_at, b_at, c_at, d_at = main, main + 1, main + 2, main + 6
         api.send(f"/api/rizin/{sid}/emulation/start", {"addr": main})
         session.text(f"wx {original[paddr] ^ 0xFF:02x} @ {a_at:#x}")       # a: a run's byte, not the file's
         api.send(f"/api/rizin/{sid}/patch", {"addr": a_at, "bytes": "90"})
@@ -7262,6 +7268,8 @@ def test_real_rizin_the_note_header_is_true_in_all_three_cases_that_name_a_row(t
         api.send(f"/api/rizin/{sid}/patch", {"addr": b_at, "bytes": "92"})   # ... and a second thought
         session.text(f"wx {original[paddr + 2]:02x} @ {c_at:#x}")           # c: the run writes the file's own byte
         api.send(f"/api/rizin/{sid}/patch", {"addr": c_at, "bytes": "93"})
+        api.send(f"/api/rizin/{sid}/patch", {"addr": main + 4, "bytes": "90909090"})   # d: a patch of four bytes ...
+        api.send(f"/api/rizin/{sid}/patch", {"addr": d_at, "bytes": "94"})              # ... and one byte inside it
 
         rows = api.read(f"/api/rizin/{sid}/patches")["patches"]
         mine = {r["addr"]: r for r in rows if r["mine"]}
@@ -7269,17 +7277,20 @@ def test_real_rizin_the_note_header_is_true_in_all_three_cases_that_name_a_row(t
         assert mine[b_at]["over_run"] is False, "case b: no run was involved, and the pane shows no mark"
         assert mine[c_at]["over_run"] is True and mine[c_at]["before"] == original[paddr + 2:paddr + 3].hex(), \
             "case c: the run's byte *is* the file's"
+        assert mine[d_at]["over_run"] is False and mine[d_at]["before"] == "90", "case d: the earlier patch's byte, no run"
+        assert mine[d_at]["before"] != original[paddr + 6:paddr + 7].hex()
 
         note = api.send(f"/api/rizin/{sid}/export", {})["note"]
         assert "not the file's" not in note, "case c's bytes are the file's: " + note
-        assert "rizin's write cache already held a write at the address of these patches when they were made (3)" in note, note
-        assert "a write by an emulation run (or the console), or an earlier patch of yours at the same address" in note, \
+        assert "rizin's write cache already held a write at the address of these patches when they were made (4)" in note, note
+        assert "a write by an emulation run (or the console), or an earlier patch of yours that covers it" in note, \
             "the header names both writers it can be (the note's first line mentions a run too, so the whole phrase is pinned): " + note
         was = lambda at: original[paddr + at - main:paddr + at - main + 1].hex()
-        for at in (a_at, b_at, c_at):
+        for at in (a_at, b_at, c_at, d_at):
             replaced = next(r for r in mine.values() if r["addr"] == at)["before"]
+            cause = "a run wrote there first" if mine[at]["over_run"] else "no run is known to have written there"
             assert f"  {at:#x}  file {paddr + at - main:#x}  the patch replaced {replaced}; " \
-                   f"in the file they are {was(at)}" in note, note
+                   f"in the file they are {was(at)}; {cause}" in note, note
         assert mine[c_at]["before"] == was(c_at), "case c's own line says the two are the same"
     finally:
         mgr.shutdown()

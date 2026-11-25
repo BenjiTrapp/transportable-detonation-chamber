@@ -380,10 +380,11 @@ def patch_rows(rows, mine, ordered=False):
 
     ``over_run`` marks a ``mine`` row that lies over bytes a **foreign** row written before it changed --
     a patch set by hand into code an emulation run decrypted, which is what this tab invites. It matters
-    because rizin's ``before`` for such a row is what the run wrote, **not** what the file holds
-    (measured: a run's ``wx 41 @ a`` and then a patch ``wx 90 @ a`` give a second row with
-    ``before: "41"`` while the file still has ``31``), so the export has to read the file itself and name
-    the row, and the pane has to mark it. It is false on every foreign row.
+    because rizin's ``before`` for such a row is what the run wrote, which need not be what the file
+    holds -- a run may have written the file's own byte back (measured: a run's ``wx 41 @ a`` and then a
+    patch ``wx 90 @ a`` give a second row with ``before: "41"`` while the file still has ``31``), so the
+    export has to read the file itself and name the row, and the pane has to mark it. It is false on
+    every foreign row.
     """
     places = {}
     for index, entry in enumerate(mine):
