@@ -370,9 +370,10 @@ def _collect(path, limits=None):
 # --- the report: masking ------------------------------------------------------------------------
 
 _SCRUBBED_TEXT = ("query", "url", "body_text", "resp_text")
-# Header values masked whole: the credential headers, the cookies, and any
-# header whose name says secret (X-Api-Key, X-Auth-Token...), as the decoder's
-# credential flag reads names.
+# Header values masked whole: the credential headers, the cookies, any header
+# whose name says secret (X-Api-Key, X-Auth-Token...), as the decoder's
+# credential flag reads names, and any that carries a session (X-Session,
+# Session-Id, X-SID).
 _SECRET_HEADERS = frozenset(("authorization", "proxy-authorization", "cookie", "set-cookie"))
 _HEADER_FIELDS = frozenset(("headers", "resp_headers"))
 # Fields of free text read line by line ("name: value" lines, dump records).
@@ -414,7 +415,8 @@ def _mask_header(name, value):
     lname = name.lower() if isinstance(name, str) else ""
     if lname == "host":
         return value            # a name, rendered like dest; nothing in it is a secret
-    if lname in _SECRET_HEADERS or net_decode.is_secret_name(lname):
+    if (lname in _SECRET_HEADERS or net_decode.is_secret_name(lname)
+            or net_decode.is_session_header(lname)):
         value = value.strip()
         if lname in ("authorization", "proxy-authorization") and " " in value:
             return value.split(None, 1)[0] + " ***"

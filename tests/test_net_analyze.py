@@ -57,6 +57,8 @@ Regressions covered:
     boundary; after a ``/`` a key counts with ``=`` only, so ``/key/stage.exe``
     and ``keys.top:8080/stage.exe`` stay whole
   * one parser that raised took the whole analysis down
+  * a session header (X-Session, Session-Id, X-SID), an XML login and a
+    percent-encoded form reached the report unmasked (final review M6, M7)
   * the baseline hid an upload to a spoofed known host: its key had no size
     and no address, so 200 KB with the OCSP Host header sent to the sample's
     own address was the clean machine's 600-byte OCSP POST; and
@@ -973,6 +975,29 @@ def test_no_credential_leaks_through_fragments_brackets_pipes_or_header_pairs(tm
     assert leaked == []
     http = [e for e in r["events"] if e["type"] == "http" and e["dest"] == "a.top"][0]
     assert http["resp_headers"]["location"] == "https://app.top/cb#id_token=***"
+
+
+def test_session_headers_xml_and_percent_encoded_credentials_do_not_leak(tmp_path):
+    """Regressions covered (final review M6, M7): an X-Session or Session-Id
+    value, an XML login and a percent-encoded form in a query reached the
+    report as they were; and a base64 value in a session header decoded to an
+    event that was not a credential."""
+    import base64 as b64mod
+    cap = Capture()
+    cap.web(5.0, "a.top", b"GET /s HTTP/1.1\r\nHost: a.top\r\nX-Session: Sess-1\r\n"
+            b"Session-Id: Sess-2\r\nX-SID: Sess-3\r\nX-Side: left\r\nSession-Data: "
+            + b64mod.b64encode(b"session secret Sess-4") + b"\r\n\r\n", _ok(b"x"))
+    cap.post(6.0, "b.top", "/x", b"<login><user>bob</user><pwd>Xml-5</pwd><password>Xml-6</password></login>",
+             "text/xml")
+    cap.get(7.0, "c.top", "/a?data=user%3Dbob%26password%3DPct-7%26go%3D1", b"x")
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    text = json.dumps(r)
+    leaked = [v for v in ("Sess-1", "Sess-2", "Sess-3", "Sess-4", "Xml-5", "Xml-6", "Pct-7")
+              if v in text]
+    assert leaked == []
+    http = [e for e in r["events"] if e["type"] == "http" and e["dest"] == "a.top"][0]
+    assert http["headers"]["x-session"] == "***" and http["headers"]["x-side"] == "left"
+    assert "bob" in text                     # only the secrets go
 
 
 def test_a_baseline_key_cannot_be_guessed_back_to_the_secret_it_held(tmp_path):

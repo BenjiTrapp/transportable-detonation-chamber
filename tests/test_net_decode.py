@@ -78,6 +78,11 @@ Regressions covered:
     looks only in the 64 characters before each colon, with the same matches
     (held against ``finditer`` on generated lines), and a pattern whose
     separator is not in the text is not run
+  * XML (``<pwd>S</pwd>``) and percent-encoded (``user%3Dx%26password%3DS``)
+    credentials were neither flagged nor masked; both are, with the same
+    patterns, so flag and mask agree (final review M6); a session header's
+    value (X-Session, Session-Id, X-SID) is masked and what is decoded from
+    it is a credential (final review M7)
   * wall-clock bounds of 5 and 10 s flaked under load; they are ten times
     wider (final review M3)
   * a masked value in a URL path ran past "/", so ``/dl;token=abc/stage.exe``
@@ -682,9 +687,13 @@ def test_a_bearer_token_is_read_segment_by_segment():
 
 def test_a_custom_header_name_is_read_too():
     out = net_decode.decode_event_fields(http(headers={
-        "X-Session": b64(b"host=PC01;user=bob;role=admin")}))
+        "X-Client": b64(b"host=PC01;user=bob;role=admin")}))
     assert [(d["field"], d["text"], d["credential"]) for d in out] == [
-        ("headers.x-session", "host=PC01;user=bob;role=admin", False)]
+        ("headers.x-client", "host=PC01;user=bob;role=admin", False)]
+    # a session header is read the same way, and what it holds is a credential (M7)
+    out = net_decode.decode_event_fields(http(headers={
+        "X-Session": b64(b"host=PC01;user=bob;role=admin")}))
+    assert [(d["field"], d["credential"]) for d in out] == [("headers.x-session", True)]
 
 
 def test_cookie_values_are_read_one_by_one():
@@ -1044,6 +1053,55 @@ def test_masking_agrees_with_the_credential_flag_for_every_key_and_boundary(sepa
                 if "Val-9" in net_decode.mask_credentials(text, lines=True):
                     missed.append(text)
     assert missed == []
+
+
+_XML_AND_PERCENT = ["<{k}>Val-9</{k}>", "<{k} type=\"x\">Val-9</{k}>", "<a><{k}>Val-9", "<{k}><value>Val-9</value></{k}>",
+                    "<{k}>\n  <v>Val-9</v>\n</{k}>", "{k}%3DVal-9", "user%3Dx%26{k}%3DVal-9%26go%3D1",
+                    "d=a%3D1%26{k}%3dVal-9"]
+
+
+@pytest.mark.parametrize("shape", _XML_AND_PERCENT)
+def test_xml_and_percent_encoded_credentials_are_flagged_and_masked(shape):
+    """Regressions covered (final review M6): ``<pwd>S</pwd>``, ``<password>...``,
+    ``password%3DS`` and ``user%3Dx%26password%3DS`` were neither flagged nor
+    masked. Both now, for every secret word, in a body and in any other field."""
+    missed = []
+    for key in _SECRET_KEYS:
+        if key.lower() in ("p", "pw") and "<" in shape:
+            continue                    # <p> is a paragraph; the long words only
+        text = shape.format(k=key)
+        if not net_decode._is_credential("body_text", "", _Text(text)):
+            missed.append(("flag", text))
+        for lines in (True, False):
+            if "Val-9" in net_decode.mask_credentials(text, lines=lines):
+                missed.append(("mask", lines, text))
+    assert missed == []
+
+
+def test_a_value_decoded_from_a_session_header_is_a_credential():
+    """Final review M7: a session header's value is masked whole, so what is
+    decoded from it is a credential too (the flag and the mask agree)."""
+    value = b64(b"session number 42 of bob")
+    for name, marked in (("x-session", True), ("session-id", True), ("x-sid", True),
+                         ("x-side", False), ("inside", False)):
+        out = net_decode.decode_event_fields(http(headers={name: value}))
+        assert [d["credential"] for d in out] == [marked], name
+        assert net_decode.is_session_header(name) is marked, name
+
+
+def test_a_paragraph_and_other_markup_are_not_credentials():
+    for text in ("<p>Hello</p>", "<b>bold</b><password/>x", "<a href=\"/x\">pw</a>", "100%25 sure"):
+        assert not net_decode._is_credential("body_text", "", _Text(text)), text
+        assert net_decode.mask_credentials(text) == text, text
+
+
+def test_xml_and_percent_masks_stay_linear_on_hostile_text():
+    for text in ("<password>" * 30000, "</password>" * 30000, "<password>" + "<a>" * 50000,
+                 "password%3D" * 20000, "%41" * 80000, "<password>" + (" " * 60 + "<a>") * 3000):
+        started = time.time()
+        net_decode.mask_credentials(text, lines=True)
+        net_decode._is_credential("body_text", "", _Text(text))
+        assert time.time() - started < 20, text[:20]      # quadratic is minutes
 
 
 @pytest.mark.parametrize("text,masked", [

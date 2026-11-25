@@ -113,6 +113,9 @@ MAX_CREDENTIAL_CHARS = 64 * 1024    # characters of a decoded text checked
 _SECRET_WORDS = r"(?:pass|pwd|secret|token|key|auth|cred)"
 _SHORT_WORDS = r"(?<![A-Za-z0-9])(?:pw|p)(?![A-Za-z0-9])"
 _SECRET_NAME = re.compile(_SECRET_WORDS + "|" + _SHORT_WORDS, re.I)
+# A header that carries a session: its value is a login as good as a password
+# (X-Session, Session-Id, X-SID); "sid" only as a whole word (not "x-side").
+_SESSION_HEADER = re.compile(r"session|(?<![A-Za-z0-9])sid(?![A-Za-z0-9])", re.I)
 _SECRET_PAIR = re.compile(
     "(?:" + _SECRET_WORDS + r"[A-Za-z0-9_.-]{0,32}|" + _SHORT_WORDS + r")[\"']?[ \t]*[=:][ \t]*[\"']?\S", re.I)
 _URL_SCHEME = r"[A-Za-z][A-Za-z0-9+.-]{0,20}://"
@@ -518,13 +521,18 @@ def _is_credential(field, name, decoded):
     True when any of these holds:
       * it came from an ``Authorization`` or ``Proxy-Authorization`` header;
       * the name it was found under (form key, cookie, header) says secret:
-        ``pass``, ``pwd``, ``secret``, ``token``, ``key``, ``auth`` or ``cred``;
+        ``pass``, ``pwd``, ``secret``, ``token``, ``key``, ``auth`` or ``cred``,
+        or the header carries a session (``session`` in its name, ``sid`` as a
+        word);
       * any line of the text has ``name:value`` shape, the value running to the
         end of the line (spaces allowed), or ``name=value`` / a JSON pair whose
         key says secret, or URL userinfo (``scheme://user:pw@host``);
       * any line is a delimited record (``|``, tab, ``;``, ``,``) with a URL
         field and at least two other fields: the line format of a browser
-        credential dump, ``Chrome|https://bank.com|bob|Passw0rd!``.
+        credential dump, ``Chrome|https://bank.com|bob|Passw0rd!``;
+      * a secret key's pair percent-encoded once more (``password%3DS``,
+        ``user%3Dx%26password%3DS``), or an XML element whose name says
+        secret with text in it (``<pwd>S</pwd>``, ``<password>``...).
 
     **This errs towards True, on purpose.** The flag exists so that a later
     layer can mask what it names: a false mark costs a reader one ``***``, a
@@ -536,10 +544,12 @@ def _is_credential(field, name, decoded):
     if field in _CREDENTIAL_HEADERS:
         return True
     header = field.partition(".")[2] if field.startswith(("headers.", "resp_headers.")) else ""
-    if _SECRET_NAME.search(name) or _SECRET_NAME.search(header):
+    if _SECRET_NAME.search(name) or _SECRET_NAME.search(header) or is_session_header(header):
         return True
     text = (decoded.text or "")[:MAX_CREDENTIAL_CHARS]
     if _SECRET_PAIR.search(text) or _URL_USERINFO.search(text):
+        return True
+    if _SECRET_PERCENT.search(text) or _SECRET_XML.search(text):
         return True
     for line in text.splitlines()[:MAX_CREDENTIAL_LINES]:
         if _colon_pair(line) or _credential_record(line):
@@ -656,6 +666,22 @@ _SECRET_BARE = re.compile("(" + _EQ_START + _KEY_BODY + r"[\"']?[ \t]*=" + _BARE
 _SECRET_SEGMENT = re.compile("(" + _EQ_START + _KEY_BODY + r"[\"']?[ \t]*=" + _SEGMENT_VALUE,
                              re.I)
 _QUERY_START = re.compile(r"[?#]")
+# A form that was percent-encoded once more (a query value, a cookie):
+# ``password%3DS``, ``user%3Dx%26password%3DS``. The value ends at an encoded
+# ``&``, ``;`` or ``,`` as the plain one ends at the character.
+_PERCENT_KEY = ("(?:(?<=%[0-9A-Fa-f]{2})|" + _EQ_START + ")(?:[" + _NAME_CHARS + "]{0,32}"
+                + _SECRET_WORDS + "[" + _NAME_CHARS + "]{0,32}|(?:pw|p)(?![A-Za-z0-9]))")
+_SECRET_PERCENT = re.compile(
+    "(" + _PERCENT_KEY + r"%3[dD])((?:%(?!26|3[bB]|2[cC])[0-9A-Fa-f]{2}"
+    r"|[^\s&;,\"'<>%])+)", re.I)
+# An XML element whose name says secret: ``<pwd>S</pwd>``, ``<password type="x">S``,
+# ``<password><value>S</value>``. Only the long words: ``<p>`` is a paragraph.
+# The value is the first text after the tag and any elements it opens, up to
+# the next tag, closed or not (a body cut short).
+_XML_KEY = "[:" + _NAME_CHARS + "]{0,32}" + _SECRET_WORDS + "[" + _NAME_CHARS + "]{0,32}"
+_SECRET_XML = re.compile(
+    "(<" + _XML_KEY + r"(?:\s[^<>]{0,256})?>(?:\s{0,64}<[A-Za-z][^<>/]{0,256}>){0,4})"
+    r"([^<]*[^<\s][^<]*)", re.I)
 _SECRET_BARE_COLON = re.compile(
     "(" + _COLON_START + "(" + _KEY_BODY + r")[\"']?[ \t]*:" + _BARE_VALUE, re.I)
 _PORT = re.compile(r"\d{1,5}(?:[/?#]|$)")
@@ -700,6 +726,12 @@ def _mask_parts(text):
             ending = content[len(content.rstrip("\r\n")):]
             pieces[i] = part[:blank.end()] + MASK + ending
     return boundary.join(pieces)
+
+
+def is_session_header(name):
+    """Does a header's name say its value is a session (``X-Session``, ``Session-Id``,
+    ``X-SID``)? Its value is masked whole, and a value decoded from it is a credential."""
+    return isinstance(name, str) and bool(_SESSION_HEADER.search(name))
 
 
 def is_secret_name(name):
@@ -764,6 +796,10 @@ def mask_credentials(text, lines=False, colons=None, path=False):
             text = _SECRET_BARE.sub(bare, text)
     if colons and ":" in text:
         text = _SECRET_BARE_COLON.sub(_bare_colon, text)
+    if "%" in text:
+        text = _SECRET_PERCENT.sub(bare, text)
+    if "<" in text:
+        text = _SECRET_XML.sub(lambda m: m.group(1) + MASK, text)
     if lines:
         out = []
         for line in text.splitlines(True):
