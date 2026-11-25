@@ -12412,6 +12412,26 @@ button.logs-trunc:hover { color: var(--accent-orange); text-decoration: underlin
     border-left-color: var(--accent-purple);
     background: rgba(var(--accent-purple-rgb), 0.08);
 }
+/* A past measurement on the map: a notice of the warning tone (the error tone when its cells are not drawn), its tag
+   in the tone's colour, and the way back to live at the end of the line */
+.syscall-past-banner {
+    align-items: center;
+    margin: 10px 14px 0;
+}
+.syscall-past-banner[hidden] {
+    display: none;
+}
+.syscall-past-tag {
+    color: var(--severity-medium);
+    letter-spacing: 0.06em;
+}
+.syscall-notice-error .syscall-past-tag,
+.syscall-past-refusal {
+    color: var(--severity-critical);
+}
+.syscall-past-back {
+    margin-left: auto;
+}
 .syscall-scan-result {
     margin: 8px 14px 0;
     padding: 4px 10px;

@@ -19,7 +19,7 @@
             document.documentElement.dataset.theme = 'cyberpunk';
         }
     </script>
-    <link rel="stylesheet" href="/static/css/style.css?v=94">
+    <link rel="stylesheet" href="/static/css/style.css?v=95">
     <link rel="stylesheet" href="/static/css/theme-layout.css?v=5">
     <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=38">
 </head>
@@ -1282,6 +1282,9 @@
                         <label class="syscall-check" title="win32u stubs exist only in GUI processes, so a scan leaves them out unless asked for"><input type="checkbox" id="syscall-win32u"> win32u</label>
                         <button type="button" class="btn btn-sm btn-primary" id="syscall-scan" onclick="runSyscallScan()" disabled title="Choose a process first">SCAN</button>
                         <button type="button" class="btn btn-sm" id="syscall-stubs-run" onclick="runSyscallStubs()" disabled title="Choose a process first">STUBS</button>
+                        <select id="syscall-past" class="filter-select" aria-label="A past measurement to look at" onchange="syscallOnPast()" title="Look at a measurement the scan history kept, a detonation's among them: it is drawn as it was measured then, nothing is measured again">
+                            <option value="">— a past measurement —</option>
+                        </select>
                     </div>
                     <div class="syscall-group syscall-filter-group">
                         <input type="text" id="syscall-filter" class="filter-input" placeholder="Filter by name or number" aria-label="Filter syscalls by name or number" autocomplete="off" spellcheck="false" oninput="syscallOnFilter()">
@@ -1292,6 +1295,7 @@
                         </select>
                     </div>
                 </div>
+                <div class="syscall-notice syscall-past-banner" id="syscall-past-banner" role="status" hidden></div>
                 <div class="syscall-notices" id="syscall-notices" hidden></div>
                 <div class="syscall-scan-result" id="syscall-scan-result" role="status" hidden></div>
                 <div class="syscall-work" id="syscall-work" data-pane="map">
@@ -1959,6 +1963,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
         <div id="decision-toasts" class="decision-stack" role="region" aria-label="Firewall decisions"></div>
     </div>
 
-    <script src="/static/js/app.js?v=162"></script>
+    <script src="/static/js/app.js?v=163"></script>
 </body>
 </html>
