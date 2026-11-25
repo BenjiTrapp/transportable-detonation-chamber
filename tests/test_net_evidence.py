@@ -13,6 +13,9 @@ Regressions covered:
     about one series in ten) given the full weight of a check-in
   * Windows housekeeping (connectivity checks, OCSP, wpad) turned into C2
     evidence because the findings ignored ``known_good``
+  * an OCSP POST of the idle machine, visible as an upload, was corroborated by
+    an unrelated reflective PE in the same process: 3.0 SUSPICIOUS became 7.0
+    MALICIOUS
 """
 
 import json
@@ -488,3 +491,49 @@ def test_a_checkin_rule_on_a_request_without_an_answer_gives_nothing(tmp_path):
     assert net_evidence.findings_from(unanswered, rs.evaluate(unanswered), known_good=rs) == []
     assert _kinds(net_evidence.findings_from(answered, rs.evaluate(answered),
                                              known_good=rs)) == ["c2_checkin"]
+
+
+# --- a known-good transfer is about its endpoint only -------------------------------------
+
+def test_the_idle_machine_s_ocsp_posts_do_not_turn_a_host_finding_malicious():
+    rs = _rules()
+    events = _benign_capture()
+    net = net_evidence.findings_from(events, rs.evaluate(events), process="a.exe", known_good=rs)
+    pe = memory_evidence.MemoryFinding("aether", "reflective_pe", "a.exe")
+    alone = memory_evidence.score([pe])
+    both = memory_evidence.score([pe] + net)
+    assert (alone["score"], alone["label"]) == (3.0, "SUSPICIOUS")
+    assert both["label"] == "SUSPICIOUS" and both["score"] == 3.0 + 1.6
+    upload = [f for f in both["findings"] if f["kind"] == "exfil_upload"][0]
+    assert upload["known_good"] is True and upload["factors"]["corroboration"] == 0.4
+
+
+def test_a_known_good_upload_does_not_vouch_for_an_unrelated_host_finding():
+    up = net_evidence.findings_from(
+        [net_events.NetEvent("upload", 1.0, dest="ocsp.digicert.com", size=600)], [],
+        known_good=["ocsp.digicert.com"])
+    heap = memory_evidence.MemoryFinding("aether", "heap_api_table", "")
+    out = memory_evidence.score([heap] + up)
+    assert [f for f in out["findings"] if f["kind"] == "heap_api_table"][0][
+        "factors"]["corroboration"] == memory_evidence.UNCORROBORATED
+
+
+def test_a_known_good_upload_is_corroborated_by_a_finding_about_the_same_endpoint():
+    up = net_evidence.findings_from(
+        [net_events.NetEvent("upload", 1.0, dest="ocsp.digicert.com", size=600)], [],
+        known_good=["ocsp.digicert.com"])
+    other = memory_evidence.MemoryFinding("sysmon-network", "c2_beaconing", "",
+                                          extra={"dest": "ocsp.digicert.com"})
+    out = memory_evidence.score(up + [other])
+    upload = [f for f in out["findings"] if f["kind"] == "exfil_upload"][0]
+    assert upload["factors"]["corroboration"] == 1.0
+    assert upload["corroborated_by"] == ["sysmon-network"]
+
+
+def test_an_upload_to_an_unlisted_host_is_corroborated_as_before():
+    up = net_evidence.findings_from(
+        [net_events.NetEvent("upload", 1.0, dest="c2.top", size=600)], [], process="a.exe",
+        known_good=["ocsp.digicert.com"])
+    pe = memory_evidence.MemoryFinding("aether", "reflective_pe", "a.exe")
+    assert "known_good" not in up[0]
+    assert memory_evidence.score([pe] + up)["score"] == 7.0

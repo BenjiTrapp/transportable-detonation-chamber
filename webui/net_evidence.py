@@ -40,12 +40,17 @@ the findings wrong:
     name it claims is not evidence (``net_rules.ALWAYS_VISIBLE``, used here as
     it is: a sample that sends its harvest with ``Host: ocsp.digicert.com``
     must not vanish). Ordinary POSTs over 512 bytes to known hosts therefore
-    stay findings. Without a process they need a second signal (below): one
-    host is 1.6 and CLEAN, but two or more reach 3.2 and SUSPICIOUS by
-    saturation, which is the price of not letting a claimed name hide data. The list is a
-    required argument: without it an idle machine is MALICIOUS. A retry of a
-    name the resolver asks for on its own (``wpad``, reverse lookups) is no
-    dead C2.
+    stay findings, but they are marked ``known_good`` with the corroboration
+    scope ``endpoint``: such a finding is corroborated only by a finding about
+    the same endpoint, and vouches only for one. Every event of a capture is
+    the sample's process, so without the scope any host-side finding (a
+    reflective PE, 3.0) would turn the machine's OCSP POSTs into 4.0 of
+    exfiltration, two unrelated facts counted as one. Without a process and
+    without such a second signal an upload is 1.6; one host is CLEAN, two or
+    more reach 3.2 and SUSPICIOUS by saturation, the price of not letting a
+    claimed name hide data. The list is a required argument: without it an
+    idle machine is MALICIOUS. A retry of a name the resolver asks for on its
+    own (``wpad``, reverse lookups) is no dead C2.
   * A capture knows the process. It does not: an event without one is the
     sample's, ``process`` names it. That makes every periodic service and
     every telemetry POST on the machine look like the sample's own, so a
@@ -130,10 +135,18 @@ def _housekeeping(dest):
 class _Collector:
     """Findings by (kind, process, destination), in the order they were first seen."""
 
-    def __init__(self, process, observed_fully):
+    def __init__(self, process, observed_fully, known_good):
         self.process = process if isinstance(process, str) else ""
         self.observed_fully = observed_fully
+        self.known_good = known_good
         self.by_key = {}
+
+    def scope(self, e):
+        """Extra fields of a transfer to a known-good name (see the module docstring)."""
+        if self.known_good and self.known_good.hides(e):
+            return {"known_good": True,
+                    "corroboration_scope": memory_evidence.CORROBORATION_SCOPE_ENDPOINT}
+        return {}
 
     def owner(self, item):
         process = item.get("process")
@@ -248,7 +261,7 @@ def _upload(c, e, process):
         return
     c.add("exfil_upload", process, dest, "Upload to %s, %d bytes" % (dest, size), pid=_pid(e),
           size=size, sha256=_plain(e.get("sha256")), file_kind=_plain(e.get("kind")),
-          method=_plain(e.get("method")), path=_plain(e.get("path")), count=1)
+          method=_plain(e.get("method")), path=_plain(e.get("path")), count=1, **c.scope(e))
 
 
 def _download(c, e, process):
@@ -262,7 +275,7 @@ def _download(c, e, process):
     c.add("payload_staging", process, dest,
           "%s file downloaded from %s" % (str(e["kind"]).upper(), dest), pid=_pid(e),
           sha256=_plain(e.get("sha256")), size=_plain(e.get("size")),
-          file_kind=e["kind"], url=_plain(e.get("url")), count=1)
+          file_kind=e["kind"], url=_plain(e.get("url")), count=1, **c.scope(e))
 
 
 def _retry(c, e, process):
@@ -411,7 +424,7 @@ def findings_from(events, hits, process="", observed_fully=True, *, known_good):
     """
     known_good = _known_good(known_good)
     events = list(events or ())
-    c = _Collector(process, observed_fully)
+    c = _Collector(process, observed_fully, known_good)
     for e in events:
         if not isinstance(e, dict):
             continue

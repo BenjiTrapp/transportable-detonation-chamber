@@ -33,8 +33,9 @@ of it is scored: whichever gives the higher total, chosen over the whole set at
 once so that the order findings arrive in cannot change the verdict. The other
 side stays listed with ``superseded_by`` and still counts as the independent
 second opinion that it is. Adding a finding never lowers the score, except a
-finding that shows two such phenomena to be one: what was counted twice is then
-counted once.
+finding that shows two such phenomena to be one (what was counted twice is then
+counted once), and except past ``SUPERSEDE_MAX_ENUMERATED`` such phenomena on
+one process, where the choice is no longer searched exhaustively.
 
 Adding a scanner means adding a normalizer function; nothing else changes.
 """
@@ -327,6 +328,8 @@ SATURATION_CAP = 2.0
 
 # Minimum base weight for a finding to count as an independent second opinion.
 CORROBORATION_MIN_WEIGHT = 1.0
+# corroboration_scope of a finding that is about one destination only.
+CORROBORATION_SCOPE_ENDPOINT = "endpoint"
 
 VERDICT_MALICIOUS = 6.0
 VERDICT_SUSPICIOUS = 2.0
@@ -977,6 +980,24 @@ def _supersessions(findings, entries, proc_key):
     components to be one phenomenon (it joins them): what was counted twice is
     then counted once. A finding the baseline knows takes part in neither side:
     it counts nothing, so it must not take away what another would have counted.
+
+    Both guarantees are bounded. The best total is searched over all choices
+    only up to ``SUPERSEDE_MAX_ENUMERATED`` components on one process; past
+    that the result starts from the best of three whole-set choices and is
+    improved one component at a time (see the code). It is still independent
+    of order and never below counting either view of every component whole,
+    but it is a local optimum, so there adding a finding can lower the score
+    without joining anything.
+
+    Considered and not taken: forbid only *pairs* of findings that share an
+    endpoint and take the best total over the pair-free subsets. That is
+    monotone by construction (0 drops in 1,500 random sets against 12 here),
+    but it counts two views of one C2 twice whenever they name different
+    endpoints of it: a check-in to a name and Sysmon's beacon to an address
+    the name also resolves to, through a third finding. With no process
+    attribution in a capture that is the more likely error, so components
+    were chosen. A later phase that attributes connections to processes may
+    want the pair rule instead.
     """
     out = {}
     by_process = {}
@@ -999,9 +1020,36 @@ def _supersessions(findings, entries, proc_key):
                     best = (rank, mask)
             choices = [not best[1] >> bit & 1 for bit in range(len(components))]
         else:
-            choices = [_total({i: entries[i] for i in side_a}, set())
-                       >= _total({i: entries[i] for i in side_b}, set())
-                       for _p, side_a, side_b in components]
+            # Past the cap: the best of three choices, each independent of the
+            # order of the findings: every component on its superseding side,
+            # every one on the other side, and each on its own larger side.
+            candidates = [
+                [True] * len(components),
+                [False] * len(components),
+                [_total({i: entries[i] for i in side_a}, set())
+                 >= _total({i: entries[i] for i in side_b}, set())
+                 for _p, side_a, side_b in components]]
+
+            def total_of(choice):
+                excluded = set()
+                for keep_a, (_p, side_a, side_b) in zip(choice, components):
+                    excluded.update(side_b if keep_a else side_a)
+                return _total(local, excluded)
+            choices = max(candidates, key=lambda c: (total_of(c), c.count(True)))
+            # Then flip one component at a time, in the canonical order, while
+            # that raises the total: saturation often makes a mix of sides
+            # best (two beacons fill their kind's cap, the rest count as
+            # check-ins), and none of the three candidates is a mix.
+            best_total = total_of(choices)
+            improved = True
+            while improved:
+                improved = False
+                for bit in range(len(choices)):
+                    trial = list(choices)
+                    trial[bit] = not trial[bit]
+                    value = total_of(trial)
+                    if value > best_total:
+                        choices, best_total, improved = trial, value, True
         for keep_a, (_p, side_a, side_b) in zip(choices, components):
             keep, drop = (side_a, side_b) if keep_a else (side_b, side_a)
             winner = winner_of(keep)
@@ -1036,13 +1084,38 @@ def score(findings, baseline=None):
     # Only substantial findings may corroborate another source. Otherwise a
     # trivial string hit ("kernel32.dll", weight 0.2) would vouch for anything
     # that happens to share the process.
+    # A finding with corroboration_scope "endpoint" is about one destination
+    # only (an upload to a known-good host): it neither gets nor gives a second
+    # opinion except with a finding that names the same endpoint. An OCSP
+    # request is not made suspicious by a reflective PE elsewhere in the
+    # process, nor does it vouch for one.
     sources_by_process = {}
+    scoped = []
     for f in findings:
         if f.get("base_weight", 0) < CORROBORATION_MIN_WEIGHT:
             continue
         if known(f):
             continue
+        if f.get("corroboration_scope") == CORROBORATION_SCOPE_ENDPOINT:
+            scoped.append(f)
+            continue
         sources_by_process.setdefault(proc_key(f), set()).add(f["source"])
+    eligible = [f for f in findings
+                if f.get("base_weight", 0) >= CORROBORATION_MIN_WEIGHT and not known(f)]
+
+    def corroborators(f):
+        if f.get("corroboration_scope") == CORROBORATION_SCOPE_ENDPOINT:
+            pool = [g for g in eligible if g is not f]
+        elif scoped:
+            pool = scoped
+        else:
+            return sources_by_process.get(proc_key(f), set()) - {f["source"]}
+        mine = _endpoints(f)
+        near = {g["source"] for g in pool
+                if proc_key(g) == proc_key(f) and mine & _endpoints(g)}
+        if f.get("corroboration_scope") != CORROBORATION_SCOPE_ENDPOINT:
+            near |= sources_by_process.get(proc_key(f), set())
+        return near - {f["source"]}
 
     # Every finding is weighed first, then supersede decides which side of
     # each phenomenon counts, from the totals of all choices at once. The
@@ -1056,7 +1129,7 @@ def score(findings, baseline=None):
         corroborated_by = None
         cf = 1.0
         if f.get("needs_corroboration"):
-            others = sources_by_process.get(proc_key(f), set()) - {f["source"]}
+            others = corroborators(f)
             if others:
                 corroborated_by = sorted(others)
             else:

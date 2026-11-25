@@ -600,3 +600,44 @@ def test_random_sets_are_order_independent_and_only_an_identification_lowers_the
         new = one()
         before, after = me.score(base)["score"], me.score(base + [new])["score"]
         assert after >= before or _joins(me, base, new), (base, new, before, after)
+
+
+def _components_of(me, n, checkin_weight=2.1):
+    """n components: a tight Sysmon beacon and a check-in per address."""
+    out = []
+    for k in range(n):
+        ip = "10.0.%d.1" % k
+        out.append(_f(me, "c2_beaconing", ip, 3.0, corroborate=False))
+        out.append(_f(me, "c2_checkin", ip, checkin_weight))
+    return out
+
+
+@pytest.mark.parametrize("n", [11, 12])
+def test_past_the_search_cap_the_score_is_independent_of_order(tdc, n):
+    import random
+    me = tdc.memory_evidence
+    assert n > me.SUPERSEDE_MAX_ENUMERATED
+    findings = _components_of(me, n)
+    rng = random.Random(n)
+    scores = set()
+    for _ in range(20):
+        rng.shuffle(findings)
+        scores.add(me.score(findings)["score"])
+    assert len(scores) == 1
+
+
+@pytest.mark.parametrize("checkin_weight", [2.1, 4.0])
+def test_past_the_search_cap_no_view_is_counted_below_its_whole(tdc, checkin_weight):
+    me = tdc.memory_evidence
+    findings = _components_of(me, 11, checkin_weight)
+    beacons = [f for f in findings if f["kind"] == "c2_beaconing"]
+    checkins = [f for f in findings if f["kind"] == "c2_checkin"]
+    whole = max(me.score(beacons)["score"], me.score(checkins)["score"])
+    assert me.score(findings)["score"] >= whole
+
+
+def test_crossing_the_search_cap_with_one_more_component_does_not_lower_this_shape(tdc):
+    me = tdc.memory_evidence
+    ten = _components_of(me, 10)
+    eleven = _components_of(me, 11)
+    assert me.score(eleven)["score"] >= me.score(ten)["score"]
