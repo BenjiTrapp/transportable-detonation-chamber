@@ -37,6 +37,9 @@ Regressions covered:
     (``ocsp.digicert.com A <C2>``) made forty uploads to it the clean machine's
     OCSP requests; ``trusted_lookups`` keeps only the answers of the capture's
     resolvers, never a self-answer nor one from where traffic went (follow-up F4)
+  * one DNS-over-TCP exchange with the resolver (Windows retries a truncated
+    reply over TCP/53) made it an endpoint and no resolver; connections to
+    port 53 and 853 do not count (follow-up review, Important 1)
 """
 
 import os
@@ -490,3 +493,12 @@ def test_the_resolvers_of_a_capture_are_believed_and_events_are_not_changed():
     assert events[0]["answers"] == ["198.51.100.1"] and trusted[0] is not events[0]
     # a lookup without a server (an event built by hand) counts as one server
     assert len(net_dns.trusted_lookups([{"type": "dns", "dest": "x", "answers": ["1.2.3.4"]}])) == 1
+
+
+def test_dns_over_tcp_or_tls_to_the_resolver_keeps_it_a_resolver():
+    events = [_lookup("a.example", ["198.51.100.1"]), _lookup("b.example", ["198.51.100.2"])]
+    for port in (53, 853):
+        conn = net_events.NetEvent("conn", 2.0, dest=RESOLVER, port=port)
+        assert len(net_dns.trusted_lookups(events + [conn])) == 2, port
+    other = net_events.NetEvent("conn", 2.0, dest=RESOLVER, port=443)
+    assert net_dns.trusted_lookups(events + [other]) == []

@@ -280,6 +280,7 @@ def events_from_flow(flow):
 
 RESOLVER_SHARE = 0.25           # of the answered lookups a resolver answered at least
 _ENDPOINT_TYPES = frozenset(("conn", "conn_failed"))
+_DNS_PORTS = frozenset((53, 853))   # DNS over TCP and DNS over TLS: a resolver's own ports
 
 
 def _address(text):
@@ -299,7 +300,11 @@ def trusted_lookups(events):
     ``RESOLVER_SHARE`` of the capture's answered lookups (the machine's one
     or two configured resolvers answer nearly all of them; a sample's own
     server answers its few) and to which the capture made no TCP connection
-    and sent no HTTP exchange (a resolver is not where an upload goes). And
+    and sent no HTTP exchange (a resolver is not where an upload goes). A
+    connection to port 53 or 853 does not count: Windows asks its resolver
+    again over TCP when a reply was truncated, and one such exchange took the
+    resolver of an idle hour away (411 of 415 events no longer suppressed,
+    thirteen check-ins on known-good servers, SUSPICIOUS 4.0). And
     never an answer that names the server that gave it (a self-answer: the
     C2 vouching for itself). Events without a ``server`` count as one server.
 
@@ -324,7 +329,7 @@ def trusted_lookups(events):
     for e in events:
         if not isinstance(e, dict) or e.get("type") == "dns":
             continue
-        if e.get("type") in _ENDPOINT_TYPES:
+        if e.get("type") in _ENDPOINT_TYPES and e.get("port") not in _DNS_PORTS:
             endpoints.add(_address(e.get("dest")))
         for address in e.get("addresses") or ():
             endpoints.add(_address(address))

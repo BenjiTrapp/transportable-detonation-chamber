@@ -87,6 +87,10 @@ Regressions covered:
     made forty uploads to it known to the baseline, its address quiet and its
     beacon the OCSP host's; only the answers of the capture's resolvers count,
     never a self-answer or one from where traffic went (follow-up F4)
+  * one DNS-over-TCP exchange with the real resolver took it away as a
+    resolver: an idle hour with its baseline lost 4 suppressions and scored
+    SUSPICIOUS 4.0 with thirteen check-ins on known-good servers (follow-up
+    review, Important 1)
 """
 
 import base64
@@ -1284,3 +1288,16 @@ def test_the_resolvers_answers_still_absorb_the_clean_machine(tmp_path):
     _fake_lookup(cap, 3.0, "evil.top", C2)
     r = net_analyze.analyze_pcap(_write(tmp_path, cap), baseline=bl)
     assert _uploads(r) == [(640, "known")] and "exfil_upload" not in _kinds(r)
+
+
+def test_dns_over_tcp_to_the_resolver_keeps_an_idle_hour_absorbed(tmp_path, monkeypatch):
+    monkeypatch.setattr(Capture, "read", lambda self: self)
+    p = _write(tmp_path, _benign_capture(), "hour.pcap")
+    bl = net_baseline.NetBaseline(str(tmp_path / "bl.json"))
+    bl.add(net_analyze.analyze_pcap(p)["events"])
+    hour = _benign_capture()
+    hour.tcp(1800.0, RESOLVER, 53, [("c", b"\x00\x20" + os.urandom(32)), ("s", b"\x00\x40" + os.urandom(64))])
+    r = net_analyze.analyze_pcap(_write(tmp_path, hour, "hour2.pcap"), baseline=bl)
+    assert r["evidence_findings"] == [] and r["suppressed_count"] >= 415
+    s = memory_evidence.score(memory_evidence.collect({"network": r}, process="sample.exe"))
+    assert s["label"] == "CLEAN" and s["score"] == 0
