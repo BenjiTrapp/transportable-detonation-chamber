@@ -34,6 +34,13 @@
 #                                          still be the real one
 #   add_by_cmdlet_ms                       New-NetIPAddress once, for comparison with netsh
 #   remove_total_s, addresses_left_behind  what the cleanup cost and whether it was complete
+#   dhcp_before, dhcp_after_adding         whether adding addresses took the adapter off DHCP. If it did, the
+#                                          machine lost its DHCP address the moment that happened, and
+#                                          dhcp_restored says whether putting it back worked. This is the
+#                                          finding that outranks the timings: an approach that costs the chamber
+#                                          its own address cannot be used as designed.
+#   addresses_after_cleanup                what the adapter has once the script is done - the real address must
+#                                          be among them
 #   network_profile_moved                  the interfaces whose network category changed while addresses were
 #                                          being added, with what it changed from and to. Empty is the good
 #                                          answer. Anything in it is the most important result of the run: it
@@ -164,6 +171,26 @@ foreach ($p in @(Get-NetConnectionProfile -ErrorAction SilentlyContinue)) {
 }
 Write-Host ("profiles     : " + (($profilesBefore.GetEnumerator() |
     ForEach-Object { "if" + $_.Key + "=" + $_.Value }) -join ", "))
+
+# The one that actually cost a VM its network. `netsh interface ipv4 add address` puts a *static* address on the
+# adapter, and on an adapter configured by DHCP that switches it off: the DHCP-assigned address goes, the client
+# stops renewing, and when the lease runs out the machine is gone from the network - no ARP, no DHCP request,
+# nothing. That is what happened here, and it was mistaken for a firewall at first, because every port had closed.
+# A firewall cannot stop ARP; a lost address can.
+#
+# So the DHCP state is recorded now and put back in the finally, and a DHCP adapter gets a warning before the first
+# address is added.
+$dhcpBefore = [string](Get-NetIPInterface -InterfaceIndex $ifIndex -AddressFamily IPv4).Dhcp
+Write-Host "dhcp         : $dhcpBefore"
+if ($dhcpBefore -eq "Enabled") {
+    Write-Host ""
+    Write-Host "WARNING: this adapter gets its address by DHCP. Adding a static address takes it off DHCP, and the" -ForegroundColor Yellow
+    Write-Host "         machine loses that address. The script puts DHCP back when it finishes - but if it is killed" -ForegroundColor Yellow
+    Write-Host "         (a WinRM timeout does that), the machine is unreachable until someone at the console runs:" -ForegroundColor Yellow
+    Write-Host "           netsh interface ipv4 set address name=$ifIndex source=dhcp" -ForegroundColor Yellow
+    Write-Host "           netsh interface ipv4 set dnsservers name=$ifIndex source=dhcp && ipconfig /renew" -ForegroundColor Yellow
+    Write-Host ""
+}
 Write-Host ""
 
 try {
@@ -288,6 +315,26 @@ finally {
             Write-Host "  netsh interface ipv4 delete address $ifIndex $($l.IPAddress)"
         }
     }
+
+    # DHCP first: without an address the machine is off the network, and nothing
+    # else that follows matters until it is back.
+    $dhcpNow = [string](Get-NetIPInterface -InterfaceIndex $ifIndex -AddressFamily IPv4).Dhcp
+    $result["dhcp_before"] = $dhcpBefore
+    $result["dhcp_after_adding"] = $dhcpNow
+    if ($dhcpBefore -eq "Enabled" -and $dhcpNow -ne "Enabled") {
+        Write-Host "DHCP WAS SWITCHED OFF by adding addresses - putting it back" -ForegroundColor Yellow
+        try {
+            & netsh interface ipv4 set address name=$ifIndex source=dhcp 2>&1 | Out-Null
+            & netsh interface ipv4 set dnsservers name=$ifIndex source=dhcp 2>&1 | Out-Null
+            & ipconfig /renew 2>&1 | Out-Null
+            $result["dhcp_restored"] = [string](Get-NetIPInterface -InterfaceIndex $ifIndex -AddressFamily IPv4).Dhcp
+        } catch {
+            $result["dhcp_restored"] = "failed: $($_.Exception.Message)"
+        }
+        Write-Host "  dhcp now: $($result["dhcp_restored"])"
+    }
+    $result["addresses_after_cleanup"] = @(Get-NetIPAddress -InterfaceIndex $ifIndex -AddressFamily IPv4 `
+        -ErrorAction SilentlyContinue | ForEach-Object { $_.IPAddress })
 
     # The profile, before anything else is reported: if it moved, the machine is
     # unreachable from outside right now and that is the first thing to fix.
