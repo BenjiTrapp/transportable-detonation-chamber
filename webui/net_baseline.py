@@ -233,6 +233,12 @@ class NetBaseline:
                 raise ValueError("not a network baseline")
             data.setdefault("dests", {})
             data.setdefault("resolvers", {})
+            if not (isinstance(data["dests"], dict) and isinstance(data["resolvers"], dict)):
+                # a file edited by hand (null, a string, a list): its fields would give a set
+                # of characters or raise, so it is treated as stale and replaced on the next add
+                print("[net_baseline] %s has dests or resolvers that are not objects: ignored "
+                      "until the baseline is captured again" % self.path)
+                data = dict(data, dests={}, resolvers={}, key_version=None)
             self._data = data
             if self._stale():
                 print("[net_baseline] %s uses key scheme v%s, current is v%d: ignored until "

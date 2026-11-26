@@ -104,6 +104,9 @@ Regressions covered:
   * ``<key><url>``, ``<auth><server>`` and ``<token><host>`` masked the C2 in
     the report again, in a plain response and in decoded text (round-2
     review, Minor)
+  * a hand-edited baseline whose ``resolvers`` or ``dests`` was null, a string
+    or a list raised or gave a set of characters as learned resolvers; such a
+    file is stale (round-2 review, Nit)
 """
 
 import base64
@@ -1425,3 +1428,24 @@ def test_a_c2_host_inside_a_secret_element_stays_in_the_report(tmp_path):
     _served(still, 11.0, "t.example", base64.b64encode(b"<cfg><password><![CDATA[Sec-Pw-15]]></password></cfg>"))
     blob = json.dumps(net_analyze.analyze_pcap(_write(tmp_path, still, "still.pcap")))
     assert "Sec-Pw-22" not in blob and "Sec-Pw-15" not in blob
+
+
+@pytest.mark.parametrize("field,value", [("resolvers", None), ("resolvers", "198.51.100.53"),
+                                         ("resolvers", ["198.51.100.53"]), ("dests", None),
+                                         ("dests", "a.top"), ("dests", ["a.top"])])
+def test_a_baseline_with_fields_of_the_wrong_type_is_stale(tmp_path, field, value):
+    bl = _ocsp_baseline(tmp_path)
+    with open(bl.path) as fh:
+        data = json.load(fh)
+    data[field] = value
+    with open(bl.path, "w") as fh:
+        json.dump(data, fh)
+    again = net_baseline.NetBaseline(bl.path)
+    assert again.count == 0 and again.learned_resolvers() is None
+    assert not again.knows_dest("ocsp.digicert.com") and again.stats()["stale"] is True
+    cap = Capture()
+    _ocsp(cap, 10.0, 640)
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap), baseline=again)
+    assert _uploads(r) == [(640, None)]
+    again.add(r["events"])                      # replaced on the next capture
+    assert again.learned_resolvers() == frozenset((RESOLVER,))
