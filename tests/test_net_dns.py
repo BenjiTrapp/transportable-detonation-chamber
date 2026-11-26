@@ -29,6 +29,10 @@ Regressions covered:
   * a wall-clock bound (3 s) on matching 20,000 lookups with one transaction
     ID failed on a loaded machine; the test counts the entries popped instead
     (final review M3)
+  * compression pointers let 56 KB of reply hold 4000 answers of 253
+    characters: sixty such replies were 61 MB of report and 12 s; a message
+    keeps ``MAX_ANSWERS`` records and ``answers_capped`` says more existed
+    (follow-up F1)
 """
 
 import os
@@ -418,3 +422,30 @@ def test_a_tcp_flow_is_not_claimed():
     flow = _raw_udp_flow(53, b"x")
     flow.proto = "tcp"
     assert net_dns.is_dns(flow) is False
+
+
+# --- a bound on the answers of one message (follow-up F1) ----------------------
+
+def _pointer_reply(count):
+    """A reply whose ``count`` CNAME answers all point back at the question name."""
+    name = b"".join(bytes([63]) + b"a" * 63 for _ in range(3)) + bytes([60]) + b"b" * 60 + b"\x00"
+    question = name + struct.pack("!HH", 1, 1)
+    answers = (b"\xc0\x0c" + struct.pack("!HHIH", 5, 1, 60, 2) + b"\xc0\x0c") * count
+    ask = struct.pack("!6H", 7, 0x0100, 1, 0, 0, 0) + question
+    reply = struct.pack("!6H", 7, 0x8180, 1, count, 0, 0) + question + answers
+    return ask, reply
+
+
+def test_a_reply_keeps_at_most_max_answers_and_says_it_was_cut():
+    ask, reply = _pointer_reply(4000)
+    e = net_dns.events_from_flow(_flow_from([(1.0, "c", ask), (1.1, "s", reply)]))[0]
+    assert len(e["answers"]) == net_dns.MAX_ANSWERS and e["answers_capped"] is True
+    assert net_dns.MAX_ANSWERS <= 100
+
+
+def test_a_reply_within_the_bound_is_not_marked_cut():
+    ask, reply = _pointer_reply(net_dns.MAX_ANSWERS)
+    e = net_dns.events_from_flow(_flow_from([(1.0, "c", ask), (1.1, "s", reply)]))[0]
+    assert len(e["answers"]) == net_dns.MAX_ANSWERS and e["answers_capped"] is False
+    plain = net_dns.events_from_flow(_dns_flow("evil.top", "A", ["203.0.113.9"]))[0]
+    assert plain["answers_capped"] is False

@@ -48,6 +48,13 @@ module is that order, in ``analyze_pcap``. The false assumptions it avoids:
     ``MAX_EVENTS`` parser and connection events: what comes after is not
     parsed, and ``events_capped`` says the report is cut (the UI says so). A
     DNS answer that points back into itself many times is bounded the same way.
+    Decoded values are not parser events and query strings are no body text:
+    two hundred GETs with four base64-gzip query values each were 800 decoded
+    events and 60 MB of report, so the decoded events of a capture share one
+    ``net_decode.DecodeBudget`` (``MAX_DECODED`` of them, their kept text, their
+    inflating) of which each flow has a share (``decoded_capped``), and a
+    capture keeps at most ``MAX_DNS_ANSWERS`` DNS answers (``dns_answers_capped``;
+    ``net_dns`` keeps a few dozen per message).
   * "No finding" is an answer. A rule the regex time budget could not decide
     is listed (``rule_unevaluated``, ``rule_budget_spent``), an empty capture
     is ``observed`` False with a ``note`` and differs from a capture in which
@@ -117,6 +124,15 @@ MODES = {"online": True, "isolated": False}     # mode -> observed_fully
 CAPTURE_HASH_BUDGET = 256 * 1024 * 1024         # bytes streamed into file hashes per capture
 CAPTURE_TEXT_BUDGET = 8 * 1024 * 1024           # characters of body text kept per capture
 MAX_EVENTS = 20000                              # parser and connection events kept per capture
+# decoded events (net_decode) of a capture and of one flow: how many, the text
+# they keep, the bytes their inflate steps produce
+MAX_DECODED = 5000
+MAX_DECODED_PER_FLOW = 1000
+DECODED_TEXT_BUDGET = 8 * 1024 * 1024
+DECODED_TEXT_PER_FLOW = 2 * 1024 * 1024
+DECODE_INFLATE_BUDGET = 64 * 1024 * 1024
+DECODE_INFLATE_PER_FLOW = 16 * 1024 * 1024
+MAX_DNS_ANSWERS = 10000                         # DNS answer records kept per capture
 MAX_IOCS = 5000
 
 BEHAVIOR_TYPES = ("beacon", "retry", "fanout")
@@ -181,6 +197,9 @@ class _Limits:
             CAPTURE_TEXT_BUDGET)
         self.events_left = MAX_EVENTS if max_events is None else max_events
         self.events_capped = False
+        self.answers_left = MAX_DNS_ANSWERS
+        self.answers_capped = False
+        self.flow_of = {}           # id of a parser event -> the index of its flow
 
 
 def _parse(name, flow, budget):
@@ -348,7 +367,7 @@ def _collect(path, limits=None):
         limits = _Limits()
     result = net_flows.read_pcap(path)
     errors, events, claimed = [], [], {}
-    for flow in result.flows:
+    for index, flow in enumerate(result.flows):
         if limits.events_left <= 0:
             limits.events_capped = True
             break
@@ -362,9 +381,54 @@ def _collect(path, limits=None):
             found = found[:limits.events_left]
             limits.events_capped = True
         limits.events_left -= len(found)
+        for e in found:
+            limits.flow_of[id(e)] = index
+            if e.get("type") == "dns":
+                _charge_answers(e, limits)
         events += found
     events = net_events.sort_events(_render_names(e) for e in events)
     return events, errors, result, claimed
+
+
+def _charge_answers(event, limits):
+    """Keep a DNS event's answers within what the capture may still keep."""
+    answers = event.get("answers")
+    if not isinstance(answers, list):
+        return
+    if len(answers) > limits.answers_left:
+        event["answers"] = answers[:limits.answers_left]
+        event["answers_capped"] = True
+    if event.get("answers_capped"):
+        limits.answers_capped = True
+    limits.answers_left -= len(event["answers"])
+
+
+def _decode_all(base, limits, errors):
+    """``(decoded, source_of, budget)``: the decoded events of the http and
+    websocket events, within a ``net_decode.DecodeBudget`` for the capture and
+    a share of it for each flow, so that one flow cannot spend what the
+    others' values need."""
+    budget = net_decode.DecodeBudget(MAX_DECODED, DECODED_TEXT_BUDGET, DECODE_INFLATE_BUDGET)
+    shares = {}
+    decoded, source_of = [], {}
+    for e in base:
+        if e["type"] not in ("http", "websocket"):
+            continue
+        flow = limits.flow_of.get(id(e))
+        share = shares.get(flow)
+        if share is None:
+            share = shares[flow] = net_decode.DecodeBudget(
+                MAX_DECODED_PER_FLOW, DECODED_TEXT_PER_FLOW, DECODE_INFLATE_PER_FLOW, budget)
+        try:
+            found = net_decode.decode_event_fields(e, share)
+        except Exception as exc:
+            errors.append(_failure("net_decode on a %s event to %s" % (e["type"], e["dest"]),
+                                   exc))
+            continue
+        for d in found:
+            source_of[id(d)] = e
+        decoded += found
+    return decoded, source_of, budget
 
 
 # --- the report: masking ------------------------------------------------------------------------
@@ -711,19 +775,7 @@ def analyze_pcap(path, rules=None, baseline=None, process="", mode="online"):
     base, parse_errors, result, claimed = _collect(path, limits)
     errors += parse_errors
 
-    decoded, source_of = [], {}
-    for e in base:
-        if e["type"] not in ("http", "websocket"):
-            continue
-        try:
-            found = net_decode.decode_event_fields(e)
-        except Exception as exc:
-            errors.append(_failure("net_decode on a %s event to %s" % (e["type"], e["dest"]),
-                                   exc))
-            continue
-        for d in found:
-            source_of[id(d)] = e
-        decoded += found
+    decoded, source_of, decode_budget = _decode_all(base, limits, errors)
 
     try:
         behavior = list(net_behavior.analyze(base + decoded))
@@ -802,6 +854,10 @@ def analyze_pcap(path, rules=None, baseline=None, process="", mode="online"):
         "text_budget_spent": any(e.get("text_budget_spent") for e in events),
         "events_capped": limits.events_capped,
         "max_events": MAX_EVENTS,
+        "decoded_capped": decode_budget.capped,
+        "max_decoded": MAX_DECODED,
+        "dns_answers_capped": limits.answers_capped,
+        "max_dns_answers": MAX_DNS_ANSWERS,
     }
     # The one masking pass over everything serialized (see mask_report). The
     # event copies went through it above; a second pass over them changes

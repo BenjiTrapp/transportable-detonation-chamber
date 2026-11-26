@@ -60,6 +60,9 @@ Regressions covered:
     reached ``net_analyze`` as different characters depending on its other
     bytes and got another spelling than in DNS and TLS; ``dest`` and ``url``
     keep the bytes (``surrogateescape``) for the central rendering
+  * a body was inflated to ``MAX_INFLATED`` although the text budget was long
+    spent and nothing of it could be kept; past the budget only the first
+    ``KIND_PEEK`` bytes are inflated, for the kind (follow-up F1)
 """
 
 import gzip
@@ -1335,3 +1338,27 @@ def test_one_host_or_an_absolute_target_is_one_name_and_none_is_none():
 def test_an_absolute_target_keeps_its_bytes_too():
     e = _events(b"GET http://a\xe9\x01.top/x HTTP/1.1\r\n\r\n", b"")[0]
     assert _wire(e["dest"]) == b"a\xe9\x01.top" and _wire(e["url"]) == b"http://a\xe9\x01.top/x"
+
+
+# --- no inflating past what the text budget can keep (follow-up F1) -------------------
+
+def test_a_spent_text_budget_inflates_only_the_kind_peek(monkeypatch):
+    limits = []
+    real = net_http._inflate
+
+    def recorded(data, limit):
+        limits.append(limit)
+        return real(data, limit)
+    monkeypatch.setattr(net_http, "_inflate", recorded)
+    payload = b"MZ" + b"\x90" * 58 + (64).to_bytes(4, "little") + b"PE\x00\x00" + b"\x00" * _MIB
+    flow = _http_flow(_get(), _encoded(gzip.compress(payload, 9), b"gzip"))
+    budget = net_http.TextBudget(0)
+    events = net_http.events_from_flow(flow, text_budget=budget)
+    assert limits and limits[0] == net_http.KIND_PEEK
+    download = [e for e in events if e["type"] == "download"][0]
+    assert download["kind"] == "pe" and download["sha256"] == _sha(payload)
+    http = [e for e in events if e["type"] == "http"][0]
+    assert http["resp_text"] in ("", None) and http["resp_capped"] is True
+    limits.clear()
+    net_http.events_from_flow(flow, text_budget=net_http.TextBudget(10 ** 9))
+    assert limits[0] == net_http.MAX_INFLATED

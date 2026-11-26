@@ -88,6 +88,10 @@ Regressions covered:
   * a masked value in a URL path ran past "/", so ``/dl;token=abc/stage.exe``
     lost its file name in the report and shared the baseline key of
     ``.../update.bin``; with ``path`` it ends with its segment (final review I2)
+  * the bounds were per event only: two hundred GETs with four base64-gzip
+    query values each were 800 decoded events, 60 MB of report and 14 s; a
+    ``DecodeBudget`` shared by many events bounds their number, the text they
+    keep and their inflating, and says when it refused anything (follow-up F1)
 """
 
 import base64
@@ -1266,3 +1270,41 @@ def test_a_slash_boundary_does_not_make_a_colon_a_separator_in_a_body():
 def test_in_a_body_a_colon_still_separates_a_secret_key_from_its_value():
     assert net_decode.mask_credentials("token: Tk-9 more", lines=True) == "token: ***"
     assert net_decode.mask_credentials("token: Tk-9") == "token: Tk-9"
+
+
+# --- a budget over many events (follow-up F1) -----------------------------------
+
+_BIG = base64.urlsafe_b64encode(gzip.compress(b"hello world, this is text\n" * 40330, 9)).decode()
+
+
+def test_a_decode_budget_bounds_the_count_of_many_events():
+    budget = net_decode.DecodeBudget(3, 10 ** 9, 10 ** 9)
+    out = [net_decode.decode_event_fields(http(body_text="data=aGVsbG8gd29ybGQ="), budget)
+           for _ in range(5)]
+    assert [len(o) for o in out] == [1, 1, 1, 0, 0] and budget.capped is True
+
+
+def test_a_decode_budget_bounds_the_text_kept():
+    budget = net_decode.DecodeBudget(100, 1000, 10 ** 9)
+    first = net_decode.decode_event_fields(http(query="v=" + _BIG), budget)[0]
+    second = net_decode.decode_event_fields(http(query="v=" + _BIG), budget)[0]
+    assert len(first["text"]) == 1000 and first["text_capped"] is True
+    assert second["text"] == "" and second["text_capped"] is True and second["kind"] == "text"
+    assert budget.capped is True
+
+
+def test_a_decode_budget_bounds_inflating_and_a_parent_is_charged_too():
+    parent = net_decode.DecodeBudget(100, 10 ** 9, 2 * 1024 * 1024)
+    share = net_decode.DecodeBudget(100, 10 ** 9, 10 ** 9, parent)
+    for _ in range(6):
+        net_decode.decode_event_fields(http(query="&".join("v%d=%s" % (i, _BIG) for i in range(2))),
+                                       share)
+    assert parent.spent["inflate"] <= 2 * 1024 * 1024 and share.spent == parent.spent
+    assert share.capped is True and parent.capped is True
+
+
+def test_without_a_budget_nothing_changes():
+    budget = net_decode.DecodeBudget(10 ** 6, 10 ** 9, 10 ** 9)
+    event = http(query="v=" + _BIG, body_text="data=aGVsbG8gd29ybGQ=")
+    assert net_decode.decode_event_fields(event) == net_decode.decode_event_fields(event, budget)
+    assert budget.capped is False

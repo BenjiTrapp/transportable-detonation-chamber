@@ -65,6 +65,12 @@ Regressions covered:
     ``/dl;token=abc/stage.exe`` was keyed (and shown) as ``/dl;token=***``
     like ``.../update.bin`` (final review I2)
   * an empty capture looked the same as a capture in which nothing was found
+  * decoded values and DNS answers were outside every budget: 2.8 MB of GETs
+    with base64-gzip query values were 800 decoded events, 60.6 MB of JSON and
+    14 s, sixty DNS replies of 4000 pointer answers 61.5 MB; the decoded
+    events of a capture and of each flow have a budget (``decoded_capped``),
+    so do its DNS answers (``dns_answers_capped``), and a body is no longer
+    inflated past what the text budget can still keep (follow-up F1)
 """
 
 import base64
@@ -480,9 +486,56 @@ def test_a_capture_past_the_event_cap_is_cut_and_says_so(tmp_path, monkeypatch):
     assert not any(e.get("dest", "").startswith("203.0.113.2") for e in r["events"])
 
 
+def _query_amplifier(cap, count, server=C2, values=4):
+    import gzip
+    val = base64.urlsafe_b64encode(gzip.compress(b"hello world, this is text\n" * 40330, 9)).decode()
+    q = "&".join("v%d=%s" % (i, val) for i in range(values))
+    cap.tcp(10.0, server, 80, [("c", ("GET /g?%s HTTP/1.1\r\nHost: a.top\r\n\r\n" % q).encode() * count)])
+
+
+def test_decoded_values_have_a_budget_per_capture_and_say_when_it_was_spent(tmp_path):
+    # the reviewer's probe: 2.8 MB of capture, 800 decoded events, 60.6 MB of JSON, 14 s
+    cap = Capture()
+    _query_amplifier(cap, 200)
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    decoded = [e for e in r["events"] if e["type"] == "decoded"]
+    assert r["decoded_capped"] is True and r["max_decoded"] == net_analyze.MAX_DECODED
+    assert sum(len(d["text"] or "") for d in decoded) <= net_analyze.DECODED_TEXT_PER_FLOW
+    assert len(json.dumps(r)) < 4 * os.path.getsize(_write(tmp_path, cap, "again.pcap"))
+
+
+def test_one_flow_cannot_spend_the_decoding_budget_of_the_others(tmp_path, monkeypatch):
+    monkeypatch.setattr(net_analyze, "MAX_DECODED_PER_FLOW", 20)
+    cap = Capture()
+    _query_amplifier(cap, 50, values=1)
+    secret = base64.b64encode(b"<config><c2>http://evil-c2.top/gate.php</c2></config>").decode()
+    cap.get(50.0, "evil.top", "/s?cfg=" + secret, b"ok")
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    decoded = [e for e in r["events"] if e["type"] == "decoded"]
+    assert sum(1 for d in decoded if d["dest"] == "a.top") == 20
+    assert any(d["dest"] == "evil.top" and "evil-c2.top" in (d["text"] or "") for d in decoded)
+    assert r["decoded_capped"] is True
+
+
+def test_dns_answers_have_a_budget_per_capture(tmp_path, monkeypatch):
+    monkeypatch.setattr(net_analyze, "MAX_DNS_ANSWERS", 100)
+    import test_net_dns
+    cap = Capture()
+    ask, reply = test_net_dns._pointer_reply(4000)
+    for i in range(5):
+        cap.udp(10.0 + i, RESOLVER, 53, ask, reply)
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    dns = [e for e in r["events"] if e["type"] == "dns"]
+    assert len(dns) == 5 and all(e["answers_capped"] for e in dns)
+    assert sum(len(e["answers"]) for e in dns) == 100
+    assert r["dns_answers_capped"] is True and r["max_dns_answers"] == 100
+    assert len(json.dumps(r)) < 200 * 1024
+
+
 def test_a_capture_under_the_event_cap_is_not_marked_cut(tmp_path):
     r = net_analyze.analyze_pcap(_pcap_with_http_c2(tmp_path))
     assert r["events_capped"] is False and r["text_budget_spent"] is False
+    assert r["decoded_capped"] is False and r["dns_answers_capped"] is False
 
 
 # --- the baseline ----------------------------------------------------------------------------------

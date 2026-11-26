@@ -9,7 +9,8 @@ Regressions covered:
   * "could not decide" shown as "nothing found": a rule left undecided, a spent regex, hash or
     text budget, a capture past its event cap (events_capped), a cut capture and a failed step
     each need their own say in OVERVIEW; a capture without
-    traffic is "not observed" with its note, never "nothing found"
+    traffic is "not observed" with its note, never "nothing found"; a spent decoding budget
+    (decoded_capped) and DNS answers cut by their budget (dns_answers_capped) too (follow-up F1)
   * a finding another finding absorbed (superseded_by) listed under "suppressed by the baseline",
     here and in the memory evidence block; baseline events and findings not marked
   * the evidence source `network` drawn as live memory (the verdict flow's default kind)
@@ -281,6 +282,8 @@ UNDECIDED = {
     "hash budget": ({"hash_budget_spent": True}, ["hash budget"]),
     "events capped": ({"events_capped": True, "max_events": 20000}, ["more than 20000 events", "report is cut"]),
     "text budget": ({"text_budget_spent": True}, ["text budget"]),
+    "decoded capped": ({"decoded_capped": True, "max_decoded": 5000}, ["decoding budget", "5000 decoded values"]),
+    "dns answers capped": ({"dns_answers_capped": True, "max_dns_answers": 10000}, ["DNS answers were not kept", "10000"]),
     "truncated": ({"truncated": True}, ["capture was cut"]),
     "errors": ({"errors": ["net_decode on a http event to a.example: ValueError"]}, ["net_decode on a http event"]),
 }

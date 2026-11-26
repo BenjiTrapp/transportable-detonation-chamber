@@ -126,6 +126,7 @@ from net_events import NetEvent, is_readable_text
 
 MAX_BODY_TEXT = 256 * 1024       # text kept per body or message; the size is still exact
 MAX_INFLATED = MAX_BODY_TEXT     # output of one inflate step kept for text; nothing past it is kept anyway
+KIND_PEEK = 4096                 # inflated bytes read for a file's kind once the text budget is gone
 MAX_HASHED = 64 * 1024 * 1024    # decoded bytes hashed and sized for a download; bounds time, not memory
 MAX_HEAD = 256 * 1024            # a header section longer than this is not read
 UPLOAD_MIN = 512                 # a request body above this many bytes is an upload
@@ -545,7 +546,7 @@ def _layers(encoding):
     return [c for c in reversed(codings) if c != "identity"]
 
 
-def _decoded(body, encoding):
+def _decoded(body, encoding, limit=MAX_INFLATED):
     """``(data, capped, failed, applied)``: the body with its content encoding undone.
 
     ``applied`` is True when an inflate was attempted. ``capped`` means more
@@ -559,7 +560,7 @@ def _decoded(body, encoding):
         return body, False, False, False
     data, capped, failed = body, False, False
     for _coding in layers:
-        data, capped, failed = _inflate(data, MAX_INFLATED)
+        data, capped, failed = _inflate(data, limit)
         if capped or failed:
             break
     return data, capped, failed, True
@@ -572,8 +573,11 @@ def _body_text(body, encoding, budget=None):
     ``decoded`` is what ``_decoded`` returned. A body that could not be decoded
     at all has no text, however empty its remains are. ``budget`` is the
     capture's ``TextBudget``; ``budget_spent`` is True when it cut the text.
+    Nothing is inflated past what the budget can still keep, except the first
+    ``KIND_PEEK`` bytes that say what kind of file a body is.
     """
-    decoded = _decoded(body, encoding)
+    limit = MAX_INFLATED if budget is None else min(MAX_INFLATED, max(budget.left, KIND_PEEK))
+    decoded = _decoded(body, encoding, limit)
     data, inflate_capped, failed, _applied = decoded
     text, capped = _text(data, cut=inflate_capped or failed)
     if failed and not data:

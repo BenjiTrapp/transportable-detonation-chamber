@@ -147,7 +147,8 @@ _SESSION = ("user", "password_captured", "auth_attempts", "auth_ok", "starttls",
             "truncated", "stream_capped")
 
 FIELDS = {
-    "dns": COMMON | {"server", "query", "query_type", "answers", "rcode", "nxdomain"},
+    "dns": COMMON | {"server", "query", "query_type", "answers", "answers_capped", "rcode",
+                     "nxdomain"},
     # made from the flows by net_analyze, one per TCP flow (conn or conn_failed)
     # and one per UDP flow no parser claims
     "conn": COMMON | {"src", "sport", "proto", "app", "first_ts", "last_ts", "duration",

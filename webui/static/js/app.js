@@ -13355,6 +13355,8 @@ function networkUndecided(report) {
     if (report.hash_budget_spent) out.push('The hash budget was spent: some files have no full hash.');
     if (report.events_capped) out.push(`The capture held more than ${networkText(report.max_events)} events: the flows after that were not parsed, so the report is cut.`);
     if (report.text_budget_spent) out.push('The text budget was spent: some bodies keep only part of their text, or none.');
+    if (report.decoded_capped) out.push(`The decoding budget was spent (at most ${networkText(report.max_decoded)} decoded values per capture, and a share per flow, with a bound on their text and inflating): some encoded values were not decoded, or keep only part of their text.`);
+    if (report.dns_answers_capped) out.push(`Some DNS answers were not kept (at most ${networkText(report.max_dns_answers)} per capture, and a few dozen per message).`);
     const errors = Array.isArray(report.errors) ? report.errors : [];
     errors.slice(0, NETWORK_ERRORS_SHOWN).forEach(err => out.push(`A step failed: ${networkText(err)}`));
     if (errors.length > NETWORK_ERRORS_SHOWN) out.push(`${errors.length - NETWORK_ERRORS_SHOWN} more failed step(s) are not listed.`);

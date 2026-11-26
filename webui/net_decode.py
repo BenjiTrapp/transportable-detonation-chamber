@@ -159,10 +159,42 @@ class Decoded:
 class _Work:
     """What one decode (or one event's worth of decodes) has spent."""
 
-    def __init__(self):
-        self.inflate_left = MAX_EVENT_INFLATE
+    def __init__(self, inflate=MAX_EVENT_INFLATE):
+        self.inflate_left = inflate
         self.chars_left = MAX_EVENT_CHARS
         self.truncated = False
+        self.starved = False        # an inflate step got less than MAX_INFLATED
+
+
+class DecodeBudget:
+    """What the ``decoded`` events of many source events may still cost
+    together: how many there are (``count``), the characters of decoded text
+    they keep (``text``) and the bytes all their inflate steps produce
+    (``inflate``). The bounds per event are not the bound that matters: two
+    hundred GETs with four base64-gzip query values each were 800 decoded
+    events, 60 MB of report and 14 s. A budget with a ``parent`` (a flow's
+    share of the capture's) is charged to both and has what both have left.
+    ``capped`` is set on the budget, and its parents, that refused something."""
+
+    def __init__(self, count, text, inflate, parent=None):
+        self.limits = {"count": count, "text": text, "inflate": inflate}
+        self.spent = {"count": 0, "text": 0, "inflate": 0}
+        self.parent = parent
+        self.capped = False
+
+    def left(self, what):
+        own = max(0, self.limits[what] - self.spent[what])
+        return own if self.parent is None else min(own, self.parent.left(what))
+
+    def charge(self, what, amount):
+        self.spent[what] += amount
+        if self.parent is not None:
+            self.parent.charge(what, amount)
+
+    def cap(self):
+        self.capped = True
+        if self.parent is not None:
+            self.parent.cap()
 
 
 # --- reading bytes as text -----------------------------------------------------
@@ -249,7 +281,7 @@ def _inflate(raw, wbits, work):
     """The start of the inflated data, at most ``MAX_INFLATED`` bytes, or None."""
     limit = min(MAX_INFLATED, work.inflate_left)
     if limit <= 0:
-        work.truncated = True
+        work.truncated = work.starved = True
         return None
     decoder = zlib.decompressobj(wbits)
     try:
@@ -259,6 +291,8 @@ def _inflate(raw, wbits, work):
     work.inflate_left -= len(out)
     if not decoder.eof:
         work.truncated = True
+        if limit < MAX_INFLATED and len(out) >= limit:
+            work.starved = True
     return out or None
 
 
@@ -842,7 +876,7 @@ def _fields(event):
                     yield "messages[%d].text" % index, message.get("text"), False
 
 
-def _decoded_event(source, field, name, value, decoded):
+def _decoded_event(source, field, name, value, decoded, keep=MAX_EVENT_TEXT):
     text = decoded.text
     return NetEvent(
         "decoded", source.get("ts", 0.0), process=source.get("process", ""),
@@ -850,15 +884,15 @@ def _decoded_event(source, field, name, value, decoded):
         source=source.get("type"), field=field, name=name,
         scheme=decoded.scheme, layers=list(decoded.layers), kind=decoded.kind,
         charset=decoded.charset,
-        text=text[:MAX_EVENT_TEXT] if text is not None else None,
-        text_capped=text is not None and len(text) > MAX_EVENT_TEXT,
+        text=text[:keep] if text is not None else None,
+        text_capped=text is not None and len(text) > keep,
         size=len(decoded.bytes), sha256=hashlib.sha256(decoded.bytes).hexdigest(),
         preview=render_bytes(decoded.bytes[:PREVIEW_BYTES]) if text is None else "",
         credential=_is_credential(field, name, decoded),
         encoded=value[:ENCODED_SHOWN], encoded_len=len(value), truncated=decoded.truncated)
 
 
-def decode_event_fields(event):
+def decode_event_fields(event, budget=None):
     """``decoded`` events for the encoded values in an ``http`` or ``websocket``
     event (query, headers, body, response; or WebSocket messages), in field order; an empty list when there is nothing worth reporting.
 
@@ -867,19 +901,49 @@ def decode_event_fields(event):
     source event is not changed and no ``Secret`` can travel into the result.
     The walk is bounded: ``MAX_EVENT_CHARS`` of field text, ``MAX_VALUES_PER_FIELD``
     values per field, ``MAX_EVENT_INFLATE`` inflated bytes and
-    ``MAX_DECODED_PER_EVENT`` results.
+    ``MAX_DECODED_PER_EVENT`` results. ``budget``, a ``DecodeBudget``, bounds
+    many events together: no more results than its ``count``, no more kept
+    text than its ``text`` (a result past it keeps the start, or "", with
+    ``text_capped``) and no more inflating than its ``inflate``; it is
+    ``capped`` when it refused anything.
     """
-    work = _Work()
+    start = MAX_EVENT_INFLATE if budget is None else min(MAX_EVENT_INFLATE,
+                                                         budget.left("inflate"))
+    work = _Work(start)
     found = []
-    for field, raw, is_header in _fields(event):
-        text = _field_text(raw)
-        if text is None or not text.strip():
-            continue
-        if work.chars_left <= 0:
-            break
-        work.chars_left -= len(text)
-        for name, value, decoded in (_decode_header if is_header else _decode_text)(text, work):
-            found.append(_decoded_event(event, field, name, value, decoded))
-            if len(found) == MAX_DECODED_PER_EVENT:
-                return found
-    return found
+    if budget is not None and budget.left("count") <= 0:
+        if any(isinstance(raw, (str, bytes, bytearray)) and len(raw) >= _MIN_VALUE
+               for _field, raw, _header in _fields(event)):
+            budget.cap()
+        return found
+    try:
+        for field, raw, is_header in _fields(event):
+            text = _field_text(raw)
+            if text is None or not text.strip():
+                continue
+            if work.chars_left <= 0:
+                break
+            work.chars_left -= len(text)
+            for name, value, decoded in (_decode_header if is_header else _decode_text)(text,
+                                                                                         work):
+                if budget is not None and budget.left("count") <= 0:
+                    budget.cap()
+                    return found
+                keep = MAX_EVENT_TEXT
+                if budget is not None and decoded.text is not None:
+                    keep = min(keep, budget.left("text"))
+                    if keep < MAX_EVENT_TEXT and len(decoded.text) > keep:
+                        budget.cap()
+                one = _decoded_event(event, field, name, value, decoded, keep)
+                found.append(one)
+                if budget is not None:
+                    budget.charge("count", 1)
+                    budget.charge("text", len(one["text"] or ""))
+                if len(found) == MAX_DECODED_PER_EVENT:
+                    return found
+        return found
+    finally:
+        if budget is not None:
+            budget.charge("inflate", start - work.inflate_left)
+            if work.starved and start < MAX_EVENT_INFLATE:
+                budget.cap()

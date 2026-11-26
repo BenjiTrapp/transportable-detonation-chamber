@@ -42,6 +42,10 @@ instructions. The assumptions this module refuses to make:
     not DNS at all is skipped on its own; it does not stop the messages beside
     it. A response cut inside its answers keeps the records read before the
     cut. Nothing in a message is executed or opened as a file.
+  * An answer section is a few records. Compression pointers let 56 KB of
+    message hold 4000 answers of 253 characters each, a megabyte of names in
+    one event; sixty such replies were 61 MB of report. A message keeps its
+    first ``MAX_ANSWERS`` records and ``answers_capped`` says more existed.
 
 Only UDP is read. DNS over TCP frames its messages inside a stream, and the
 flow keeps no per-message time for a stream, so ``is_dns`` leaves those flows
@@ -57,6 +61,7 @@ import struct
 from net_events import NetEvent, render_bytes
 
 DNS_PORT = 53
+MAX_ANSWERS = 64                # answer records kept per message
 
 _QTYPES = {
     1: "A", 2: "NS", 5: "CNAME", 6: "SOA", 12: "PTR", 15: "MX", 16: "TXT",
@@ -163,11 +168,12 @@ def _answer(buf, kind, start, rdata):
 
 
 def _parse(payload):
-    """``(txid, is_response, name, qtype, rcode, answers)`` or None to skip.
+    """``(txid, is_response, name, qtype, rcode, answers, capped)`` or None to skip.
 
     ``name`` and ``qtype`` are None for a message with no question. The header
     and the first question must be readable; the answers are the complete
-    records before the first one that is not.
+    records before the first one that is not, at most ``MAX_ANSWERS``
+    (``capped`` says the message declared more).
     """
     if len(payload) < _HEADER.size:
         return None
@@ -187,7 +193,7 @@ def _parse(payload):
         return None
     answers = []
     try:
-        for _ in range(ancount):
+        for _ in range(min(ancount, MAX_ANSWERS)):
             _owner, pos = _read_name(payload, pos)
             if pos + _RR_FIXED.size > len(payload):
                 break
@@ -200,7 +206,8 @@ def _parse(payload):
             pos = start + rdlength
     except _Bad:
         pass
-    return txid, bool(flags & 0x8000), name, qtype, flags & 0x000F, answers
+    return (txid, bool(flags & 0x8000), name, qtype, flags & 0x000F, answers,
+            ancount > MAX_ANSWERS)
 
 
 def _take(stack):
@@ -226,11 +233,11 @@ def events_from_flow(flow):
     by_txid = {}
     seen = set()        # (txid, name, type) of every lookup already reported
 
-    def make(ts, name, qtype, rcode=None, answers=()):
+    def make(ts, name, qtype, rcode=None, answers=(), capped=False):
         """rcode None: a query whose answer has not been seen."""
         return NetEvent("dns", ts, dest=name, port=DNS_PORT, server=server,
                         query=name, query_type=_type_name(qtype),
-                        answers=list(answers),
+                        answers=list(answers), answers_capped=bool(capped),
                         rcode="" if rcode is None else _rcode_name(rcode),
                         nxdomain=rcode == _NXDOMAIN)
 
@@ -238,7 +245,7 @@ def events_from_flow(flow):
         parsed = _parse(payload)
         if parsed is None:
             continue
-        txid, is_response, name, qtype, rcode, answers = parsed
+        txid, is_response, name, qtype, rcode, answers, capped = parsed
         if not is_response:
             if name is None:
                 continue
@@ -255,9 +262,10 @@ def events_from_flow(flow):
             event = _take(by_question.get((txid, name, qtype), []))
         if event is not None:
             event["answers"] = answers
+            event["answers_capped"] = capped
             event["rcode"] = _rcode_name(rcode)
             event["nxdomain"] = rcode == _NXDOMAIN
         elif name is not None and (txid, name, qtype) not in seen:
             seen.add((txid, name, qtype))
-            events.append(make(ts, name, qtype, rcode, answers))
+            events.append(make(ts, name, qtype, rcode, answers, capped))
     return events
