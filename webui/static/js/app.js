@@ -19652,6 +19652,11 @@ function renderSyscallStageBlock(sc) {
         });
         html += '</tbody></table>';
     }
+    // the measurement went into the scan history: the map can show it, as the past measurement it is
+    if (typeof sc.history_id === 'string' && sc.history_id) {
+        html += `<button class="btn btn-sm" onclick="switchTab('syscalls');syscallSetView('map');syscallOpenMeasurement(${jsArg(sc.history_id)})" `
+            + 'title="Draw this measurement on the map of the SYSCALLS tab, as the past measurement it is: nothing is measured again">Show on the syscall map</button>';
+    }
     return html + _detRawButton('View Syscalls raw', sc);
 }
 
@@ -26627,15 +26632,18 @@ function syscallMapLegendHtml(counts, unscanned) {
 }
 
 // One row of the catalog under the map: the dot of its state, its name, its module and its number. `state` is
-// the measured state, absent without a scan; `selected` marks the chosen syscall.
+// the measured state, absent without a scan; `selected` marks the chosen syscall. `unplaced`: the past measurement on
+// the map did measure it, but its cells cannot be placed on this baseline, so it has no state here and is no
+// syscall that was not scanned.
 function syscallRowHtml(entry) {
     const name = String(entry.name === null || entry.name === undefined ? '' : entry.name);
     const state = entry.state ? String(entry.state) : '';
     const module = String(entry.module || '').replace(/\.dll$/i, '');
+    const none = entry.unplaced ? 'measured, its cell not placed on this baseline' : 'not scanned';
     return `<button type="button" class="syscall-row${entry.selected ? ' selected' : ''}"${entry.selected ? ' aria-current="true"' : ''} ` +
            `data-name="${escapeHtml(name)}" ` +
-           `aria-label="${escapeHtml(`${name}, ${state || 'not scanned'}`)}" onclick="syscallSelect(${jsArg(name)})">` +
-           `<span class="syscall-row-dot syscall-state-${cssToken(state || 'baseline')}" title="${escapeHtml(state || 'not scanned')}"></span>` +
+           `aria-label="${escapeHtml(`${name}, ${state || none}`)}" onclick="syscallSelect(${jsArg(name)})">` +
+           `<span class="syscall-row-dot syscall-state-${cssToken(state || 'baseline')}" title="${escapeHtml(state || none)}"></span>` +
            `<span class="syscall-row-name">${escapeHtml(name)}</span>` +
            `<span class="syscall-row-module">${escapeHtml(module)}</span>` +
            `<span class="syscall-row-num" title="${escapeHtml(entry.number)}">${escapeHtml(syscallHex(entry.number))}</span>` +
@@ -26785,6 +26793,47 @@ function syscallScanSummary(scan) {
     return text;
 }
 
+// The time of a measurement as the history wrote it (the VM's clock, ISO), to the second: '2026-11-20 09:15:42'.
+// It is shown as written and not converted: the browser's zone need not be the VM's.
+function syscallWhen(iso) {
+    const text = String(iso ?? '');
+    const m = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})/.exec(text);
+    return m ? `${m[1]} ${m[2]}` : (text || 'an unknown time');
+}
+
+// The choices of the past-measurement control: the measurements /api/syscalls/measurements names, newest first, each
+// as process · PID · time · view. `selected` is the id on the map; `error` a list that could not be read, which is
+// said instead of looking like an empty history.
+function syscallPastOptionsHtml(list, selected, error) {
+    let html = '<option value="">— a past measurement —</option>';
+    if (error) html += `<option value="" disabled>the scan history could not be read: ${escapeHtml(error)}</option>`;
+    for (const m of Array.isArray(list) ? list : []) {
+        if (!m || typeof m.id !== 'string' || !m.id) continue;
+        const label = `${m.process || 'unknown process'} · PID ${m.pid} · ${syscallWhen(m.at)} · ${m.view || 'unknown view'}`;
+        html += `<option value="${escapeHtml(m.id)}"${m.id === selected ? ' selected' : ''}>${escapeHtml(label)}</option>`;
+    }
+    return html;
+}
+
+// The banner over the map while a past measurement is shown: { tone, html }. It says that it is one, whose and when,
+// that it is not a scan of now, and why its cells are not drawn when they are not, and it leads back to live.
+function syscallPastBannerHtml(past) {
+    const tag = '<span class="syscall-notice-title syscall-past-tag">PAST MEASUREMENT</span>';
+    const back = '<button type="button" class="btn btn-xs syscall-past-back" onclick="syscallBackToLive()" ' +
+                 'title="Put the past measurement away: the map shows the baseline again, and SCAN measures now">BACK TO LIVE</button>';
+    const text = t => `<span class="syscall-notice-text">${escapeHtml(t)}</span>`;
+    if (past.loading) return { tone: 'warn', html: tag + text(`Loading the measurement ${past.id}… It is not a scan of now.`) + back };
+    if (!past.data) return { tone: 'error', html: tag + text(`The measurement ${past.id} could not be loaded: ${past.error}`) + back };
+    const d = past.data;
+    // the history writes the chamber's datetime.now() and no zone: the time is said to be the chamber's, once, here
+    let html = tag + text(`Measured ${syscallWhen(d.measured_at)} by the chamber's clock (no time zone recorded), not a scan of now: ` +
+                          'the process may have changed since, or be gone. ' +
+                          syscallScanSummary(d));
+    if (past.refusal) html += `<span class="syscall-notice-text syscall-past-refusal">No map: ${escapeHtml(past.refusal)}. ` +
+                              'Its figures and its deviations are its own and are shown.</span>';
+    return { tone: past.refusal ? 'error' : 'warn', html: html + back };
+}
+
 // --- The detail panel, the deviation list and the rule draft: markup from what the baseline, the target and a
 // drafted rule hold. Every string of them goes through escapeHtml; a rule is shown as text, never as markup. ---
 
@@ -26864,7 +26913,11 @@ function renderSyscallDetail(sc) {
                `<dl class="syscall-facts">${facts.join('')}</dl>`;
 
     if (sc.scanned === false) {
-        html += '<p class="syscall-detail-note">This syscall is not part of the last scan (win32u is left out unless it is asked for).</p>';
+        html += sc.past === true
+            ? '<p class="syscall-detail-note">This syscall is not part of this past measurement (win32u is left out unless it is asked for).</p>'
+            : '<p class="syscall-detail-note">This syscall is not part of the last scan (win32u is left out unless it is asked for).</p>';
+    } else if (sc.past === true && !state) {
+        html += '<p class="syscall-detail-note">The past measurement on the map cannot be placed on this baseline, so nothing it measured is shown here: DEVIATIONS lists what it recorded.</p>';
     }
     const jumps = state === 'hooked' || state === 'patched' || state === 'diverged';
     if (state) {
@@ -26881,9 +26934,10 @@ function renderSyscallDetail(sc) {
             }
             if (sc.pattern) rows.push(fact('Pattern', escapeHtml(sc.pattern)));
             // number_matches is true, false or null: null is a jump over the prologue, which shows no number
-            if (sc.number_matches === true) rows.push(fact('Number', 'The live bytes carry the number of the baseline.'));
-            else if (sc.number_matches === false) rows.push(fact('Number', '<strong class="syscall-number-differs">The live bytes do NOT carry the number of the baseline: the stub names another syscall.</strong> That is a finding of its own.'));
-            else rows.push(fact('Number', 'The live bytes do not show a number: a jump overwrote the prologue.'));
+            const bytes = sc.past === true ? 'The bytes read then' : 'The live bytes';
+            if (sc.number_matches === true) rows.push(fact('Number', `${bytes} carry the number of the baseline.`));
+            else if (sc.number_matches === false) rows.push(fact('Number', `<strong class="syscall-number-differs">${bytes} do NOT carry the number of the baseline: the stub names another syscall.</strong> That is a finding of its own.`));
+            else rows.push(fact('Number', `${bytes} do not show a number: a jump overwrote the prologue.`));
         }
         if (rows.length) finding += `<dl class="syscall-facts">${rows.join('')}</dl>`;
         if (state === 'hooked' && sc.allowlisted === true) {
@@ -26910,6 +26964,9 @@ function renderSyscallDetail(sc) {
             const differ = syscallBytesDiffer(prefix, sc.actual);
             note += differ ? `, ${differ} differ` : ', all alike';
             if (state === 'unreadable') note += ' · the stub reads as zeros, or too short to compare: a page that is not paged in, or a wiped stub';
+        } else if (sc.past === true && state === 'intact') {
+            // the history keeps the bytes of a deviation only: these were read, found as the baseline has them, and not kept
+            note += ' · found intact; the bytes read are not kept with a past measurement';
         } else if (state === 'unreadable' || measured) {
             note += ' · No bytes could be read.';
         }
@@ -26955,7 +27012,8 @@ function renderSyscallDetail(sc) {
 
 // The deviations of a scan as a table, the loudest first. `list` is what /scan holds under `deviations`: every state
 // but intact, unreadable and diverged included, so a row is not always a finding. options: scanned (false: no scan
-// yet), selected (a name), scores (name → what the stub added to the evidence score). A hook the allowlist knows
+// yet), selected (a name), scores (name → what the stub added to the evidence score), past (the list is of a past
+// measurement, whose bytes were read then). A hook the allowlist knows
 // stays in the list, with its owner, and says that it does not score: an EDR that hooks ntdll in this process is
 // something to see, even though it is not evidence.
 function renderSyscallDeviations(list, options) {
@@ -26985,7 +27043,7 @@ function renderSyscallDeviations(list, options) {
             ? `<code class="syscall-bytes view-table-clip" title="${escapeHtml(own)}">${syscallBytesHtml(own, other)}</code>` : '<span class="syscall-muted">–</span>');
         return `<tr${name === opts.selected ? ' class="selected"' : ''}>` +
             `<td data-sort-value="${escapeHtml(name)}"><button type="button" class="syscall-link" onclick="syscallSelect(${jsArg(name)})">${escapeHtml(name)}</button>` +
-            (d.number_matches === false ? ' <span class="syscall-flag" title="The live bytes carry another syscall number than the baseline">number differs</span>' : '') + '</td>' +
+            (d.number_matches === false ? ` <span class="syscall-flag" title="${opts.past ? 'The bytes read then carry' : 'The live bytes carry'} another syscall number than the baseline">number differs</span>` : '') + '</td>' +
             `<td class="view-table-num" data-sort-value="${escapeHtml(d.number)}">${escapeHtml(syscallHex(d.number))}</td>` +
             `<td data-sort-value="${rank(d)}"><span class="syscall-row-dot syscall-state-${cssToken(state)}"></span> ${escapeHtml(state)}</td>` +
             `<td>${bytes(d.expected, d.actual)}</td><td>${bytes(d.actual, d.expected)}</td>` +
@@ -27135,6 +27193,7 @@ function renderHookAllowlist(state) {
     const hookable = scan ? Number(scan.hookable) || 0 : 0;
     const record = !scan || hookable === 0 || st.busy === true || st.loaded !== true;
     const recordTitle = st.loaded !== true ? 'The known hooks have not been read yet: recording waits for them'
+        : st.past === true ? 'A past measurement is on the map: go back to live and scan, the hooks of a run of now are what gets recorded'
         : !scan ? 'Scan a process first: the hooks of that run are what gets recorded'
         : hookable === 0 ? 'The last scan found no hook that is not known already' : 'Record the hooks of the last scan as known (asks first)';
     const forgetThis = !st.scope || !entries.length || st.busy === true;
@@ -27244,6 +27303,11 @@ const syscallState = {
     lowerFolded: false, lowerByHand: false,
     targets: {}, target: '',
     timer: null,
+    // A past measurement on the map in place of a scan of now: null while the map is live, else { id, loading } and
+    // then { id, data } or { id, error }. `refusal` says why its cells are not drawn. pastSeq drops late answers.
+    past: null, pastSeq: 0,
+    // What /api/syscalls/measurements named: the choices of the control
+    pastList: [], pastListError: '',
 };
 
 // A request to /api/syscalls/...: never throws, `data` is an object whatever the answer was
@@ -27304,11 +27368,22 @@ async function syscallLoadBaseline(view) {
 function syscallDropForeignScan() {
     const scan = syscallState.scan, baseline = syscallState.baseline;
     if (!scan || (baseline && baseline.view === scan.view)) return;
+    // a refused past measurement draws no cell on any baseline: another one changes nothing about it
+    if (syscallPastRefusal()) return;
+    const past = scan.live === false;
     syscallState.scan = null;
     syscallState.states = null;
+    if (past) {
+        syscallState.past = null;
+        syscallState.pastSeq++;
+    }
     syscallState.note = {
         tone: 'warn',
-        text: `The scan of PID ${scan.pid} measured the ${scan.view} view, but the map shows ` +
+        text: past
+            ? `The past measurement of PID ${scan.pid} ${scan.view ? `measured the ${scan.view} view` : 'names no view'}, so it cannot be placed ` +
+              `${baseline ? `on the ${baseline.view} baseline the map now shows` : 'while the map shows no baseline'}: it is put away. ` +
+              'Choose it again to see its figures and deviations.'
+            : `The scan of PID ${scan.pid} ${scan.view ? `measured the ${scan.view} view` : 'names no view'}, but the map shows ` +
               `${baseline ? `the ${baseline.view} baseline` : 'no baseline'}: its measurement is cleared.`,
     };
 }
@@ -27376,19 +27451,29 @@ function syscallOnTarget() {
 function syscallEmptyText() {
     if (syscallState.loading) return 'Loading the baseline…';
     if (syscallState.baselineError) return syscallState.baselineError;
+    const refusal = syscallPastRefusal();
+    if (refusal) return `No map of this past measurement: ${refusal}`;
     if (syscallState.baseline) return 'The baseline has no syscalls.';
     return 'No baseline loaded.';
+}
+
+// Why the past measurement on the map has no cells, '' when it has them or none is shown. A cell is drawn only on
+// the baseline the measurement was rebuilt against: never on another one.
+function syscallPastRefusal() {
+    const past = syscallState.past;
+    return past && past.data && past.refusal ? past.refusal : '';
 }
 
 // The bands' markup: a heading and a canvas per module, built again only when the baseline (or what stands in
 // its place) changed
 function syscallEnsureBands(host) {
-    const key = syscallState.bands.length ? `bands:${syscallState.bandsKey}` : `empty:${syscallEmptyText()}`;
+    const drawn = syscallState.bands.length && !syscallPastRefusal();
+    const key = drawn ? `bands:${syscallState.bandsKey}` : `empty:${syscallEmptyText()}`;
     if (host.dataset.key === key) return;
     host.dataset.key = key;
     host.replaceChildren();
     syscallState.layouts.clear();
-    if (!syscallState.bands.length) {
+    if (!drawn) {
         const empty = document.createElement('p');
         empty.className = 'syscall-empty';
         empty.textContent = syscallEmptyText();
@@ -27477,7 +27562,7 @@ function renderSyscallLegend() {
     if (!host) return;
     const counts = syscallState.scan ? syscallState.scan.counts || {} : null;
     const measured = counts ? SYSCALL_STATES.reduce((sum, s) => sum + (Number(counts[s]) || 0), 0) : 0;
-    const total = syscallState.baseline ? syscallState.baseline.items.length : 0;
+    const total = syscallState.baseline && !syscallPastRefusal() ? syscallState.baseline.items.length : 0;
     host.innerHTML = syscallMapLegendHtml(counts, Math.max(total - measured, 0));
 }
 
@@ -27489,6 +27574,10 @@ function renderSyscallRows() {
     const match = syscallState.match;
     const matching = match ? items.filter(item => match.has(item.name)) : items;
     const shown = matching.slice(0, SYSCALL_ROWS_MAX);
+    // under a refusal: the modules the measurement covered, whose rows have no state only because none is drawn
+    const unplaced = syscallPastRefusal() && syscallState.scan
+        ? new Set((Array.isArray(syscallState.scan.modules) ? syscallState.scan.modules : ['ntdll.dll']).map(m => String(m).toLowerCase()))
+        : null;
     if (head) {
         head.textContent = `Catalog · ${matching.length.toLocaleString('en-US')} of ${items.length.toLocaleString('en-US')} syscalls` +
             (matching.length > shown.length ? ` · the first ${shown.length} listed, narrow the filter for the rest` : '');
@@ -27498,6 +27587,7 @@ function renderSyscallRows() {
     host.innerHTML = shown.length
         ? shown.map(item => syscallRowHtml({
             ...item, state: syscallState.states ? syscallState.states.get(item.name) : '', selected: item.name === syscallState.selected,
+            unplaced: !!unplaced && unplaced.has(item.module),
         })).join('')
         : (items.length ? '<div class="syscall-empty">No syscall matches the filter.</div>' : '');
     host.scrollTop = top;
@@ -27514,21 +27604,31 @@ function renderSyscallNotices() {
     host.hidden = notices.length === 0;
 }
 
-// SCAN waits for a target and while a scan runs; the toggles show the surface that is on
+// SCAN waits for a target and while a scan runs; the toggles show the surface that is on. While a past measurement
+// is on the map nothing measures now: a map half of then and half of now would read as one measurement.
 function renderSyscallToolbar() {
+    const past = !!syscallState.past;
+    const back = 'A past measurement is on the map: go back to live to measure now';
     const scan = document.getElementById('syscall-scan');
     if (scan) {
-        scan.disabled = syscallState.scanning || !syscallState.target;
+        scan.disabled = past || syscallState.scanning || !syscallState.target;
         scan.textContent = syscallState.scanning ? 'SCANNING…' : 'SCAN';
-        scan.title = syscallState.target ? 'Measure the syscall stubs of the chosen process against the baseline'
-                                          : 'Choose a process first';
+        scan.title = past ? back : syscallState.target ? 'Measure the syscall stubs of the chosen process against the baseline'
+                                                       : 'Choose a process first';
     }
     const stubs = document.getElementById('syscall-stubs-run');
     if (stubs) {
-        stubs.disabled = syscallState.stubs.running || syscallState.scanning || !syscallState.target;
+        stubs.disabled = past || syscallState.stubs.running || syscallState.scanning || !syscallState.target;
         stubs.textContent = syscallState.stubs.running ? 'SEARCHING…' : 'STUBS';
-        stubs.title = syscallState.target ? 'Search the process memory and the image file of the chosen process for syscall stubs of their own'
-                                          : 'Choose a process first';
+        stubs.title = past ? back : syscallState.target ? 'Search the process memory and the image file of the chosen process for syscall stubs of their own'
+                                                        : 'Choose a process first';
+    }
+    const choice = document.getElementById('syscall-past');
+    if (choice) {
+        const busy = syscallState.scanning || syscallState.stubs.running || syscallState.hooks.busy;
+        choice.disabled = busy;
+        choice.title = busy ? 'A measurement of now is under way: a past one can be chosen when it is done'
+            : 'Look at a measurement the scan history kept, a detonation\'s among them: it is drawn as it was measured then, nothing is measured again';
     }
     for (const name of SYSCALL_VIEW_NAMES) {
         const button = document.getElementById(`syscall-view-${name}`);
@@ -27579,6 +27679,8 @@ function syscallRenderAll() {
     const subtitle = document.getElementById('syscalls-subtitle');
     if (subtitle) subtitle.textContent = syscallSubtitle(syscallState.baseline);
     renderSyscallToolbar();
+    renderSyscallPastList();
+    renderSyscallPast();
     renderSyscallNotices();
     renderSyscallScan();
     renderSyscallLegend();
@@ -27631,7 +27733,8 @@ function syscallApplyLower() {
     const button = document.getElementById('syscall-lower-fold');
     if (button) {
         button.setAttribute('aria-expanded', String(!folded));
-        button.title = folded ? 'Show the panels of the last scan' : 'Fold the panels of the last scan away';
+        const whose = syscallState.scan && syscallState.scan.live === false ? 'the past measurement on the map' : 'the last scan';
+        button.title = folded ? `Show the panels of ${whose}` : `Fold the panels of ${whose} away`;
         button.setAttribute('aria-label', button.title);
     }
     const note = document.getElementById('syscall-lower-note');
@@ -27767,7 +27870,7 @@ function syscallOnMapClick(event) {
 // SCAN: the chosen process, ntdll and, if asked for, win32u. A scan that fails clears the measurement: the map goes
 // back to the baseline, so no cell shows what was measured in another process or before.
 async function runSyscallScan() {
-    if (syscallState.scanning) return;
+    if (syscallState.scanning || syscallState.past) return;
     const select = document.getElementById('syscall-target');
     const pid = parseInt(select ? select.value : syscallState.target, 10);
     if (!(pid > 0)) {
@@ -27805,6 +27908,133 @@ async function runSyscallScan() {
     }
     syscallApplyFilter();
     syscallRenderAll();
+    // the scan went into the history: it is one of the past measurements from now on
+    if (r.ok) syscallLoadPastList();
+}
+
+// --- A past measurement on the map ----------------------------------------------------------------------------
+// /api/syscalls/measurement answers in the shape of a scan, so the map reads it as it reads a scan. What it may never
+// do is read as a scan of now: the banner says what it is, SCAN and STUBS are off while it is shown, the live scan and
+// stub search are put away when it comes, and its cells are drawn only on the baseline its states were rebuilt for.
+
+async function syscallLoadPastList() {
+    const r = await syscallApi('/api/syscalls/measurements');
+    if (r.ok) {
+        syscallState.pastList = Array.isArray(r.data.measurements) ? r.data.measurements : [];
+        syscallState.pastListError = '';
+    } else {
+        syscallState.pastListError = syscallErrorText(r);
+    }
+    renderSyscallPastList();
+    return r.ok;
+}
+
+// The control names the measurement on the map even when the list read before it was made does not hold it yet
+function renderSyscallPastList() {
+    const select = document.getElementById('syscall-past');
+    if (!select) return;
+    const past = syscallState.past, list = syscallState.pastList.slice();
+    if (past && past.data && !list.some(m => m && m.id === past.id)) {
+        const d = past.data;
+        list.unshift({ id: past.id, at: d.measured_at, pid: d.pid, process: String(d.process || '').split(/[\\/]/).pop(), view: d.view });
+    }
+    select.innerHTML = syscallPastOptionsHtml(list, past ? past.id : '', syscallState.pastListError);
+    select.value = past ? past.id : '';
+}
+
+function renderSyscallPast() {
+    const host = document.getElementById('syscall-past-banner');
+    if (!host) return;
+    const past = syscallState.past;
+    const banner = past ? syscallPastBannerHtml(past) : null;
+    host.innerHTML = banner ? banner.html : '';
+    host.className = `syscall-notice syscall-past-banner${banner ? ` syscall-notice-${cssToken(banner.tone)}` : ''}`;
+    host.hidden = !banner;
+}
+
+function syscallOnPast() {
+    const select = document.getElementById('syscall-past');
+    const id = select ? select.value : '';
+    return id ? syscallOpenMeasurement(id) : syscallBackToLive();
+}
+
+// Put the measurement `id` of the scan history on the map. Not while a measurement of now runs: its answer would land
+// on the past one. Its states are drawn only when the server could rebuild them (`problem` is null) and the map holds
+// the baseline of the measurement's own build and view, loaded for its view when it is another one. The map can load
+// only this system's build (/api/syscalls/baseline has no build), so a measurement of another build has no cells here
+// even where the server rebuilt them against a baseline of that build: other numbers, other places.
+async function syscallOpenMeasurement(id) {
+    const wanted = String(id ?? '');
+    if (!wanted) return syscallBackToLive();
+    if (syscallState.scanning || syscallState.stubs.running || syscallState.hooks.busy) {
+        syscallSetScanNote('warn', 'A measurement of now is under way: choose the past one when it is done.');
+        renderSyscallPastList();
+        return false;
+    }
+    const seq = ++syscallState.pastSeq;
+    syscallState.past = { id: wanted, loading: true };
+    syscallState.scan = null;
+    syscallState.states = null;
+    syscallState.note = null;
+    syscallState.stubs = { searched: false, running: false, pid: 0, name: '', sources: {} };
+    syscallState.draftSeq++;
+    syscallState.draft = null;
+    syscallApplyFilter();
+    syscallRenderAll();
+    const r = await syscallApi(`/api/syscalls/measurement?id=${encodeURIComponent(wanted)}`);
+    if (seq !== syscallState.pastSeq) return false;
+    if (!r.ok) {
+        syscallState.past = { id: wanted, error: syscallErrorText(r) };
+        syscallRenderAll();
+        return false;
+    }
+    const data = r.data, view = String(data.view || '');
+    let unloaded = '';
+    // a read of the baseline that another one overtook (the tab's own refresh, when it was opened from a detonation)
+    // decides nothing: it is read again
+    for (let tries = 0; !data.problem && view && tries < 3 && !(syscallState.baseline && syscallState.baseline.view === view); tries++) {
+        const loaded = await syscallLoadBaseline(view);
+        if (seq !== syscallState.pastSeq) return false;
+        if (!loaded.ok && !loaded.superseded) {
+            unloaded = loaded.error;
+            break;
+        }
+    }
+    const baseline = syscallState.baseline;
+    let refusal = '';
+    if (data.problem) refusal = String(data.problem);
+    else if (!data.states || typeof data.states !== 'object') refusal = 'the server sent no map of it';
+    else if (!baseline || baseline.view !== view) refusal = `the ${view} baseline of this system could not be loaded${unloaded ? ` (${unloaded})` : ''}`;
+    else if (String(baseline.build) !== String(data.build)) {
+        refusal = `it was measured on build ${data.build}, and the map holds only this system's baseline, build ${baseline.build} ` +
+                  `(${baseline.view}): its cells are not drawn on the baseline of another build`;
+    }
+    syscallState.past = { id: wanted, data, refusal };
+    syscallState.scan = data;
+    syscallState.states = refusal ? null : new Map(Object.entries(data.states).map(([name, s]) => [name, s && s.state]));
+    syscallApplyFilter();
+    syscallRenderAll();
+    if (!syscallState.pastList.some(m => m && m.id === wanted)) syscallLoadPastList();
+    return !refusal;
+}
+
+// BACK TO LIVE: the past measurement leaves the map with what came from it (its states, a rule drafted from it), the
+// map is the baseline again and SCAN and STUBS measure now. A live scan on the map is left alone.
+function syscallBackToLive() {
+    syscallState.pastSeq++;
+    if (syscallState.past) {
+        syscallState.past = null;
+        if (syscallState.scan && syscallState.scan.live === false) {
+            syscallState.scan = null;
+            syscallState.states = null;
+        }
+        syscallState.draftSeq++;
+        syscallState.draft = null;
+        syscallState.note = null;
+    }
+    syscallApplyFilter();
+    syscallRenderAll();
+    return true;
 }
 
 // --- The detail panel, the deviation list, the rule draft and the known hooks ---------------------------------
@@ -27816,7 +28046,9 @@ function syscallDetailModel() {
     if (!detail.data) return null;
     const model = { ...detail.data };
     if (baseline) model.symbols = baseline.symbols;
-    if (scan) {
+    // a past measurement whose cells are not drawn says nothing about this syscall either
+    if (scan && scan.live === false) model.past = true;
+    if (scan && !(scan.live === false && !syscallState.states)) {
         const measured = scan.states && Object.prototype.hasOwnProperty.call(scan.states, detail.name) ? scan.states[detail.name] : null;
         if (measured && typeof measured === 'object') {
             for (const key of ['state', 'pattern', 'target_owner', 'expected', 'actual', 'number_matches', 'allowlisted']) {
@@ -27939,11 +28171,14 @@ function renderSyscallDeviationPanel() {
     const list = scan && Array.isArray(scan.deviations) ? scan.deviations : [];
     if (head) {
         const total = scan ? SYSCALL_STATES.reduce((sum, s) => sum + (Number((scan.counts || {})[s]) || 0), 0) : 0;
-        head.textContent = scan ? `${list.length.toLocaleString('en-US')} of ${total.toLocaleString('en-US')} measured` : '';
+        // a past measurement's deviations are of its process then, and the head says whose and when
+        const whose = scan && scan.live === false ? ` · PID ${scan.pid} at ${syscallWhen(scan.measured_at)}, a past measurement` : '';
+        head.textContent = scan ? `${list.length.toLocaleString('en-US')} of ${total.toLocaleString('en-US')} measured${whose}` : '';
     }
     if (!host) return;
     const top = host.scrollTop;
-    host.innerHTML = renderSyscallDeviations(list, { scanned: !!scan, selected: syscallState.selected, scores: syscallScores(scan) });
+    host.innerHTML = renderSyscallDeviations(list, { scanned: !!scan, selected: syscallState.selected, scores: syscallScores(scan),
+                                                     past: !!scan && scan.live === false });
     host.scrollTop = top;
 }
 
@@ -28082,7 +28317,7 @@ function renderSyscallStubsPanel() {
 
 async function runSyscallStubs() {
     const st = syscallState.stubs;
-    if (st.running) return false;
+    if (st.running || syscallState.past) return false;
     const select = document.getElementById('syscall-target');
     const pid = parseInt(select ? select.value : syscallState.target, 10);
     if (!(pid > 0)) {
@@ -28163,9 +28398,11 @@ function syscallHooksModel() {
     const h = syscallState.hooks, baseline = syscallState.baseline, scan = syscallState.scan;
     const model = {
         entries: h.entries, loaded: h.loaded, problem: h.problem, error: h.error, note: h.note, busy: h.busy, scan: null,
+        past: !!scan && scan.live === false,
         scope: baseline && baseline.build && baseline.view ? { build: String(baseline.build), view: String(baseline.view) } : null,
     };
-    if (scan) {
+    // recording measures the process again, now: a past measurement is not what it would be checked against
+    if (scan && scan.live !== false) {
         const hooked = (Array.isArray(scan.deviations) ? scan.deviations : [])
             .filter(d => d && d.state === 'hooked' && typeof d.target_owner === 'string' && d.target_owner && d.target_owner !== 'private');
         const pairs = syscallHookPairs(scan);
@@ -28186,6 +28423,8 @@ function renderSyscallHooks() {
     host.innerHTML = renderHookAllowlist(syscallHooksModel());
     host.scrollTop = top;
     syscallApplyLower();
+    // recording measures now: the choice of a past measurement waits for it
+    renderSyscallToolbar();
 }
 
 async function syscallLoadHooks() {
@@ -28357,6 +28596,7 @@ function syscallsTabShown() {
     initSyscalls();
     renderSyscallMap();
     syscallLoadTargets();
+    syscallLoadPastList();
     syscallLoadHooks();
     syscallRefresh();
 }
@@ -28636,7 +28876,7 @@ function binaryGraphSvg(layout, model) {
 // deviation and a filter match. It names only what the drawing in front of the reader can show: the explore view
 // (mode 'explore', with the edges it draws) has no syscall, deviation or filter match, and a curated or unknown edge
 // only where one is drawn.
-function binaryGraphLegend(mode, edges) {
+function binaryGraphLegend(mode, edges, past) {
     const explore = mode === 'explore';
     const drawn = new Set((Array.isArray(edges) ? edges : []).map(e => binaryGraphOrigin(e)));
     const item = (key, mark, text, help) =>
@@ -28659,9 +28899,12 @@ function binaryGraphLegend(mode, edges) {
             'An edge whose answer names neither origin. It is not claimed to be read from a binary.'));
     }
     if (explore) return parts.join('');
+    // the deviations are those of the measurement on the map: a past one is named as such, never as the last scan
+    const whose = past && typeof past === 'object'
+        ? `the past measurement on the map (PID ${past.pid}, measured ${syscallWhen(past.measured_at)})` : '';
     parts.push(item('deviation', box(themeColor(SYSCALL_STATE_COLORS.patched), themeColor(SYSCALL_STATE_COLORS.patched, 0.18)),
-        'deviated in the last scan, and the path to it, in the colour of its state on the map',
-        'A syscall whose stub the last scan of this view did not find intact, coloured as on the map, and every edge on a path into it.'));
+        `deviated in ${whose ? 'the past measurement on the map' : 'the last scan'}, and the path to it, in the colour of its state on the map`,
+        `A syscall whose stub ${whose || 'the last scan of this view'} did not find intact, coloured as on the map, and every edge on a path into it.`));
     parts.push(item('match', box(themeColor('--text-muted'), themeColor('--bg-secondary'),
         `<rect x="0.5" y="0.5" width="17" height="11" rx="3" fill="none" stroke="${themeColor('--graph-match')}" stroke-width="1"></rect>`),
         'filter match', 'A node the filter of the tab matches: its name, or for a syscall its name or number as on the map.'));
@@ -28716,7 +28959,8 @@ function renderBinaryGraph() {
         status.hidden = !s.html;
     }
     const legend = document.getElementById('binary-graph-legend');
-    if (legend) legend.innerHTML = binaryGraphLegend();
+    const scan = syscallState.scan;
+    if (legend) legend.innerHTML = binaryGraphLegend('path', [], scan && scan.live === false ? scan : null);
     const host = document.getElementById('binary-graph-canvas');
     if (!host) return;
     if (st.loading || !st.nodes.length) {

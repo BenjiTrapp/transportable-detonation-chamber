@@ -450,6 +450,9 @@ FLOW_FUNCTIONS = [
     "syscallRequestDraft", "syscallDraftStubRule",
     "syscallHookKey", "syscallHookPairs", "syscallHookDifference", "syscallHookDrift", "syscallWin32uMissing", "syscallSyncModuleFilter",
     "syscallToggleLower", "syscallApplyLower", "syscallLowerNote",
+    # a past measurement on the map
+    "syscallWhen", "syscallPastOptionsHtml", "syscallPastBannerHtml", "syscallPastRefusal", "syscallLoadPastList", "renderSyscallPastList",
+    "renderSyscallPast", "syscallOnPast", "syscallOpenMeasurement", "syscallBackToLive",
     # the GRAPH surface (tests/test_binary_graph_ui.py): the map's choice and filter reach it
     "binaryGraphLayout", "binaryGraphEdgeLook", "binaryGraphNodeLook", "binaryGraphTones", "binaryGraphMatches", "binaryGraphCut",
     "binaryGraphSvg", "binaryGraphLegend", "binaryGraphStatus", "binaryGraphModel", "renderBinaryGraph", "binaryGraphOnQuery",
@@ -521,12 +524,13 @@ const ids = ['syscalls-subtitle', 'syscall-view-map', 'syscall-view-graph', 'sys
              'syscall-work', 'syscall-pane-map', 'syscall-pane-detail', 'syscall-detail-body', 'syscall-draft',
              'syscall-deviations', 'syscall-deviations-head', 'syscall-hooks', 'syscall-hooks-head',
              'syscall-stubs', 'syscall-stubs-body', 'syscall-stubs-head', 'syscall-stubs-run', 'syscall-lower',
-             'syscall-lower-fold', 'syscall-lower-note', 'syscall-lower-body'];
+             'syscall-lower-fold', 'syscall-lower-note', 'syscall-lower-body', 'syscall-past', 'syscall-past-banner'];
 const els = Object.fromEntries(ids.map(id => [id, Object.assign(new Node('div'), { id })]));
 els['syscall-map'].parentElement = Object.assign(new Node('div'), { boxWidth: 800 });
 els['syscall-tip'].hidden = true;
 els['syscall-draft'].hidden = true;
 els['syscall-stubs'].hidden = true;
+els['syscall-past-banner'].hidden = true;
 els['syscall-work'].dataset.pane = 'map';
 globalThis.window = globalThis;
 globalThis.devicePixelRatio = 2;
@@ -577,7 +581,8 @@ const lookupBody = (name, view = 'arm64') => { const a = ALL.find(x => x.name ==
     return { body: { ...a, return_type: 'NTSTATUS', calling_convention: 'stdcall', is_true_syscall: true, build: '26220.5770', view, prefix_len: 8,
                      stub_hex: '010300d4c0035fd60000000000000000', parameters: [{ name: 'Handle', type: 'HANDLE', sal_annotation: '_In_' }] } }; };
 const freshRoutes = () => { routes = { '/api/syscalls/status': { body: STATUS }, '/api/syscalls/baseline': baselineRoute,
-                                      '/api/processes': { body: PROCESSES }, '/api/syscalls/hook-baseline': { body: HOOKS } };
+                                      '/api/processes': { body: PROCESSES }, '/api/syscalls/hook-baseline': { body: HOOKS },
+                                      '/api/syscalls/measurements': { body: { measurements: [] } } };
                             for (const a of ALL) routes['/api/syscalls/' + a.name] = () => lookupBody(a.name, currentView()); };
 const currentView = () => (syscallState.baseline && syscallState.baseline.view) || 'arm64';
 freshRoutes();
@@ -636,7 +641,8 @@ def test_showing_the_tab_again_asks_for_the_status_but_not_for_the_baseline_agai
         syscallRefresh(true); await settle();
         out({ again, forced: requests.slice(before + again.length).map(q => q.url.split('?')[0]) });
       })();""")
-    assert sorted(r["again"]) == ["/api/processes", "/api/syscalls/hook-baseline", "/api/syscalls/status"]
+    # the past measurements are read again too: a detonation may have added one since
+    assert sorted(r["again"]) == ["/api/processes", "/api/syscalls/hook-baseline", "/api/syscalls/measurements", "/api/syscalls/status"]
     assert r["forced"].count("/api/syscalls/baseline") == 3, "a forced refresh reads the baseline anew"
 
 
@@ -2635,7 +2641,7 @@ def test_every_tone_a_note_can_have_has_its_accent_in_both_themes():
 
 # --- the syscall stage in the Memory tab of a detonation ---------------------------------------------
 
-STAGE_FUNCTIONS = ["renderSyscallStageBlock", "_detRawButton", "syscallOwnerHtml"]
+STAGE_FUNCTIONS = ["renderSyscallStageBlock", "_detRawButton", "syscallOwnerHtml", "jsArg"]
 STAGE_PRELUDE = "const _detRawPayloads = [];\n"
 
 
@@ -2755,3 +2761,475 @@ def test_the_fold_bar_follows_a_stub_run_and_says_when_a_count_is_not_the_whole_
     assert r["incomplete"] != r["after"] and "complete" in r["incomplete"].lower(), r["incomplete"]
     assert "earch" in r["running"], r["running"]
     assert "KNOWN HOOKS" in r["hooks"] and "read" in r["hooks"].lower(), r["hooks"]
+
+
+# --- a past measurement on the map --------------------------------------------------------------------
+# The scan history keeps every syscall scan, the one a detonation makes too. The map can show one of them, but a past
+# measurement may never read as a scan of now: a banner says what it is, SCAN and STUBS are off while it is on the
+# map, and where its cells cannot be placed on this system's baseline none are drawn.
+
+PAST = r"""
+const PAST_DEVS = [{ name: 'Nt7', module: 'ntdll.dll', number: 7, rva: 4096, state: 'patched', pattern: 'B', target_owner: 'private',
+                     expected: '010300d4c0035fd6', actual: 'e92b170000000000', number_matches: null }];
+// What /api/syscalls/measurement answers: the shape of a scan, with live false and the time it was measured
+const pastBody = (extra = {}) => ({ ...scanBody({ Nt7: 'patched' }), deviations: PAST_DEVS,
+    states: { ...scanBody().states, Nt7: PAST_DEVS[0] },
+    id: 'a1b2c3d4e5f6', measured_at: '2026-11-20T09:15:42.123456', live: false, problem: null, process: 'C:\\samples\\sample.exe', ...extra });
+const PAST_LIST = { measurements: [
+    { id: 'a1b2c3d4e5f6', at: '2026-11-20T09:15:42.123456', pid: 4242, process: 'sample.exe', build: '26220.5770', view: 'arm64',
+      counts: { intact: 599, hooked: 0, patched: 1, diverged: 0, unreadable: 0 }, partial: false },
+    { id: 'ffff00001111', at: '2026-11-19T18:01:02', pid: 77, process: '<img src=x>.exe', build: '26220.5770', view: 'x64',
+      counts: { intact: 3, hooked: 0, patched: 0, diverged: 0, unreadable: 0 }, partial: true }] };
+routes['/api/syscalls/measurements'] = { body: PAST_LIST };
+routes['/api/syscalls/measurement'] = { body: pastBody() };
+const shown = async () => { initSyscalls(); syscallsTabShown(); await settle(); };
+const choosePast = async (id) => { els['syscall-past'].value = id; await syscallOnPast(); await settle(); };
+const colours = calls => Object.fromEntries([...new Set(calls.map(c => c.color))].map(k => [k, calls.filter(c => c.color === k).length]));
+const ntdll = () => canvases().find(c => c.dataset.module === 'ntdll.dll');
+const banner = () => ({ html: els['syscall-past-banner'].innerHTML, hidden: els['syscall-past-banner'].hidden,
+                        cls: els['syscall-past-banner'].className });
+"""
+
+
+def _past(script):
+    return _panels(PAST + script)
+
+
+def test_the_past_measurements_have_a_control_of_their_own_after_stubs():
+    """One control, one verb: the process list measures, this one looks. It is not a second meaning of the target list."""
+    tab = _tab_markup("syscalls")
+    group = tab[tab.index('class="syscall-group syscall-target-group"'):tab.index('class="syscall-group syscall-filter-group"')]
+    stubs, past = group.find('id="syscall-stubs-run"'), group.find('id="syscall-past"')
+    assert 0 < stubs < past, "the past measurements come after STUBS"
+    select = re.search(r'<select[^>]*id="syscall-past"[^>]*>(.*?)</select>', group, re.S)
+    assert select and 'onchange="syscallOnPast()"' in select.group(0)
+    assert re.search(r'<option value="">— a past measurement —</option>', select.group(1))
+    target = re.search(r'<select[^>]*id="syscall-target"[^>]*>(.*?)</select>', group, re.S).group(1)
+    assert "past" not in target.lower()
+    # the banner over the map has its place before the notices
+    assert 0 < tab.find('id="syscall-toolbar"') < tab.find('id="syscall-past-banner"') < tab.find('id="syscall-notices"')
+    assert re.search(r'id="syscall-past-banner"[^>]*\shidden', tab)
+
+
+@needs_node
+def test_each_past_measurement_is_named_by_process_pid_time_and_view_and_escaped():
+    r = _past(r"""
+      (async () => { await shown(); out({ html: els['syscall-past'].innerHTML, urls: requests.map(q => q.url) }); })();""")
+    assert "/api/syscalls/measurements" in r["urls"], "the list is read with the tab"
+    options = re.findall(r'<option value="([^"]*)"[^>]*>([^<]*)</option>', r["html"])
+    assert options[0] == ("", "— a past measurement —")
+    assert options[1] == ("a1b2c3d4e5f6", "sample.exe · PID 4242 · 2026-11-20 09:15:42 · arm64")
+    assert "<img" not in r["html"] and "&lt;img src=x&gt;.exe · PID 77 · 2026-11-19 18:01:02 · x64" in r["html"]
+
+
+@needs_node
+def test_a_past_measurement_draws_its_map_under_a_banner_that_says_it_is_not_a_scan_of_now():
+    r = _past(r"""
+      (async () => {
+        await shown();
+        await choosePast('a1b2c3d4e5f6');
+        out({ urls: requests.map(q => q.url), cells: colours(ntdll().calls), banner: banner(),
+              scan: [els['syscall-scan'].disabled, els['syscall-scan'].title], stubs: [els['syscall-stubs-run'].disabled, els['syscall-stubs-run'].title],
+              head: els['syscall-deviations-head'].textContent, list: els['syscall-deviations'].innerHTML,
+              legend: els['syscall-legend'].innerHTML, result: [els['syscall-scan-result'].hidden, els['syscall-scan-result'].textContent],
+              select: els['syscall-past'].value });
+      })();""")
+    assert "/api/syscalls/measurement?id=a1b2c3d4e5f6" in r["urls"]
+    assert r["cells"]["--syscall-patched"] == 1 and r["cells"]["--syscall-intact"] == 599
+    b = r["banner"]
+    assert b["hidden"] is False and "syscall-notice-warn" in b["cls"]
+    for needle in ("PAST MEASUREMENT", "sample.exe", "PID 4242", "2026-11-20 09:15:42", "build 26220.5770", "arm64", "not a scan of now"):
+        assert needle in b["html"], needle
+    assert 'onclick="syscallBackToLive()"' in b["html"]
+    # SCAN and STUBS are off, and say how to measure now
+    for disabled, title in (r["scan"], r["stubs"]):
+        assert disabled is True and "back to live" in title.lower(), title
+    assert "2026-11-20 09:15:42" in r["head"] and "1 of 600" in r["head"], r["head"]
+    assert "syscallSelect(&quot;Nt7&quot;)" in r["list"]
+    assert ">599<" in r["legend"]
+    # the line a live scan leaves is not left standing beside it
+    assert r["result"][0] is True
+    assert r["select"] == "a1b2c3d4e5f6"
+
+
+@needs_node
+def test_going_back_to_live_clears_the_past_measurement_and_gives_scan_and_stubs_back():
+    r = _past(r"""
+      (async () => {
+        await shown(); chooseTarget(4242);
+        await choosePast('a1b2c3d4e5f6');
+        syscallBackToLive(); await settle();
+        out({ cells: colours(ntdll().calls), banner: banner(), scan: els['syscall-scan'].disabled, stubs: els['syscall-stubs-run'].disabled,
+              head: els['syscall-deviations-head'].textContent, select: els['syscall-past'].value, list: els['syscall-deviations'].innerHTML });
+      })();""")
+    assert r["cells"] == {"--syscall-intact": 600}, "the map is the baseline again, quiet"
+    assert r["banner"]["hidden"] is True
+    assert r["scan"] is False and r["stubs"] is False
+    assert r["head"] == "" and r["select"] == ""
+    assert "Scan a process" in r["list"]
+
+
+@needs_node
+def test_choosing_the_empty_option_goes_back_to_live():
+    r = _past(r"""
+      (async () => {
+        await shown(); await choosePast('a1b2c3d4e5f6');
+        await choosePast('');
+        out({ banner: banner(), past: syscallState.past, scan: syscallState.scan });
+      })();""")
+    assert r == {"banner": {"html": r["banner"]["html"], "hidden": True, "cls": r["banner"]["cls"]}, "past": None, "scan": None}
+
+
+@needs_node
+def test_a_measurement_whose_map_cannot_be_drawn_draws_no_cells_and_keeps_its_figures_and_deviations():
+    r = _past(r"""
+      (async () => {
+        await shown();
+        routes['/api/syscalls/measurement'] = { body: pastBody({ states: null,
+            problem: 'this system has no syscall baseline for build 26100.1, view arm64: the stubs of another build are numbered differently, so its map cannot be drawn here' }) };
+        await choosePast('a1b2c3d4e5f6');
+        out({ canvases: canvases().length, map: els['syscall-map'].textContent, banner: banner(), legend: els['syscall-legend'].innerHTML,
+              list: els['syscall-deviations'].innerHTML, head: els['syscall-deviations-head'].textContent,
+              rows: els['syscall-rows'].innerHTML.includes('syscall-state-intact'), scan: els['syscall-scan'].disabled });
+      })();""")
+    assert r["canvases"] == 0, "no cell is drawn against another baseline"
+    assert "no syscall baseline for build 26100.1" in r["map"]
+    assert "syscall-notice-error" in r["banner"]["cls"] and "no syscall baseline for build 26100.1" in r["banner"]["html"]
+    assert "PAST MEASUREMENT" in r["banner"]["html"] and 'onclick="syscallBackToLive()"' in r["banner"]["html"]
+    assert ">599<" in r["legend"] and "not scanned" not in r["legend"], "its figures, and no claim about cells it does not draw"
+    assert "syscallSelect(&quot;Nt7&quot;)" in r["list"] and "1 of 600" in r["head"]
+    assert r["rows"] is False, "the catalog carries no state of it either"
+    assert r["scan"] is True
+
+
+@needs_node
+def test_a_measurement_of_another_build_is_not_drawn_on_this_builds_baseline_even_with_states():
+    """The server rebuilds states against the baseline of the measurement's own build, which this system may still
+    hold. The map can draw only this build's baseline (/api/syscalls/baseline has no build): other numbers, other cells."""
+    r = _past(r"""
+      (async () => {
+        await shown();
+        routes['/api/syscalls/measurement'] = { body: pastBody({ build: '26100.4000' }) };
+        await choosePast('a1b2c3d4e5f6');
+        out({ canvases: canvases().length, map: els['syscall-map'].textContent, banner: banner(), states: syscallState.states });
+      })();""")
+    assert r["canvases"] == 0 and r["states"] is None
+    assert "26100.4000" in r["map"] and "26220.5770" in r["map"]
+    assert "syscall-notice-error" in r["banner"]["cls"] and "26100.4000" in r["banner"]["html"]
+
+
+@needs_node
+def test_a_measurement_of_another_view_is_drawn_on_that_views_baseline():
+    r = _past(r"""
+      (async () => {
+        await shown();
+        routes['/api/syscalls/measurement'] = { body: pastBody({ view: 'x64' }) };
+        await choosePast('a1b2c3d4e5f6');
+        out({ view: syscallState.baseline.view, urls: requests.map(q => q.url).filter(u => u.includes('view=x64')).length,
+              cells: colours(ntdll().calls), banner: banner() });
+      })();""")
+    assert r["view"] == "x64" and r["urls"] >= 1
+    assert r["cells"]["--syscall-patched"] == 1
+    assert "syscall-notice-warn" in r["banner"]["cls"] and "x64" in r["banner"]["html"]
+
+
+@needs_node
+def test_a_measurement_the_history_does_not_hold_says_so_and_draws_nothing_of_it():
+    r = _past(r"""
+      (async () => {
+        await shown();
+        routes['/api/syscalls/measurement'] = { status: 404, body: { error: 'no syscall measurement <b>zz</b> in the scan history' } };
+        await choosePast('a1b2c3d4e5f6');
+        out({ banner: banner(), cells: colours(ntdll().calls), scan: els['syscall-scan'].disabled });
+      })();""")
+    assert "syscall-notice-error" in r["banner"]["cls"] and "&lt;b&gt;zz" in r["banner"]["html"] and "<b>" not in r["banner"]["html"]
+    assert 'onclick="syscallBackToLive()"' in r["banner"]["html"]
+    assert r["cells"] == {"--syscall-intact": 600}
+    assert r["scan"] is True, "one measurement at a time holds while the past one is chosen, whatever it answered"
+
+
+@needs_node
+def test_a_late_answer_for_a_past_measurement_left_meanwhile_is_dropped():
+    r = _past(r"""
+      (async () => {
+        await shown();
+        let release;
+        routes['/api/syscalls/measurement'] = () => ({ body: pastBody() });
+        const original = globalThis.fetch;
+        globalThis.fetch = (url, options) => url.includes('/measurement?') ? new Promise(resolve => { release = () => resolve({ ok: true, status: 200, json: async () => pastBody() }); })
+                                                                            : original(url, options);
+        els['syscall-past'].value = 'a1b2c3d4e5f6'; const pending = syscallOnPast(); await settle();
+        const loading = banner();
+        syscallBackToLive();
+        release(); await pending; await settle();
+        out({ loading, banner: banner(), cells: colours(ntdll().calls), past: syscallState.past });
+      })();""")
+    assert r["loading"]["hidden"] is False and "PAST MEASUREMENT" in r["loading"]["html"]
+    assert r["banner"]["hidden"] is True and r["past"] is None
+    assert r["cells"] == {"--syscall-intact": 600}
+
+
+@needs_node
+def test_nothing_is_measured_while_a_past_measurement_is_on_the_map():
+    r = _past(r"""
+      (async () => {
+        await shown(); chooseTarget(4242);
+        routes['/api/syscalls/scan'] = { body: scanBody({ Nt9: 'hooked' }) };
+        routes['/api/syscalls/stubs'] = { body: { hits: [] } };
+        await choosePast('a1b2c3d4e5f6');
+        const before = requests.length;
+        await runSyscallScan(); await runSyscallStubs();
+        out({ asked: requests.slice(before).map(q => q.url), cells: colours(ntdll().calls) });
+      })();""")
+    assert r["asked"] == []
+    assert r["cells"]["--syscall-patched"] == 1 and "--syscall-hooked" not in r["cells"]
+
+
+@needs_node
+def test_a_past_measurement_replaces_the_live_scan_and_the_stub_search_on_the_page():
+    r = _past(r"""
+      (async () => {
+        await scanned();
+        routes['/api/syscalls/stubs'] = { body: { mode: 'process', pid: 4242, view: 'arm64', build: '26220.5770', hits: [], partial: false, note: '' } };
+        await runSyscallStubs();
+        const stubsBefore = els['syscall-stubs'].hidden;
+        await choosePast('a1b2c3d4e5f6');
+        out({ stubsBefore, stubs: els['syscall-stubs'].hidden, cells: colours(ntdll().calls), list: els['syscall-deviations'].innerHTML });
+      })();""")
+    assert r["stubsBefore"] is False and r["stubs"] is True, "no live stub search beside a past measurement"
+    assert "--syscall-hooked" not in r["cells"] and r["cells"]["--syscall-patched"] == 1
+    assert "Nt9" not in r["list"]
+
+
+@needs_node
+def test_a_past_measurement_is_not_chosen_while_a_measurement_of_now_runs():
+    r = _past(r"""
+      (async () => {
+        await shown(); chooseTarget(4242);
+        let release;
+        const original = globalThis.fetch;
+        globalThis.fetch = (url, options) => url.includes('/api/syscalls/scan') ? new Promise(resolve => { release = () => resolve({ ok: true, status: 200, json: async () => scanBody({ Nt9: 'hooked' }) }); })
+                                                                                : original(url, options);
+        const scanning = runSyscallScan(); await settle();
+        const disabled = els['syscall-past'].disabled;
+        const before = requests.length;
+        await syscallOpenMeasurement('a1b2c3d4e5f6');
+        const asked = requests.length - before;
+        release(); await scanning; await settle();
+        out({ disabled, asked, past: syscallState.past, cells: colours(ntdll().calls), after: els['syscall-past'].disabled });
+      })();""")
+    assert r["disabled"] is True and r["after"] is False
+    assert r["asked"] == 0 and r["past"] is None
+    assert r["cells"]["--syscall-hooked"] == 1
+
+
+@needs_node
+def test_an_intact_stub_of_a_past_measurement_does_not_claim_that_no_bytes_could_be_read():
+    r = _past(r"""
+      (async () => {
+        await shown(); await choosePast('a1b2c3d4e5f6');
+        syscallSelect('Nt41'); await settle();
+        const intact = els['syscall-detail-body'].innerHTML;
+        syscallSelect('NtUser3'); await settle();
+        const outside = els['syscall-detail-body'].innerHTML;
+        syscallSelect('Nt7'); await settle();
+        out({ intact, outside, patched: els['syscall-detail-body'].innerHTML });
+      })();""")
+    assert "intact" in r["intact"] and "No bytes could be read" not in r["intact"]
+    assert "not kept" in r["intact"], "the bytes were read and not kept, which is what it says"
+    assert "not part of this past measurement" in r["outside"] and "last scan" not in r["outside"]
+    assert "e92b170000000000" in r["patched"], "a deviation keeps its bytes"
+
+
+@needs_node
+def test_the_hooks_of_a_past_measurement_cannot_be_recorded():
+    """Recording measures the process again, now: under a past measurement that is a measurement of another time."""
+    r = _past(r"""
+      (async () => {
+        await shown();
+        routes['/api/syscalls/measurement'] = { body: pastBody({ deviations: [{ ...PAST_DEVS[0], name: 'Nt9', state: 'hooked', target_owner: 'edr.dll' }],
+            states: { ...scanBody().states, Nt9: { ...PAST_DEVS[0], name: 'Nt9', state: 'hooked', target_owner: 'edr.dll' } },
+            counts: { intact: 599, hooked: 1, patched: 0, diverged: 0, unreadable: 0 } }) };
+        await choosePast('a1b2c3d4e5f6');
+        const before = requests.length;
+        globalThis.confirm = () => true;
+        const done = await syscallCaptureHooks();
+        out({ done, asked: requests.length - before, model: syscallHooksModel().scan });
+      })();""")
+    assert r == {"done": False, "asked": 0, "model": None}
+
+
+@needs_node
+def test_a_past_measurement_put_away_by_a_baseline_of_another_view_says_so():
+    r = _past(r"""
+      (async () => {
+        await shown(); chooseTarget(4242);
+        routes['/api/syscalls/measurement'] = { body: pastBody({ view: 'x64' }) };
+        await choosePast('a1b2c3d4e5f6');
+        await syscallRefresh(true); await settle();
+        out({ past: syscallState.past, banner: banner(), note: els['syscall-scan-result'].textContent, scan: els['syscall-scan'].disabled });
+      })();""")
+    assert r["past"] is None and r["banner"]["hidden"] is True
+    assert "past measurement" in r["note"] and "x64" in r["note"]
+    assert r["scan"] is False
+
+
+@needs_node
+def test_the_detonation_block_opens_its_measurement_on_the_map_only_when_it_has_one():
+    r = _run_node(STAGE_FUNCTIONS, r"""
+      const base = { tool: 'Syscalls', pid: 4242, build: '26220.5770', view: 'arm64', counts: { intact: 600 }, deviations: [], stubs: {} };
+      out([renderSyscallStageBlock({ ...base, history_id: 'a1b2c3d4e5f6' }), renderSyscallStageBlock(base),
+           renderSyscallStageBlock({ ...base, history_id: '' }), renderSyscallStageBlock({ ...base, history_id: 7 }),
+           renderSyscallStageBlock({ ...base, history_id: 'x"); alert(1); ("' })]);""", STAGE_PRELUDE)
+    button = re.search(r'<button[^>]*onclick="([^"]*syscallOpenMeasurement[^"]*)"[^>]*>([^<]*)</button>', r[0])
+    assert button, r[0]
+    handler = button.group(1)
+    assert handler.index("switchTab('syscalls')") < handler.index("syscallSetView('map')") < handler.index("syscallOpenMeasurement(")
+    assert "syscallOpenMeasurement(&quot;a1b2c3d4e5f6&quot;)" in handler
+    assert r[0].index("syscallOpenMeasurement") < r[0].index("View Syscalls raw"), "beside the raw button"
+    assert all("syscallOpenMeasurement" not in html for html in r[1:4])
+    assert 'alert(1); ("\'' not in r[4] and "&quot;x\\&quot;); alert(1)" in r[4]
+
+
+@needs_node
+def test_the_map_opens_a_measurement_the_list_did_not_hold_yet():
+    r = _past(r"""
+      (async () => {
+        await shown();
+        routes['/api/syscalls/measurement'] = { body: pastBody({ id: 'newnewnew123', measured_at: '2026-11-25T11:00:00' }) };
+        await syscallOpenMeasurement('newnewnew123'); await settle();
+        out({ html: els['syscall-past'].innerHTML, value: els['syscall-past'].value, banner: banner() });
+      })();""")
+    assert 'value="newnewnew123"' in r["html"] and r["value"] == "newnewnew123"
+    assert "2026-11-25 11:00:00" in r["banner"]["html"]
+
+
+def test_app_js_moved_on_with_the_past_measurement():
+    html = _read(INDEX_HTML)
+    assert all(f'app.js?v={v}"' not in html for v in (162, 163)), "app.js changed, its version did not"
+
+
+def test_the_banner_of_a_past_measurement_is_a_notice_of_the_warning_tone_and_hides_when_it_is_put_away():
+    rules = _rules(STYLE_CSS)
+    # .syscall-notice is a flex box, which would show the element over its hidden attribute
+    assert _declared(rules[".syscall-past-banner[hidden]"], "display") == "none"
+    assert "var(--severity-medium)" in rules[".syscall-past-tag"], "the tag in the warning tone of the tab"
+    assert "--severity-medium" in rules[".syscall-notice-warn"] and "--severity-critical" in rules[".syscall-notice-error"]
+    from test_theme import _cyberpunk_values
+    assert "cp-amber" in _cyberpunk_values()["--severity-medium"], "which is the --cp-amber family in Cyberpunk"
+
+
+# --- review of the past measurement: what the page says while one is shown --------------------------------
+
+@needs_node
+def test_under_a_refusal_the_catalog_rows_say_measured_and_not_placed_and_not_that_they_were_not_scanned():
+    """Ruling 1: a refusal draws no state, and a row with no state said "not scanned" - of a syscall the measurement
+    did scan. A module it did not scan (win32u, left out unless asked for) is still not scanned, and says so."""
+    r = _past(r"""
+      (async () => {
+        await shown();
+        const live = els['syscall-rows'].innerHTML;
+        routes['/api/syscalls/measurement'] = { body: pastBody({ states: null, problem: 'this system has no syscall baseline for build 26100.1, view arm64' }) };
+        await choosePast('a1b2c3d4e5f6');
+        const refused = els['syscall-rows'].innerHTML;
+        syscallState.module = 'win32u.dll'; syscallApplyFilter();
+        out({ live, refused, win32u: els['syscall-rows'].innerHTML });
+      })();""")
+    assert 'aria-label="Nt0, not scanned"' in r["live"], "before a scan of now, not scanned is true"
+    assert "not scanned" not in r["refused"]
+    assert re.search(r'aria-label="Nt0, measured, [^"]*not placed[^"]*"', r["refused"]), r["refused"][:400]
+    assert re.search(r'title="measured, [^"]*not placed[^"]*"', r["refused"])
+    assert 'aria-label="NtUser0, not scanned"' in r["win32u"], "a module the measurement did not cover"
+
+
+@needs_node
+def test_the_graph_legend_and_the_number_flag_speak_of_the_measurement_on_the_map_and_not_of_now():
+    """Ruling 2: "the last scan" and "the live bytes" are false of a past measurement while a newer scan exists."""
+    r = _past(r"""
+      (async () => {
+        els['binary-graph-legend'] = new Node('div');
+        await shown();
+        const live = els['binary-graph-legend'].innerHTML;
+        routes['/api/syscalls/measurement'] = { body: pastBody({ deviations: [{ ...PAST_DEVS[0], number_matches: false, live_number: 9 }] }) };
+        await choosePast('a1b2c3d4e5f6');
+        out({ live, past: els['binary-graph-legend'].innerHTML, list: els['syscall-deviations'].innerHTML,
+              fold: els['syscall-lower-fold'].title, back: (syscallBackToLive(), els['binary-graph-legend'].innerHTML),
+              liveFold: els['syscall-lower-fold'].title });
+      })();""")
+    assert "the last scan" in r["live"] and r["back"] == r["live"]
+    assert "last scan" not in r["past"] and "past measurement" in r["past"]
+    assert "PID 4242" in r["past"] and "2026-11-20 09:15:42" in r["past"]
+    assert "number differs" in r["list"] and "live bytes" not in r["list"] and "bytes read then" in r["list"]
+    # the fold over DEVIATIONS speaks of the measurement on the map too
+    assert "last scan" not in r["fold"] and "past measurement" in r["fold"], r["fold"]
+    assert "last scan" in r["liveFold"]
+
+
+@needs_node
+def test_a_refused_measurement_stays_when_the_baseline_changes_and_a_placed_one_is_put_away_in_a_whole_sentence():
+    """Ruling 3: a refused measurement draws no cell on any baseline, so a baseline change changes nothing about it.
+    One that is placed and loses its view is put away, and the note has no hole where a view should be."""
+    r = _past(r"""
+      (async () => {
+        await shown(); chooseTarget(4242);
+        routes['/api/syscalls/measurement'] = { body: pastBody({ view: '', build: '', states: null,
+            problem: 'the measurement names no usable build and view (build ?, view ?)' }) };
+        await choosePast('a1b2c3d4e5f6');
+        await syscallRefresh(true); await settle();
+        const refused = { past: !!syscallState.past, banner: banner(), note: els['syscall-scan-result'].hidden, scan: els['syscall-scan'].disabled };
+        syscallBackToLive();
+        routes['/api/syscalls/measurement'] = { body: pastBody({ view: 'x64' }) };
+        await choosePast('a1b2c3d4e5f6');
+        await syscallRefresh(true); await settle();
+        const placed = els['syscall-scan-result'].textContent;
+        // a placed one that names no view at all (it cannot be drawn, so the state is put by hand)
+        await choosePast('a1b2c3d4e5f6');
+        syscallState.scan = { ...syscallState.scan, view: '' }; syscallState.past.data = syscallState.scan;
+        await syscallRefresh(true); await settle();
+        out({ refused, placed, noView: els['syscall-scan-result'].textContent });
+      })();""")
+    assert r["refused"]["past"] is True and r["refused"]["banner"]["hidden"] is False and r["refused"]["note"] is True
+    assert r["refused"]["scan"] is True, "still the one measurement on the map"
+    assert "PID 4242 measured the x64 view" in r["placed"] and "the arm64 baseline the map now shows" in r["placed"]
+    assert "put away" in r["placed"]
+    for note in (r["placed"], r["noView"]):
+        assert "  " not in note and "the  view" not in note, note
+    assert "PID 4242 names no view" in r["noView"] and "arm64 baseline" in r["noView"], r["noView"]
+
+
+@needs_node
+def test_the_banner_says_whose_clock_the_time_is_and_the_list_and_the_label_keep_the_bare_time():
+    """Ruling 4: the history writes the chamber's datetime.now() with no zone; the banner says so, once."""
+    r = _past(r"""
+      (async () => {
+        await shown(); await choosePast('a1b2c3d4e5f6');
+        out({ banner: banner().html, list: els['syscall-past'].innerHTML, head: els['syscall-deviations-head'].textContent });
+      })();""")
+    from html import unescape
+    assert "2026-11-20 09:15:42" in r["banner"] and "chamber's clock" in unescape(r["banner"])
+    assert r["banner"].count("clock") == 1
+    assert "clock" not in r["list"] and "clock" not in r["head"]
+
+
+@needs_node
+def test_a_past_measurement_is_not_chosen_while_hooks_are_recorded_and_record_says_what_is_in_the_way():
+    """Ruling 5: recording measures the process again, now, as SCAN does; and under a past measurement the RECORD
+    button does not tell the reader to scan, which they cannot."""
+    r = _past(r"""
+      (async () => {
+        await shown(); chooseTarget(4242);
+        syscallState.hooks.busy = true; renderSyscallHooks();
+        const disabled = els['syscall-past'].disabled;
+        const before = requests.length;
+        const opened = await syscallOpenMeasurement('a1b2c3d4e5f6');
+        const asked = requests.length - before;
+        syscallState.hooks.busy = false; renderSyscallHooks();
+        const after = els['syscall-past'].disabled;
+        await choosePast('a1b2c3d4e5f6');
+        out({ disabled, opened, asked, after, note: els['syscall-scan-result'].textContent, hooks: els['syscall-hooks'].innerHTML });
+      })();""")
+    assert r["disabled"] is True and r["after"] is False
+    assert r["opened"] is False and r["asked"] == 0
+    record = re.search(r'<button[^>]*syscallCaptureHooks\(\)[^>]*>', r["hooks"]).group(0)
+    assert "disabled" in record and "Scan a process first" not in record
+    assert "past measurement" in record.lower() and "back to live" in record.lower(), record

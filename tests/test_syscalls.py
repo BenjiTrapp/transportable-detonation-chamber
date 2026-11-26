@@ -2996,8 +2996,12 @@ def target(tdc, monkeypatch, fake_baseline_dir):
     monkeypatch.setattr(tdc, "_syscall_view_for_pid", lambda pid: t.view)
     monkeypatch.setattr(tdc, "_image_path_for_pid", lambda pid: "C:\\Samples\\sample.exe")
     monkeypatch.setattr(tdc, "_open_syscall_reader", opening)
-    monkeypatch.setattr(tdc, "_record_scan",
-                        lambda tool, name, result, status="ok": t.history.append((tool, name, result, status)))
+    # _record_scan hands back the id of the entry it wrote; the syscall stage keeps it to name its measurement
+    def recording(tool, name, result, status="ok"):
+        t.history.append((tool, name, result, status))
+        return f"hist{len(t.history)}"
+
+    monkeypatch.setattr(tdc, "_record_scan", recording)
     t.reader = _reader_from(syscall_baseline.load_baseline(str(fake_baseline_dir / "ntsleuth-26220.5770-arm64.json")),
                             patched={})
     return t
@@ -4832,18 +4836,22 @@ def _detonate(tdc, path=None):
     assert _until(lambda: tdc._scans_running() == 0)
 
 
-def test_a_detonation_runs_the_stage_after_aether_and_before_process_dump(tdc, pipeline, monkeypatch,
+def test_a_detonation_runs_the_stage_first_so_a_short_lived_sample_is_still_there(tdc, pipeline, monkeypatch,
                                                                          fake_baseline_dir, target):
     target.reader = _patched_reader(tdc, fake_baseline_dir, "private")
     real = tdc._run_syscall_stage
     monkeypatch.setattr(tdc, "_run_syscall_stage",
                         lambda pid, path, notes=None: pipeline.append("syscalls") or real(pid, path, notes))
     _detonate(tdc)
-    assert pipeline == ["hsb", "aether", "syscalls", "processdump"]
+    # Measured on the chamber: injectsim.exe lives 4.2s and shortlived.exe 6.7s, while the stage itself takes under
+    # 2s (a scan of 0.12-0.41s and a stub search of 1.3-1.5s). Behind hsb, beaconeye and aether - which samples three
+    # times - it reached neither and skipped with "the process is gone". It reads only, so among the read-only
+    # scanners its place is free, and first is where it can still measure. Process Dump stays last: it writes files.
+    assert pipeline == ["syscalls", "hsb", "aether", "processdump"]
     stored = tdc._beacon_results_cache.lookup("syscalls", 4812, SHA_SAMPLE)
     assert stored["tool"] == "Syscalls" and stored["evidence"]["score"] > 0
-    assert [t for t, *_ in target.history] == ["Aether", "Syscalls", "Process Dump"]
-    assert target.history[1][1] == "PID 4812"
+    assert [t for t, *_ in target.history] == ["Syscalls", "Aether", "Process Dump"]
+    assert target.history[0][1] == "PID 4812"
 
 
 def test_the_stage_is_given_the_path_of_the_sample(tdc, pipeline, monkeypatch):
@@ -4918,13 +4926,17 @@ def _submit(client, tdc, monkeypatch, installed=(), pid=4812, agent_path="C:\\Us
                        content_type="multipart/form-data")
 
 
-def test_submit_starts_the_stage_with_the_sample_it_ran(client, tdc, fake_baseline_dir, monkeypatch):
+def test_submit_starts_the_stage_with_the_sample_it_ran(client, tdc, fake_baseline_dir, monkeypatch, tmp_path):
+    # the path has to exist: _sample_path_for drops one it cannot read, and on the chamber the web UI runs on the
+    # same machine the agent wrote to. This suite does not, so the agent's path is a real file here.
+    sample = tmp_path / "a.exe"
+    sample.write_bytes(b"MZ")
     seen = []
     monkeypatch.setattr(tdc, "_run_memory_scans_async", lambda *a: seen.append(a))
-    r = _submit(client, tdc, monkeypatch)
+    r = _submit(client, tdc, monkeypatch, agent_path=str(sample))
     body = r.get_json()
     assert r.status_code == 200 and body["beacon_scan"] == {"triggered": True, "tools": ["Syscalls"]}
-    assert seen == [(4812, hashlib.sha256(b"MZ").hexdigest(), "C:\\Users\\Public\\Downloads\\a.exe")]
+    assert seen == [(4812, hashlib.sha256(b"MZ").hexdigest(), str(sample))]
 
 
 def test_submit_names_the_stage_after_the_tools_it_runs_with(client, tdc, fake_baseline_dir, monkeypatch, tmp_path):
@@ -5324,3 +5336,176 @@ def test_the_sweep_alone_with_the_syscall_scan_unasked_has_no_tool(client, tdc, 
     monkeypatch.setattr(tdc, "_sweep_state", {})
     r = client.post("/api/memory/sweep", json={})
     assert r.status_code == 400
+
+
+def test_the_stage_gets_the_sample_path_even_though_the_agent_reports_none(
+        client, tdc, fake_baseline_dir, monkeypatch, tmp_path):
+    """Measured on the chamber: the DetonatorAgent answers `{"pid": N, "status": "ok", "message": null}` and reports
+    no path at all, so `agent_file_path` was None and every detonation's stage read
+    `"file": {"skipped": "the path of the sample is not known"}`. The file search is the only half that can prove a
+    bypass - the process half cannot attribute private memory - so the proof never ran in a detonation.
+
+    `_record_submission` already solves this, 30 lines later in the same request: the running process's image, else
+    the agent's drop folder. The stage must get the same path. The old test for this passed only because its fake
+    agent reported a path the real one never does."""
+    sample = tmp_path / "a.exe"
+    sample.write_bytes(b"MZ")
+    monkeypatch.setattr(tdc, "SAMPLE_DROP_DIR", str(tmp_path))
+    monkeypatch.setattr(tdc, "_image_path_for_pid", lambda pid: "")        # the process is already gone
+    seen = []
+    monkeypatch.setattr(tdc, "_run_memory_scans_async", lambda *a: seen.append(a))
+    r = _submit(client, tdc, monkeypatch, agent_path=None)
+    assert r.status_code == 200
+    assert seen and seen[0][2] == str(sample), \
+        "the stage was started without the sample it ran: its file search can never prove a bypass"
+
+
+def test_the_stage_prefers_the_running_image_over_the_drop_folder(
+        client, tdc, fake_baseline_dir, monkeypatch, tmp_path):
+    """The order `_record_submission` uses, and for its reason: the process knows where it was run from, the drop
+    folder is only where the agent usually writes. A sample run from somewhere else is still searched."""
+    elsewhere = tmp_path / "elsewhere.exe"
+    elsewhere.write_bytes(b"MZ")
+    (tmp_path / "a.exe").write_bytes(b"MZ")
+    monkeypatch.setattr(tdc, "SAMPLE_DROP_DIR", str(tmp_path))
+    monkeypatch.setattr(tdc, "_image_path_for_pid", lambda pid: str(elsewhere))
+    seen = []
+    monkeypatch.setattr(tdc, "_run_memory_scans_async", lambda *a: seen.append(a))
+    _submit(client, tdc, monkeypatch, agent_path=None)
+    assert seen and seen[0][2] == str(elsewhere)
+
+
+# --- A past measurement on the map: reconstructing its states from what the history kept -----------------------------
+
+def test_a_past_measurement_rebuilds_its_states_and_proves_it_did(arm64_baseline):
+    """The history keeps a scan without `states` - some 2,000 stubs per scan is not what a timeline row expands to -
+    but it keeps `deviations`, and those are *every* state that is not intact (syscall_scan.measure). So every
+    measured syscall the deviations do not name was intact, and the map of a past measurement is reconstructible.
+
+    What makes it honest is the count. `counts['intact']` says how many there were; the rebuild must produce exactly
+    that many, or something was measured that the rebuild cannot place - a module loaded twice is not measured at
+    all, for instance - and then no map may be drawn from it. The check is the point of the function."""
+    live = syscall_scan.measure(arm64_baseline, _reader_from(
+        arm64_baseline, patched={"NtProtectVirtualMemory": ("0500001400000000", "edrhook.dll")}))
+    states, problem = syscall_scan.states_from_deviations(
+        arm64_baseline, ("ntdll.dll",), live["deviations"], live["counts"])
+    assert problem is None, problem
+    assert set(states) == set(live["states"]), "the same syscalls, no more and no fewer"
+    assert {n: s["state"] for n, s in states.items()} == {n: s["state"] for n, s in live["states"].items()}
+    rebuilt = states["NtProtectVirtualMemory"]
+    assert rebuilt == live["deviations"][0], "a deviation is carried over as the scan recorded it"
+    intact = next(s for n, s in states.items() if s["state"] == "intact")
+    assert intact["number"] == arm64_baseline.syscalls[intact["name"]].number
+    assert "bytes" not in intact and "read" not in intact, \
+        "the bytes of an intact stub were never kept: inventing them would be a measurement nobody made"
+
+
+def test_a_past_measurement_that_does_not_add_up_draws_no_map(arm64_baseline):
+    live = syscall_scan.measure(arm64_baseline, _reader_from(arm64_baseline, patched={}))
+    short = dict(live["counts"], intact=live["counts"]["intact"] - 3)
+    states, problem = syscall_scan.states_from_deviations(
+        arm64_baseline, ("ntdll.dll",), live["deviations"], short)
+    assert states == {} and problem and "3" in problem, problem
+    more = dict(live["counts"], intact=live["counts"]["intact"] + 1)
+    _, problem_more = syscall_scan.states_from_deviations(
+        arm64_baseline, ("ntdll.dll",), live["deviations"], more)
+    assert problem_more, "more intact than the baseline holds is just as unplaceable"
+
+
+def test_a_past_measurement_of_a_module_the_baseline_does_not_hold_is_no_map(arm64_baseline):
+    live = syscall_scan.measure(arm64_baseline, _reader_from(arm64_baseline, patched={}))
+    states, problem = syscall_scan.states_from_deviations(
+        arm64_baseline, ("ntdll.dll", "win32u.dll"), live["deviations"], live["counts"])
+    assert states == {} and problem, "win32u was asked for and this baseline has none: the count cannot match"
+
+
+def _history(tdc, monkeypatch, entries):
+    # the tdc fixture already replaces _load_scan_history with an empty one; this gives it content
+    monkeypatch.setattr(tdc, "_load_scan_history", lambda: entries)
+
+
+def _measurement_entry(live, entry_id="aa11bb22cc33", pid=4812, when="2026-11-25T08:33:12.100000"):
+    return {"id": entry_id, "timestamp": when, "tool": "Syscalls", "filename": f"PID {pid}",
+            "verdict": "clean", "score": 0,
+            "result": {k: v for k, v in {**live, "tool": "Syscalls", "pid": pid,
+                                         "process": r"C:\Users\Public\Downloads\injectsim.exe",
+                                         "modules": ["ntdll.dll"]}.items() if k != "states"}}
+
+
+def test_the_measurements_route_lists_the_syscall_scans_the_history_kept(
+        client, tdc, arm64_baseline, monkeypatch):
+    """The way in that does not come from a detonation: a list of what was measured before, so a scan of a process
+    that is long gone can still be put on the map. Only syscall scans, newest first, and only what the control needs
+    to name one - never the whole result, which carries every deviation."""
+    live = syscall_scan.measure(arm64_baseline, _reader_from(
+        arm64_baseline, patched={"NtProtectVirtualMemory": ("0500001400000000", "edrhook.dll")}))
+    _history(tdc, monkeypatch, [
+        _measurement_entry(live),
+        {"id": "ff00", "timestamp": "2026-11-25T07:00:00", "tool": "Aether", "filename": "PID 1", "result": {}},
+    ])
+    r = client.get("/api/syscalls/measurements")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert [m["id"] for m in body["measurements"]] == ["aa11bb22cc33"], "syscall scans only"
+    one = body["measurements"][0]
+    assert one["pid"] == 4812 and one["process"] == "injectsim.exe" and one["view"] == "arm64"
+    assert one["at"] == "2026-11-25T08:33:12.100000" and one["counts"]["intact"] == live["counts"]["intact"]
+    assert "deviations" not in one and "result" not in one, "the list names a measurement, it does not carry it"
+
+
+def test_one_measurement_comes_back_shaped_like_a_scan_and_says_it_is_not_one(
+        client, tdc, arm64_baseline, fake_baseline_dir, monkeypatch):
+    """The map draws a scan's `states`, so a past measurement is handed over in exactly that shape - otherwise the
+    map would need a second way to read. What it must never do is read as a scan of now: `live` is false and
+    `measured_at` says when, and every caveat the scan recorded travels with it."""
+    live = syscall_scan.measure(arm64_baseline, _reader_from(
+        arm64_baseline, patched={"NtProtectVirtualMemory": ("0500001400000000", "edrhook.dll")}))
+    _history(tdc, monkeypatch, [_measurement_entry(live)])
+    r = client.get("/api/syscalls/measurement?id=aa11bb22cc33")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["live"] is False and body["measured_at"] == "2026-11-25T08:33:12.100000"
+    assert body["pid"] == 4812 and body["view"] == "arm64" and body["problem"] is None
+    assert set(body["states"]) == set(live["states"])
+    assert body["states"]["NtProtectVirtualMemory"] == live["states"]["NtProtectVirtualMemory"], \
+        "a deviation comes back exactly as the scan recorded it"
+    assert body["counts"] == live["counts"] and body["partial"] == live["partial"]
+    assert len(body["deviations"]) == len(live["deviations"])
+
+
+def test_a_measurement_whose_baseline_is_gone_keeps_its_deviations_and_draws_no_map(
+        client, tdc, arm64_baseline, fake_baseline_dir, monkeypatch):
+    """A Windows update leaves the old build's baseline behind, and another build numbers its stubs differently.
+    The answer still carries what was recorded, so the reader sees the deviations and the figures - only `states` is
+    null, with the reason. Drawing those cells against another baseline would put them in the wrong place."""
+    live = syscall_scan.measure(arm64_baseline, _reader_from(arm64_baseline, patched={}))
+    entry = _measurement_entry(live)
+    entry["result"]["build"] = "99999.1"
+    _history(tdc, monkeypatch, [entry])
+    r = client.get("/api/syscalls/measurement?id=aa11bb22cc33")
+    assert r.status_code == 200
+    body = r.get_json()
+    assert body["states"] is None and body["problem"]
+    assert "99999.1" in body["problem"], body["problem"]
+    assert body["counts"] == live["counts"], "the figures it recorded are still its own"
+
+
+def test_an_unknown_measurement_is_a_404_and_an_id_that_is_not_one_is_refused(client, tdc, monkeypatch):
+    _history(tdc, monkeypatch, [])
+    assert client.get("/api/syscalls/measurement?id=deadbeef").status_code == 404
+    assert client.get("/api/syscalls/measurement").status_code == 400
+    assert client.get("/api/syscalls/measurement?id=" + "x" * 200).status_code == 400
+
+
+def test_the_stage_keeps_the_history_id_so_the_memory_tab_can_name_its_measurement(
+        tdc, pipeline, monkeypatch, fake_baseline_dir, target):
+    """The button in the detonation's memory block hands a measurement to the map, and the map asks for it by the
+    history id. The stage's own result carried no id - the history makes one when it records - so the block had no
+    way to name what it was showing. The stage records first and keeps the id it got."""
+    target.reader = _patched_reader(tdc, fake_baseline_dir, "private")
+    _detonate(tdc)
+    stored = tdc._beacon_results_cache.lookup("syscalls", 4812, SHA_SAMPLE)
+    tool, _name, recorded, _status = next(h for h in target.history if h[0] == "Syscalls")
+    assert tool == "Syscalls"
+    assert stored["history_id"] == "hist1", "the cached stage result names the history entry the map would load"
+    assert "history_id" not in recorded, "the id is not part of what it identifies"

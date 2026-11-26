@@ -732,7 +732,25 @@ Der Scan läuft nicht nur von Hand im Tab, sondern als Stufe einer Detonation.
 
 - Eine neue Stufe in der Liste der Live-Memory-Werkzeuge
   (`_run_memory_scans_async`, **nicht** `api_submit` — das führt keine
-  Stufenliste und liefert kein `scans`), nach Aether und vor Process Dump.
+  Stufenliste und liefert kein `scans`), **als erste und vor dem Warten auf
+  einen eingeschlafenen Beacon**. Zuerst stand hier „nach Aether und vor Process
+  Dump"; auf der Kammer gemessen war das falsch: `_scan_all` wartet fünf
+  Sekunden, dann laufen die Beacon-Jäger und Aether mit drei Proben, während
+  `injectsim.exe` 4,2 s und `shortlived.exe` 6,7 s leben. Die Stufe erreichte
+  keines der beiden und übersprang sich mit „the architecture of process N is
+  unknown (it is gone)". Sie dauert selbst unter zwei Sekunden (Scan 0,12–0,41 s,
+  Stub-Suche 1,3–1,5 s) und liest nur, ihr Platz unter den Nur-Lese-Scannern ist
+  also frei — und zuerst ist der einzige, an dem sie noch messen kann. Das Warten
+  gehört den Beacon-Jägern, die einen schlafenden Beacon brauchen; die Stufe
+  braucht das Gegenteil. Process Dump bleibt letzter: er schreibt Dateien.
+- **Die Stufe braucht den Pfad des Samples.** Der Agent meldet ihn nicht — seine
+  Antwort auf `/execute/exec` trägt nur `status`, `pid` und `message`, gemessen
+  auf der Kammer. Ohne Pfad lief die Datei-Suche in **keiner** Detonation
+  (`"file": {"skipped": "the path of the sample is not known"}`), und sie ist die
+  einzige Quelle, die eine Umgehung belegen kann. `api_submit` sucht den Pfad
+  daher mit derselben Regel wie die Einsendungs-Historie (`_sample_path_for`:
+  das Abbild des laufenden Prozesses, sonst der Drop-Ordner des Agenten) und
+  übergibt ihn, bevor die Scans starten.
 - Ihre Befunde gehen durch `memory_evidence.collect()` in den Gesamt-Score,
   erscheinen im VERDICT FLOW und in der Score-Historie.
 - Der System-Sweep (`/api/memory/sweep`) nimmt den Syscall-Scan als weiteres

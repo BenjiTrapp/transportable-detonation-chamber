@@ -12,7 +12,7 @@ When the DetonatorAgent returns a PID, these run automatically (Submit tab →
 |------|------|-------|
 | Armed before execution | **Exit Capture** | Windows writes a full-memory dump when the sample exits (`C:\dumps\exit`). Armed per image name for 120 s, then the registry keys are removed again |
 | Live, read-only | Hunt-Sleeping-Beacons, BeaconEye, **Aether** | Aether samples the process 3× (3 s apart) |
-| Live, read-only | **Syscalls** | Measures the process's `ntdll` syscall stubs against the NTSleuth baseline of this build and view, and searches the process and the sample file for stubs the sample carries itself. Needs the baseline file only, not NTSleuth. Skips itself, with its reason kept, without a baseline of this build (it never extracts one), for a process that is gone, or when `TDC_NO_SYSCALL_STAGE=1`; the detonation goes on |
+| Live, read-only | **Syscalls** | Measures the process's `ntdll` syscall stubs against the NTSleuth baseline of this build and view, and searches the process and the sample file for stubs the sample carries itself. Needs the baseline file only, not NTSleuth. In a detonation it runs **first**, before the wait for a beacon to settle: it is the only tool that needs the process to still be there, and a sample living a few seconds was always gone behind that wait. Skips itself, with its reason kept, without a baseline of this build (it never extracts one), for a process that is gone, or when `TDC_NO_SYSCALL_STAGE=1`; the detonation goes on |
 | Live, writes files | **Process Dump** | Runs last; skips modules in the clean-hash database (`C:\dumps\<time>_pid<PID>`) |
 | From the log | **Network beaconing** | Sysmon EID 3 connections scored for check-in periodicity - still available after the process exited |
 
@@ -185,6 +185,41 @@ hooks of a sample's process and the sample's own hooks stop counting.
 renumbered stub, which scores as above. A scan goes
 into the scan history like the others, and into the combined verdict through the
 same evidence model as everything else in this page.
+
+### A past measurement on the map
+
+A detonated sample is gone seconds after it ran, so the measurement its syscall
+stage made could not be shown by a live SCAN. Every syscall scan, the stage's
+among them, goes into the scan history, and the SYSCALLS tab can put one of them
+on the map: the list after STUBS, *— a past measurement —*, names each by
+process, PID, time and view, and in the Memory tab of a detonation *Show on the
+syscall map*, beside the raw button, opens the measurement of that run (when the
+stage ran and its history entry was written; a stage that skipped itself, or a
+run older than this feature, has none). Choosing one measures nothing.
+
+A past measurement may never read as a scan of now. A banner over the map says
+PAST MEASUREMENT, the process and PID, when it was measured (by the chamber's clock, as
+the history wrote it, with no time zone), its build and view and that it is not a scan of now, with
+BACK TO LIVE at its end. While it is shown, SCAN and STUBS are off, because a map
+half of then and half of now would read as one measurement; the live scan and
+stub search are put away when it comes, recording its hooks as known is not
+offered (that measures the process again, now), and DEVIATIONS names the PID and
+the time of the deviations it lists. BACK TO LIVE clears it and gives SCAN and
+STUBS back.
+
+The history keeps a scan's `counts` and `deviations`, not its 2,000 states. The
+map is rebuilt from them against the baseline of the measurement's **own** build
+and view (`GET /api/syscalls/measurement`): every measured syscall the deviations
+do not name was intact, and the rebuild is used only when it places exactly as
+many intact stubs as the scan counted. An intact stub rebuilt so has **no bytes**:
+none were kept, and the detail panel says that instead of showing a read nobody
+made. Where no map can be rebuilt - this system has no baseline for that build and
+view (after a Windows update), that baseline is unusable, or the numbers do not
+place - no cell is drawn, and the banner takes the error tone and says why. The
+map also draws nothing for a measurement of another build than the one its
+baseline is of, even where the server could rebuild it: the map loads only this
+system's build, and its cells are numbered otherwise. Either way the figures and
+the deviations the measurement recorded are still shown: they are its own.
 
 ### Stubs the sample brings itself
 

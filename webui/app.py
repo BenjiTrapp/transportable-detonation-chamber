@@ -527,10 +527,12 @@ def _normalize_scan(tool, result):
 
 
 def _record_scan(tool, filename, result, status="ok"):
-    """Append a scan to the shared history timeline (best-effort).
+    """Append a scan to the shared history timeline (best-effort); the id of the entry, or "".
 
     ``result`` is the full JSON dict returned to the client (stored verbatim
     for the "> more" expander); ``status`` is "ok", "timeout", or "error".
+    The id is what names this measurement afterwards: the syscall stage keeps it
+    so a detonation's memory block can hand its measurement to the map.
     """
     import datetime
     try:
@@ -557,8 +559,9 @@ def _record_scan(tool, filename, result, status="ok"):
             if len(history) > SCAN_HISTORY_MAX:
                 del history[SCAN_HISTORY_MAX:]
             _save_scan_history(history)
+        return entry["id"]
     except Exception:
-        pass  # history must never break a scan
+        return ""  # history must never break a scan
 
 
 # --- Scan <-> process/sample correlation (graph enrichment) ---
@@ -810,6 +813,24 @@ def _save_submissions(submissions):
         raise
 
 
+def _sample_path_for(agent_path, pid, filename):
+    """Where the sample the agent just ran can be read, for every tool that searches the file itself.
+
+    The agent does not report where it wrote the sample: its /execute/exec answer carries status, pid and message
+    and nothing else, measured on the chamber. So: the path it gave when it gave one, else the running process's
+    image (it may still be alive right after the submit), else the agent's drop folder. None when none of them is
+    a file - a path that cannot be read is worth no more than none.
+
+    One rule for two callers. The submission record needs it for the hex, PE and FileMap links; the syscall stage
+    needs it because the file is the only source that can prove a bypass, and without a path it searched nothing.
+    """
+    candidates = [agent_path]
+    if pid:
+        candidates.append(_image_path_for_pid(pid))
+    candidates.append(os.path.join(SAMPLE_DROP_DIR, os.path.basename(str(filename or "").replace("\\", "/"))))
+    return next((c for c in candidates if c and os.path.isfile(c)), None)
+
+
 def _record_submission(filename, sha256, size, target, results):
     """Record a new submission in the history."""
     import datetime
@@ -861,16 +882,10 @@ def _record_submission(filename, sha256, size, target, results):
     if isinstance(fi, dict):
         entry["litterbox_hash"] = fi.get("litterbox_hash")
 
-    # The agent does not report where it wrote the sample. The running
-    # process knows (it may still be alive right after the submit); else the
-    # agent's drop folder. The former guess (a "vagrant" desktop folder) did
-    # not exist on any VM, so hex/PE/FileMap links to samples were dead.
-    if not entry["file_path"]:
-        candidates = []
-        if entry.get("agent_pid"):
-            candidates.append(_image_path_for_pid(entry["agent_pid"]))
-        candidates.append(os.path.join(SAMPLE_DROP_DIR, os.path.basename(filename)))
-        entry["file_path"] = next((c for c in candidates if c and os.path.isfile(c)), None)
+    # The agent does not report where it wrote the sample, so _sample_path_for looks: the running process's image
+    # (it may still be alive right after the submit), else the agent's drop folder. The former guess (a "vagrant"
+    # desktop folder) did not exist on any VM, so hex/PE/FileMap links to samples were dead.
+    entry["file_path"] = _sample_path_for(entry["file_path"], entry.get("agent_pid"), filename)
 
     with submissions_lock:
         subs = _load_submissions()
@@ -4118,7 +4133,10 @@ def api_submit():
                               or os.path.isfile(PROCESSDUMP_EXE)
                               or _syscall_stage_available())
     if agent_pid and memory_tools_available:
-        _run_memory_scans_async(agent_pid, file_sha256, agent_file_path)
+        # The agent reports no path, so the stage would search no file at all - and the file is the only source that
+        # can prove a bypass. The same look the submission record does, done here, before the scans start.
+        _run_memory_scans_async(agent_pid, file_sha256,
+                                _sample_path_for(agent_file_path, agent_pid, filename))
         results["beacon_scan"] = {
             "triggered": True,
             "tools": [],
@@ -8788,6 +8806,82 @@ def _syscall_measure(pid, modules, allowlist=None):
     return measured, view, build
 
 
+def _syscall_measurements():
+    """The syscall scans the history kept, newest first, as the list that names one.
+
+    The history is where a measurement outlives both its process and a restart of the web UI: the stage's own cache
+    is in memory and keyed by pid. Only what the control needs to name a measurement goes in - never the result,
+    which carries every deviation of some 2,000 stubs.
+    """
+    out = []
+    for entry in _load_scan_history():
+        if not isinstance(entry, dict) or (entry.get("tool") or "") != "Syscalls":
+            continue
+        result = entry.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("counts"), dict):
+            continue
+        process = str(result.get("process") or "")
+        out.append({
+            "id": entry.get("id") or "",
+            "at": entry.get("timestamp") or "",
+            "pid": result.get("pid"),
+            "process": os.path.basename(process.replace("\\", "/")) or (entry.get("filename") or ""),
+            "build": result.get("build") or "",
+            "view": result.get("view") or "",
+            "counts": result.get("counts"),
+            "partial": bool(result.get("partial")),
+        })
+    return out
+
+
+@app.route("/api/syscalls/measurements")
+def api_syscalls_measurements():
+    """The syscall scans the history kept, to put one on the map. The list names them; it does not carry them."""
+    return jsonify({"measurements": _syscall_measurements()})
+
+
+@app.route("/api/syscalls/measurement")
+def api_syscalls_measurement():
+    """One measurement the history kept, shaped like a scan so the map needs no second way to read it.
+
+    `states` is rebuilt from the deviations against the baseline of the measurement's own build and view, and only
+    when the count adds up (syscall_scan.states_from_deviations). Where it cannot be, `states` is null and `problem`
+    says why, while the figures and deviations the scan recorded still travel: they are its own either way. `live`
+    is false and `measured_at` says when, because nothing here may read as a scan of now.
+    """
+    wanted = (request.args.get("id") or "").strip()
+    if not wanted or len(wanted) > 64 or not re.fullmatch(r"[A-Za-z0-9_-]+", wanted):
+        return jsonify({"error": "Provide the id of a measurement"}), 400
+    entry = next((e for e in _load_scan_history()
+                  if isinstance(e, dict) and (e.get("tool") or "") == "Syscalls" and e.get("id") == wanted), None)
+    if entry is None:
+        return jsonify({"error": f"no syscall measurement {wanted} in the scan history"}), 404
+    result = entry.get("result") if isinstance(entry.get("result"), dict) else {}
+    view, build = result.get("view") or "", result.get("build") or ""
+    modules = tuple(m for m in (result.get("modules") or ("ntdll.dll",)) if isinstance(m, str))
+    states, problem = None, None
+    baseline = None
+    if view in SYSCALL_BASELINE_VIEWS and build:
+        path = syscall_baseline.find_baseline(NTSLEUTH_BASELINE_DIR, build, view)
+        if path is None:
+            problem = (f"this system has no syscall baseline for build {build}, view {view}: the stubs of another "
+                       "build are numbered differently, so its map cannot be drawn here")
+        else:
+            try:
+                baseline = _load_syscall_baseline(path)
+            except syscall_baseline.BaselineError as exc:
+                problem = f"the syscall baseline of build {build} ({view}) is unusable: {exc}"
+    else:
+        problem = f"the measurement names no usable build and view (build {build or '?'}, view {view or '?'})"
+    if baseline is not None:
+        states, problem = syscall_scan.states_from_deviations(
+            baseline, modules, result.get("deviations"), result.get("counts") or {})
+        states = states or None
+    return jsonify({**{k: v for k, v in result.items() if k != "states"},
+                    "id": entry.get("id") or "", "measured_at": entry.get("timestamp") or "",
+                    "live": False, "states": states, "problem": problem})
+
+
 def _syscall_stage_enabled():
     """False when the detonation's syscall stage is switched off for the whole web UI: TDC_NO_SYSCALL_STAGE=1."""
     return os.environ.get("TDC_NO_SYSCALL_STAGE") != "1"
@@ -10001,9 +10095,10 @@ def _parse_beaconeye_output(output):
 def _run_memory_scans_async(pid, sha256, path=None):
     """Run every live-memory tool against a detonated process, in background.
 
-    Order matters: the read-only scanners go first so their view of the process
-    is undisturbed, and Process Dump runs last because it writes files. `path`
-    is the sample's file, which the syscall stage searches as well.
+    Order matters. The syscall stage goes first, before the wait for a beacon to settle: it is the only tool that
+    needs the process to still be there and it is the fastest, and behind that wait a sample living a few seconds
+    was always gone. The other read-only scanners follow, and Process Dump runs last because it writes files.
+    `path` is the sample's file, which the syscall stage searches as well - the only source that can prove a bypass.
     """
     def _scan():
         try:
@@ -10013,6 +10108,29 @@ def _run_memory_scans_async(pid, sha256, path=None):
 
     def _scan_all():
         import time as _time
+
+        # Syscalls first, before the wait below. Measured on the chamber: injectsim.exe lives 4.2 s and
+        # shortlived.exe 6.7 s, so behind a five-second wait plus the beacon hunters plus Aether's three samples the
+        # stage reached neither and skipped with "the architecture of process N is unknown (it is gone)". The stage
+        # itself takes under two seconds (a scan of 0.12-0.41 s, a stub search of 1.3-1.5 s) and it only reads, so
+        # among the read-only scanners its place is free and first is the only one where it can still measure. The
+        # wait is for the beacon hunters, which need a beacon that has entered its sleep; the stage needs the
+        # opposite, a process that is still there. Process Dump stays last: it writes files.
+        if _syscall_stage_enabled():
+            try:
+                notes = []
+                syscall_result = _run_syscall_stage(pid, path, notes)
+                if syscall_result:
+                    # recorded first: the id it gets back is how the memory block names this measurement to the map
+                    history_id = _record_scan("Syscalls", f"PID {pid}", syscall_result)
+                    _beacon_results_cache.put("syscalls", {**syscall_result, "history_id": history_id},
+                                              pid=pid, sha256=sha256)
+                else:
+                    _beacon_results_cache.put("syscalls", {"tool": "Syscalls", "skipped": "; ".join(notes) or "skipped"},
+                                              pid=pid, sha256=sha256)
+            except Exception as e:
+                _beacon_results_cache.put("syscalls", {"tool": "Syscalls", "error": str(e)}, pid=pid, sha256=sha256)
+
         # Wait a few seconds for the beacon to initialize and enter sleep
         _time.sleep(5)
 
@@ -10040,21 +10158,6 @@ def _run_memory_scans_async(pid, sha256, path=None):
                     _record_scan("Aether", f"PID {pid}", aether_result)
             except Exception as e:
                 _beacon_results_cache.put("aether", {"tool": "Aether", "error": str(e)}, pid=pid, sha256=sha256)
-
-        # Syscalls: the stubs of the process against the NTSleuth baseline, and the stubs the sample carries
-        # itself. It only reads, and skips itself, with its reason kept, where it cannot run.
-        if _syscall_stage_enabled():
-            try:
-                notes = []
-                syscall_result = _run_syscall_stage(pid, path, notes)
-                if syscall_result:
-                    _beacon_results_cache.put("syscalls", syscall_result, pid=pid, sha256=sha256)
-                    _record_scan("Syscalls", f"PID {pid}", syscall_result)
-                else:
-                    _beacon_results_cache.put("syscalls", {"tool": "Syscalls", "skipped": "; ".join(notes) or "skipped"},
-                                              pid=pid, sha256=sha256)
-            except Exception as e:
-                _beacon_results_cache.put("syscalls", {"tool": "Syscalls", "error": str(e)}, pid=pid, sha256=sha256)
 
         # Process Dump last: it writes files, and running it after the scanners
         # keeps their view of the process undisturbed. The clean-hash database
