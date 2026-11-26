@@ -3,6 +3,7 @@
 #   1. PowerShell Script Block Logging and Module Logging (Event IDs 4104 / 4103)
 #   2. A 256 MB PowerShell operational log
 #   3. Windows Firewall logging of allowed and blocked packets (pfirewall.log)
+#   4. The BITS client operational log, 32 MB (the FIREWALL tab reads download URLs from it)
 #
 # Safe to run any number of times (runs on every 'vagrant up'). Run as Administrator.
 
@@ -60,6 +61,18 @@ try {
     }
 } catch {
     Write-Host "[!] Firewall logging: $($_.Exception.Message)" -ForegroundColor Yellow
+}
+
+# --- BITS client log: on, 32 MB (the FIREWALL tab reads the URLs of BITS jobs from it) ---
+try {
+    wevtutil sl Microsoft-Windows-Bits-Client/Operational /e:true /ms:33554432
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "[+] BITS client log enabled and limited to 32 MB" -ForegroundColor Green
+    } else {
+        Write-Host "[!] wevtutil exited with code $LASTEXITCODE" -ForegroundColor Yellow
+    }
+} catch {
+    Write-Host "[!] BITS client log: $($_.Exception.Message)" -ForegroundColor Yellow
 }
 
 Write-Host "=== Logging configured ===" -ForegroundColor Cyan

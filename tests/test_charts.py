@@ -17,6 +17,11 @@ Regressions covered:
     a legend in other colours than its donut
   * bars whose parts do not add up to their bin or are stacked in another
     order, midnight labelled 24:00, a selection beside the bins it selects
+  * a line of several series in other colours than its legend, series drawn
+    over time axes of their own, a bucket without events taken as a count of
+    0 or breaking the line in two, points drawn in the order they came in
+    instead of by their time, a single point or a flat series drawn as a path
+    of NaN, or a series of many values buried under its dots
   * a rule, process, file or category name (data from the sample) reaching a
     chart, a tooltip, a legend or a data-* attribute as markup
   * a colour written as a literal, or a colour of the caller that is no theme
@@ -772,6 +777,193 @@ def test_sparkline_and_scatter_place_their_points():
     assert _Tree(r["empty"]).find(cls="chart-empty")[0]["text"] == "No scans yet"
 
 
+# --- Lines over time ------------------------------------------------------------
+
+def _line_points(path):
+    """The coordinate pairs of a <path class="chart-line">, in their order."""
+    return [(float(x), float(y)) for x, y in re.findall(r"[ML](-?[\d.]+) (-?[\d.]+)", path["attrs"]["d"])]
+
+
+@needs_node
+@pytest.mark.parametrize("zone", ZONES)
+def test_line_svg_draws_every_series_and_nothing_else(zone):
+    """A timechart of several series (LINE of the Logs tab): one line per
+    series in the colour of its legend row, over a grid whose highest value
+    is named, labels of the local times under it, and a dot per value while
+    there are few of them. Nothing else: no second axis, no legend of its
+    own, no element a view would have to know about."""
+    r = _run_node(CHART_JS, r"""
+        const at = (...a) => new Date(...a).getTime();
+        const H = 3600000, t0 = at(2026, 6, 14, 22);
+        const times = [0, 1, 2, 3, 4].map(i => t0 + i * H);
+        const counts = { powershell: [4, 0, 2, 8, 6], firewall: [1, 1, 1, 1, 1], OTHER: [0, 0, 1, 0, 2] };
+        // OTHER without a colour of its own: it takes the palette, as its legend row does
+        const series = [
+            { key: 'powershell', label: 'powershell', color: 'var(--accent-cyan)' },
+            { key: 'firewall', label: 'firewall', color: 'var(--accent-pink)' },
+            { key: 'OTHER', label: 'OTHER' },
+        ].map(s => ({ ...s, points: times.map((t, i) => [t, counts[s.key][i]]) }));
+        console.log(JSON.stringify({
+            times: times.map(String),
+            svg: lineSvg(series, { width: 300, height: 128, unit: 'hour', step: H }),
+            legend: chartLegendHtml(series.map(s => ({ key: s.key, label: s.label, color: s.color, value: 1 }))),
+        }));
+    """, _prelude(zone))
+    tree = _Tree(r["svg"])
+    assert {node["tag"] for node in tree.all} == {"svg", "line", "text", "path", "circle", "title"}
+    lines = {path["attrs"]["data-key"]: path for path in tree.find("path", cls="chart-line")}
+    assert list(lines) == ["powershell", "firewall", "OTHER"], "a series without its line, or in another order"
+    bottom = _num(tree.find("line", cls="chart-axis")[0], "y1")
+    grid = sorted({_num(line, "y1") for line in tree.find("line", cls="chart-grid")})
+    assert len(grid) == 4 and grid[-1] < bottom, "no grid over the axis"
+    top = grid[0]
+    assert tree.find("text", cls="chart-ymax")[0]["text"] == "8", "the highest value of all series is not named"
+    points = {key: _line_points(path) for key, path in lines.items()}
+    assert [len(p) for p in points.values()] == [5, 5, 5], "a value without its place on a line"
+    xs = [x for x, _ in points["powershell"]]
+    assert xs == sorted(xs) and _close([x for x, _ in points["firewall"]], xs), "the series are not over one time axis"
+    assert _close([points["powershell"][3][1]], [top]), "the highest value is not at the top of the plot"
+    assert _close([points["powershell"][1][1]], [bottom]), "a value of 0 is not on the axis"
+    assert _close([points["firewall"][0][1]], [bottom - (bottom - top) / 8]), "a value is not placed by the scale"
+    # Colours come from _chartColor by the place in the list: a line and its legend row match
+    legend = {row["attrs"]["data-key"]: _style(row["children"][0])["background"]
+              for row in _Tree(r["legend"]).find(cls="chart-legend-row")}
+    assert {key: _style(path)["stroke"] for key, path in lines.items()} == legend
+    assert legend["powershell"] == "var(--accent-cyan)" and legend["OTHER"].startswith("var(--")
+    assert [path["attrs"]["data-total"] for path in lines.values()] == ["20", "5", "3"]
+    titles = {key: _child(path, "title")["text"] for key, path in lines.items()}
+    assert titles == {"powershell": "powershell: 0\u20138 per point, 20 in all",
+                      "firewall": "firewall: 1 per point, 5 in all",
+                      "OTHER": "OTHER: 0\u20132 per point, 3 in all"}
+    # A dot per value while a series has few of them, with its count, its time and its period
+    dots = tree.find("circle", cls="chart-point")
+    assert len(dots) == 15 and {c["attrs"]["data-key"] for c in dots} == set(lines)
+    mine = [c for c in dots if c["attrs"]["data-key"] == "powershell"]
+    assert [c["attrs"]["data-value"] for c in mine] == ["4", "0", "2", "8", "6"]
+    assert [c["attrs"]["data-time"] for c in mine] == r["times"]
+    assert _close([_num(c, "cx") for c in mine], xs) and \
+        _close([_num(c, "cy") for c in mine], [y for _, y in points["powershell"]]), "a dot beside its line"
+    assert _child(mine[3], "title")["text"] == "powershell \u00b7 15 Jul 2026, 01:00\u201302:00: 8"
+    ticks = [t["text"] for t in tree.find("text", cls="chart-tick")]
+    assert ticks == ["22:00", "23:00", "15 Jul", "01:00"], "the hours, a new day by its date, none past the right edge"
+    assert "24:00" not in r["svg"]
+
+
+@needs_node
+def test_line_svg_is_empty_without_data():
+    """Nothing to draw is '', so the card shows chartEmptyHtml instead of an
+    empty picture: no series, no points, no value, no time, and a window in
+    which nothing happened at all."""
+    r = _run_node(CHART_JS, r"""
+        const H = 3600000, t0 = new Date(2026, 6, 14, 22).getTime();
+        const opts = { width: 300, height: 128, unit: 'hour', step: H };
+        console.log(JSON.stringify({
+            none: [
+                lineSvg([], opts), lineSvg(undefined), lineSvg(null, opts), lineSvg([null], opts),
+                lineSvg([{ key: 'a', label: 'a', points: [] }], opts),
+                lineSvg([{ key: 'a', label: 'a' }], opts),
+                lineSvg([{ key: 'a', points: [[t0, null], [t0 + H, undefined], [t0 + 2 * H, '']] }], opts),
+                lineSvg([{ key: 'a', points: [[null, 5], [undefined, 6], ['x', 7]] }], opts),
+                lineSvg([{ key: 'a', points: [[t0, 0], [t0 + H, 0], [t0 + 2 * H, 0]] }], opts),
+            ],
+        }));
+    """, _prelude())
+    assert r["none"] == [""] * 9
+
+
+@needs_node
+@pytest.mark.parametrize("zone", ZONES)
+def test_line_svg_handles_one_point_and_flat_series(zone):
+    """One point is a dot and no path of NaN, a series of one value a
+    horizontal line over the axis with a scale of its own; a value that is
+    none is skipped and the line goes on, points out of order are drawn by
+    their time, and a series of many values keeps its dots off."""
+    r = _run_node(CHART_JS, r"""
+        const at = (...a) => new Date(...a).getTime();
+        const H = 3600000, t0 = at(2026, 6, 14, 22);
+        const opts = { width: 300, height: 128, unit: 'hour', step: H };
+        const times = [0, 1, 2, 3, 4].map(i => t0 + i * H);
+        const run = (length, value) => Array.from({ length }, (_, i) => [t0 + i * H, value(i)]);
+        console.log(JSON.stringify({
+            one: lineSvg([{ key: 'a', label: 'a', points: [[t0, 5]] }], opts),
+            flat: lineSvg([{ key: 'a', label: 'a', points: times.map(t => [t, 7]) }], opts),
+            gap: lineSvg([{ key: 'a', label: 'a', points: [[t0, 2], [t0 + H, null], [t0 + 2 * H, 4]] }], opts),
+            mixed: lineSvg([{ key: 'a', label: 'a', points: [[t0 + 2 * H, 1], [t0, 3], [t0 + H, 2]] }], opts),
+            many: lineSvg([{ key: 'a', label: 'a', points: run(60, i => i + 1) }], opts),
+            few: lineSvg([{ key: 'a', label: 'a', points: run(30, i => i + 1) }], opts),
+            width: opts.width,
+        }));
+    """, _prelude(zone))
+    assert "NaN" not in "".join(r[k] for k in ("one", "flat", "gap", "mixed", "many", "few"))
+    one = _Tree(r["one"])
+    dot = one.find("circle", cls="chart-point")
+    assert len(dot) == 1 and _close([_num(dot[0], "cx")], [r["width"] / 2]), "a single point is not in the middle"
+    assert len(_line_points(one.find("path", cls="chart-line")[0])) == 1, "a line through a single point"
+    assert one.find("text", cls="chart-ymax")[0]["text"] == "5"
+    flat = _Tree(r["flat"])
+    bottom = _num(flat.find("line", cls="chart-axis")[0], "y1")
+    ys = [y for _, y in _line_points(flat.find("path", cls="chart-line")[0])]
+    assert len(set(ys)) == 1 and ys[0] < bottom, "a series of one value is no horizontal line over the axis"
+    assert flat.find("text", cls="chart-ymax")[0]["text"] == "7", "a flat series without a scale of its own"
+    gap, line = _Tree(r["gap"]), _Tree(r["gap"]).find("path", cls="chart-line")[0]
+    drawn = _line_points(line)
+    assert len(drawn) == 2 and len(gap.find("circle", cls="chart-point")) == 2, "a bucket without events is a value of 0"
+    assert line["attrs"]["d"].count("M") == 1, "the line breaks where a value is none"
+    assert drawn[0][0] < 5 and drawn[1][0] > 295, "the line does not reach from the first time to the last"
+    mixed = [x for x, _ in _line_points(_Tree(r["mixed"]).find("path", cls="chart-line")[0])]
+    assert mixed == sorted(mixed), "points drawn in the order they came in, not by their time"
+    assert not _Tree(r["many"]).find("circle", cls="chart-point"), "60 values are buried under 60 dots"
+    assert len(_Tree(r["few"]).find("circle", cls="chart-point")) == 30
+
+
+@needs_node
+def test_line_svg_escapes_labels():
+    """A series name is a field value from a sample: it reaches the lines,
+    their tooltips and their data-key as text, never as markup."""
+    r = _run_node(CHART_JS, r"""
+        const H = 3600000, t0 = new Date(2026, 6, 14, 22).getTime();
+        const evil = '</text><script>x</script>';
+        console.log(JSON.stringify({
+            evil,
+            svg: lineSvg([{ key: evil, label: '</title><script>x</script>', points: [[t0, 1], [t0 + H, 2]] },
+                          { key: '__proto__', label: 'a"b', points: [[t0, 3], [t0 + H, 4]] }],
+                         { width: 300, height: 128, unit: 'hour', step: H }),
+        }));
+    """, _prelude())
+    assert "<script" not in r["svg"] and "&lt;script&gt;" in r["svg"]
+    tree = _Tree(r["svg"])
+    assert not tree.find("script")
+    paths = tree.find("path", cls="chart-line")
+    assert [path["attrs"]["data-key"] for path in paths] == [r["evil"], "__proto__"]
+    assert _child(paths[0], "title")["text"] == "</title><script>x</script>: 1\u20132 per point, 3 in all"
+    assert _child(paths[1], "title")["text"] == 'a"b: 3\u20134 per point, 7 in all'
+    dots = tree.find("circle", cls="chart-point")
+    assert {c["attrs"]["data-key"] for c in dots} == {r["evil"], "__proto__"}
+    assert _child(dots[0], "title")["text"].startswith("</title><script>x</script> \u00b7 ")
+
+
+@needs_node
+def test_line_svg_cuts_the_label_its_tooltips_repeat():
+    """A series name is a field value from a sample and can be 64 KB: lineSvg
+    repeats it in a <title> per series and per dot, so it cuts it as the other
+    drawers do. Today's caller pre-cuts at 200 characters; the next may not."""
+    r = _run_node(CHART_JS, r"""
+        const H = 3600000, t0 = new Date(2026, 6, 14, 22).getTime();
+        const long = 'x'.repeat(30000);
+        const svg = lineSvg([{ key: 'a', label: long, points: Array.from({ length: 12 }, (_, i) => [t0 + i * H, i + 1]) }],
+            { width: 300, height: 128, unit: 'hour', step: H });
+        console.log(JSON.stringify({ max: CHART_LABEL_MAX, length: svg.length,
+            titles: [...svg.matchAll(/<title>([^<]*)<\/title>/g)].map(m => m[1].length) }));
+    """, _prelude())
+    assert len(r["titles"]) == 13, r["titles"]
+    assert max(r["titles"]) <= r["max"] + 60, r["titles"]
+    assert r["length"] < 20000, f"a 30,000-character series name was drawn whole ({r['length']} characters)"
+
+
+def test_the_line_chart_raised_the_asset_version():
+    assert "app.js?v=102" not in _read(INDEX_HTML), "app.js changed, its version did not"
+
+
 # --- Sankey ---------------------------------------------------------------------
 
 # Two sources, three middle nodes, two sinks. Node values by hand, max(in, out):
@@ -1304,6 +1496,8 @@ def test_chart_colours_are_variables():
                                              selection: { from: t0, to: t0 + 1800000 } }),
                 donut: donutSvg(items, { centerSub: 'ALERTS' }), pie: pieSvg(items), legend: chartLegendHtml(items),
                 spark: sparklineSvg([1, 3, 2], { color }),
+                line: lineSvg([{ key: 'a', label: 'a', color, points: [[t0, 1], [t0 + 3600000, 3]] }],
+                              { unit: 'hour', step: 3600000 }),
                 scatter: scatterSvg([{ x: 1, y: 3, color }, { x: 2, y: null, color }], { thresholds: [{ y: 2, label: 'SUSPICIOUS' }] }),
                 verdict: verdictBarsSvg([{ y: 3, color }, { y: null, color }], { thresholds: [{ y: 2, label: 'SUSPICIOUS' }] }),
                 sankey: sankeySvg(flow, { colors: { a: color, c: color } }),
@@ -2788,7 +2982,7 @@ def test_drilldown_leaves_own_settings_alone():
     steps forget that kind of filter, and a step left without one drops out
     of the path; BACK then skips it. A step of two kinds stays with the one
     left: the band Sigma → Run Key, then the engine chosen by hand, leaves
-    "rule: Run Key" (as the README says), and BACK takes the rule back, not
+    "rule: Run Key" (as docs/web-ui.md says), and BACK takes the rule back, not
     the engine. The render of the click by hand already finds the path that
     is left, and its version is another (what shows the path draws it
     again)."""
@@ -7322,7 +7516,7 @@ VERDICT_FLOW_CONSTS = ["VERDICT_FLOW_KINDS", "VERDICT_FLOW_LITTERBOX_MIN", "VERD
                        "_verdictFlowDrawn", "SUBMISSION_VERDICT_GROUPS", "cardViewState"] + CHART_CONSTS
 # The two results views around the card: the panels of the Submit tab, the detail panel
 RESULT_VIEW_FUNCTIONS = list(dict.fromkeys(VERDICT_FLOW_FUNCTIONS + [
-    "renderDetonationPanels", "viewDetonationResult", "_detRawButton", "renderMemoryEvidence", "evidenceClassLabel",
+    "renderDetonationPanels", "detHasMemoryResults", "viewDetonationResult", "_detRawButton", "renderMemoryEvidence", "evidenceClassLabel",
     "confidenceClass", "renderExitCaptureBlock", "renderNetworkBeaconingBlock", "renderNamedPipesBlock", "pipesIsGone",
     "pipesCanonical", "pipeProcLabel", "formatTime", "formatSize", "cssToken", "severitySortValue", "sortTimeValue",
     "sortNumberValue", "pushDetailHistory", "setDetailHeader", "setDetailBody", "showDetail",

@@ -16,10 +16,13 @@ bleiben:
    noch bewerten.
 
 NTSleuth (`xaitax/NTSleuth`, BSD-3-Clause) schließt die erste Hälfte: Es zieht
-rund 2.461 Syscalls aus `ntdll.dll` und `win32u.dll` mit Nummer, RVA,
+die Syscalls aus `ntdll.dll` und `win32u.dll` mit Nummer, RVA,
 Rückgabetyp, Parametern samt SAL-Annotationen und den Stub-Bytes, und gibt das
 als JSON aus. Das ist die Referenz, gegen die sich ein laufender Prozess messen
-lässt.
+lässt. **Wie viele es sind, hängt von Build und Sicht ab.** Auf Build
+`26200.9974`, ARM64, hält die arm64-Sicht 1.991 (490 aus `ntdll.dll`, 1.501 aus
+`win32u.dll`), die x64-Sicht 490 und **keinen** aus `win32u.dll`. Jede Zahl in
+diesem Dokument ist ein Beispiel, keine Konstante.
 
 Der Nutzer will daraus drei Dinge, und einen vierten Teil dazu:
 
@@ -54,11 +57,16 @@ Oberfläche englisch. Aufbau von oben nach unten:
   - **Ziel:** eine Prozessauswahl (PID und Name, aus `/api/processes`), dazu
     **SCAN**. Ohne Ziel zeigt die Karte nur die Baseline.
   - **Filter** (Name, Nummer, Modul) wirkt auf beide Ansichten.
-  - **Modul-Umschalter** ntdll / win32u / beide.
+  - **Modul-Umschalter** ntdll / win32u / beide — angeboten werden nur die
+    Module, für die die geladene Baseline Einträge hat. Eine Wahl, die nur jede
+    Zelle dimmen könnte, gibt es nicht.
 - **Hauptfläche links, Ansicht MAP:**
-  - Eine Zelle je Syscall, nach Syscall-Nummer sortiert, in zwei Bändern:
-    `ntdll.dll` und `win32u.dll`, jedes mit Überschrift und Anzahl.
-  - Farbe ist der Zustand: intakt, EDR-Hook, gepatcht, kein Stub lesbar.
+  - Eine Zelle je Syscall, nach Syscall-Nummer sortiert, in einem Band je
+    Modul — `ntdll.dll` und `win32u.dll` —, jedes mit Überschrift und Anzahl.
+    Ein Modul, für das die geladene Baseline keinen Eintrag hat, bekommt kein
+    leeres Band.
+  - Farbe ist der Zustand: intakt, hooked (dateigedecktes Modul), gepatcht,
+    abweichend, kein Stub lesbar.
     Ohne Scan sind alle Zellen im Baseline-Ton.
   - Eine Legende nennt jeden Zustand mit seiner Anzahl.
   - Hover zeigt Name und Nummer, Klick lädt das Detailpanel.
@@ -84,13 +92,21 @@ Oberfläche englisch. Aufbau von oben nach unten:
 
 - `ntsleuth.exe --auto-params` läuft **einmal beim Provisionieren** und legt
   seine JSON-Ausgabe unter `C:\tools\ntsleuth\baseline\` ab, benannt nach
-  Build-Nummer und Architektur, etwa `26220.5770-arm64.json`.
+  Build-Nummer und Sicht, als `ntsleuth-<build>-<view>.json`, etwa
+  `ntsleuth-26220.5770-arm64.json`. Der Präfix hält sie vom Binary-Graph-Cache
+  im selben Verzeichnis auseinander.
 - Das Web-UI lädt die passende Datei beim Start und hält sie im Speicher. Die
   Daten sind pro Build konstant; es gibt keinen Grund, sie je Anfrage neu zu
   ziehen.
 - **Ungültig** wird die Baseline, wenn die Build-Nummer des laufenden Systems
   nicht mehr zur Datei passt. Dann zieht TDC sie im Hintergrund neu und sagt es
   im Tab. NTSleuth braucht dafür unter 4 Sekunden.
+- **Ein Fehlschlag gilt nur, bis ihn eine Baseline widerlegt.** Sobald eine
+  brauchbare Baseline für Build und Sicht eines fehlgeschlagenen Versuchs
+  vorliegt, ist dessen Eintrag gelöscht — gleich, wer die Datei geschrieben hat;
+  der Installer schreibt sie ohne das Web-UI. Sonst meldete
+  `/api/syscalls/status` in einer Antwort eine geladene Baseline und den
+  Fehlschlag, sie zu erzeugen, und hielte einen neuen Versuch zurück.
 - **Eine Baseline je Sicht, nicht je Prozess-Architektur.** Auf einer ARM64-VM
   bildet `System32\ntdll.dll` als ARM64X-Datei zwei Sichten ab: die native
   ARM64- und die x64/EC-Sicht. Beide haben eigene RVAs und eigene Stub-Bytes.
@@ -125,7 +141,8 @@ Neues Modul `webui/syscall_scan.py`, reines ctypes, kein zusätzliches Binary.
 - `EnumProcessModulesEx(…, LIST_MODULES_ALL)` und `GetModuleFileNameExW` liefern
   die geladenen Module mit Basisadresse und Größe. Daraus die Basis von
   `ntdll.dll`, und, wenn vorhanden, `win32u.dll`.
-- Für jeden Syscall der Baseline die Bytes an `base + rva` lesen.
+- Für jeden Syscall der Baseline die Bytes an `base + rva` lesen, und zwar so viele, wie die Sicht zur Erkennung braucht — auf ARM64 mehr als zum Vergleich, weil ein Hook der Form `ADRP; ADD; BR` erst in 12 Byte und `MOVZ` mit drei `MOVK` und Sprung erst in 20 Byte erkennbar ist.
+- **Den Eigentümer des Sprungziels in zwei Schritten bestimmen.** Folgt die Zieladresse direkt aus den Bytes (relativer Sprung oder eingebettete absolute Adresse), wird sie damit erfragt. Liest die Hook-Form ihr Ziel erst aus dem Speicher (`FF 25` auf x64, `LDR`+`BR` und `ADRP`+`LDR`+`BR` auf ARM64), ist aus den Bytes nur die Adresse des **Zeigers** bestimmbar; dort wird das Zeigerwort gelesen und erst dessen Ziel nach dem Eigentümer gefragt. Ohne diesen zweiten Schritt käme die häufigste EDR-Hook-Form immer als `diverged` durch, und `hooked` wäre für den Normalfall unerreichbar — womit die Trennung aus Ziel 4 ihren Zweck verlöre.
 - **Nur das Stub-Präfix vergleichen, nicht NTSleuths ganzes Fenster.**
   `stub_bytes` ist ein festes 32-Byte-Fenster, das über die Funktion
   hinausläuft: NTSleuths eigenes Beispiel für `NtCreateProcessEx` enthält hinter
@@ -136,14 +153,26 @@ Neues Modul `webui/syscall_scan.py`, reines ctypes, kein zusätzliches Binary.
   tatsächlichen Stubs, der je nach WOW64-Prüfung variiert. Diese Länge erscheint
   im Detailpanel, bestimmt die Diff-Markierung und steht in den Tests.
 - **Gebündelt lesen.** Die RVAs werden sortiert und in zusammenhängenden Spannen
-  gelesen, nicht einzeln. 2.461 Einzelaufrufe von `ReadProcessMemory` sind
-  unnötig; die Stubs liegen dicht beieinander.
+  gelesen, nicht einzeln. Ein Aufruf von `ReadProcessMemory` je Stub, bei
+  einer arm64-Baseline rund 2.000, ist unnötig; die Stubs liegen dicht
+  beieinander.
 - Ein Lesefehler ist kein Abbruch: die betroffene Zelle wird „kein Stub lesbar".
+- **Ein Scan, der keinen Stub messen konnte, ist nie `CLEAN`.** Ein Stub
+  `unreadable` ist keiner, der gemessen wurde. Hat ein Scan nur solche (oder gar
+  keinen), heißt sein Urteil NOT OBSERVED — beim Knopf SCAN, in der
+  Detonationsstufe, im Verlauf und im Urteil der Detonation —, und der Sweep
+  zählt den Prozess nicht als gescannt. Ein Befund aus der Stub-Suche hebt das
+  Urteil trotzdem.
 - **Nur lesen.** Kein `WriteProcessMemory`, kein Debugger-Attach, keine
   Injektion. Der Zielprozess bleibt unverändert, wie bei den übrigen
   Live-Memory-Werkzeugen.
 - **Standardmäßig nur ntdll.** `win32u`-Stubs gibt es nur in GUI-Prozessen; sie
-  erzeugen sonst Rauschen. win32u ist im Tab zuschaltbar.
+  erzeugen sonst Rauschen. win32u ist im Tab zuschaltbar — sofern die geladene
+  Baseline win32u-Einträge hat. Hat sie keine, ist der Schalter aus und sagt
+  warum; die Wahl des Nutzers bleibt erhalten und gilt wieder, sobald eine
+  Baseline mit win32u geladen ist. Das entscheiden die Daten, nicht die Sicht: Die x64-Sicht des Builds
+  `26200.9974` auf ARM64 hat keine, ein anderer Build oder ein x64-Host kann
+  sie haben.
 - **Zeitlimit** für den ganzen Scan, wie bei den Scan-Routen. Ein Scan darf das
   Web-UI nicht blockieren.
 
@@ -157,8 +186,39 @@ gehört**, nicht das Befehlsmuster:
 
 - Zeigt es in ein geladenes, auf der Platte hinterlegtes Modul, das nicht
   `ntdll` ist, heißt das `hooked`. Das ist der Normalfall bei installiertem EDR.
-- Zeigt es in privaten, nicht von einer Datei gedeckten Speicher, heißt das
-  `patched`. Das ist das Signal.
+- Zeigt es in privaten, nicht von einer Datei gedeckten Speicher oder in eine
+  gemappte Ansicht einer Datei, die kein geladenes Modul ist, heißt das
+  `patched`. Das ist das Signal — gemeint ist der **letzte** Eigentümer nach dem
+  folgenden Punkt, nicht der erste Sprung.
+- **Ein erster Sprung in privaten Speicher ist für sich noch kein Befund.**
+  MinHook und Microsoft Detours, die beiden verbreitetsten x64-Hook-Bibliotheken,
+  schreiben `E9 rel32` in den Stub und landen auf einem Relay, das sie mit
+  `VirtualAlloc` nahe am Ziel anlegen — privatem Speicher. Erst das Relay springt
+  (`FF 25`) in die Hook-DLL. ARM64-Hooker brauchen ein Relay zwangsläufig, weil
+  `B` nur ±128 MB reicht. EDRs, Overlay- und Aufnahme-Software und die Sandboxen
+  von Chromium/Edge und Firefox hooken so. Darum gilt: Liegt das erste Ziel in
+  privatem oder nicht dateigedecktem Speicher und sind seine Bytes eine der
+  bekannten Sprungformen, folgt die Messung diesem Sprung, **höchstens zwei
+  Sprünge weit**, und entscheidet nach dem **letzten** Eigentümer. Die
+  durchlaufenen Relays stehen im Ergebnis. Privater Code, der kein Sprung ist,
+  bleibt `patched`, ebenso eine Kette, die nach zwei Sprüngen noch in privatem
+  Speicher steht. Ist ein Relay nicht lesbar oder sein Ziel nicht erfragbar,
+  wird nicht geraten: der Stub ist `diverged` und zählt als fehlgeschlagene
+  Eigentümer-Abfrage.
+- **Der Decoder ist nicht vollständig.** Ein privates Relay, dessen Sprungform
+  er nicht kennt, gilt als „privater Code, der kein Sprung ist", also
+  `patched`. Diese Richtung ist gewollt und wird hier ausgesprochen: Unbekannten
+  privaten Code stattdessen nicht zu werten, gäbe Malware einen freien Ausgang
+  — sie schriebe Code, den der Decoder nicht kennt, und nichts zählte. Der Rest
+  ist daher ein **falsch positiver Befund bei einer unbekannten Hook-Form, nie
+  ein falsch negativer bei Malware.** Jede neue, in der Praxis gesehene Form
+  erweitert den Decoder; die Regel ändert sie nicht.
+- Zeigt es **direkt** in `ntdll` selbst oder in das Modul des Stubs, heißt das
+  `diverged`: `hooked` ist für ein fremdes, dateigedecktes Modul reserviert und
+  `patched` für privaten Speicher. Ein modulinterner Sprung — oder ein Fehler
+  der Baseline — ist keins von beidem und wird nicht geraten. **Über ein Relay**
+  dorthin ist es `patched`: ein Sprung aus dem Modul in privaten Speicher und
+  zurück ist weder ein eigener Sprung des Moduls noch ein Fehler der Baseline.
 - Weichen die Bytes ab, ist das Ziel aber nicht auflösbar, heißt das `diverged`.
   Dieser Fall wird nie stumm als `intact` geführt.
 
@@ -167,17 +227,64 @@ gehört**, nicht das Befehlsmuster:
 dafür nicht — sie können „privat, nicht dateigedeckt" nicht von „in einem Modul"
 unterscheiden. `webui/syscall_scan.py` braucht daher zusätzlich `VirtualQueryEx`
 und `GetMappedFileNameW`. Der Weg über die bloße Modulliste wäre kürzer, würde
-aber ein überschriebenes Modul fälschlich als `hooked` führen. Der für die Tests
+aber Speicher, den der Angreifer selbst angelegt hat, nicht von einem Modul
+unterscheiden. **Ein überschriebenes Modul erkennt auch die Region-Abfrage
+nicht:** Module Stomping behält `MEM_IMAGE` und den Pfad, und
+`GetMappedFileNameW` nennt die Datei, nicht ihren Inhalt. `hooked` heißt darum
+nur „ein dateigedecktes Modul hält das Ziel" — ein EDR, aber ebenso eine vom
+Sample geladene oder eine überschriebene DLL — und wird so beschriftet, nicht
+als EDR-Hook. **Ebenso wenig sieht sie ein Gadget:** Das Verfolgen der Relays
+endet am ersten dateigedeckten Modul. Springt ein privates Relay auf ein
+`BR Xn`- oder `JMP`-Gadget in irgendeiner geladenen, nicht zum Kern gehörenden
+DLL, heißt der Stub `hooked` mit dem Namen dieser DLL, während die Kontrolle in
+privaten Code zurückkehrt. Das galt schon für `B` und `FF 25` und gilt für jede
+Sprungform; der Code eines Moduls wird nicht weiter verfolgt, weil jeder Sprung
+eines legitimen Handlers sonst dieselbe Frage stellte. Ein Ziel in einem Windows-Kernmodul (`kernelbase.dll`,
+`kernel32.dll`, `win32u.dll` und wenige andere, in denen kein Hook-Produkt seinen
+Handler ablegt) ist eine Code-Cave und gilt als `patched`. Der für die Tests
 injizierte Leser muss diese Schicht mit abbilden.
+
+**Was die Region-Abfrage zurückgibt, wird über dem Leser entschieden.** Ein
+`MEM_MAPPED`-Bereich ohne Dateinamen (ein vom Pagefile gedeckter Abschnitt, das
+klassische Ziel von `NtMapViewOfSection`) ist nicht dateigedeckt und zählt als
+privat. Ein `MEM_IMAGE`-Bereich ohne Namen ist eine **fehlgeschlagene**
+Abfrage — ein Image ist per Definition dateigedeckt, und unter dem
+eingeschränkten Zugriffsrecht scheitert `GetMappedFileNameW` leicht — und wird
+wie jede fehlgeschlagene Eigentümer-Abfrage gezählt. Ein `MEM_MAPPED`-Bereich
+**mit** Dateinamen ist eine Datenansicht und kein geladenes Modul — geladene
+Module sind `MEM_IMAGE` —, gleich welche Datei er abbildet, auch eine
+Datenkopie von `ntdll.dll`. Kein Hook-Produkt führt seinen Handler aus einer
+solchen Ansicht aus. Sein Eigentümer heißt `mapped`, nicht der Dateiname, und
+er wird wie privater Speicher behandelt: `patched`, und als Relay verfolgt.
+Sonst hinge der Zustand derselben Ansicht davon ab, ob `GetMappedFileNameW`
+ihren Namen liefern konnte — ohne Namen wäre sie privat, mit Namen ein
+Modulname, der keiner ist.
 
 Die Befehlsmuster sind **pro Architektur** zu prüfen:
 
 - **x64:** Der saubere Stub beginnt `4C 8B D1 B8 <ssn:4>` und endet mit `0F 05`.
   Hook-Muster: `E9` (JMP rel32), `FF 25` (JMP [rip+disp32]),
-  `48 B8 <imm64> FF E0`, `49 BB <imm64> 41 FF E3`, `68 <imm32> C3`.
+  `48 B8 <imm64> FF E0`, `49 BB <imm64> 41 FF E3`, `68 <imm32> C3` und der
+  14-Byte-Absolutsprung `68 <imm32> C7 44 24 04 <imm32> C3`.
 - **ARM64:** Der saubere Stub ist `SVC #imm` gefolgt von `RET`, in NTSleuths
   Ausgabe etwa `01 18 00 d4 c0 03 5f d6`. Hook-Muster: ein unbedingtes `B`
-  (Opcode-Maske `0x14000000`), `LDR x16, …` + `BR x16`, `ADRP` + `ADD` + `BR`.
+  (Opcode-Maske `0x14000000`), `LDR Xn, literal` + `BR Xn` für jedes Register
+  n, `ADRP` + `ADD` + `BR`, `ADRP Xn` + `LDR Xt, [Xn, #imm]` + `BR Xt` und
+  `MOVZ Xn` mit bis zu drei `MOVK Xn` + `BR Xn`. Statt `BR` darf jede dieser
+  Formen mit einem Sprung mit Zeiger-Authentifizierung enden (`BRAA`, `BRAB`,
+  `BRAAZ`, `BRABZ`), den Windows auf ARM64 verwendet; gefragt wird dann nach der
+  Adresse ohne die PAC-Bits darüber, also nach den unteren **47** Bits. Eine
+  Windows-Nutzeradresse endet bei `0x7FFF'FFFFFFFF`, 47 Bits tragen jede davon,
+  gleich ob der Nutzerbereich 47 oder 48 Bits hat. Mit 48 gehörte Bit 47 unter
+  47 Bits zur PAC, die der Signierende wählt: ein Zeiger, der es setzt, ergäbe
+  keine Adresse, eine fehlgeschlagene Abfrage, `diverged` — ungewertet, wo das
+  Relay vorher `patched` war. `BLR` ist keine Sprungform: es ist ein
+  Aufruf, und ein Relay, das aufruft, kehrte nicht durch den Stub zurück.
+  Das Register ist nicht fest: Der übliche EDR-Hook nimmt x16, Microsoft
+  Detours x17 für beide Formen (`LDR x17, #8; BR x17` und
+  `ADRP x17; LDR x17, [x17, #off]; BR x17`). Ein Relay in einer dieser Formen
+  nicht zu erkennen hieße, es als privaten Code ohne Sprung zu lesen und den
+  Hook `patched` zu nennen.
 - Die Syscall-Nummer im Stub muss zur Nummer der Baseline passen. Weicht nur
   die Nummer ab, ist das ein eigener, besonders deutlicher Befund.
 
@@ -195,6 +302,22 @@ Drei Ziele, in dieser Rangfolge:
    Eintrag gegen ein Schema prüft, defekte Einträge überspringt und das Gewicht
    nach oben begrenzt, damit ein einzelner Treffer nie allein MALICIOUS erreicht.
    Hier leben die Hook- und Patch-Muster.
+
+   **Die Arbeitsteilung mit dem Code ist festgelegt, damit nichts doppelt lebt:**
+   Die Erkennung einer Form bleibt im Code (`classify_stub` muss das
+   Displacement *dekodieren*, nicht nur Bytes vergleichen). Die Datei liefert
+   **Familienname und Notiz** zu einer erkannten Form, also was der Analyst
+   liest. Ihr `weight` ist **beratend und nicht der Score** — der kommt aus
+   `memory_evidence.KINDS`. Ein Test pinnt die Muster der Datei gegen die des
+   Codes, damit die beiden nicht auseinanderlaufen; die Datei sagt das über sich
+   selbst, damit niemand sie für die Bewertungsquelle hält. Ob ein Eintrag eine
+   Abweichung schon abdeckt, wird an **allen gelesenen Bytes** geprüft
+   (`read`, `READ_LEN`), nicht am verglichenen Präfix: auf ARM64 sind das 8
+   Bytes, und `ADRP; LDR; BR` braucht 12, `MOVZ/MOVK; BR` bis zu 20.
+
+   Ein Eintrag darf zusätzlich eine `view` nennen: ein x64-Opcode ist auf ARM64
+   eine andere Anweisung, ein Muster ohne Sicht wäre also mindestens zur Hälfte
+   falsch.
 2. **Generierte YARA-Regeln** nach `rules/yara/`. Der wertvolle Fall sind
    Samples, die **eigene** Syscall-Stubs mitbringen, statt ntdll zu rufen. Erst
    die Baseline macht so eine Regel benennbar: aus „hier steht ein Stub mit
@@ -208,6 +331,9 @@ Drei Ziele, in dieser Rangfolge:
    `syscall_stub_patched`, strukturell, Gewicht in der Größe von
    `disk_mem_diff` (4.0), ohne Korroborationspflicht;
    `syscall_stub_hooked`, behavioral, kleines Gewicht, korroborationspflichtig;
+   `syscall_stub_renumbered`, strukturell, 4.0, ohne Korroborationspflicht,
+   für einen Stub intakter Form mit fremder Nummer (Ziel 4) — er braucht kein
+   Sprungziel und hat keine harmlose Erklärung;
    und `direct_syscall_stub` aus Ziel 7a, strukturell, mit dem höheren Gewicht,
    wenn die zugehörige Import-Kette im Sample fehlt.
 
@@ -230,6 +356,14 @@ Drei Ziele, in dieser Rangfolge:
    den Scorer nicht. Gefiltert wird an der Quelle, nicht im Scorer; damit bleibt
    `MemoryBaseline` unberührt. Die Liste wird über eine eigene Route aufgenommen
    und ist im Tab sichtbar und löschbar.
+
+**Eine Regel gibt es nur für einen Stub.** Die Oberfläche hat keine Anmeldung,
+und die CSRF-Sperre lässt Clients ohne Header durch: Malware in der VM kann die
+Routen rufen. Entwurf und Übernahme verlangen darum, dass die Bytes genau ein
+Stub der Form ihrer Sicht sind und die genannte Nummer laden, und dass der
+Regelname der aus Syscall, Sicht und Bytes gebildete ist. Das Verzeichnis nimmt
+höchstens `RULES_MAX` Regeldateien, und ist es selbst ein Link oder eine
+Junction, wird nicht hindurch geschrieben.
 
 **Nichts wird ungefragt geschrieben.** „Regel erzeugen" zeigt den Entwurf, der
 Nutzer übernimmt ihn. Erzeugte Regeln sind als erzeugt markiert und nennen
@@ -285,6 +419,43 @@ ARM64-VM der falsche. Nach WinGraph wird nur verlinkt.
   Ohne Auflösung endet die Kette dort, nur einen Sprung später. Die Zuordnung
   kommt einmalig aus der ApiSetMap in `apisetschema.dll` und liegt als Tabelle
   im Cache. Das ist eine Extraktion, keine Analyse.
+- **Grenzen der API-Set-Auflösung.** Drei davon sind Absicht und gehören hierher,
+  neben die übrigen Grenzen dieses Dokuments:
+  - **Die Auflösung ist unabhängig vom Importeur.** Die echte Map kann einen
+    Alias je nach importierendem Modul verschieden umleiten: ein Wert mit leerem
+    Importernamen ist der Standard (`value[0]`), ein benannter eine Ausnahme für
+    ein bestimmtes Modul. Wie der Loader unter ihnen wählt, ist hier nicht an
+    einem echten Loader geprüft. Die Tabelle führt jeden Host der Map in der
+    Reihenfolge der Map, ohne den Importernamen auszuwerten, und der Verbraucher
+    löst zum ersten Host auf, der die Funktion definiert. Eine Kette kann
+    deshalb über einen Host laufen, den der Loader für einen anderen Importeur
+    nähme als den im Pfad. Eine solche falsche Kante
+    verbindet zwei echte Module, die die Map tatsächlich einander zuordnet; sie
+    ist keine erfundene Beziehung. Die Reihenfolge wird nicht umgestellt — den
+    Standard nach vorn zu ziehen wäre erfundene Information.
+  - **Ein unlesbarer Wert verwirft den ganzen Eintrag, ein leerer Standard
+    ebenso.** Zeigt ein Wert eines Eintrags aus der Map hinaus, oder ist der
+    Hostname von `value[0]` leer, fällt der Alias ganz aus der Tabelle, nicht nur
+    dieser Host. Ginge der Standard verloren oder wäre er unbekannt, löste die
+    Kette über das falsche Modul auf. Fehlt der Alias, endet die Kette sichtbar
+    an `api-ms-win-*` — das ist ehrlicher als ein falscher Sprung. Ein leerer
+    Hostname in einem **späteren** Wert dagegen fällt allein weg, und die übrigen
+    Hosts behalten ihre Reihenfolge: der Standard bleibt vorn, und keine Ausnahme
+    rückt an seine Stelle. Diese Regel hat auf Windows 11 `26200.9974` **keinen
+    Fall**: die Map erklärt 985 Einträge, 841 davon haben einen Host. Die 144
+    übrigen tragen einen einzigen Wert ohne Importeur und ohne Host (Flag `0x1`),
+    also ein API-Set, das diese Edition nicht hostet; sie fallen nach der Regel für
+    `value[0]` weg, und das ist richtig, denn auch der Loader löst sie nicht auf.
+    Die Regel für spätere Werte ist ein Modell, das einen Fall ausdrücken kann, den
+    die echte Map derzeit nicht enthält, wie der Platz für mehrere `nt` je
+    Win32-Name. `api-ms-win-core-memory-l1-1-0` und
+    `api-ms-win-core-processthreads-l1-1-0` fehlen unter diesen Namen aus einem
+    anderen Grund: die Map führt `api-ms-win-core-memory-l1-1-9` und
+    `api-ms-win-core-processthreads-l1-1-8`, und die `-l1-1-0`-Weiterleitungen löst
+    der Rückfall auf die Familie auf (Entscheidung 23), gemessen für 35 Namen.
+  - Die Map endet dort, wo `Size` im Kopf es sagt (ist `Size` null oder größer
+    als die Sektion, gilt die Sektion). Ein Eintrag, der zwischen `Size` und dem
+    Ende der Sektion liegt, wird verworfen.
 - **Knoten** sind Binaries und, eine Ebene tiefer, Funktionen. **Kanten** sind
   `imports`, `forwards_to`, `resolves_to` (API-Set) und `reaches_syscall`.
   Woher eine Kante kommt, steht an ihr: `derived` oder `curated`.
@@ -364,10 +535,19 @@ Graphen.
 Der eigentliche Gewinn liegt im Zusammenspiel:
 
 - **Der Weg nach unten:** Ein Sample importiert `WriteProcessMemory`. Der Graph
-  führt über `kernel32` und `kernelbase` zu `ntdll`, die kuratierte Tabelle
-  nennt `NtWriteVirtualMemory`, und die Baseline nennt dessen Nummer. Aus einer
-  Import-Tabelle wird so ein Pfad bis zur Syscall-Nummer — mit dem letzten
-  Sprung als kuratiert markiert, nach Ziel 6.
+  führt über Weiterleitungen und API-Sets bis zu der Funktion, die den Code
+  enthält, hier `kernelbase!WriteProcessMemory`. Dort endet, was die Tabellen
+  beweisen: `kernelbase` leitet nicht an `ntdll` weiter, es ruft
+  `NtWriteVirtualMemory` im eigenen Code (siehe Ziel 6). Der Schritt zum
+  Nt-Gegenstück ist der kuratierte: die Tabelle nennt `NtWriteVirtualMemory`,
+  und die Baseline nennt dessen Nummer und Modul (`ntdll.dll`). Aus einer
+  Import-Tabelle wird so ein Pfad bis zur Syscall-Nummer — mit genau diesem
+  letzten Sprung als kuratiert markiert, nach Ziel 6. Zwischen `kernelbase` und
+  dem Syscall steht kein Knoten von `ntdll`, denn keine Kantenart verbindet ihn
+  ehrlich. Importiert ein Sample dagegen `ntdll!NtClose` unmittelbar, ist der
+  Export schon der Stub: Dann ist der ganze Weg abgeleitet und hat keine
+  kuratierte Kante. Ein Pfad hat also höchstens eine kuratierte Kante, und sie
+  ist die letzte.
 - **Der Weg über die Abwesenheit:** Fehlt diese Import-Kette, und liegt im
   Sample trotzdem ein Stub mit genau dieser Nummer, hat es die Kette
   übersprungen. Das ist Direct-Syscall-Umgehung, sichtbar gemacht dadurch, dass
@@ -394,6 +574,155 @@ mitgebrachten Stub daher nie sähe.
   das Sample dieselbe Funktion **nicht** importiert, denn dann ist die Umgehung
   belegt und nicht nur möglich. Importiert es sie auch, ist es ein schwächerer
   Hinweis.
+- **Der starke Anspruch braucht die Win32→Nt-Kette.** Ein Sample, das
+  `VirtualAllocEx` importiert und einen Stub für `NtAllocateVirtualMemory` trägt,
+  importiert den Nt-Namen nicht — gegen die rohe Importtabelle geprüft sähe das wie
+  eine belegte Umgehung aus, obwohl der dokumentierte Weg vorhanden ist. Deshalb
+  wird die Importmenge über die kuratierte Tabelle `win32_to_nt.json` erweitert,
+  bevor sie etwas über ein Fehlen sagen darf. Fehlt der Funktion eines Stubs dann
+  jeder Weg, ist die Umgehung belegt (`import_present` False). Welche Syscalls die
+  Tabelle abdeckt, begrenzen die APIs, die TDC schon als verdächtig führt; zu einem
+  abgedeckten Syscall nennt sie jede Tür, auch eine unverdächtige. Eine Tür ist eine
+  API, deren Vertrag die Operation dieses Syscalls auf Operanden des Aufrufers
+  ausführt, nicht jede API, die ihn unterwegs erreicht: der Heap und der Loader sind
+  keine Tür, denn ihr Aufrufer nennt weder Adresse noch Schutz noch Prozess. Für einen
+  Syscall, zu dem keine
+  kuratierte Zeile führt, bleibt `import_present` **unbekannt** und der Treffer ein
+  Hinweis — ebenso, wenn die Importtabelle nicht lesbar ist. Ein Befund darf nie
+  mehr behaupten, als die Daten tragen.
+- **Im Prozessspeicher ist der Nenner die Vereinigung aller geladenen Module.**
+  Privater, ausführbarer Speicher gehört nicht dem Sample allein: eine Hook-Engine,
+  die Interception-Thunks eines Browser-Brokers oder eine Laufzeit legen dort
+  ebenfalls Stubs an. Ein Stub dort wird daher gegen die Türen geprüft, die **jedes
+  geladene Modul** importiert, nie gegen die Importtabelle des Images allein. Die
+  Importtabellen der System32-Binaries hält der Binary-Graph-Cache; ein Modul zählt
+  nach seinem Pfad, nicht nach seinem Namen, und nur eines, das direkt aus System32
+  geladen ist und das der Cache hält, trägt bei. Die Importe des Images selbst kommen
+  aus seiner Datei. Kennt der Cache ein geladenes Modul nicht (eine Sample-eigene
+  DLL, eine Laufzeit oder Hook-Engine außerhalb System32, eine von anderswo geladene
+  DLL mit System32-Namen, ein abgeschnittener Eintrag), läuft der Prozess in einer
+  anderen Sicht als der Cache, fehlt der Cache oder lässt sich die Modulliste
+  nach der Suche nicht mehr lesen, ist die Vereinigung **unvollständig**: `import_present` bleibt
+  dann unbekannt, nie False. Ein fehlendes Modul ist eine fehlende Tür, und eine
+  fehlende Tür wäre eine falsche Anklage. Exporte zählen in der Vereinigung nicht:
+  kein Export löst auf privaten Speicher auf, und ntdll exportiert jeden Nt-Namen.
+  Das Image des Prozesses ist das Sample selbst: seine Importtabelle ist genau die
+  Frage, und ein Sample, das `VirtualAllocEx` importiert, ist keine belegte Umgehung.
+  Jedes **andere** Modul, das der Cache nicht hält, trägt weder Importe noch Exporte
+  bei und macht die Vereinigung unvollständig — sonst schaltete ein Sample mit einer
+  eigenen DLL und erfundener Tabelle den Beleg für den ganzen Prozess ab. Malware mit
+  eigener DLL bekommt im Prozessmodus daher meist `None`; der Beleg kommt dann aus
+  der Datei, der zuordenbaren Quelle. Die Modulliste wird vor **und** nach der Suche
+  gelesen, und der Nenner ist die Vereinigung beider Listen: auch ein Modul, das nur
+  zeitweise geladen war, hatte seine Türen im Adressraum.
+- **Ein Import per Ordinal ist eine Tür wie jede andere**, in beiden Modi. Er wird
+  über `ordinal_names` des exportierenden Moduls im Cache benannt
+  (`kernel32.dll!#157`). Lässt er sich nicht benennen — das Modul fehlt im Cache,
+  die Nummer in seiner Tabelle, es gibt keinen Cache, oder der Cache hat eine andere
+  Sicht als die Datei —, ist die Tür unbekannt: im Prozessmodus ist die Vereinigung
+  unvollständig, und auch im Dateimodus wird dann kein Fehlen behauptet.
+- **Ein Stub, der Rumpf eines Exports unter seinem eigenen Nt- oder Zw-Namen ist**
+  (eine Kopie von ntdll), gilt im Dateimodus als importiert (`True`): er beginnt an
+  der Adresse des Exports oder weniger als eine Stub-Leselänge dahinter (`READ_LEN`,
+  20 Byte auf ARM64, 32 auf x64), denn die ARM64-ntdll trägt einen zweiten `SVC`
+  sechzehn Byte tief in `NtUnmapViewOfSection`. Die Grenze hält die Regel eng: ohne
+  sie passte jeder Stub hinter einem Export dieses Namens.
+- **Grenze: Eine Sicht, die nicht zur Maschine der Datei passt, trägt kein Fehlen.**
+  Verglichen wird die gesuchte Sicht mit `FileHeader.Machine` der Datei. Die
+  Exporttabelle, die pefile liest, beschreibt die native Sicht der Datei; ein Stub,
+  der in einer anderen Sicht gefunden wird, lässt sich nicht gegen sie abgleichen.
+  Gemessen: eine unveränderte ARM64X-ntdll (Maschine ARM64) in der x64-Sicht hat ihre
+  x64-Stubs um Dateioffset `0x2fb000`, während jeder benannte Export auf einen
+  ARM64-Stub unter `0x2400` zeigt; ohne diese Regel las jeder gedeckte Syscall von
+  Microsofts eigener ntdll als belegte Umgehung. Dort ist jeder Treffer `None`, außer
+  die Importtabelle nennt die Funktion (`True`), `doors_complete` ist `false`, und
+  `doors_note` nennt beide Maschinen. Die hybride (ARM64X-)Exporttabelle, die die
+  andere Sicht beschreibt, wird nicht gelesen: pefile legt sie nicht offen, und sie zu
+  erraten wäre schlechter, als abzulehnen.
+- **Kopien eines Syscalls sind ein Befund, und er sagt den schwächsten Anspruch unter
+  ihnen** (Entscheidung 72): `True`, wenn eine Kopie `True` ist, sonst `None`, wenn eine
+  `None` ist, sonst `False` — gleich in welcher Reihenfolge. Eine Kopie, die die Datei
+  als eigenen Code exportiert, wird so nie von einer früher gefundenen überstimmt. Die
+  Ordnung gilt über die Kopien einer Quelle: Hat die Sample-Datei Kopien, entscheiden
+  diese; eine Kopie im Prozessspeicher spricht für jedes geladene Modul, nie für das
+  Sample, und ließe sonst jeden Datei-Beleg einer Detonation fallen.
+- **Ein Treffer, dessen Tür der eigene Export der Datei ist, sagt das** (Entscheidung
+  73, `own_export`), und der Befund spricht nur für die Kopien, die er beschreibt
+  (Entscheidung 76). Ist jede Kopie Rumpf eines eigenen Exports, nennt er den Stub
+  eigenen Code des Moduls, keinen am dokumentierten Weg vorbei mitgebrachten. Sind es
+  nur einige der Kopien in der Datei, sagt er, wie viele, dass die übrigen es nicht
+  sind und der Befund darum ein Hinweis statt eines Belegs ist und die Datei einen
+  Blick verdient — der laute Hinweis von oben: ein Köder-Export unter dem Nt-Namen
+  kauft einen Hinweis, nie die Worte „eigener Code". Gezählt werden darin die Kopien
+  in der Datei; `copies` zählt in einer Detonation auch die im Prozessspeicher. Das
+  ist eine Tatsache je Treffer und braucht keine Schwelle über die Datei. Ein
+  billig erklärter Köder-Export über einer Kopie macht den Befund seines Syscalls zum
+  Hinweis, gleich was die übrigen Kopien sind und nun auch gleich in welcher
+  Reihenfolge: dieses Schlupfloch gab es unter der Regel der ersten Kopie schon, es
+  fällt zum Hinweis, der Satz benennt es, und es wird so hingenommen.
+  Ntdll selbst zu durchsuchen ist ein Kategorienfehler, keine Umgehung: fast jeder
+  Stub liest dann so, und das Urteil lautet trotzdem SUSPICIOUS aus mehreren hundert
+  Hinweisen allein, weil seine Gründe die Art nennen, nicht das Detail.
+- **Grenzen des Belegs im Prozessspeicher.**
+  - **Der Prozessmodus liefert praktisch nie einen Beleg.** `kernelbase.dll`, in
+    jedem Win32-Prozess geladen, implementiert die Win32-Türen und importiert deren
+    Nt-Funktionen deshalb direkt aus ntdll (`NtAllocateVirtualMemory`,
+    `NtProtectVirtualMemory`, `NtWriteVirtualMemory`, `NtCreateThreadEx`,
+    `NtSetContextThread`, `NtOpenProcessToken`, `NtAdjustPrivilegesToken`). Der
+    dokumentierte Pfad liegt damit im Adressraum, auch wenn das Sample ihn nicht
+    benutzt, und ein Stub im privaten Speicher liest als `True`. Diese Antwort ist
+    richtig, kein Fehler des Nenners: bei einem nicht zuordenbaren Stub ist „enthält
+    der Adressraum den dokumentierten Pfad" die einzige beantwortbare Frage, und auf
+    einem echten Windows-Prozess lautet die Antwort ja. Die direkt aus ntdll
+    importierten Nt-Namen aus der Vereinigung zu nehmen, ließe einen Prozess, dessen
+    dokumentierter Pfad wirklich in kernelbase liegt, als Umgehung lesen — die
+    Richtung der falschen Anklage. Ein Beleg im Prozessmodus ist nur für einen
+    gedeckten Syscall möglich, den kein geladenes Modul importiert, und auf einem
+    echten System gibt es einen solchen womöglich nicht. **Der Beleg kommt aus der
+    Sample-Datei, der zuordenbaren Quelle.**
+  - **Ein emulierter x64-Prozess auf ARM64 bekommt nie einen Beleg aus dem
+    Prozessspeicher.** Das ist auf dieser Kammer der **Normalfall**, kein Rand: ein
+    64-Bit-Sample läuft auf der ARM64-VM emuliert, deshalb gibt es überhaupt zwei
+    Baselines. Der Cache liest die native Sicht der ARM64X-Binaries, und deren
+    EC-Sicht kann andere Importe haben; eine Vereinigung daraus wäre falsch. Es
+    bleibt der Beleg aus der Datei, der zuordenbaren Quelle.
+  - **Ein Modul, das sich aus der Modulliste des Loaders austrägt,** fehlt in der
+    Vereinigung und schiebt die Antwort **zu** `False`, also zum Beleg. Das liegt
+    gegen das Interesse eines Angreifers: Malware will Hinweis sein, nicht Beleg,
+    und hat keinen Grund, ein Modul mit einer Tür zu verstecken. Gefährdet wäre nur
+    ein sauberes Programm, das ein Modul vor seinem eigenen Loader verbirgt, und
+    saubere Software tut das nicht. Ein Abgleich mit den dateigedeckten Regionen
+    wird deshalb bewusst nicht gebaut; die Abwägung steht hier statt der Arbeit.
+  - **Die Datei des Images hat sich nach dem Start geändert** (ein Sample, das sich
+    ersetzt, ein Updater): die Vereinigung beschreibt dann die Datei, nicht das
+    gemappte Image.
+  - **Ein Modul, das vor der Suche wieder entladen wurde,** steht in keiner Liste,
+    auch wenn es den Stub hinterlassen hat.
+  - **Eine System32-Datei, die ohne Build-Wechsel überschrieben wurde,** wird nicht
+    bemerkt: der Cache beschreibt die alte Datei. Das setzt Adminrechte voraus.
+  - **Ein Modul schreibt einen Stub, den seine Importe nicht erklären.** Eine
+    Hook-Engine kopiert die Stub-Bytes von ntdll in ein privates Trampolin, statt
+    `VirtualAllocEx` aufzurufen; ein Broker oder Injektor schreibt einen Stub von
+    außen in den Prozess. Liegt ein solches Modul direkt in System32 und hält der
+    Cache es, ist die Vereinigung vollständig, keine Tür wird gefunden, und ein
+    sauberer Host gilt als belegte Umgehung — „jeder EDR-Hook ist ein Befund", das
+    erste Anti-Ziel, eine Schicht höher. **Die Host-Baseline mildert das heute
+    nicht:** ein `direct_syscall_stub`-Befund ist nach dem Prozess geschlüsselt, in
+    dem er gefunden wurde (dessen Image-Pfad), ein Eintrag für ein Programm passt
+    also nie auf ein anderes; und kein Sweep nimmt einen solchen Befund auf, denn
+    die Syscall-Stufe des Sweeps misst Hooks und sucht keine mitgebrachten Stubs,
+    und „Sweep as baseline" führt sie nicht aus. Ein einmaliger Schreiber und ein
+    Host ohne Baseline sind aus demselben Grund nicht gedeckt. Engines außerhalb von
+    System32 (die meisten EDRs liegen unter `Program Files`) machen die Vereinigung
+    unvollständig und sind nicht betroffen. Die VM-Prüfung sucht ein solches Modul
+    auf dem Image der Kammer; wird eines gefunden, ist das ein Defekt, keine Grenze.
+  - **Viele gewöhnliche GUI-Samples bekommen keinen Beleg aus dem Prozessspeicher,**
+    und das ist erwartet: `comctl32` v6 und die Side-by-Side-Assemblies laden aus
+    `WinSxS`, eine app-lokale Visual-C++-Laufzeit (`vcruntime140.dll` neben der exe)
+    aus dem Ordner des Samples. Beide liegen nicht direkt in System32, der Cache hält
+    sie nicht, die Vereinigung ist unvollständig. Auch die Modulliste selbst muss
+    ganz sein: ein Modul, dessen Angaben oder Dateiname der Leser nicht lesen kann,
+    macht sie unvollständig, ebenso eine leere Liste.
 - **Eigene Route** `POST /api/syscalls/stubs` mit `pid` oder `path`.
 - Dieser Befund ist die Eingabe für die generierte YARA-Regel aus Ziel 5.2.
 
@@ -401,16 +730,55 @@ mitgebrachten Stub daher nie sähe.
 
 Der Scan läuft nicht nur von Hand im Tab, sondern als Stufe einer Detonation.
 
-- Eine neue Stufe in der Stufenliste von `/api/submit`, mit Fortschritt wie die
-  übrigen, zwischen den Live-Memory-Werkzeugen eingeordnet.
+- Eine neue Stufe in der Liste der Live-Memory-Werkzeuge
+  (`_run_memory_scans_async`, **nicht** `api_submit` — das führt keine
+  Stufenliste und liefert kein `scans`), **als erste und vor dem Warten auf
+  einen eingeschlafenen Beacon**. Zuerst stand hier „nach Aether und vor Process
+  Dump"; auf der Kammer gemessen war das falsch: `_scan_all` wartet fünf
+  Sekunden, dann laufen die Beacon-Jäger und Aether mit drei Proben, während
+  `injectsim.exe` 4,2 s und `shortlived.exe` 6,7 s leben. Die Stufe erreichte
+  keines der beiden und übersprang sich mit „the architecture of process N is
+  unknown (it is gone)". Sie dauert selbst unter zwei Sekunden (Scan 0,12–0,41 s,
+  Stub-Suche 1,3–1,5 s) und liest nur, ihr Platz unter den Nur-Lese-Scannern ist
+  also frei — und zuerst ist der einzige, an dem sie noch messen kann. Das Warten
+  gehört den Beacon-Jägern, die einen schlafenden Beacon brauchen; die Stufe
+  braucht das Gegenteil. Process Dump bleibt letzter: er schreibt Dateien.
+- **Die Stufe braucht den Pfad des Samples.** Der Agent meldet ihn nicht — seine
+  Antwort auf `/execute/exec` trägt nur `status`, `pid` und `message`, gemessen
+  auf der Kammer. Ohne Pfad lief die Datei-Suche in **keiner** Detonation
+  (`"file": {"skipped": "the path of the sample is not known"}`), und sie ist die
+  einzige Quelle, die eine Umgehung belegen kann. `api_submit` sucht den Pfad
+  daher mit derselben Regel wie die Einsendungs-Historie (`_sample_path_for`:
+  das Abbild des laufenden Prozesses, sonst der Drop-Ordner des Agenten) und
+  übergibt ihn, bevor die Scans starten.
 - Ihre Befunde gehen durch `memory_evidence.collect()` in den Gesamt-Score,
   erscheinen im VERDICT FLOW und in der Score-Historie.
 - Der System-Sweep (`/api/memory/sweep`) nimmt den Syscall-Scan als weiteres
-  Werkzeug auf.
+  Werkzeug auf, **aber nur auf Anfrage** (`"syscalls": true`). Ohne diesen
+  Schlüssel bleibt er aus: SWEEP und „Sweep as baseline" senden ihn nicht, und
+  eine Baseline-Aufnahme darf keine Syscall-Befunde in die Host-Baseline
+  schreiben, solange nicht gezeigt ist, dass eine saubere VM damit sauber
+  durchläuft.
+- Ein Teilergebnis der Stufe (`partial`, fehlgeschlagene Eigentümer-Abfragen,
+  eine unvollständige Stub-Suche) und eine Zahl von `diverged`-Stubs erscheinen
+  in den Gründen des Urteils, wie NOT OBSERVED: keins davon ist ein Beleg für
+  einen sauberen Prozess. Die Stufe hat im Memory-Reiter der Detonation einen
+  eigenen Block, mit dem Grund, wenn sie sich übersprungen hat.
 - `_update_preconditions` in `webui/app.py` muss einen laufenden Syscall-Scan
-  kennen, damit ein Werkzeug-Update ihn nicht unterbricht.
-- Die Stufe ist abschaltbar. Fehlt NTSleuth oder die passende Baseline,
-  überspringt sie sich mit Hinweis statt die Detonation scheitern zu lassen.
+  **und eine laufende Baseline-Extraktion** kennen, damit ein Werkzeug-Update
+  keins von beiden unterbricht.
+- **Zum Messen genügt die Baseline-Datei.** NTSleuth selbst wird nur gebraucht,
+  um eine Baseline zu *erzeugen*. Die Stufe prüft daher auf die passende
+  Baseline, nicht auf die Anwesenheit des Binaries — ein System mit Baselines
+  und ohne NTSleuth kann messen.
+- **Die Stufe startet nie eine Extraktion**, sondern fragt die Baseline ohne
+  Erzeugungsauftrag: eine Detonation darf nicht auf einen externen
+  Extraktionslauf warten, und ein Werkzeug-Update, das mitten darin die
+  `ntsleuth-*.exe` tauscht, wäre das Gegenteil von hilfreich.
+- Die Stufe ist abschaltbar, über eine Umgebungsvariable wie
+  `TDC_NO_BACKGROUND` es vormacht, nicht je Einreichung. Fehlt die passende
+  Baseline, überspringt sie sich mit Hinweis statt die Detonation scheitern zu
+  lassen.
 
 ### 8. Routen
 
@@ -447,13 +815,41 @@ schlagen `test_readme_documents_every_api_route_and_nothing_else` und
     an emulierten Samples),
   - prüft jeden SHA-256 gegen `checksums.txt` der Release,
   - installiert nach `C:\tools\ntsleuth\`,
-  - schreibt einen Marker `tdc-release.txt` mit Tag und Prüfsummen,
-  - erzeugt je installiertem Binary eine Baseline und dazu den
-    Binary-Graph-Cache,
-  - prüft sich selbst (`ntsleuth.exe --lookup NtCreateProcess` liefert eine
-    Nummer).
+  - prüft sich selbst (`ntsleuth-<view>.exe --lookup NtCreateProcess` liefert
+    eine Nummer),
+  - schreibt **danach** einen Marker `tdc-release.txt` mit Tag und Prüfsummen,
+  - erzeugt je installiertem Binary eine Baseline,
+  - und prüft auf ARM64, dass die beiden Baselines sich **unterscheiden**:
+    wären sie byteweise gleich, läge die x64-Variante nicht die x64-Sicht vor,
+    und die Messung emulierter Samples wäre still wirkungslos. Sind sie gleich,
+    wird die x64-Baseline **gelöscht** — eine fehlende Baseline behandeln
+    Tasks 7 und 9 anständig, eine falsche nicht.
+  - **Die Form der Stubs entscheidet unabhängig davon.** Eine Baseline, deren
+    Stubs nicht überwiegend die Form ihrer Sicht haben (x64: `4C 8B D1 B8`,
+    ARM64: `SVC`), wird weder gespeichert noch geladen. Das hängt weder von der
+    Reihenfolge der Extraktionen noch davon ab, dass die Datei der anderen Sicht
+    existiert, und deckt eine nicht löschbare Doppelgängerin ab.
+  - **Derselbe Schutz muss zur Laufzeit gelten.** Die Extraktion auf Abruf
+    (Ziel 2) würde die gelöschte Datei sonst beim nächsten Tab-Besuch mit
+    demselben falschen Inhalt neu schreiben. Eine x64-Extraktion, deren
+    Fingerabdruck dem der arm64-Baseline gleicht, wird daher nicht gespeichert,
+    und der Tab sagt, warum.
+  - **Die Architektur wird aus der Registry bestimmt, nicht aus
+    `$env:PROCESSOR_ARCHITECTURE`.** Der Updater läuft als emuliertes
+    x64-Python, und die Umgebungsvariable meldete dort `AMD64` auch auf einer
+    ARM64-Maschine — die arm64-Baseline entstünde dann nie.
   - Nimmt `[switch]$Force` und `-Version`, wie die anderen.
   - Die Binaries sind statisch gelinkt; ein VC-Redist ist nicht nötig.
+- **Rückgabewerte:** Ein fehlgeschlagener Download oder eine nicht passende
+  Prüfsumme beenden das Skript mit einem Fehler — das Werkzeug läuft als SYSTEM
+  auf einer Maschine, auf der auch Malware läuft, und eine ungeprüfte Datei wird
+  nie installiert. Eine **fehlgeschlagene Baseline-Erzeugung nach geprüfter
+  Installation** ist dagegen nur eine Warnung mit Rückgabewert 0: die Kammer
+  provisioniert weiter, der Tab meldet „keine Baseline", und Tasks 7 und 9
+  behandeln genau diesen Fall schon. Die Stufe ist eine Ergänzung der Kammer,
+  keine neue Abhängigkeit — das ist ein Anti-Ziel dieses Dokuments.
+- **Der Binary-Graph-Cache gehört zu Plan 2** (Ziel 6) und wird hier nicht
+  gebaut.
 - **Native für ARM64 vorhanden.** Anders als Aether, Rizin und BeaconEye gibt es
   NTSleuth als ARM64-Binary. Nur die zweite, x64-Baseline entsteht unter
   Emulation.
@@ -546,7 +942,7 @@ Node-Harness (`_function_source`, `_run_node`).
 - **Die Oberfläche gibt eine kuratierte Kante als abgeleitete aus.** Der letzte
   Sprung von Win32 zu Nt stammt aus einer Tabelle, nicht aus den Daten. Wer das
   verwechselt, zieht aus dem Graphen falsche Schlüsse.
-- Die Karte wird zur Tapete: 2.461 bunte Zellen ohne Aussage. Ohne Scan muss sie
+- Die Karte wird zur Tapete: rund 2.000 bunte Zellen ohne Aussage. Ohne Scan muss sie
   ruhig sein, und eine Abweichung muss auffallen.
 - Ein Scan oder eine Graph-Abfrage friert das Web-UI ein.
 - **Die Detonationsstufe lässt eine Detonation scheitern**, weil NTSleuth fehlt
@@ -639,8 +1035,8 @@ hat so entschieden:
    kuratiert. Daraus folgt die Markierungspflicht in Ziel 6 und das Anti-Ziel,
    eine kuratierte Kante nicht als abgeleitete auszugeben.
 2. **Der Scanner für Stubs außerhalb von ntdll ist dabei**, nicht in einer
-   späteren Phase. Daher Ziel 7a, ein dritter `KINDS`-Eintrag und eine eigene
-   Route.
+   späteren Phase. Daher Ziel 7a, ein eigener `KINDS`-Eintrag
+   (`direct_syscall_stub`) und eine eigene Route.
 3. **Der Scan läuft als Stufe einer Detonation**, nicht nur von Hand. Daher
    Ziel 7b mit Stufenliste, `collect()`, VERDICT FLOW, Sweep und
    `_update_preconditions`.
@@ -652,17 +1048,18 @@ hat so entschieden:
   Nutzers hinzu, damit der Graph eine eigene Visualisierung neben der Heatmap
   ist und nicht in ihr aufgeht.
 - **Zustandsfarben** folgen den vorhandenen Bedeutungen: intakt in der Farbe für
-  „sauber", EDR-Hook in der Warnfarbe, gepatcht in der kritischen Farbe, kein
+  „sauber", hooked (dateigedecktes Modul) in der Warnfarbe, gepatcht in der kritischen Farbe, kein
   Stub gedämpft. Sie kommen aus den Theme-Variablen, nicht aus neuen Werten.
 - **Dichte der Karte:** Ohne Scan ruhig und gedämpft, damit der Blick nichts
   sucht. Nach einem Scan heben sich Abweichungen deutlich ab, auch einzelne
-  Zellen unter 2.461.
+  Zellen unter rund 2.000.
 - **Classic/Telemetry** zeigt denselben Aufbau in den Classic-Variablen.
 
 ## Dem Builder überlassen
 
-- Die genaue Zellgröße und Spaltenzahl der Karte, solange 2.461 Zellen bei
-  1920 px lesbar bleiben und eine einzelne Abweichung auffällt.
+- Die genaue Zellgröße und Spaltenzahl der Karte, solange die Zellen einer
+  Baseline (auf ARM64 rund 2.000; die Tests nehmen 2.461) bei 1920 px lesbar
+  bleiben und eine einzelne Abweichung auffällt.
 - Wie die Spannen beim Lesen gebündelt werden und wie groß sie sind.
 - Das Anordnungsverfahren des Binary-Graphen, solange Pfade ohne Überlappung
   und mit wenigen Kreuzungen lesbar sind.
@@ -687,13 +1084,21 @@ hat so entschieden:
   hält schon fest, dass die das auf ARM64 nicht kann.
 - Verglichen wird ein Stub-**Präfix** je Architektur, nicht NTSleuths 32-Byte-
   Fenster, weil das in den nächsten Stub hineinreicht.
-- Fünf Zustände statt vier: `diverged` für „Bytes weichen ab, Ziel nicht
-  auflösbar", damit dieser Fall nicht stumm als `intact` durchgeht.
+- Fünf Zustände statt vier: `diverged` für „Bytes weichen ab, und nichts
+  unterscheidet Hook von Patch" — kein Sprung, ein nicht auflösbares Ziel oder
+  ein direkter Sprung in `ntdll` oder das Modul des Stubs —, damit dieser Fall
+  nicht stumm als `intact` durchgeht.
 - Der Live-Scan nimmt standardmäßig nur `ntdll`; `win32u` ist zuschaltbar.
-- `hooked` gegen `patched` wird am Besitzer des Sprungziels entschieden, und
-  dafür kommen `VirtualQueryEx` und `GetMappedFileNameW` dazu; die Modulliste
-  allein würde ein überschriebenes Modul als `hooked` ausgeben.
-- Zwei neue `KINDS`-Einträge statt eines, weil Hook und Patch verschieden wiegen.
+- `hooked` gegen `patched` wird am **letzten** Besitzer des Sprungziels
+  entschieden, nach höchstens zwei privaten Relays, und dafür kommen
+  `VirtualQueryEx` und `GetMappedFileNameW` dazu. Ein überschriebenes Modul
+  (Module Stomping) sieht auch diese Abfrage nicht; `hooked` heißt darum
+  „dateigedecktes Modul", nicht „EDR-Hook".
+- Drei neue `KINDS`-Einträge für die Messung statt eines —
+  `syscall_stub_patched`, `syscall_stub_hooked` und `syscall_stub_renumbered` —,
+  weil Hook, Patch und ein Stub mit fremder Nummer verschieden wiegen. Dazu
+  kommt `direct_syscall_stub` aus Ziel 7a, vom Nutzer entschieden; zusammen
+  sind es vier.
 - **Kein `baseline_exempt`** — das Flag macht einen Befund immun gegen die
   Baseline. EDR-Hooks werden stattdessen über eine eigene,
   prozessunabhängige Hook-Eigentümer-Liste schon vor dem Scorer gefiltert, weil

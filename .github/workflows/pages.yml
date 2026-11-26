@@ -1,0 +1,64 @@
+name: pages
+
+# The guide as a website: `make site` builds docs/ and README.md into site/,
+# and that folder is what GitHub Pages serves. tests.yml keeps the checks on
+# every push and every pull request; this workflow only publishes, and only
+# what is on main - the site says what main says, never what a branch says.
+on:
+  push:
+    branches:
+      - main
+
+# What a deployment needs and nothing more: the OIDC token deploy-pages
+# exchanges for its deployment credential, the right to publish, and read
+# access for the checkout. Nothing here writes to the repository.
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One deployment at a time, and the second one waits: cancelling a running
+# deployment can leave the site half-published, so a push that arrives during
+# a deployment queues behind it instead of overtaking it.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    # The build is a second of Python and the upload a few of a 44 MB folder,
+    # so ten minutes is generous. Without a limit a hung step would hold the
+    # concurrency group - and with it every later push - for GitHub's default
+    # six hours.
+    timeout-minutes: 10
+    # The deployment shows up as the Pages one, and the run's summary carries
+    # the address the site went to.
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Pages is on for this repository, source "GitHub Actions": this reads
+      # the settings the upload needs, so it gets no `enablement` - that would
+      # ask for rights a GITHUB_TOKEN does not have.
+      - uses: actions/configure-pages@v6
+      # The generator is Python standard library only, so there is nothing to
+      # install. `site` builds the offline wiki first, which the site offers
+      # for download, and the build stops on a missing screenshot or a Mermaid
+      # copy whose checksum does not match - the step fails with it, and the
+      # site that is already published stays as it is.
+      - name: Build the website
+        run: make site
+      # The folder as it was built. Hidden files stay out, which is the
+      # default: the build writes .nojekyll (an artifact deployment never runs
+      # Jekyll, so it has nothing to switch off) and .site-files (the manifest
+      # the next local build sweeps with), and neither belongs on the site.
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v5

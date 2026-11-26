@@ -1,0 +1,1437 @@
+# FIREWALL tab: handover for the first run on a real VM
+
+Everything in the FIREWALL tab was written and tested on macOS, against mocked
+Windows answers. **None of it has run on Windows yet.** This note is for
+whoever first deploys it to a VM: what to do once, which screenshots to take,
+and the list of assumptions about Windows that only a real VM can confirm.
+
+## 1. Once, on an existing VM
+
+A new VM gets all of this from provisioning. A VM that was provisioned before
+the FIREWALL tab needs:
+
+1. **`make deploy`, then `make restart`** (`.\make.ps1 deploy` on Hyper-V). The
+   deploy now ships the five new modules (`firewall.py`, `firewall_fetch.py`,
+   `firewall_rules.py`, `firewall_store.py`, `geoip.py`), `firewall_rules.ps1`,
+   the data directories `webui/data/` (the offline geo index, about 9 MB) and
+   `webui/static/data/` (the world map), and `scripts/tdc-unisolate.ps1` to
+   `C:\tdc\scripts`. Without the restart the old `app.py` keeps running.
+   `deploy-app` ships the same modules, data and `tdc-unisolate.ps1`, without
+   the page assets.
+   - The deploy overwrites the geo index while the web UI runs. That works
+     because `geoip.load` maps a **copy** in `%TEMP%\tdc-geoip` (named after
+     the source's size and mtime), never the file in `webui\data`; Windows
+     refuses to overwrite a mapped file. A new index takes effect at the next
+     start of the web UI.
+2. **`C:\tdc\scripts\configure-logging.ps1`, once, as Administrator.** It turns
+   on what the tab reads besides Sysmon: PowerShell script block and module
+   logging, Windows Firewall logging of allowed and dropped packets
+   (`pfirewall.log`), and now also the BITS client operational log (32 MB).
+   Without it the tab still shows Sysmon's connections, but finds no download
+   in a script or a BITS job, and `FW (endpoint)` and `dropped` stay empty.
+3. **`make geoip` is not needed on the VM.** The geo index is committed in
+   `webui/data/` and travels with the deploy. `make geoip` runs on the **host**
+   (it needs internet) and only refreshes that index; each refresh adds a
+   few-MB blob to git history, so do it rarely, then deploy. If the map says
+   "No geo data ... run make geoip on the host and deploy again" after a
+   deploy, the data directory did not arrive: check
+   `C:\DetonationChamberUI\data\ip2asn-v4.idx`, rather than running `make geoip`.
+
+The web UI tries to make `C:\tdc\samples` and its Defender exclusion at its own
+start (provisioning does too). Whether the exclusion really holds is one of the
+open Windows questions in Section 3: a failure is only logged.
+
+## 2. Three screenshots
+
+They can only be made on a running VM. The README references **none** of them
+yet: `tests/test_docs.py::test_readme_images_exist_and_none_are_orphaned`
+fails on a PNG in `static/` that the README does not use, and on a README
+image that does not exist. So add each PNG and its reference **in the same
+commit**, in the shape the LOGS section uses:
+
+```html
+<p align="center">
+  <img src="static/firewall_tab.png" alt="..." width="100%">
+</p>
+
+> One or two sentences on what the picture shows.
+```
+
+| File | What it shows | Where in `README.md` |
+|------|---------------|----------------------|
+| `static/firewall_tab.png` | The tab during a detonation: the process tree with a detonated loader unfolded (its endpoints, tags and activity bars), MAP with arcs to a few countries, the summary below. A selected endpoint, so HUNT FURTHER shows its queries. | `## Firewall`, after the first paragraph (as `logs_tab.png` sits in `## Logs`) |
+| `static/firewall_decision.png` | A decision toast with an open decision: the defanged URL, the countdown, CUT + FETCH, CUT ONLY, ALLOW and `in LOGS ▸`. Best over another tab, to show that it comes on every tab. | `## Firewall`, after the paragraph that ends "...so a sample cannot use TDC as its proxy." |
+| `static/firewall_isolated.png` | ISOLATED on: the red ISOLATED switch and the band with what stays open (the per-fetch residual). | `## Firewall`, after the **ISOLATED** paragraph |
+
+A detonation that makes such a picture without real malware: a submitted
+PowerShell script that runs `Invoke-WebRequest http://<a public test host>/x.exe`
+(a URL to an `.exe` in a script block, from a submission) opens a decision in
+ASK `Detonation`.
+
+## 3. What has never run on Windows
+
+Gathered from the reports of Tasks 1-9 and the final review. For each: what to
+check on the VM, and what breaks if the assumption is wrong. Most checks are
+one command in an elevated PowerShell on the VM. Run them in this order: the
+panic cut, the ISOLATED check, the curl and BITS decisions, blocking a running
+transfer, then the rest.
+
+### The panic cut (mandatory, first)
+
+The switch-on path of ISOLATED is now two stages, specified in
+`docs/superpowers/specs/2026-11-17-panic-cut-design.md`. A press writes **one**
+catch-all outbound Block rule, `TDC-FW-ISO-cut`, and returns with `stage: "cut"`
+after 8.8 s on a quiet machine, 9.9-16.9 s while the tab's own polls load it (the
+old path, 135 rules switched off one by one, took 38.5 s; see the open point on
+the call budget at the end). A
+background worker, `converge`, then does what ISOLATED always did, so that a
+per-fetch Allow exception is possible again: when `allowed_out` comes back empty
+the cut rule is dropped and the stage is `isolated`; when it does not (a group
+policy Allow rule), the cut rule stays and the stage is `cut_policy`.
+
+**These checks are mandatory, not optional.** The reason is one, and it holds for
+every item below: the fake PowerShell runner in the tests does not model WFP
+semantics. It cannot know that a Block rule beats an Allow rule, so **no test on
+macOS can prove that the cut works**. That same blindness let the original
+"default deny" ship while 135 Allow rules stayed enabled. What was measured on the
+VM before the design (below) is evidence for the design; it is not a check of
+what was built. Do all eight on the finished build.
+
+Measured on the Windows 11 ARM VM (135 local outbound Allow rules, 2026-11-17),
+for what to expect:
+
+| Measured | Result |
+|---|---|
+| One catch-all Block rule written and read back, one PowerShell call | 2.13 s (hand-written script); the finished `Cut` verb alone 2.44-2.49 s (two quiet-moment runs) |
+| `Profiles` alone | 1.13-1.65 s (two quiet-moment runs); 2.10 s under load in the first run |
+| The press end to end (profiles read first, then the cut), quiet | 8.8 s |
+| The same press while the tab's polls load the machine | 9.9-16.9 s (inside it: `Profiles` 5.66 s, `Cut` 7.29 s; lock wait 0 ms) |
+| Convergence until `stage: "isolated"` | 59.3 s |
+| Leaving from `isolated` (135 rules back) | 57.5 s |
+| Repairing a rule of that name that was **disabled** | 5.92 s |
+| Repairing one **narrowed** to one program and address | 3.38 s |
+| With the cut standing: `curl https://1.1.1.1` | `http=000`, instantly |
+| With the cut standing: DNS | dead |
+| With the cut standing: `curl http://127.0.0.1:9000` | `http=200` (Windows does not filter loopback) |
+| After removing the cut | `http=301`, DNS back |
+| The old full ISOLATED cycle | 38.5 s on, 41.4 s off |
+
+The rows about the cut standing held **while all 135 Allow rules were still
+enabled**; that is the point of the design.
+
+1. **Time to `stage: "cut"`.** *Check:* time
+   `POST /api/firewall/isolate {"on": true}` from the request to the answer; the
+   answer carries `stage: "cut"`, `verified: true`, `converging: true`. It must be
+   **≤ 12 s**, the spec's ceiling; measured 8.8 s. Do it with the three profiles
+   on, no `TDC-FW-ISO-cut` present, and **no browser polling the FIREWALL tab**
+   (closed, or LIVE off): the threshold is for a quiet machine. With the tab open
+   on LIVE the same press measured 9.9-16.9 s, because the tab's polls cost more
+   than their interval; that is the open point on the call budget at the end of
+   this document, not a regression of the cut, and until that point is fixed the
+   figure under load is written down, not asserted. *If wrong (quiet, above
+   12 s):* the button is not a panic button again. Look in
+   `webui/logs/firewall-calls.log` at which of the two PowerShell calls it is
+   (`Profiles`, then `Cut`): alone 1.13-1.65 s and 2.44-2.49 s. A repair of a
+   falsified rule (item 7) is slower by design and does not count here.
+2. **The egress is shut while the cut stands.** *Check:* right after the answer of
+   item 1, while `converging` is still `true` (the Allow rules are still mostly
+   enabled; that is what is being tested):
+   `Resolve-DnsName example.com -DnsOnly` fails;
+   `curl.exe -s -o NUL -m 5 -w "%{http_code}" https://1.1.1.1` prints `000` at
+   once, not after the timeout; `curl.exe -s -o NUL -w "%{http_code}"
+   http://127.0.0.1:9000` prints `200`. *If wrong:* the cut does not close, or
+   closes the UI as well. In the first case the band must not say closed:
+   `verified` is only "the cut rule was read back" (and read again, from the rule
+   list or one `Get`, within 10 s), so a rule that reads back and does nothing is
+   exactly what this check exists to catch. Repeat it once more in
+   `cut_policy` if the VM has a group-policy Allow rule: the cut stays and must
+   still close.
+3. **Time to `stage: "isolated"`, and the cut is gone by then.** *Check:* poll
+   `GET /api/firewall/isolate` after item 1 until `stage` is `isolated`; note the
+   time. At that moment `Get-NetFirewallRule -Name TDC-FW-ISO-cut` finds nothing,
+   `allowed_out` is `[]`, `converging` is `false`, DNS is still dead, and the
+   `Get-NetFirewallRule -PolicyStore ActiveStore -Direction Outbound -Action Allow
+   -Enabled True` check of the section below lists nothing. Run
+   `curl.exe -s -o NUL -m 2 -w "%{http_code}\n" https://1.1.1.1` in a loop from
+   before the press until after this stage: it must never print anything but
+   `000`, in particular not at the moment the cut rule falls (the Allow rules are
+   switched off and the default is Block *before* the cut is dropped). The old
+   path took 38.5 s; the whole convergence was **measured at 59.3 s** on the
+   finished code. Write down what you see. *If it stays `cut`:* the worker failed and the band must say why (the cut
+   stands and the egress is shut, which is the safe side). *If it stays
+   `cut_policy`:* `allowed_out` names the rule and its store.
+4. **Leaving in the middle of the convergence.** *Check:* press ISOLATED on; 5-10 s
+   later, while `converging` is `true`, read `allow_disabled` in
+   `C:\DetonationChamberUI\firewall_state.json` (it is written before the first
+   switch is flipped, and may still be empty), then `POST /api/firewall/isolate
+   {"on": false}`. It must **not** wait for the whole convergence: the worker
+   stops between its PowerShell calls and the leave takes its normal path, so the
+   time is the running call plus a normal leave, not the convergence's remaining
+   time on top. Then **every rule named in `allow_disabled` is enabled again**
+   (compare with the list read before leaving, and with the section below's
+   count), `allow_disabled` is `[]`, no `TDC-FW-ISO-*` rule is left, `converging`
+   is `false` and does **not** turn `true` again afterwards (a worker that kept
+   running would switch the Allow rules off again behind the leave), and DNS
+   works. Do it at least twice, at different moments (also right after the press,
+   before the first rule is switched). *If wrong:* a leave that waits is a cut
+   that cannot be undone for a minute; a rule left off is the VM without DNS,
+   which is the failure the section below is about. No figure was measured for a
+   leave in the middle of the convergence (a leave from `isolated` took 57.5 s):
+   write down the time of the leave.
+5. **The round trip.** *Check:* before the press, record
+   `(Get-NetFirewallProfile -PolicyStore PersistentStore | Select Name,
+   DefaultOutboundAction)` and the names
+   `Get-NetFirewallRule -PolicyStore PersistentStore -Direction Outbound -Action Allow
+   -Enabled True | Sort Name | Select -Expand Name` (135 on this VM). On a VM where
+   the profiles are `NotConfigured`, ISOLATED records `outbound_before:
+   "NotConfigured"`. Press on, wait for `isolated`, press off, and record both
+   again: `DefaultOutboundAction` is back to the **configured** value, so
+   `NotConfigured` is `NotConfigured` and **not** `Allow`; the 135 names are
+   identical (`Compare-Object` prints nothing); `Get-NetFirewallRule -Name 'TDC-FW-*'`
+   finds nothing (on a VM with no rule blocked by hand). Do it again leaving
+   through `C:\tdc\scripts\tdc-unisolate.ps1`. *If wrong:* the host is left
+   configured differently from how it was found, which is the one property of this
+   feature that was proven on the VM and must not be lost.
+6. **A restart in stage `cut` changes nothing.** *Check:* press on and restart the
+   web UI (`make restart`, or stop the process) while `stage` is still `cut`, within
+   a few seconds. After the start: `GET /api/firewall/isolate` says `stage: "cut"`,
+   `TDC-FW-ISO-cut` is still standing, the marker in `firewall_state.json` is
+   **not** cleared, `allow_disabled` is as it was, the egress is still shut (item 2's
+   commands), and the convergence is **not** resumed by itself (`converging` stays
+   `false`; the analyst decides to leave or to press again). Then leaving restores
+   everything as in item 5. *If wrong:* the start treats "marker set, no profile on
+   Block" as stale, switches the Allow rules back on and clears the marker, with the
+   cut rule still standing: the state this design exists to avoid, and the one a
+   crash in this stage leaves.
+7. **The repair path.** *Check:* with ISOLATED off, make the rule wrong by hand,
+   then press, once for each shape:
+   - **Disabled:** `New-NetFirewallRule -Name TDC-FW-ISO-cut -DisplayName x
+     -Direction Outbound -Action Block -Enabled False`.
+   - **Narrowed:** `New-NetFirewallRule -Name TDC-FW-ISO-cut -DisplayName x
+     -Direction Outbound -Action Block -Program C:\Windows\System32\notepad.exe
+     -RemoteAddress 192.0.2.1` (a program and an address that do not include
+     `1.1.1.1`, so the egress is open before the press).
+
+   With the `curl` loop of item 3 running from before the press: the press ends
+   with `stage: "cut"`, `verified: true`, the rule is the catch-all
+   (`Get-NetFirewallRule -Name TDC-FW-ISO-cut | Get-NetFirewallApplicationFilter,
+   Get-NetFirewallAddressFilter`: `Program Any`, `RemoteAddress Any`, enabled,
+   `Profile Any`, `Block`, `Outbound`), and once the loop prints `000` it **never
+   prints anything else** again: the repair must not remove the rule and write a new
+   one (a gap with an open egress). Measured: **5.92 s** for the disabled rule,
+   **3.38 s** for the narrowed one, both ending with the egress shut. That is slower
+   than item 1 and is why the UI must not promise two seconds here. Leave
+   afterwards, and check that `TDC-FW-ISO-cut` is gone. *If wrong:* a falsified
+   cut rule is read as "cut", or repaired through a moment of open egress.
+8. **A profile switched off after a cut.** *Check:* press on; once `stage: "cut"`
+   (and again once `isolated`), switch one profile off with
+   `Set-NetFirewallProfile -Profile Public -Enabled False`. Nothing may read as
+   confirmed closed: `verified` is `false`; the skull button reads
+   `CUT · FIREWALL OFF` and is **disabled**, with the reason in its title; the
+   header switch shows the same state, not another one; and the red band offers
+   `LEAVE ISOLATED` next to `TURN THE FIREWALL ON`, and that button works
+   (it asks first, and gives the firewall back as found). Then switch the profile
+   on again and see the state read confirmed again. *If wrong:* a rule that stands
+   and reads back but does nothing is called closed (the same finding as the
+   loopback block), or the panic button turns into a "reopen the network?" dialog
+   in exactly the state where a reflexive yes throws the marker and the baseline
+   away.
+
+**To watch, not to assert: a deadline during a convergence.** Found in review, not
+yet seen on a VM. A decision deadline that falls due while `converge` is running
+stalls the sweep, and with it the collector, for tens of seconds. The deadline's
+per-program block waits on the rules module's lock, which the convergence holds
+across its PowerShell calls, and it waits inside `_fw_decision_lock`. A deadline
+shortly after a press nearly always coincides with the convergence that follows
+it, so in the cut this is the common case, not a corner case. A newly detected
+download (`_fw_open_decision`, which blocks the loader first and asks then) waits
+on the same lock in the same way. *What to look for:* press ISOLATED on during a
+detonation with ASK on `Detonation` (or All) and a short decision deadline, and let
+a decision open or fall due in the first minute. Watch for the LIVE list not
+advancing (the newest connection ages while the sample is active), `/connections`
+and `/pending` answering late, and the gap between a decision's `created_at` or
+deadline and its block's `BLOCK` line in LOGS. By reading the code,
+an analyst's answer to a decision takes `_fw_decision_lock` too, so a CUT ONLY or
+ALLOW pressed in that window may hang as well: that is an inference, look for it.
+Write down how long the stall lasts. It does not open anything (the cut stands and
+the egress stays shut); the cost is that the tab is blind for that time.
+
+### ISOLATED really closes
+
+The text below is the old description of the whole of ISOLATED, written before the
+panic cut. It still holds for the **end state** (stage `isolated`) and for the way
+back. Where it speaks of how ISOLATED is switched **on** (the number of PowerShell
+calls, how long switching takes), the panic cut above replaces it.
+
+`DefaultOutboundAction Block` stops only what **no** rule allows, and Windows
+ships enabled outbound Allow rules (Core Networking's DNS above all). ISOLATED
+therefore switches off every enabled local outbound Allow rule that is not
+TDC's, records the names in `allow_disabled` of
+`C:\DetonationChamberUI\firewall_state.json`, and switches exactly those on
+again when it is left.
+
+- **Nothing but TDC's own rules is let out.** *Check:* turn ISOLATED on and wait for
+  `stage: "isolated"`; then
+  `Resolve-DnsName example.com -DnsOnly` fails, and
+  `Get-NetFirewallRule -PolicyStore ActiveStore -Direction Outbound -Action Allow -Enabled True | Select Name, DisplayName, PolicyStoreSourceType`
+  lists nothing, or only a `TDC-FW-ISO-fetch-*` rule while a fetch runs
+  (ISOLATED writes no rule of its own any more). The band says "Read back: no outbound Allow rule
+  but TDC's own is enabled", and `GET /api/firewall/isolate` has
+  `allowed_out: []`. *If wrong:* DNS-tunnel C2 and DNS exfiltration still work
+  in the one mode meant to stop them. If a rule is still listed, the band and
+  `allowed_out` must name it (that half holds even when a rule resists); if
+  the band says nothing while the command lists one, the read back is broken.
+- **The way back is exact.** *Check:* note
+  `(Get-NetFirewallRule -PolicyStore PersistentStore -Direction Outbound -Action Allow -Enabled True).Count`
+  before ISOLATED, leave ISOLATED, count again: the same number, and
+  `allow_disabled` in `firewall_state.json` is `[]`. Do it once more leaving
+  through `C:\tdc\scripts\tdc-unisolate.ps1` instead of the UI (it prints one
+  "Switched on again" line per rule). *If wrong:* Core Networking stays off
+  after ISOLATED, and the VM has no DNS until someone notices.
+- **`PolicyStoreSourceType` says `Local` for the built-in rules.** Only `Local`
+  rules are switched off; any other source is only reported. *Check:* the
+  command above shows `Local` for `CoreNet-DNS-Out-UDP`. *If wrong:* ISOLATED
+  switches nothing off and the band lists every Windows rule as still open
+  (honest, but not closed).
+- **How long switching takes.** *Superseded for switching on:* a press now cuts in
+  8.8 s on a quiet machine (9.9-16.9 s under the tab's polling) and the thorough
+  work below runs in the background (see "The panic cut");
+  the figures here are those of the whole convergence and of leaving.
+  ISOLATED on was four PowerShell calls (AllowOut,
+  DisableAllowOut, SetDefaultOutbound, AllowOut), off is three
+  (SetDefaultOutbound, EnableAllowOut, RemoveIsolate); the rules go through one
+  pipeline per call (one call per ~6000 characters of names). *Check:* time
+  `POST /api/firewall/isolate` both ways; it must stay well under
+  `RUN_TIMEOUT_S` (90 s). While it runs the button reads CUTTING… / LEAVING…
+  and an info toast says why it takes a while. **Measured** on the Windows 11
+  ARM VM (135 local outbound Allow rules, 2026-11-17): **41.9 s on, 30.1 s
+  off**. That is the expected figure, not a hang: switching that many rules is
+  slow on Windows even in one pipeline per call.
+- **What is put back is what was configured.** The baseline is read from the
+  PersistentStore (`Configured` in `-Op Profiles`), the store
+  `SetDefaultOutbound` writes; the ActiveStore (what is in force) answers
+  whether ISOLATED holds. *Check:* with all three profiles `NotConfigured`
+  (`Get-NetFirewallProfile -PolicyStore PersistentStore | Select Name,
+  DefaultOutboundAction`), ISOLATED on records `outbound_before:
+  "NotConfigured"`, the ActiveStore shows `Block`, and after leaving the
+  PersistentStore shows `NotConfigured` again, not `Allow`. *If wrong:* the
+  host is left configured differently from how it was found.
+
+### Processes and Sysmon
+
+- **The ctypes process-time check** (`_process_started_at` in `webui/app.py`:
+  `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION)`, `GetProcessTimes`,
+  `GetExitCodeProcess == STILL_ACTIVE`, run as SYSTEM).
+  *Check:* during a detonation, `/api/firewall/connections` tags the
+  submission's connections `detonated`, and KILL on a sample process asks for
+  confirmation instead of answering "its start time cannot be read".
+  *If wrong:* detonation windows close 60 s after the submission's timestamp
+  instead of when the process ends (`FIREWALL_WINDOW_GRACE_S`), so a loader
+  that downloads later is not "in a detonation" and ASK `Detonation` asks
+  nothing; the fast 1 s collector tick stops early; and KILL refuses every PID
+  (409).
+- **A venv's `python.exe` is a launcher.** On Windows the venv's
+  `Scripts\python.exe` starts the base interpreter (`sys._base_executable`, e.g.
+  `C:\Python312\python.exe`), and the child owns the sockets.
+  *Check:* the `Image` Sysmon EID 3 reports for the web UI's own connections and
+  for a fetch (LOGS: `source=netflow image="*python*" | stats count by image`).
+  *If wrong:* the fetch and the "never block TDC's fetcher" guard already name
+  both binaries (`_fw_fetcher_paths`), so the fetch is covered. But
+  `firewall.TDC_IMAGES` lists only the venv path: if Sysmon reports the base
+  interpreter, the web UI's own traffic is not in the `TDC` group, carries no
+  `tdc-anomaly`, and looks like any other process (it could be blocked by hand).
+  Adding the base path to `TDC_IMAGES` would exempt every Python on the box, so
+  it was deliberately not done blind.
+- **Sysmon logs the connections a download needs.** SwiftOnSecurity's config
+  logs EID 3 only for an include list; `install-sysmon.ps1` adds `curl.exe`,
+  `python.exe`, `pythonw.exe` and `C:\Windows\System32\svchost.exe` (BITS) to
+  it (`Set-NetworkConnectIncludes`), each as a `Rule` with
+  `<Initiated condition="is">true</Initiated>`, so only their outbound
+  connections are logged. *Check:* `C:\tools\sysmon\sysmonconfig.xml` contains
+  four `<Rule name="TDC firewall tab: ...">` entries and `sysmon -c` accepted
+  the config; browse the web UI from the host for a minute and no `tdc-anomaly`
+  appears on a python flow (an accepted connection must not read as TDC's own
+  outbound traffic); then, with ASK on
+  All, `curl.exe -o %TEMP%\x.exe http://<test host>/x.exe` and
+  `bitsadmin /transfer t http://<test host>/y.exe %TEMP%\y.exe` must each open a
+  decision. *If wrong:* a curl or BITS download never becomes a finding, and
+  `tdc-anomaly` never fires because TDC's own python is not logged. If BITS
+  still opens none, its connection is not reported as `svchost.exe`, and the
+  BITS window logic of Task 3 serves nothing.
+- **Sysmon field names for alerts** (`sigma` tag): `raw.destination.ip|address|port`
+  and `raw.network.destination.*` are a reading of `app.py`; only the port keys
+  were seen in code. *If wrong:* no connection ever gets `sigma`.
+
+### BITS, PowerShell and the firewall log
+
+- **The BITS `Url` field name** (EID 59/60 of
+  `Microsoft-Windows-Bits-Client/Operational`, matched case-insensitively as
+  `url`). *Check:* `bitsadmin /transfer t http://<host>/x.exe %TEMP%\x.exe`, then
+  `wevtutil qe Microsoft-Windows-Bits-Client/Operational /c:2 /rd:true /f:xml`
+  and look for `<Data Name='url'>`. *If wrong:* no BITS download is ever found;
+  BITS (T1197) is then invisible as a download.
+- **The BITS log is on** after `configure-logging.ps1` (`wevtutil gl
+  Microsoft-Windows-Bits-Client/Operational` shows `enabled: true`). *If not:*
+  same as above.
+- **`pfirewall.log` and the `dropped` tag**: after `configure-logging.ps1`, a
+  blocked connection shows `DROP` lines (LOGS: `source=firewall action=DROP`).
+
+### Running `firewall_rules.ps1`
+
+Every rule change goes through
+`powershell -NoProfile -NonInteractive -ExecutionPolicy Bypass -File firewall_rules.ps1 -Op <verb> ...`.
+
+- **`exit 3` and `exit 4` under `-File`.** The script refuses `Create` with
+  `exit 3` when a profile is off and `exit 4` when the rule exists.
+  *Check:* with one profile off, `powershell -File firewall_rules.ps1 -Op Create
+  -Name TDC-FW-test -Action Block -RemoteAddress 192.0.2.1; $LASTEXITCODE`
+  prints `3`; a second identical call with all profiles on prints `4`.
+  *If wrong:* a refusal reads as a plain failure (1) or as success (0): a block
+  while a profile is off could be reported with the wrong reason, and the
+  repair of an existing rule takes the wrong branch.
+- **`-File` takes `$`, `;`, `"` and `,` in a value as text.** *Check:* a block
+  of a program whose path holds a `;` or `$` creates exactly one rule with that
+  path. *If wrong:* a hostile image path could become PowerShell code. This is
+  the one security assumption on this list.
+- **`-ExecutionPolicy Bypass` is allowed.** A policy set by GPO (MachinePolicy)
+  overrides it. *If wrong:* every call fails: no rule, no ISOLATED, the tab says
+  the rules cannot be read.
+- **`Get-NetFirewallProfile -PolicyStore ActiveStore`** reports
+  `DefaultOutboundAction` **per profile** as `Allow` / `Block` (and `Enabled` as
+  `True` / `False`). *Check:* `Get-NetFirewallProfile -PolicyStore ActiveStore |
+  Select Name, Enabled, DefaultOutboundAction`. *If it says `NotConfigured`* (the
+  persistent store's word for "default"): ISOLATED's previous value is
+  remembered as `NotConfigured` and put back as such (harmless), but the
+  start-up check that decides whether an ISOLATED marker is still in force
+  compares against `Block`; a misread makes it call a real isolation stale and
+  clear the marker, or the reverse.
+- **`AllowOut`, `DisableAllowOut` and `EnableAllowOut` under 5.1.** They were
+  run only under PowerShell 7 on a Mac, against stub cmdlets. `-Names` is base64
+  of a JSON list, decoded with `ConvertFrom-Json`. *Check:* `-Op AllowOut` gives
+  `{"rules": [...]}` with zero, one and many rules; ISOLATED on and off with the
+  checks above. *If wrong:* ISOLATED is refused ("could not be read; nothing was
+  changed"), or the band says whether it is closed is unknown.
+- **The `ConvertTo-Json` shapes** (Windows PowerShell 5.1). The script uses
+  `-InputObject` and `@(...)` so that one profile or one rule is still a list,
+  and `RemoteAddress` / `RemotePort` are arrays. *Check:* `-Op List` with zero,
+  one and two `TDC-FW-*` rules, and `-Op Profiles`; each must be valid JSON with
+  `rules` a list and `profiles` three objects. PowerShell 5.1 can wrap an array
+  as `{"value": [...], "Count": n}`. *If wrong:* the rule list cannot be read:
+  `rules_error` is set, nothing is claimed as blocked, and the switches show `?`.
+- **Windows' spellings of a rule.** `Profile` (`Any`, or `Domain, Private,
+  Public`), `Protocol` (`TCP` or `6`), `Program` (`Any` when none, the path's
+  case), `RemoteAddress` (`1.2.3.4`, or with `/32` or `/255.255.255.255`). The
+  read-back normalises these; that a rule written by `Create` reads back with
+  `Profile: Any` and enabled is assumed. *Check:* block one endpoint, then
+  `GET /api/firewall/rules` shows it with `blocking: true`.
+  *If wrong:* `verified` is false, the flow never turns `blocked`, and every
+  repeat block removes and rewrites the rule (the repair path).
+- **An Allow rule with `-RemotePort` and `-Protocol`.** ISOLATED's per-fetch
+  rule is `Create -Action Allow -Program <python> -RemoteAddress <ip>
+  -RemotePort <port> -Protocol tcp`. *Check:* with ISOLATED on, answer a
+  decision with CUT + FETCH; the capture appears, its `allow_closed` is `true`,
+  and `Get-NetFirewallRule -Name 'TDC-FW-ISO-fetch-*'` is empty afterwards.
+  *If wrong:* the fetch in ISOLATED fails (`allow_problem` says why) or the rule
+  does not read back as written.
+- **Loopback needs no allow rule** under `DefaultOutboundAction Block`: Windows
+  Firewall does not filter loopback, and Windows refuses `::1` as a
+  RemoteAddress, so ISOLATED writes none. *Check:* with ISOLATED on, every tab
+  still works (Detonator 8000, Agent 8080, LitterBox 1337, Fibratus 8180), and
+  `Test-NetConnection 127.0.0.1 -Port 8000` succeeds. *If wrong:* TDC's own
+  services cannot reach each other in ISOLATED; the egress stays shut, so
+  leave ISOLATED (the web UI is reached inbound) or run the hatch.
+- **The host still reaches port 9000 in ISOLATED** (an outbound default does not
+  touch the answers to inbound sessions). *Check:* the web UI stays usable from
+  the host with ISOLATED on. *If wrong:* ISOLATED locks the analyst out, and
+  `C:\tdc\scripts\tdc-unisolate.ps1` from the VM console is the way back; run it
+  once on purpose to see that it works.
+
+### Reads without the NetSecurity module (`-Op Compare`)
+
+`List` and `Get` read **TDC's own rules** over **COM** (`HNetCfg.FwPolicy2.Rules`)
+without the NetSecurity module, and since the plan
+`2026-11-19-in-force-reads.md` **`Profiles` reads both firewall stores without
+the module too**, through `-PolicyStore` as a CIM **operation option**
+(`CimOperationOptions.SetCustomOption('PolicyStore', <store>, $false)` on a
+session from `[Microsoft.Management.Infrastructure.CimSession]::Create('.')`).
+That was the one route left unmeasured when the previous plan reverted
+`Profiles` to the cmdlets; it works, and it partly reverses that revert (the
+section "`Profiles` was converted and reverted" below is history, marked as
+such). **`List` is therefore fully module-free** (it only loaded the module for
+its profile half). **`AllowOut` is the one verb that stays on the cmdlets**, for
+a reason that is stated under its own bullet. Every number and spelling COM or
+CIM gives is mapped from an exhaustive written-out list; anything not on it
+throws into a fallback onto the old cmdlet path. The fallback is never silent:
+`Via` and a one-line `Fallback` reason reach the call log.
+
+**`via=` now means "without the module" for `Profiles`, `List` and `Get`.** For
+`List` it says `fast` only when **both** halves (profiles and rules) were read
+fast, and its `Fallback` names every half that fell back, each with its own
+reason. `AllowOut` carries no `via=` at all.
+
+- **Which store each way reads, as measured.** COM reads the **local store**
+  (the PersistentStore), not what is in force, which is why it reads TDC's
+  rules (written there) but not the profiles' in-force value. The CIM option
+  reads either store by name: `ActiveStore` for what is in force,
+  `PersistentStore` for what is configured. `Get-NetFirewallRule` without
+  `-PolicyStore` reads the PersistentStore too, and Create and Cut write TDC's
+  rules there. So for TDC's rules both sides read the same store, which is why
+  `Compare` agreed on every field. **The group-policy residual is measured
+  now:** with one local GPO outbound Allow rule, the cmdlets report ActiveStore
+  539 and PersistentStore 538, and **COM sees 538 both with and without the
+  policy rule standing**: COM does not see a group-policy rule. So a policy
+  rule named `TDC-FW-*` is seen by neither the COM read nor the default cmdlet
+  read; they cannot disagree about it, and it is not a way for the fast path to
+  report a rule the cmdlets do not.
+
+- **The sentinel: why the option cannot be forced, and what stands in for it.**
+  `mustComply = $true` is **refused** by the WS-Man WMI plug-in for every call,
+  so the option cannot be forced. A provider that silently ignored it would
+  hand back the PersistentStore, and TDC would publish a configured value as in
+  force. So before any value is trusted, the reader reads a store that cannot
+  exist; if it **answers**, the option is being ignored and the read falls back
+  to the cmdlets. A proof per call, not a promise of the API.
+
+  **Its name had to be measured, and the result is counter-intuitive:** an
+  unknown store is treated as a **computer name** (`-PolicyStore
+  <computername>` is how the local GPO store is addressed). Ten reads each,
+  DNS cache cleared first (a separate twenty-read run of the old name gave
+  35 / 319 / 5429 ms):
+
+  | name | min / mean / max | DNS trace |
+  |---|---|---|
+  | `TDC-NoSuchStore` (a legal host name) | 24 / 545 / **5205** ms | **1 entry** |
+  | `not-a-store.invalid` | 34 / 78 / 362 ms | **1 entry** |
+  | **`TDC\|NoSuchStore`** (what ships) | 27 / **46** / **160** ms | **none** |
+
+  A legal name put a query on the wire inside the chamber whose traffic TDC
+  captures, on a verb that runs on every poll, and cost up to 5.2 s, more than
+  the cmdlet path it replaces. The pipe cannot occur in a computer name or a
+  path, so the store is refused on its own syntax. Measured on the VM
+  afterwards: **no DNS trace after 5 and after 6 `Profiles` calls.** The
+  sentinel's value must **never be empty**: an empty store name answers with
+  all three profiles, exactly like no option.
+
+  The sentinel insists on the **kind** of error, not any error: only a
+  `CimException` whose `NativeErrorCode` is `Failed` counts as the refusal
+  (measured stable over eight runs; a wrong namespace gives `InvalidNamespace`
+  instead). A different code, a non-CIM error or a transport failure is not
+  proof and falls back. **The residual, honestly:** `Failed` is a generic
+  provider failure, so this narrows the hole rather than closing it, and a
+  machine whose *client* refused such a value itself would make the sentinel
+  vacuous. `Compare` in the policy state (D below) is the backstop.
+
+- **`Compare` is a mandatory VM check, and no test on macOS replaces it.** It
+  is a verb in the script, not a test harness, so it runs on any VM, including
+  one with group policies. It reads the profiles and TDC's rules each **both
+  ways, independently** (profiles: the CIM option against the cmdlets; rules:
+  COM, as `List` and `Get` read them, against the cmdlets) and compares them
+  field by field, together with the set of names and the
+  invariant `DisplayName = Name`. It prints
+  `{"ok","rules","checked":{"profiles","displayNames","names","fields"},"differences"}`
+  and exits 0, or exits 1 on any difference. **`rules` is how many TDC rules
+  either way found; `rules: 0` means no rule was compared, whatever `ok` says,
+  and `checked.profiles` is the separate counter for the profile half.** The
+  fake runner of the tests cannot know what CIM or COM says, so only this run
+  can show that they say what the cmdlets say. *Check:* `powershell -File
+  firewall_rules.ps1 -Op Compare; $LASTEXITCODE` in **each of the six states
+  below**. *If a field differs:* the fast path is wrong, and the tab stays
+  correct only because the read falls back to the cmdlets: slow, and visible as
+  `Fallback` in the call log.
+
+  The run of this plan: six states, **all exit 0**.
+
+  | State | `rules` | `checked` | What it confirms |
+  |---|---|---|---|
+  | A: nothing isolated, IPv4 + IPv6 + **UDP** rules standing, each with a port and a program | 3 | `profiles 9, displayNames 3, names 6, fields 54` | both address spellings, protocol `17`, port, program path |
+  | B: the cut standing | 4 | `profiles 9, displayNames 4, names 8, fields 72` | the catch-all: protocol Any, program Any, address Any |
+  | C: converged (Block on all three) | 3 | `profiles 9, displayNames 3, names 6, fields 54` | the profile mapping with Block everywhere |
+  | **D: a local group policy contradicts the local store** | 0 | `profiles 9` | **in force and configured differ** |
+  | **E: D plus a group-policy rule** | 0 | `profiles 9` | the policy rule, which the rule readers must not see |
+  | F: normal, no policy, after restoring | 0 | `profiles 9` | the way back |
+
+  In D to F no TDC rule counted (`rules: 0`), so their whole content is the nine
+  profile fields.
+
+  **D is the state that matters, and it is the reason the other states are not
+  enough.** In D the local GPO had Domain `Allow` and Public `Block`, while the
+  PersistentStore had Domain `Block` and Private `Allow`, so in force it was
+  `Allow, Allow, Block`. `Profiles` reported `DefaultOutboundAction: Allow` with
+  `Configured: Block` for Domain: exactly the split COM got wrong, where COM
+  answered `Block` and would have reported *closed* while the egress was open.
+  The previous plan's three states (A, B and "no rules") are precisely the
+  states in which COM looked correct for weeks; none of them has a policy
+  contradicting the store, so none could tell a store read from an in-force
+  read. **Run D on every VM where this code changes.** Build it with
+  `Set-NetFirewallProfile -PolicyStore $env:COMPUTERNAME -Profile Domain
+  -DefaultOutboundAction Allow` over a local `Block`, and put it back afterwards
+  (empty the GPO store, `NotConfigured` on all three profiles, `gpupdate`).
+
+- **Mandatory, and separate from `Compare`: read each verb's own JSON.** Run
+  `-Op Profiles`, `-Op List`, `-Op Get -Name <a TDC rule>` and `-Op AllowOut`
+  and **look at what each prints**: `profiles` a list of three objects (not
+  `null`), `Via` `fast` on an idle VM (and, when it says `cmdlet`, a `Fallback`
+  that gives the reason), the rules as they were created. *Why:* `Compare` exercises the **readers**, not
+  the verb **branches**, so a broken branch is invisible to it. This plan found
+  two such bugs on the VM, and the first proof run was **all green while `List`
+  returned `null`**:
+  1. **`List` emitted `"profiles": null`** and always claimed `Via: cmdlet` with
+     an empty reason, on every call, idle or loaded. The `List` branch assigned
+     to `$profiles`, and the script's `param()` block declares
+     `[string]$Profiles`. PowerShell variable names are **case-insensitive** and
+     the `switch` runs in the same scope as the parameters, so the line wrote
+     into the typed parameter and coerced the object to its `ToString()`. The
+     consumer degraded **silently**: `webui/firewall_rules.py` catches the bad
+     `profiles` and sets `states = None` without a word.
+  2. **Four `foreach ($name in ...)` loops in `Compare`** wrote into
+     `[string]$Name` the same way. Harmless today, because they only loop over
+     strings, but the same trap.
+
+  A test now forbids any script-level write to a parameter name, with the
+  parameter list read out of the script itself
+  (`test_no_script_level_assignment_writes_into_a_parameter`), proven against
+  five mutations. It holds the class of bug on macOS; the VM check above is what
+  would have caught the instance, and stays.
+
+- **Three assumptions the gate disproved.** All three were found only by
+  running it on the VM, and none could have been found on macOS; they are what
+  the gate is worth.
+  1. *CIM hands back the profile action as a **name***, not only as a number.
+     Found in the earlier plan's CIM profile read, which went with the
+     `Profiles` revert; the read that came back with this plan maps through the
+     written-out list and falls back on anything off it.
+  2. *COM writes a single address of either family as a range to itself*:
+     `1.1.1.1-1.1.1.1` and `2606:4700:4700::1111-2606:4700:4700::1111`, where
+     the cmdlets say `1.1.1.1` and `2606:4700:4700::1111`. A range with
+     **different** endpoints still throws, because collapsing it would
+     misstate what the rule covers.
+  3. *COM reads the local store, not what is in force* (next point). This one
+     cost the `Profiles` conversion.
+
+  Through every failing run the tab stayed correct: the reads still answered on
+  the cmdlet path. That is the fallback working as designed.
+
+- **`Profiles` was converted and reverted, and converted again.** *History,
+  kept because it is the reason for state D and for the sentinel; superseded by
+  the plan `2026-11-19-in-force-reads.md`.* The earlier rule ("do not convert
+  it again without a module-free read of the ActiveStore") was met: the CIM
+  operation option is that read, measured above. What follows is the experiment
+  that disproved COM. The first fast path took the in-force value
+  from COM, believed to read the ActiveStore because COM said `Allow` where the
+  PersistentStore said `NotConfigured`. That only shows COM is not the
+  configured store; a COM that reads the local store and resolves
+  `NotConfigured` to its default answers the same. The two diverge only where a
+  group policy sets a different value, and `Set-NetFirewallProfile -PolicyStore
+  $env:COMPUTERNAME` (the local GPO store) builds that:
+
+  | Store | Domain outbound |
+  |---|---|
+  | local GPO | `Allow` |
+  | PersistentStore | `Block` |
+  | ActiveStore (in force; the policy wins) | `Allow` |
+  | COM | `0` = `Block` |
+
+  `Compare` caught it on its own (`exit=1`, `profile Domain
+  DefaultOutboundAction`, fast `Block`, cmdlet `Allow`). On a host where a
+  policy sets outbound `Allow` while ISOLATED writes `Block` locally, the fast
+  path would have reported **closed** while the egress was **open**: the
+  defect this feature exists to prevent. `verified`, the ISOLATED band and
+  `startup_state` all rest on that value. The configured half from CIM was
+  correct, but the in-force half needs the cmdlets and so loads the module
+  anyway, so nothing was left to save. The pin test
+  `test_profiles_stays_on_the_cmdlets_because_com_reads_the_local_store_not_what_is_in_force`
+  held it (that test went with the second conversion). The VM was put back
+  afterwards (`NotConfigured` on all three profiles, an empty GPO store).
+
+- **`AllowOut` stays on the cmdlets, and the reason is not that it cannot be
+  done.** The earlier plan reverted it because raw CIM answers from the
+  PersistentStore, so rules a group policy puts into the ActiveStore would be
+  **missing from `allowed_out` entirely** (ISOLATED would report *closed* while
+  they still let traffic out). That reason is **superseded**: the CIM option can
+  read the ActiveStore (measured: **136 enabled outbound Allow rules, the same as
+  the cmdlet, with a group-policy rule's `PolicyStoreSourceType = 2`**). It stays
+  anyway for two reasons that hold: it would save **0.4 s on a call that never
+  appears in the steady-state load**, and it is **the verb where a mistake
+  reports *closed* while traffic still goes out**. Its correctness cannot get
+  better; it is right today. The pin test is
+  `test_allowout_stays_on_the_cmdlets_because_the_gain_does_not_pay_for_the_risk`.
+  (The old name of that test, "...because_cim_cannot_read_the_activestore", was
+  renamed because its sentence had become false.)
+
+- **How far "CIM cannot reach the ActiveStore" went, and where it ended.** Two
+  routes failed: a namespace (`root/standardcimv2/ActiveStore`, "Ungültiger
+  Namespace") and a query filter (`PolicyStore='ActiveStore'`, "Die Anfrage ist
+  ungültig"). The third, `-PolicyStore` as a CIM **operation option**, was the
+  one left unmeasured, and **it works**: the CDXML of the NetSecurity module
+  declares `<Option OptionName="PolicyStore">`, so it is the module's own
+  mechanism. Measured with a local GPO contradicting the stores:
+
+  | way | Domain | rules |
+  |---|---|---|
+  | no option | `4` = Block | 538 (PersistentStore) |
+  | option `ActiveStore` | `2` = Allow | 539 (in force) |
+  | option `PersistentStore` | `4` = Block | 538 |
+  | COM | `0` = Block | 538 (local) |
+  | cmdlets | ActiveStore Allow, Persistent Block | 539 / 538 |
+
+  `CimSession::Create($null)` fails ("Der Parameter ist ungültig"); that error
+  made this route look dead in the first measurement. `'.'`, a computer name and
+  `localhost` all work, and none loads a module.
+
+- **Measured after the in-force reads (this plan; VM, fresh process, idle).**
+  Per verb:
+
+  | verb | before this plan | now |
+  |---|---|---|
+  | `Profiles` | 1.16 s | **0.62 s** |
+  | `List` | 1.43 s | **0.65 s** |
+  | `Get` | 0.63 s | **0.53 s** |
+  | `AllowOut` | 1.69 s | 1.77 s (unchanged, on the cmdlets) |
+  | both stores by cmdlet, for comparison | 1.20 s | not applicable |
+  | a single cmdlet profile read (the module floor) | 1.08 s | not applicable |
+  | bare `powershell.exe -Command exit` | 0.37 s | not applicable |
+
+  **Steady state: the goal is NOT met.** The goal was a steady load below the
+  18 % from before this whole trail. Measured properly (VM settled for 60 s
+  first, CPU 0 %, one PowerShell process, three consecutive 100 s windows with
+  nothing but the tab's own poll pattern):
+
+  | window | calls | busy | per call |
+  |---|---|---|---|
+  | 1 | 6 (`Profiles` x4, `List` x2) | 23.2 % | 3.86 % |
+  | 2 | 3 | 15.1 % | 5.02 % |
+  | 3 | 5 | 17.7 % | 3.54 % |
+  | mean | n/a | **18.6 %** | 3.99 % |
+
+  All reads took the fast path in all three windows. Against **19.5 % with 6
+  calls** before this plan, that is **no improvement**.
+
+  **The earlier "11.0 % and 12.9 %" are withdrawn.** They were two single
+  windows with only **4** calls each, where the pre-change measurement had **6**;
+  they compared fewer calls with more calls. The three-window measurement above
+  supersedes them, and the "goal met" that was written on their strength was
+  wrong. It is the third time this trail's headline figure has been walked back.
+
+  The trail, as it stands: 42 % with 16 calls at the start, 18 % after `/rules`
+  stopped forcing a read, 19.5 % after the previous plan's reverts, and 18.6 %
+  now: no steady-state gain from this plan. Timings stay the proof that the
+  module was not loaded: 0.62 s and 0.65 s are far below the 1.08 s floor.
+
+  **What this plan did gain is real**, and shows wherever a call is on the
+  critical path. Controlled comparison, same machine, same launcher, nothing
+  else running; `AllowOut` serves as the old path, since its profiles still go
+  through the cmdlets in the same script:
+
+  | | new path (`Profiles`) | old path (`AllowOut`'s profiles) |
+  |---|---|---|
+  | three calls in sequence | 0.56 / 0.57 / 0.71 s | 1.72 / 1.97 / 2.10 s |
+  | three calls at once | 1.00 / 1.03 / 1.05 s | 2.55 / 2.56 / 2.57 s |
+
+  The per-call cost of the read itself roughly halved, alone and concurrent. The
+  VM has six cores, so this is not a one-core artefact. It lands on the panic
+  cut's profile check, the `cut_stands` poll every 10 s while isolated, and every
+  write's read-back. It did not lower the steady-state load; the next point says
+  why.
+
+  **Why the load does not follow: the launch, not the script.** Measured on the
+  VM, five runs each:
+
+  | started from | `cmd.exe /c exit` | `powershell.exe -NoProfile -NonInteractive -Command exit` |
+  |---|---|---|
+  | PowerShell | 0.02 s | 0.35 s |
+  | **Python** (as the app does) | **0.05 s** | **1.40 s** |
+  | Python, without `CREATE_NO_WINDOW` | n/a | 3.10 s |
+
+  And `-Op Profiles` through the app's own runner, from the app's own Python on
+  that VM: median **2.60 s**, where the same call started from PowerShell is
+  0.62 s.
+
+  Python's spawn machinery is not slow: `cmd.exe` costs 0.05 s from Python. What
+  is expensive is **`powershell.exe` started by `python.exe`**: 1.40 s against
+  0.35 s for the same bare command, a launch cost of about 1.05 s (the
+  difference of the two table cells) on every firewall call. Measured the other
+  way round, as a share: `-Op Profiles` through the app's own runner takes
+  2.60 s, and the bare launch from that same Python is 1.40 s in one run and
+  1.65 s in another — so **somewhere between half and two thirds of a call is
+  launch**, before the script runs a line. No change to the
+  script can touch it. That is why the tab's load barely moved for any
+  script-level work, and why the one large win in this trail, 42 % down to 18 %,
+  came from **removing** calls (the `/rules` cache), not from making them
+  faster. Leaving out `CREATE_NO_WINDOW` makes it worse (3.10 s), so that flag
+  stays.
+
+  **Hypothesis, not a fact:** Defender's real-time inspection of the launch.
+  `DisableRealtimeMonitoring` is `False` and `DisableScriptScanning` is `False`
+  on that VM, and `python.exe` spawning `powershell.exe` is exactly the
+  parent/child pattern a detonation chamber should watch closely. Confirming it
+  means changing Defender's configuration on a malware chamber. **That was not
+  done and needs the user's decision.**
+
+  **Next lead for anyone picking up the call budget:** the remaining
+  steady-state cost is in the launch, not in the script. The next step is either
+  **fewer launches** (as the cache did) or a **cheaper launch**. A resident
+  process remains rejected for the reasons already recorded.
+
+  A round trip afterwards: the cut closed (`out=000`, loopback 200), converged
+  to `isolated` with `verified=True`, left cleanly, the firewall came back to
+  `NotConfigured` on all three profiles, no TDC rules were left, and the network
+  was back at 200.
+
+- **History: measured after the first `Profiles` revert** (VM, fresh process,
+  three runs each; **superseded by the figures above**). The "all-cmdlet equivalent" column is the same verb done entirely through
+  the cmdlets, measured in the same re-run; it is what the verb would cost
+  without any of this work.
+
+  | verb | now (mean; min) | all-cmdlet equivalent | where the cost sits |
+  |---|---|---|---|
+  | `Profiles` | 1.16 s (min 1.07) | 1.08 s | a single cmdlet profile read; nothing gained |
+  | `List` | 1.43 s (min 1.34) | 1.70 s | profile + all rules; saves 0.27 s |
+  | `Get` | **0.63 s** (min 0.56) | 1.08 s, the floor for anything that loads the module | module-free; saves 0.45 s |
+  | `AllowOut` | 1.69 s (min 1.57) | 1.70 s | unchanged; not converted |
+  | bare `powershell.exe -Command exit` | 0.37 s | not applicable | the process start alone |
+
+  Steady state, 100 s of a watching tab:
+
+  | | before this work | now |
+  |---|---|---|
+  | calls | 5 | **6**: `Profiles` x4, `List` x2 |
+  | `powershell.exe` busy | 18 % | **19.5 %** of one process |
+
+  Fallbacks in the 100 s window were not recorded for this run.
+
+  **The performance goal of that work was not met** (nor by the plan above, see the measurement there). The aim was a quiet
+  steady state, and it is not: the watching tab sat at 18 % before and sits at
+  19.5 % now. The two reads that dominate it have to load the module for
+  correctness: `Profiles`, because COM reads the local store rather than what is
+  in force, and `List`, because it returns the profiles too. They cannot move
+  without a module-free read of the ActiveStore (see below), which does not
+  exist. An earlier figure of 2 calls and 3.3 % was measured while `Profiles`
+  was still converted; it described a read that was wrong and is withdrawn.
+
+  What was gained instead, stated as plainly as the miss:
+
+  1. **`Get` is module-free: 0.63 s against a 1.08 s floor.** It is the read
+     `cut_stands` makes every 10 s while isolated, and the read-back of every
+     write, so the 0.45 s lands where responsiveness matters most.
+  2. **`List` saves 0.27 s**, riding on machinery `Get` already pays for.
+  3. **`Compare` exists.** In this one plan it caught: CIM returning the action
+     as a name rather than a number; COM writing a single address of either
+     family as a range to itself; and the mistaken claim that COM reports what
+     is in force, which a local-GPO experiment then disproved. Without it, a
+     later "let's just use COM" would have shipped the defect that reports
+     *closed* while the egress is open.
+  4. **Reverting `AllowOut` and `Profiles` is itself a result.** Both are
+     pinned by tests named for the reason, so the trap is documented where
+     someone would walk into it.
+
+  For the longer context: the same tab sat at **42 % with 16 calls per 100 s**
+  before `/rules` stopped forcing a read. That was a different and much larger
+  win, and it is the one that holds.
+
+  **The timings are also the proof of whether the module was loaded.** Anything
+  that loads it costs about 1.08 s here (0.37 s bare), so a verb answering in
+  0.63 s cannot have loaded it. A separate module check is not needed, and an
+  attempt to make one by inspecting a child process is meaningless: the child's
+  module state is gone when it exits.
+
+- **Mappings now confirmed** (they can leave the unconfirmed list), all against
+  the cmdlet truth in the policy state:
+  - CIM `DefaultOutboundAction` `0` = NotConfigured, `2` = Allow, `4` = Block,
+    **all three**;
+  - CIM profile `Enabled` `0` = false, `1` = true, measured with the Public
+    profile's firewall switched off (not the WMI convention 1/2);
+  - `PolicyStoreSourceType` **`2` = GroupPolicy** (only `1` = Local was known);
+  - **the Local / GroupPolicy split for rules**, which this handover used to
+    list as unprovable on this VM: with one local GPO rule, the cmdlets report
+    ActiveStore 539 and PersistentStore 538, the rule's source `GroupPolicy`.
+    That limit is struck;
+  - **COM does not see a group-policy rule** (538 with and without the policy
+    rule standing), which confirms the note next to the COM rule reader.
+
+- **What this VM still cannot prove.**
+  - **Mapped but not confirmed by `Compare`.** These values are **in** the
+    maps, so they are read on the fast path and passed through; no `Compare`
+    run has held them up against the cmdlets, because no TDC rule in the six
+    states had them (protocol `17`, UDP, is **confirmed** now: state A above):
+    - rule Direction `1` (Inbound);
+    - profile masks `1` to `6` (a rule on one or two profiles);
+    - Action `1` (Allow) on a rule, which `allow_fetch` writes and `_write`
+      verifies through `Get`, so over COM;
+    - `Enabled` false, a disabled rule.
+
+    *Check:* a `Compare` run with an `allow_fetch` rule and a disabled TDC rule
+    standing; one hand-made rule on one profile covers the
+    masks.
+
+### Blocking
+
+- **A running connection starves when it is blocked.** The toast says so ("a
+  running connection should starve; it gets no reset"), assuming Windows
+  re-checks an established flow against a new Block filter. *Check:* start a
+  long download from a test host (`curl.exe -o NUL --limit-rate 50k
+  http://<test host>/big.bin`), block that endpoint from the tab, and the
+  transfer must stall within a few seconds. *If wrong:* a block only stops new
+  connections, the toast over-claims on every block, and the text must say so.
+- **Detection to confirmed block.** A verified block is three to four PowerShell
+  launches (Create with its own profile check, Get, Profiles, the List after it)
+  behind `_fw_decision_lock`, after the 1 s tick (10 s for PowerShell script
+  blocks) that saw the URL. *Check:* with ASK on All, note the time of a
+  cradle's connection in LOGS and the `created_at` of its decision and of the
+  block's read back in DECISIONS; put the number next to the README's "up to
+  about ten seconds". *If longer:* the README states the real figure.
+
+### The guarded fetch
+
+- **`route print -4`'s columns.** The default gateway is taken from the line
+  that starts with `0.0.0.0` (destination, mask, gateway, interface, metric).
+  *Check:* `firewall_fetch.own_addresses(refresh=True)` in the web UI's Python
+  contains the gateway (`ipconfig` shows it). *If wrong:* the gateway is not
+  refused as a fetch target. The private-address refusal still covers it unless
+  `TDC_FIREWALL_FETCH_LAN=1` is set.
+- **`socket.getaddrinfo(socket.gethostname())` answers locally.** In ISOLATED
+  DNS is blocked; if this call goes to DNS it can take a while. It runs at
+  start-up and at most every 5 minutes, off the fetch's own deadline. *If slow:*
+  a fetch that refreshes the list can be late.
+
+### The secured samples and Defender
+
+- **The Defender exclusion for `C:\tdc\samples`.** The web UI runs
+  `Add-MpPreference -ExclusionPath C:\tdc\samples` at every start
+  (`_ensure_capture_dir`), and only logs a failure. Tamper Protection, a
+  policy-managed Defender or a Defender service that is not running can refuse
+  it quietly. *Check:* after a web UI start, `Get-MpPreference | Select
+  -ExpandProperty ExclusionPath` lists `C:\tdc\samples`; then let TDC fetch an
+  EICAR test file and check that the file is still in
+  `C:\tdc\samples\<sha256[:2]>\` a minute later, and that
+  `GET /api/firewall/capture/<id>` says `exists: true`. To get one: on the host,
+  `printf '%s' 'X5O!P%@AP[4\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*' > eicar.exe`
+  and `python3 -m http.server 8081` in that directory; start the web UI with
+  `TDC_FIREWALL_FETCH_LAN=1` (the host is a private address, refused
+  otherwise), set ASK to All, and in the VM run
+  `powershell -c "iwr http://<host ip>:8081/eicar.exe -OutFile $env:TEMP\e.exe"`;
+  answer CUT + FETCH. Unset `TDC_FIREWALL_FETCH_LAN` afterwards. *If wrong:*
+  Defender quarantines every fetched stage-2, which is the one output of the
+  download path; the capture's metadata stays, its file is gone, and nothing
+  says why. Add the exclusion by hand or by policy.
+- **Other EDRs.** The exclusion is Defender's only. An EDR under test (the
+  reason TDC exists) may quarantine or delete files in `C:\tdc\samples`
+  regardless. *Check:* the same EICAR run with each EDR the lab uses installed.
+  *If wrong:* that EDR's runs lose their captures; give it an exclusion of its
+  own, or say in the run's notes that captures are not kept under it.
+
+### Load and policy
+
+- **The collector's process load.** Every process TDC starts for the tab, and
+  how often:
+  - `wevtutil` for Sysmon (EID 1, 3, 22) and the BITS log every second during a
+    detonation window, every 10 s outside one; the PowerShell log every 10 s
+    (the firewall log is a file read, no process).
+  - `powershell -Op List` (the TDC rules): at most once a minute through the
+    cache (`FIREWALL_RULES_TTL_S`, shared by LIVE ticks, `/summary`, every tab's
+    `/pending` poll and the sweep), plus one forced read by `/rules` on every
+    slow tick of LIVE (every 30 s), and once after each block, unblock,
+    decision, fetch rule, ISOLATED switch or TURN THE FIREWALL ON. While
+    ISOLATED is on, the sweep's own `List` once a minute too.
+  - `powershell -Op Profiles`: at most once a minute for `GET /isolate`, every
+    10 s while ISOLATED is on or after an error, and fresh in every enforcement
+    route.
+  - `powershell -Op AllowOut`: every 10 s while ISOLATED is on, in stages
+    `isolated` and `cut_policy`.
+  - `powershell -Op Get` of the cut rule: in stages `cut` and `cut_policy`, once
+    per 10 s for `GET /isolate` when neither the press's read-back nor the rule
+    list is younger than that.
+  - Per decision: Create, Get, Profiles and the List after it.
+  None was measured. *Check:* during a detonation with the tab open on LIVE and
+  a second browser tab open, watch the web UI's Python and its children for a
+  minute (Task Manager, or `Get-Process wevtutil, powershell`). **Too high**
+  is more than 10 % of one core for the web UI's Python with its children,
+  averaged over that minute, or more than one `powershell.exe` started per
+  10 s on average with no decision open. *If too high:* the sample runs on a
+  busier box than it would, and timing-sensitive samples may notice; the fast
+  tick's sources can be split further (`firewall_store.py`).
+- **Classifying a full window.** `/connections` and `/summary` each classify
+  the whole range (the beaconing test per flow) and read `captures.json`
+  twice. *Check:* with range All and the ring near its 50 000 connections, time
+  `GET /api/firewall/connections?max=5000`. **Too slow** is more than 1 s:
+  LIVE then overlaps itself.
+- **TURN THE FIREWALL ON under a managed profile.** `Set-NetFirewallProfile
+  -Enabled True` may be overridden by a GPO. What the route then does has not
+  been seen: the expectation is a 500 with the profiles still off, which the
+  band shows. *Check, on a VM without a GPO:* switch one profile off in Windows
+  Defender Firewall, press TURN THE FIREWALL ON once, and see the red band go.
+  *Open question, only on a VM with a firewall GPO:* does the route answer 500
+  and does the band stay? If it answers 200 with a profile still off, the
+  route's read back is wrong.
+
+### Deploy
+
+- **`make deploy` while the web UI runs** overwrites `webui\data\*.idx`
+  (Section 1). *Check once:* deploy twice in a row with the web UI running; no
+  upload of an `.idx` fails, and `%TEMP%\tdc-geoip` (as SYSTEM:
+  `C:\Windows\Temp\tdc-geoip`) holds one copy of each index. *If wrong:* the
+  deploy of the index fails while the web UI runs, and a new index needs the
+  web UI stopped first.
+
+## 4. Limits that are by design, not bugs
+
+So that nobody files them:
+
+- **No byte counts.** Sysmon has none; the tab counts connections and firewall
+  records (Part B's proxy would add them).
+- **Seen after the fact.** During a detonation Sysmon and BITS are read every
+  second, PowerShell and the firewall log every 10 s; outside one, everything
+  every 10 s. A download in a PowerShell script needs the URL and the
+  connection, so a cradle can be found, and its loader blocked, up to about
+  10 s after the connection. A download decision blocks first and asks then. A
+  compiled loader that calls WinHTTP shows no URL.
+- **A Windows Update BITS job during a detonation counts as the detonation's.**
+  The BITS log does not name who asked, so a BITS job for an executable while a
+  submission runs is `in_detonation`; under ASK `Detonation` its `svchost.exe`
+  gets a block to that address and a decision is opened. Deliberate: without it
+  BITS (T1197) would be invisible as a download path. Update hosts that TDC
+  knows are never asked about.
+- **Loopback cannot be blocked.** Windows Firewall does not filter loopback
+  (seen on the VM: a "verified" rule for curl.exe to 127.0.0.1 let curl through
+  with HTTP 200), so TDC refuses a block on `127.0.0.0/8` or `::1`, for one
+  program and for all, and a download from a loopback address opens a decision
+  whose block says why it was not written. To stop such a process: block it
+  everywhere, or KILL it.
+- **"blocked" ignores the protocol.** A tcp rule makes a udp flow to the same
+  endpoint read as blocked; the UI shows the rule's protocol beside the claim.
+- **ISOLATED's residual.** While a fetch runs, anything that can run the web
+  UI's Python could reach that one address for those seconds. An outbound
+  Allow rule a group policy sets cannot be switched off locally; it is named in
+  the band and in `allowed_out`, and the cut rule then stays (stage
+  `cut_policy`): closed and `verified`, but no fetch gets through.
+- **ISOLATED changes what the EDR under test can do.** No cloud lookups, no
+  telemetry upload: compare its verdicts only with other isolated runs.
+- **A loader that runs as TDC's base Python is never blocked**, because a block
+  on that program would cut TDC's own fetch off; its toast says NOT confirmed.
+- **The MCP server only reads** (`tdc_firewall_connections`,
+  `tdc_firewall_captures`): no tool blocks, isolates, decides, kills or turns
+  the firewall on.
+- **A disabled or narrowed `TDC-FW-ISO-cut` can outlive a cleared marker.** At
+  start-up, a marker with no profile on Block and a cut rule of the wrong shape
+  is read as stale: the marker is cleared and that rule stays. It opens nothing
+  (a disabled rule blocks nothing, a narrowed one only part of the egress), the
+  old code did the same, and the next press repairs it in place.
+
+## Offener Punkt: die Aufruf-Bilanz des Tabs (gefunden beim Panikschnitt)
+
+Das Aufruf-Log (`webui/logs/firewall-calls.log`, eine Zeile je
+PowerShell-Aufruf mit Verursacher, Wartezeit auf die Sperre, Laufzeit und
+Exit-Code) hat beim ersten VM-Lauf des Panikschnitts etwas aufgedeckt, das
+**nicht** zu diesem Feature gehört, sondern zum ganzen FIREWALL-Tab:
+
+- `GET /api/firewall/isolate` löst `Profiles` **und** `AllowOut` aus — gemessen
+  3,5–7,2 s bzw. 6,1 s.
+- `GET /api/firewall/connections` und `/rules` lösen je ein `List` aus — 3,5–9,4 s.
+- Die Oberfläche fragt im LIVE-Betrieb **alle 5 Sekunden**.
+
+Die Abfragen sind damit teurer als ihr Intervall. Mehrere `powershell.exe`
+laufen dauernd gleichzeitig und bremsen sich gegenseitig: dieselbe Operation
+kostet allein 2,44 s und unter dieser Last 7,29 s. Gewartet wird dabei auf
+**keine** Sperre (`wait_ms=0.0`) — es ist reine Gleichzeitigkeit.
+
+Folgen, die man sieht: der Panikdruck braucht auf einer ruhigen Maschine
+einstellige Sekunden und unter Last bis 17 s, obwohl der Schnitt selbst 2,44 s
+ist. Und jede Zahl, die die Oberfläche über Zeiten verspricht, hängt an dieser
+Bilanz.
+
+Was dagegen zu tun wäre (eigene Arbeit, nicht Teil des Panikschnitts):
+
+1. Eine Abfrage darf nicht synchron auf einem PowerShell-Aufruf warten. Der
+   Zustand liefert, was bekannt ist, mit seinem Alter („vor 8 s gelesen"), und
+   ein Hintergrund-Auffrischer hält ihn aktuell.
+2. `Profiles`, `AllowOut` und `List` teilen sich einen Cache mit einem
+   gemeinsamen Auffrischer, statt dass drei Routen sie unabhängig anfordern.
+3. Nie zwei gleiche Aufrufe gleichzeitig: wer schon unterwegs ist, wird
+   abgewartet, nicht verdoppelt. Das gilt auch für das `Get` der Schnitt-Regel,
+   das dieser Branch hinzugefügt hat (siehe unten): es ist **je Anfrage**, nicht
+   je Server — zwei gleichzeitige `GET /isolate` starten je eines, mit N offenen
+   Tabs also bis zu N in einem 10-s-Fenster.
+4. Erst danach ist eine Zielzahl für den Druck wieder sinnvoll — und sie lässt
+   sich dann aus dem Log belegen.
+5. **Die Konvergenz hält `_LOCK` für ihren ganzen Lauf** (gefunden im
+   Abschluss-Review, breiter als der Abschnitt „To watch, not to assert" oben
+   ihn beschreibt). Hinter ihr warten nicht nur die Frist einer Entscheidung und
+   ein neu erkannter Download, sondern auch die Antwort eines Analysten (CUT
+   ONLY / ALLOW) und ein manuelles `/block` — und der Tab ist in der Minute nach
+   einem Druck blind, denn die Konvergenz dauert gemessen 59,3 s. Es öffnet
+   nichts (der Schnitt steht), kostet aber Sicht und Handlung genau dann, wenn
+   ein Ausbruch läuft. *Vorgeschlagene Richtung:* eine eigene Sperre „ein
+   Isolations-Lauf" für die Exklusivität gegen Druck und Verlassen, und `_LOCK`
+   nur noch **je Schritt** nehmen, damit ein `block()` zwischen zwei Schritten
+   der Konvergenz durchkommt. Nicht umgesetzt.
+6. **Der Regel-Cache kennt keine Generation, und `_fw_rules()` hält seine Sperre
+   über das ganze `List`** (zwei geparkte Befunde, ein Mechanismus, ein Fix).
+   Eine Abfrage, die ihr `List` vor einem Schreiben begann und nach dem Leeren
+   des Caches ablegt, legt einen veralteten Stand ab; zusammen mit einem
+   `cut()`, der nach dem Schreiben scheitert, oder einem gescheiterten
+   Speichern von `stage` ist das ein (doppelt bedingtes) Überbehaupten. Und
+   jeder Leser des Caches — auch `GET /isolate` über `_fw_cut_rule_listed` —
+   wartet hinter einem laufenden `List` (3,5–9,4 s). *Richtung:* ein
+   Generationszähler, den jedes Vergessen erhöht und den ein `List` beim Ablegen
+   prüft; dann kann die Sperre vor dem Aufruf losgelassen werden.
+   *Größe des Fensters seit der Änderung der Aufruf-Bilanz — falls es überhaupt
+   auftritt:* für die Schreiber in den Routen (`block`, `unblock`, Druck,
+   Verlassen) ließ es sich nicht herstellen: ihr Vergessen kommt nach dem
+   Schreiben und nimmt die Sperre, die das `List` hält, es räumt also auch einen
+   gerade abgelegten Stand. Möglich scheint es nur im Fenster der Konvergenz
+   (die Schritte schreiben, ein `List` liest zwischendurch, vergessen wird erst am
+   Ende des Workers; gemessen ~59 s). Dann hielt ein so abgelegter veralteter
+   Stand vorher höchstens ~30 s (der erzwungene Abruf von `/rules` heilte ihn);
+   jetzt bis zu einer TTL, 60 s, oder bis zum Ende des Workers, was früher
+   kommt, und `can_fetch` kann in dieser Zeit `true` zeigen. Nur Anzeige
+   (Entscheidung und Frist lesen mit `force=True`); `verified` ist nicht
+   betroffen.
+
+**Von diesem Branch hinzugefügt — nach dem Fix messen.** Der Panikschnitt hat
+selbst zur Bilanz beigetragen; jeder dieser Punkte ist einzeln begründet, aber
+keiner ist unter Last gemessen:
+
+- Die Isolate-TTL von 10 s: solange isoliert wird, `Profiles` alle 10 s, und in
+  `isolated` und `cut_policy` zusätzlich `AllowOut` (~6 s) alle 10 s.
+- `GET /isolate` wartet jetzt über `_fw_cut_rule_listed` auf `_fw_rules_lock`,
+  also hinter jedem laufenden `List`.
+- Ein zweites `Profiles`-Lesen, wenn der Profil-Cache aus `_fw_keep_profiles`
+  kam (dort fehlt die Default-Aktion, die `verified` in `isolated` braucht).
+- `_fw_fetch_refusal` erzwingt bei jeder `block_fetch`-Entscheidung ein `List`.
+- *(Nach dem Abschluss-Review hinzugekommen.)* In `cut` und `cut_policy` ein
+  `Get` der Schnitt-Regel alle 10 s für `GET /isolate`, wenn weder die
+  Rücklesung des Drucks noch die Regelliste jünger ist — damit `verified` dort
+  nicht auf einer einmaligen Rücklesung ruht. Billiger ginge es, wenn `Profiles`
+  den Zustand der Schnitt-Regel im selben Prozess mitliefert (kein zweiter
+  Modul-Start); das ist eine Änderung an `firewall_rules.ps1` und gehört zu
+  diesem Punkt.
+
+**Vorher gemessen, nachher wieder messen:** `Cut` allein 2,44 s; `Cut` im Druck
+unter Last 7,29 s; Druck insgesamt 9,9–16,9 s; Wartezeit auf Sperren 0 ms.
+
+### Aufruf-Bilanz, gemessen je Route (VM)
+
+Jede Route des Tabs einzeln, auf der echten VM, kalt und gleich danach. Ein
+PowerShell-Aufruf gegen das NetSecurity-Modul kostet dort 2,4–3,5 s. Die Zahlen
+der Tabelle stammen von **vor** der Änderung; die Zeile `/summary` ist nach einer
+späteren Messung richtiggestellt.
+
+| Route | Dauer je Aufruf | PowerShell |
+|---|---|---|
+| `/api/firewall/isolate` | 0,01–0,17 s | **0 Aufrufe** (Cache-Treffer) |
+| `/api/firewall/connections` | 0,85 s warm | **0 Aufrufe** warm (kalt: `Profiles` + `List`) |
+| `/api/firewall/captures` | 0,02 s | **0 Aufrufe**, reiner Speicher |
+| `/api/firewall/pending` | 0,02 s | kostenlos |
+| `/api/firewall/summary` | 0,45–0,49 s (allein, zweimal im Abstand von 70 s) | **0 Aufrufe**, beide Male |
+| `/api/firewall/rules` | 3,37 s, dann 4,26 s | **1 `List` bei jedem Aufruf** (`_fw_rules(force=True)`) |
+
+**Korrektur: `/summary` hat nie gelesen.** Eine frühere Fassung dieser Tabelle
+schrieb `/summary` „1 `List` bei jedem Aufruf“ zu (2,75 s, dann 3,24 s). Das war
+falsch: `/summary` erzwingt nichts und liest die Regelliste nicht selbst. Das
+`List` in seinem Zeitfenster war das erzwungene Lesen von `/rules`; die
+Oberfläche schickt beide im selben `Promise.all` los, und die erste Messung rief
+sie unmittelbar nacheinander auf. Dass `/summary` 2,75–3,24 s brauchte, lag daran,
+dass es auf der Sperre des Regel-Caches hinter diesem `List` wartete. Allein
+gemessen: 0 Aufrufe. Auch die 14 `List` der „16 Aufrufe“ kamen alle aus `/rules`
+— aber aus einem Messaufbau, der `/rules` öfter abfragte als der Tab es tut: er
+rief es in der Taktschleife **und** in einer eigenen Einzelsonde im selben
+Fenster auf, und frühere Läufe hatten Browser-Tabs gegen denselben Server
+offen. Der Tab allein (ein Aufruf je 30 s) ergäbe deutlich weniger; die
+Zahl 16 ist keine Tab-Zahl, und eine Rechnung „vier Abfragen = vierzehn `List`“
+gibt es nicht.
+
+- **Die beiden 5-Sekunden-Abfragen (`/isolate`, `/pending`) sind kostenlos**,
+  jedenfalls je Aufruf: Cache-Treffer. (Was `/isolate` über 100 s doch kostet,
+  steht unten.)
+- **`/captures` und `/pending` sind kostenlos.** Sie träge zu laden spart nichts.
+
+**Die Änderung:** `/rules` nimmt den Regel-Cache (`FIREWALL_RULES_TTL_S = 60`)
+statt zu erzwingen. Das ist sicher, weil jeder Weg, der eine Regel ändert
+(`block`, `unblock`, der Druck, das Verlassen, die Regeln des Abrufs), den Cache
+selbst vergisst: er kann nichts zeigen, was TDC getan hat, nur eine Änderung
+von außen bis zu einer TTL verspätet. Was durchsetzt (Entscheidung, Frist,
+`_fw_fetch_refusal`), liest weiter mit `force=True`. `/summary` brauchte keine
+Änderung.
+
+**Vorher/nachher, gemessen:** 100 s im Dauerbetrieb des Tabs, niemand drückt
+etwas (das „vorher“ stammt aus dem oben beschriebenen Messaufbau, der `/rules`
+häufiger abfragte als der Tab; der Vergleich überzeichnet die Ersparnis des
+Tabs allein).
+
+| | vorher | nachher |
+|---|---|---|
+| Aufrufe | 16 | **5** |
+| `List` | 14 (alle `/rules`) | **2** (beide `/connections`, mit eigener TTL) |
+| `Profiles` | 2 | 3 (alle `/isolate`) |
+| `powershell.exe` ausgelastet | 42 % | **18 %** |
+
+Vorhergesagt waren 1–2 `List` je 100 s (eingetroffen) und 3–6 % Auslastung
+(zu niedrig: die drei `Profiles` von `/isolate` sind schwerer als angesetzt).
+
+**Der verbleibende Verbrauch** (nicht Teil dieser Änderung, nicht umgesetzt):
+
+- 2 `List` aus `/connections`: rechtmäßig, es liest mit seiner eigenen TTL.
+- 3 `Profiles` aus `/isolate` in 100 s bei einer TTL von 60 s. Eines davon ist das
+  doppelte Lesen: `_fw_keep_profiles` legt die Default-Aktion (`blocking`) als
+  unbekannt ab, `verified` verlangt sie, also liest der Zustand die Profile
+  beim nächsten `GET` noch einmal. *Richtung, eine Zeile:* `_fw_keep_profiles`
+  hält `blocking` mit, statt `None` abzulegen.
+
+**Der Regel-Cache ist jetzt bis zu einer TTL (60 s) alt, wo er vorher durch den
+erzwungenen 30-s-Abruf nie älter als ~30 s war.** Das betrifft alles, was ihn
+liest, ohne zu erzwingen, und das sind vier Oberflächen, die größten zuerst:
+
+- **`/connections`** (alle 5 s): `flow["state"] = "blocked"` kommt aus
+  `ctx.rules` (`_firewall_context` → `firewall.classify`). Das ist die
+  Hauptliste des Tabs.
+- **`/summary`**: dieselbe Liste wird zur Zahl der **BLOCKED-Kachel**
+  (`firewall.summarize`).
+- `/pending` (`can_fetch`) und `GET /isolate` (`can_fetch` über
+  `_fw_cut_rule_listed`, das nicht einmal das Alter prüft).
+
+**Eine Regel, die außerhalb von TDC entfernt wurde, steht damit bis zu 60 s
+weiter als „blocked“ in der Liste und in der BLOCKED-Kachel.** Das ist gewollt
+(60 s ist die Anzeige-TTL, es verspätet nur, was TDC nicht selbst getan hat, und
+alles, was durchsetzt, liest mit `force=True`), aber es muss hier stehen. Die
+Obergrenze ist 60 s: bei offenem Tab lesen `/connections` und `/pending` alle
+3–5 s den Cache, ein abgelaufener wird also sofort erneuert. Zu Punkt 6 oben: in dieser Zeit kann außerdem
+`can_fetch` `true` zeigen, wo die Entscheidung selbst (mit `force=True`)
+ablehnen würde. Nur Anzeige: nichts wird daraufhin getan.
+`verified` ist davon nicht betroffen: ein Cache-Treffer erneuert die Rücklesung
+der Schnitt-Regel nicht (Test:
+`test_a_cached_rule_list_never_renews_the_read_back_of_the_cut`).
+
+**Ein Fehler wird ebenfalls eine ganze TTL lang gemerkt.** `_fw_rules` kennt
+keine kürzere Fehler-TTL wie `FIREWALL_PROFILES_ERROR_TTL_S = 10`: ein einmaliges
+Scheitern des `List` zeigt sich bis zu 60 s statt ~30 s. Eine kürzere Fehler-TTL
+wäre eine Zeile, ändert aber die Aufrufzahl bei dauerhaftem Fehler (bis zu
+6 statt 1 Aufruf je Minute, jeder hinter der Sperre) — eine Entscheidung, keine
+Nebensache.
+
+**Entscheidung: keine kurze Fehler-TTL für den Regel-Cache.** Bei einem
+*dauerhaften* Fehler wären das bis zu 6 scheiternde `List` je Minute zu je
+~3 s, jedes unter `_fw_rules_lock`, hinter der `GET /isolate` wartet: der Pfad,
+der schnell sein muss, würde genau dann ausgehungert, wenn der Analyst ihn am
+dringendsten braucht. Ein einmaliger Fehler, der bis zu 60 s steht, ist der
+billigere Fall: der Tab sagt ehrlich, dass die Regeln nicht gelesen werden
+konnten, und nichts behauptet daraufhin eine Schließung. Beim Profil-Cache ist
+es umgekehrt, deshalb hat er `FIREWALL_PROFILES_ERROR_TTL_S = 10`: dort speist
+ein veralteter Wert eine Aussage darüber, ob überhaupt etwas durchgesetzt wird.
+Die Lücke ist also gewollt, nicht übersehen; bitte nicht „nachziehen".
+
+**Gemessen und verworfen: träges Laden der 30-Sekunden-Routen.** Vorgeschlagen
+war, `/captures`, `/pending`, `/rules` und `/summary` erst bei Bedarf zu laden.
+Das bringt nichts: `/captures` und `/pending` kosten **keinen** PowerShell-Aufruf
+(0,02 s, reiner Speicher), `/summary` ebenfalls keinen (0 Aufrufe, 0,45–0,49 s),
+es gibt dort nichts zu sparen. `/rules` und `/summary` speisen immer sichtbare
+Teile der Seite — die Schalter im Prozessbaum und die ganze rechte Spalte —, sie
+ließen sich nicht aufschieben, ohne etwas, das auf dem Bildschirm steht, leer zu
+lassen. Der teure Teil war nicht der Zeitpunkt des Ladens, sondern das
+erzwungene Lesen in `/rules`; das ist behoben (16 → 5 Aufrufe, 42 % → 18 %, im Messaufbau oben).
+**Nicht erneut vorschlagen.**
+
+### Stand nach den Lesevorgängen in Kraft (gemessen, VM)
+
+Nachfolger des Abschnitts darunter; das dort verfehlte Ziel ist **auch hier
+nicht erreicht** (Messung unten). Der Plan `2026-11-19-in-force-reads.md` hat `Profiles` modulfrei gemacht (beide
+Stores über `-PolicyStore` als CIM-Operationsoption, mit einem Prüfstein je
+Aufruf), und damit auch `List`, das das Modul nur noch für seine Profilhälfte
+lud. `AllowOut` bleibt bei den Cmdlets.
+
+**Das Leistungsziel: nicht erreicht.** Das Ziel war eine Ruhelast unter den 18 %
+von vor dieser ganzen Spur. Sauber gemessen: VM zuvor 60 s beruhigt, CPU 0 %, ein
+PowerShell-Prozess, drei aufeinanderfolgende Fenster zu je 100 s, nichts außer dem
+eigenen Abfragemuster des Tabs:
+
+| Fenster | Aufrufe | ausgelastet | je Aufruf |
+|---|---|---|---|
+| 1 | 6 (`Profiles` ×4, `List` ×2) | 23,2 % | 3,86 % |
+| 2 | 3 | 15,1 % | 5,02 % |
+| 3 | 5 | 17,7 % | 3,54 % |
+| Mittel | n. z. | **18,6 %** | 3,99 % |
+
+In allen drei Fenstern nahmen alle Lesevorgänge den schnellen Weg. Gegen **19,5 %
+bei 6 Aufrufen** vor diesem Plan ist das **keine Verbesserung**.
+
+**Die früheren Angaben „11,0 % und 12,9 %“ sind zurückgezogen.** Es waren zwei
+einzelne Fenster mit nur **4** Aufrufen, die Messung davor hatte **6**; verglichen
+wurden weniger mit mehr Aufrufen. Die Dreifenstermessung oben ersetzt sie, und das
+auf ihnen geschriebene „Ziel erreicht“ war falsch. Es ist das dritte Mal, dass die
+Kennzahl dieser Spur zurückgenommen werden musste.
+
+Die Spur, wie sie steht: 42 % bei 16 Aufrufen am Anfang, 18 % nachdem `/rules` das
+erzwungene Lesen aufgab, 19,5 % nach den Rückbauten des Vorgängers, jetzt 18,6 %:
+dieser Plan hat die Ruhelast nicht gesenkt.
+
+**Was dieser Plan trotzdem gewonnen hat, und es ist echt:** der Preis des Lesens
+je Aufruf hat sich etwa halbiert. Kontrollierter Vergleich, dieselbe Maschine,
+derselbe Starter, nichts sonst in Betrieb; `AllowOut` dient als alter Weg, weil
+seine Profile im selben Skript noch über die Cmdlets laufen:
+
+| | neuer Weg (`Profiles`) | alter Weg (Profile von `AllowOut`) |
+|---|---|---|
+| drei Aufrufe nacheinander | 0,56 / 0,57 / 0,71 s | 1,72 / 1,97 / 2,10 s |
+| drei Aufrufe gleichzeitig | 1,00 / 1,03 / 1,05 s | 2,55 / 2,56 / 2,57 s |
+
+Allein wie gleichzeitig etwa halbiert. Die VM hat sechs Kerne, es ist also kein Ein-Kern-Artefakt.
+Das zeigt sich überall, wo ein Aufruf auf dem kritischen Pfad liegt: bei der
+Profilprüfung des Panikschnitts, beim `cut_stands`-Abruf alle 10 s, solange
+isoliert ist, und bei der Rücklesung jedes Schreibvorgangs. Die Ruhelast hat es
+nicht gesenkt; der nächste Punkt sagt, warum.
+
+**Warum die Last nicht folgt: der Start, nicht das Skript.** Neu und es erklärt
+die ganze Spur. Gemessen auf der VM, je fünf Läufe:
+
+| gestartet aus | `cmd.exe /c exit` | `powershell.exe -NoProfile -NonInteractive -Command exit` |
+|---|---|---|
+| PowerShell | 0,02 s | 0,35 s |
+| **Python** (wie die App) | **0,05 s** | **1,40 s** |
+| Python, ohne `CREATE_NO_WINDOW` | n. z. | 3,10 s |
+
+Und `-Op Profiles` durch den eigenen Runner der App, aus dem eigenen Python der App
+auf dieser VM: Median **2,60 s**, derselbe Aufruf aus PowerShell gestartet 0,62 s.
+
+Pythons Startmaschinerie ist also nicht langsam: `cmd.exe` kostet aus Python 0,05 s.
+Teuer ist **`powershell.exe`, von `python.exe` gestartet**: 1,40 s gegen 0,35 s für
+denselben nackten Befehl, ein Startpreis von etwa 1,05 s (Differenz der beiden
+Tabellenzellen) bei jedem Firewall-Aufruf. Als Anteil gerechnet: von den 2,60 s
+eines `Profiles`-Aufrufs über den Runner der App sind 1,40 s (in einem anderen
+Lauf 1,65 s) der nackte Start — also **zwischen der Hälfte und zwei Dritteln
+eines Aufrufs**, bevor das Skript eine Zeile tut. Keine Änderung am Skript kann ihn
+erreichen. Darum hat sich die Last des Tabs bei keiner Arbeit am Skript nennenswert
+bewegt, und darum kam der eine große Gewinn dieser Spur, 42 % auf 18 %, vom
+**Entfernen** von Aufrufen (dem `/rules`-Cache), nicht vom Beschleunigen. Ohne
+`CREATE_NO_WINDOW` wird es schlimmer (3,10 s), das Flag bleibt also.
+
+**Hypothese, kein Befund:** die Echtzeitprüfung von Defender beim Start.
+`DisableRealtimeMonitoring` ist auf dieser VM `False`, `DisableScriptScanning`
+ebenfalls, und `python.exe`, das `powershell.exe` startet, ist genau das
+Eltern/Kind-Muster, das eine Detonationskammer scharf beobachten sollte. Das zu
+bestätigen hieße, Defenders Konfiguration auf einer Malware-Kammer zu ändern. **Das
+ist nicht geschehen und braucht die Entscheidung des Nutzers.**
+
+**Nächste Spur für alle, die das Aufrufbudget weiterverfolgen:** die verbleibende
+Ruhelast sitzt im Start, nicht im Skript. Der nächste Schritt sind entweder
+**weniger Starts** (wie beim Cache) oder ein **billigerer Start**. Ein residenter
+Prozess bleibt aus den schon festgehaltenen Gründen abgelehnt.
+
+Je Verb, frischer Prozess, unbelastete VM:
+
+| Verb | vorher | jetzt |
+|---|---|---|
+| `Profiles` | 1,16 s | **0,62 s** |
+| `List` | 1,43 s | **0,65 s** |
+| `Get` | 0,63 s | **0,53 s** |
+| `AllowOut` | 1,69 s | 1,77 s (unverändert, Cmdlets) |
+
+Zum Vergleich: beide Stores per Cmdlet 1,20 s, ein einzelnes Cmdlet-Lesen der
+Profile (der Boden des Moduls) 1,08 s, ein nacktes `powershell.exe -Command
+exit` 0,37 s.
+
+**Die Pflichtprüfung auf der VM ist größer geworden** (Einzelheiten im Abschnitt
+„Reads without the NetSecurity module“ oben):
+
+1. **`Compare` in sechs Zuständen, alle Exit 0** — und darunter der, den es vorher
+   nicht gab: **eine lokale Gruppenrichtlinie, die dem lokalen Store
+   widerspricht** (Zustand D). Dort war in Kraft `Allow, Allow, Block`, konfiguriert
+   Domain `Block`; genau diese Spaltung hat COM falsch gelesen und hätte
+   „geschlossen“ gemeldet, während der Ausgang offen war. Die drei Zustände des
+   Vorgängers sind genau die, in denen COM wochenlang richtig aussah; sie ersetzen
+   ihn nicht.
+2. **Das JSON jedes Verbs lesen** (`Profiles`, `List`, `Get`, `AllowOut`), nicht
+   nur `Compare` laufen lassen. Grund: `Compare` übt die **Leser**, nicht die
+   **Zweige der Verben**, und der erste Beweislauf war grün, während `List`
+   `"profiles": null` lieferte (ein Schreibvorgang in den typisierten Parameter
+   `[string]$Profiles`; PowerShell unterscheidet Groß- und Kleinschreibung bei
+   Variablen nicht).
+3. **Keine DNS-Spur des Prüfsteins** (gemessen: keine nach 5 und nach 6
+   `Profiles`-Aufrufen).
+
+---
+
+### Stand nach den modulfreien Lesevorgängen (gemessen, VM)
+
+*Geschichte, durch den Abschnitt darüber überholt; die Zahlen stimmen für den
+Zustand nach dem ersten Rückbau von `Profiles`, ihre Folgerungen („nicht zu
+bewegen“, „gibt es nicht“) nicht mehr.*
+
+**Das Leistungsziel dieser Arbeit wurde nicht erreicht** (der Folgeplan hat es
+ebenfalls nicht erreicht, siehe oben). Der Tab im
+Dauerbetrieb, 100 s, niemand drückt etwas, nach dem Rückbau von `Profiles`:
+
+| | davor (18-%-Messung oben) | jetzt |
+|---|---|---|
+| PowerShell-Aufrufe je 100 s | 5 | **6** (`Profiles` ×4, `List` ×2) |
+| `powershell.exe` ausgelastet | 18 % | **19,5 %** von einem Prozess |
+
+Rückfälle auf die Cmdlets in diesem Fenster wurden nicht aufgeschrieben. Die
+frühere Angabe von 2 Aufrufen und 3,3 % stammt aus der Zeit, als `Profiles`
+noch umgestellt war; sie beschrieb ein Lesen, das falsch war, und ist
+zurückgezogen.
+
+Je Verb, frischer Prozess, je drei Läufe (Mittel; Minimum):
+
+| Verb | jetzt | Cmdlet-Entsprechung | Wo das Modul kostet |
+|---|---|---|---|
+| `Profiles` | 1,16 s (min. 1,07) | 1,08 s | ein einzelnes Cmdlet-Lesen der Profile; nichts gewonnen |
+| `List` | 1,43 s (min. 1,34) | 1,70 s | Profile + alle Regeln; spart 0,27 s |
+| `Get` | **0,63 s** (min. 0,56) | 1,08 s, der Boden für alles, was das Modul lädt | modulfrei; spart 0,45 s |
+| `AllowOut` | 1,69 s (min. 1,57) | 1,70 s | unverändert; nicht umgestellt |
+| nacktes `powershell.exe -Command exit` | 0,37 s | nicht zutreffend | der Prozessstart allein |
+
+**Warum sich die beiden Lesevorgänge, die den Ruhezustand bestimmen, nicht
+bewegen lassen:** beide müssen das Modul der Richtigkeit wegen laden. `Profiles`,
+weil COM den lokalen Store liest und nicht den gültigen (Abschnitt „Reads
+without the NetSecurity module“ oben); `List`, weil es die Profile mit
+zurückgibt. Ein modulfreies Lesen des ActiveStore, das beides ändern könnte,
+kannte man damals nicht; die CIM-Operationsoption war der eine ungemessene
+Weg, und sie trägt (siehe oben).
+
+**Was stattdessen gewonnen wurde**, so deutlich wie der Fehlschlag:
+
+1. **`Get` ist modulfrei: 0,63 s gegen einen Boden von 1,08 s.** Es ist das
+   Lesen, das `cut_stands` alle 10 s macht, solange isoliert ist, und das
+   Zurücklesen jedes Schreibvorgangs; die 0,45 s fallen also dorthin, wo
+   Reaktionsfähigkeit zählt.
+2. **`List` spart 0,27 s** und fährt auf Technik mit, die `Get` ohnehin bezahlt.
+3. **`Compare` gibt es.** Allein in diesem Plan hat es gefangen: CIM liefert die
+   Aktion als Namen statt als Zahl; COM schreibt eine einzelne Adresse beider
+   Familien als Bereich auf sich selbst; und die irrige Behauptung, COM melde,
+   was in Kraft ist, die ein Experiment mit dem lokalen GPO-Store widerlegt hat.
+   Ohne es hätte ein späteres „nehmen wir doch COM“ den Fehler ausgeliefert, der
+   „zu“ meldet, während der Ausgang offen ist.
+4. **Der Rückbau von `AllowOut` und `Profiles` ist selbst ein Ergebnis.** Beide
+   sind durch Tests gehalten, die nach dem Grund benannt sind; die Falle ist
+   dort dokumentiert, wo man in sie laufen würde.
+
+Zur Einordnung: derselbe Tab stand einmal bei 42 % und 16 Aufrufen je 100 s,
+bevor `/rules` aufhörte, ein Lesen zu erzwingen. Das war der andere, viel
+größere Gewinn, und er gilt. Welche Routen die sechs Aufrufe auslösten, ist
+nur als `Profiles` ×4 und `List` ×2 bekannt; `AllowOut` kam in der Messung nicht
+vor. Die Punkte 1 bis 6 oben bleiben eigene Arbeit; die Zielzahl für den Druck
+(Punkt 4) lässt sich aus dem Log neu belegen. Im Aufruf-Log hieß `via=fast` bei
+`List` damals nur „Regeln über COM“, nicht „ohne Modul“, und `Profiles` trug gar kein
+`via=`: ein `{'fast': n}` belegte keine modulfreien Aufrufe, außer bei `Get`.
+**Das gilt nicht mehr:** `Profiles` trägt jetzt `via=`, und bei `List` heißt `fast`
+nur, wenn beide Hälften schnell gelesen wurden, also ohne Modul; nur `AllowOut`
+trägt keins.
+
+**Verworfen: der residente PowerShell-Prozess.** Er wäre der größere Hebel
+gewesen (~0,2 s je Aufruf), aber:
+
+- Er stellt eine stundenlang lebende, **erhöhte** PowerShell-Sitzung in eine
+  Malware-Kammer, ein privilegiertes Ziel, das es heute nicht gibt: jeder
+  Aufruf ist ein kurzlebiges `powershell.exe -File` mit Argumenten.
+- Eine lange Sitzung sammelt Zustand (`$ErrorActionPreference`, Variablen,
+  Fehlerzustände), und dieser Zustand würde **zwischen Befehlen durchsickern**.
+  Heute beginnt jeder Aufruf frisch, und der nächste Befehl könnte der
+  Panikschnitt sein.
+- **Dieses Argument ist zurückgezogen.** Es lautete, die Messung habe ihn
+  unnötig gemacht, weil der Preis das Modul-Laden sei und ohne Modul die
+  Ruhelast bei 3,3 % liege. Die Ruhelast lag bei 19,5 %, weil die beiden
+  dominierenden Lesevorgänge das Modul laden mussten. Dass die Last mit dem
+  modulfreien Lesen sinkt, hat sich nicht bestätigt: gemessen liegt sie bei
+  18,6 %, weil der Start von `powershell.exe` aus Python den Aufruf bestimmt und
+  nicht das Modul (Abschnitt „Stand nach den Lesevorgängen in Kraft“). Die Ablehnung ruht allein auf den beiden
+  Punkten oben; sie tragen sie.
+
+**Nicht erneut vorschlagen.**

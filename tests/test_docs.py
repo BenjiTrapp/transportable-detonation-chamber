@@ -10,13 +10,20 @@ directory rules/network, which WinRM nests inside an existing one.
 """
 
 import ast
+import inspect
 import os
 import re
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DOCS = os.path.join(ROOT, "docs")
 README = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
 APP = open(os.path.join(ROOT, "webui", "app.py"), encoding="utf-8").read()
 HELP = open(os.path.join(ROOT, "webui", "templates", "index.html"), encoding="utf-8").read()
+
+
+def _doc(name):
+    """One page of the guide under docs/."""
+    return open(os.path.join(DOCS, name), encoding="utf-8").read()
 
 
 def _norm(path):
@@ -25,16 +32,40 @@ def _norm(path):
 
 ROUTES = {_norm(p) for p in re.findall(r'@app\.route\("(/api/[^"]+)"', APP)}
 
+# The API reference is these pages together. The RIZIN tab's 37 routes were 59%
+# of docs/api.md and the site caps a page at 100,000 characters
+# (test_site.py::test_the_index_is_fetched_not_inlined), so they have a page of
+# their own. A new route belongs on the page of its tab, and on exactly one.
+API_PAGES = ("api.md", "api-rizin.md")
 
-def test_readme_documents_every_api_route_and_nothing_else():
-    documented = {_norm(p) for p in re.findall(r"\|\s*[A-Z /]+\s*\|\s*`(/api/[^`]+)`", README)}
-    assert ROUTES - documented == set(), "routes missing from the README API reference"
-    assert documented - ROUTES == set(), "README documents routes that do not exist"
+
+def test_api_page_documents_every_route_and_nothing_else():
+    """The API reference moved from the README to docs/api.md; the promise is
+    the same one, against the new source: every /api/ route of webui/app.py has
+    exactly one row there, and no row names a route that does not exist.
+
+    It now spans the pages of API_PAGES, and the promise is their union: one row
+    for a route, on one of them, never on both."""
+    rows = []
+    for name in API_PAGES:
+        assert os.path.isfile(os.path.join(DOCS, name)), \
+            "docs/%s is missing: the API reference is the pages of API_PAGES" % name
+        rows += [(m.strip(), _norm(p)) for m, p in
+                 re.findall(r"\|\s*([A-Z /]+?)\s*\|\s*`(/api/[^`]+)`", _doc(name))]
+    documented = {p for _, p in rows}
+    assert ROUTES - documented == set(), "routes missing from the API reference"
+    assert documented - ROUTES == set(), "the API reference documents routes that do not exist"
+    # one row per method and route - a route with two methods has two rows
+    twice = sorted(r for r in set(rows) if rows.count(r) > 1)
+    assert twice == [], "the API reference has more than one row for %s" % twice
 
 
-def test_readme_documents_each_network_route_exactly_once():
+def test_api_page_documents_each_network_route_exactly_once():
+    # The API reference moved from the README into the pages of API_PAGES (main's
+    # restructure); the network routes are held there, one row each, like the rest.
+    lines = "\n".join(_doc(name) for name in API_PAGES).splitlines()
     for route in sorted(r for r in ROUTES if r.startswith("/api/network/")):
-        rows = [line for line in README.splitlines() if re.match(r"\|\s*[A-Z /]+\s*\|\s*`" + re.escape(route) + "`", line)]
+        rows = [line for line in lines if re.match(r"\|\s*[A-Z /]+\s*\|\s*`" + re.escape(route) + "`", line)]
         assert len(rows) == 1, (route, rows)
     assert len([r for r in ROUTES if r.startswith("/api/network/")]) == 5
 
@@ -44,28 +75,52 @@ def test_help_modal_only_mentions_existing_routes():
     assert mentioned and mentioned <= ROUTES, mentioned - ROUTES
 
 
-def test_readme_lists_every_mcp_tool():
+def test_api_page_lists_every_mcp_tool():
+    """The MCP section moved to docs/api.md and took the tool count with it:
+    "(N tools" is the one copy of that number, beside the server it belongs to."""
     tree = ast.parse(open(os.path.join(ROOT, "mcp", "server.py"), encoding="utf-8").read())
     tools = {f.name for f in tree.body if isinstance(f, ast.FunctionDef)
              and any(isinstance(d, ast.Call) and getattr(d.func, "attr", "") == "tool" for d in f.decorator_list)}
-    section = README[README.index("## MCP Server"):README.index("## Configuration")]
+    api = _doc("api.md")
+    start = api.index("## MCP Server")
+    end = api.find("\n## ", start + 1)
+    section = api[start:end if end != -1 else len(api)]
     listed = set(re.findall(r"`(tdc_\w+)`", section))
     assert tools == listed
-    assert f"({len(tools)} tools" in README
+    assert f"({len(tools)} tools" in api
+    # the help of the Web UI quotes the number too: the one place the count was left behind
+    assert re.findall(r"<code>mcp/server\.py</code>, (\d+) tools", HELP) == [str(len(tools))]
 
 
-def test_readme_images_exist_and_none_are_orphaned():
-    referenced = set(re.findall(r'src="(static/[^"]+\.png)"', README))
-    for path in referenced:
+def test_images_exist_and_none_are_orphaned():
+    """Every screenshot in static/ is used by the README (the showcase) or by a
+    page of the guide, and every image a page names is on disk. The README
+    carries its own with <img src="static/...">, a docs page as a markdown
+    image ![alt](../static/...) - the wiki generator reads markdown, so a page
+    that wrote HTML would show its picture as text, and a page sits one folder
+    down, so without the ../ the link is broken from the page even though the
+    file check (which resolves from the repository root) would be happy."""
+    here = r'(?:src="|\]\()(static/[^")\s]+\.png)'
+    referenced = set(re.findall(here, README))
+    for page in _docs_pages():
+        body = _doc(page)
+        referenced |= set(re.findall(r'(?:src="|\]\()\.\./(static/[^")\s]+\.png)', body))
+        stray = re.findall(here, body)
+        assert stray == [], "docs/%s links %s without the ../" % (page, stray)
+    for path in sorted(referenced):
         assert os.path.isfile(os.path.join(ROOT, path)), path
     on_disk = {f"static/{f}" for f in os.listdir(os.path.join(ROOT, "static")) if f.endswith(".png")}
-    assert on_disk - referenced == set(), "screenshots not used in the README"
+    assert on_disk - referenced == set(), "screenshots used neither in the README nor in docs/"
 
 
 def test_readme_tabs_match_the_ui():
     ui_tabs = re.findall(r'data-tab="[^"]+">([^<]+)</button>', HELP)
     start = README.index("### Web UI Tabs")
-    section = README[start:README.index("\n### ", start)]
+    # Bounded by the next "## " section, not the next "### ": the table is the
+    # last subsection of Architecture, so a "### " bound runs past Quick Start
+    # into Security Notes, and any later table row with a bold first cell
+    # ("| **Wiki** | ... |" in the documentation map) joins the list of tabs.
+    section = README[start:README.index("\n## ", start)]
     readme_tabs = re.findall(r"^\| \*\*([^*]+)\*\* \|", section, re.M)
     assert ui_tabs == readme_tabs
 
@@ -85,11 +140,21 @@ def test_every_deploy_path_uploads_the_web_ui_modules():
     the same files: a missing module is an ImportError on the VM, a missing
     script or style sheet a page without its behaviour or its theme."""
     utm = open(os.path.join(ROOT, "scripts", "deploy-utm.py"), encoding="utf-8").read()
-    modules = set(re.findall(r'"webui/([\w.]+\.(?:py|json))"', utm))
+    modules = set(re.findall(r'"webui/([\w.]+\.(?:py|json|ps1))"', utm))
     assert {"app.py", "pipe_proxy.py", "pipe_backends.py", "pipe_signatures.json"} <= modules
     # the network analysis: every net_*.py on disk (app.py imports them) and its rules
     on_disk = {n for n in os.listdir(os.path.join(ROOT, "webui")) if re.match(r"net_\w+\.py$", n)}
     assert len(on_disk) >= 13 and on_disk <= modules, on_disk - modules
+    # Every module app.py imports from webui/ (the FIREWALL tab brought five), and the script firewall_rules.py runs
+    local = {f[:-3] for f in os.listdir(os.path.join(ROOT, "webui")) if f.endswith(".py")}
+    imported = set(re.findall(r"^import (\w+)", APP, re.M)) & local
+    assert {"firewall", "firewall_fetch", "firewall_rules", "firewall_store", "geoip"} <= imported
+    # and the modules those import from webui/ in turn (rizin_sessions imports rizin_emulation)
+    for module in sorted(imported):
+        source = open(os.path.join(ROOT, "webui", module + ".py"), encoding="utf-8").read()
+        imported = imported | (set(re.findall(r"^import (\w+)", source, re.M)) & local)
+    assert "rizin_emulation" in imported
+    assert {f"{m}.py" for m in imported} | {"firewall_rules.ps1"} <= modules
     make = open(os.path.join(ROOT, "Makefile"), encoding="utf-8").read()
     ps1 = open(os.path.join(ROOT, "make.ps1"), encoding="utf-8").read()
     vagrant = make[make.index("\ndeploy:"):make.index("\n.PHONY: deploy-app")]
@@ -109,15 +174,129 @@ def test_every_deploy_path_uploads_the_web_ui_modules():
     assert "vagrant upload rules/network " not in make
 
 
-def test_readme_rizin_rows_say_what_the_server_answers():
+def test_every_deploy_path_ships_the_data_directories_and_the_way_out_of_isolated():
+    """The FIREWALL tab reads webui/data (the offline geo index) and webui/static/data (the world map). The deploy
+    paths copied named files only, so both directories are shipped whole, each file of them. tdc-unisolate.ps1 is
+    the way out of ISOLATED without the web UI: a VM that only gets a deploy needs it in C:\\tdc\\scripts too."""
+    utm = open(os.path.join(ROOT, "scripts", "deploy-utm.py"), encoding="utf-8").read()
+    make = open(os.path.join(ROOT, "Makefile"), encoding="utf-8").read()
+    ps1 = open(os.path.join(ROOT, "make.ps1"), encoding="utf-8").read()
+    vagrant = make[make.index("\ndeploy:"):make.index("\n.PHONY: deploy-app")]
+    hyperv = ps1[ps1.index("'deploy' {"):ps1.index("'deploy-app' {")]
+    for local in ("data", "static/data"):
+        assert os.listdir(os.path.join(ROOT, "webui", *local.split("/")))
+        win = local.replace("/", "\\")
+        assert f'"webui/{local}": r"C:\\DetonationChamberUI\\{win}"' in utm, local
+        assert f"webui/{local}/*" in vagrant, local
+        assert f"'{win}'" in hyperv and "Get-ChildItem \"webui\\$dataDir\" -File" in hyperv, local
+    assert "DATA_FILES" in utm[utm.index("def do_deploy"):]
+    assert 'os.path.join(REPO, "scripts", "tdc-unisolate.ps1")' in utm
+    assert "scripts/tdc-unisolate.ps1" in vagrant and "'scripts\\tdc-unisolate.ps1'" in hyperv
+    # deploy-app ships app.py and its modules; without the data and the hatch it would leave a tab with no geo
+    # data and no way out of ISOLATED (review m-4)
+    vagrant_app = make[make.index("\ndeploy-app:"):make.index("\n.PHONY: restart")]
+    hyperv_app = ps1[ps1.index("'deploy-app' {"):ps1.index("'restart' {")]
+    for local in ("data", "static/data"):
+        assert f"webui/{local}/*" in vagrant_app and f"'{local.replace('/', chr(92))}'" in hyperv_app, local
+    assert "scripts/tdc-unisolate.ps1" in vagrant_app and "'scripts\\tdc-unisolate.ps1'" in hyperv_app
+    # The geo index is not held open by the web UI any more (geoip maps a copy), so no path stops it to deploy
+    for path in (utm, vagrant, hyperv):
+        assert "Stop-Process" not in path.replace(utm[utm.index("RESTART_PS"):utm.index("LOGS_PS")], "")
+
+
+# The offline wiki is built on the host by `make docs` and git-ignored, so it is
+# the one file of the Web UI that a deploy may not find. The VM has no network
+# at all - no GitHub, no documentation site - so when it is there it has to go
+# up with the rest.
+WIKI = "webui/static/wiki.html"
+# What each path says when it did not find the wiki. Round 1, Important 2: this
+# used to be a search for a line holding "docs" and "wiki", which the comments
+# above the uploads satisfy - the hints could be deleted from the code and the
+# test stayed green. The message itself is pinned now, each in its own path's
+# wording, because that is what the person running the deploy reads.
+WIKI_HINTS = {
+    "scripts/deploy-utm.py": '" - build the wiki with: make docs"',
+    "Makefile": 'echo "[deploy] no webui/static/wiki.html - build the wiki with: make docs"',
+    "make.ps1": '"[deploy] no webui\\static\\wiki.html - build the wiki with: .\\make.ps1 docs"',
+}
+
+
+def test_every_deploy_path_uploads_the_wiki():
+    """All three deploy paths carry webui/static/wiki.html to the VM when it
+    exists, and none of them fails when it does not.
+
+    The file is generated and git-ignored: a fresh clone has none until someone
+    runs `make docs`, and a deploy that stopped there would leave the VM without
+    its app.py over a missing documentation file. Each path therefore guards the
+    upload with an existence check and says, in so many words, how to build what
+    it did not find.
+    """
+    utm = open(os.path.join(ROOT, "scripts", "deploy-utm.py"), encoding="utf-8").read()
+    make = open(os.path.join(ROOT, "Makefile"), encoding="utf-8").read()
+    ps1 = open(os.path.join(ROOT, "make.ps1"), encoding="utf-8").read()
+
+    # 1. deploy-utm.py: one more entry in FILES, which the loop skips when the
+    # file is not on disk (that guard is what makes the entry safe)
+    assert f'WIKI_FILE = "{WIKI}"' in utm and \
+        'WIKI_FILE: r"C:\\DetonationChamberUI\\static\\wiki.html"' in utm, \
+        "deploy-utm.py does not carry the wiki"
+    assert "if not os.path.isfile(os.path.join(REPO, local)):" in utm, \
+        "deploy-utm.py no longer skips a file that is not there"
+    # The remote copy keeps the date of the file it is a copy of, so the help on
+    # the VM dates the wiki and not the deploy (round 1, Important 1)
+    assert "LastWriteTimeUtc" in utm and "FromUnixTimeSeconds" in utm, \
+        "the UTM deploy lets the download stamp the file with the deploy's clock"
+    assert "os.path.getmtime(os.path.join(REPO, local))" in utm, \
+        "the preserved date does not come from the host's file"
+
+    # 2. the Makefile (Vagrant): the upload stands behind a test for the file,
+    # and the else branch says how to build it, so the recipe runs on either way
+    vagrant = make[make.index("\ndeploy:"):make.index("\n.PHONY: deploy-app")]
+    assert f"[ -f {WIKI} ]" in vagrant, \
+        "the Makefile's deploy does not look for the wiki before uploading it"
+    assert f"vagrant upload {WIKI} " in vagrant, "the Makefile's deploy does not carry the wiki"
+    assert vagrant.index(f"[ -f {WIKI} ]") < vagrant.index(f"vagrant upload {WIKI} "), \
+        "the Makefile uploads the wiki before it has looked for it"
+    upload = vagrant[vagrant.index(f"vagrant upload {WIKI} "):]
+    line = upload[:upload.index("\n")]
+    assert "C:\\\\DetonationChamberUI\\\\static\\\\wiki.html" in line, line
+    # 15 MB over the network can fail; the install scripts after it and the
+    # "Done." line must not be lost with it (round 1, Minor 3 - icon.png one
+    # line above has carried its `|| true` since it was added)
+    assert "||" in line, \
+        "a failed wiki upload aborts the rest of the deploy: %s" % line.strip()
+
+    # 3. make.ps1 (Hyper-V)
+    hyperv = ps1[ps1.index("'deploy' {"):ps1.index("'deploy-app' {")]
+    assert "Test-Path 'webui\\static\\wiki.html'" in hyperv, \
+        "make.ps1 uploads the wiki unguarded"
+    assert ("Copy-Item 'webui\\static\\wiki.html' -Destination "
+            "'C:\\DetonationChamberUI\\static\\wiki.html'") in hyperv, \
+        "make.ps1 does not carry the wiki"
+
+    # Each path says how to build what it did not find - the message, not a
+    # comment that happens to hold the same words
+    for where, hint in WIKI_HINTS.items():
+        text = {"scripts/deploy-utm.py": utm, "Makefile": vagrant, "make.ps1": hyperv}[where]
+        assert hint in text, "%s does not tell anybody how to build the wiki: %s" % (where, hint)
+
+
+def test_rizin_page_rows_say_what_the_server_answers():
     """Follow-up findings 1 and 2: the flags row claimed that over the 32 MB cap "Tab completes the
     function names"; the server answers names: [], common: "" and truncated: true then, and the UI's Tab
     lists the names of its function list without completing one (tests/test_rizin_ui.py). The function
     list itself has no such cap any anymore: it reads rizin's afl, whose rows are about 63 B each.
 
     Review, Minors 3 and 4: the other views are not without a limit (they carry their own, and a view
-    over it answers 500), and FUNCTIONS does have the row cap - only no 32 MB one."""
-    rows = {path: line for line in README.splitlines()
+    over it answers 500), and FUNCTIONS does have the row cap - only no 32 MB one.
+
+    The rows now live in docs/api-rizin.md, the API page the RIZIN tab's routes
+    moved to, which is where every route has to have its one row
+    (test_api_page_documents_every_route_and_nothing_else); the limits the tab
+    itself carries live in docs/rizin.md, the page about the tab."""
+    api = _doc("api-rizin.md")
+    rizin = _doc("rizin.md")
+    rows = {path: line for line in api.splitlines()
             for path in re.findall(r"`(/api/rizin/[^`]+)`", line)}
     flags = rows["/api/rizin/<sid>/flags"]
     assert "completes the function names" not in flags, flags
@@ -125,13 +304,192 @@ def test_readme_rizin_rows_say_what_the_server_answers():
     functions = rows["/api/rizin/<sid>/functions"]
     assert "`afl`" in functions and "200 000" in functions, functions
     # The error list names the lists that the cap refuses, and the limit the other views carry
-    errors = next(line for line in README.splitlines() if line.startswith("One rizin session per opened file"))
+    errors = next(line for line in api.splitlines() if line.startswith("One rizin session per opened file"))
     assert "too many strings to list here" in errors
     assert "the other views have no such limit" not in errors, errors
     assert "is larger than" in errors, errors
     # The Limitations bullet does not read as if the function list had no cap at all
-    limits = next(line for line in README.splitlines() if "FUNCTIONS has no" in line)
+    limits = next(line for line in rizin.splitlines() if "FUNCTIONS has no" in line)
     assert "no 32 MB limit" in limits, limits
+
+
+APP_JS = open(os.path.join(ROOT, "webui", "static", "js", "app.js"), encoding="utf-8").read()
+
+
+def _plain(text):
+    """A page or the help as one line of words: markup and line breaks gone, so that a sentence that wraps in the
+    source is found like any other."""
+    return re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", text))
+
+
+def test_the_patch_rows_say_what_a_waiting_patch_does_through_a_take_back():
+    """A patch that waits is no write of rizin's cache, so DELETE /patch (`wc-*` or an address) cannot take it;
+    the row that promises a taken-back patch does not come back must not leave out the one that stays."""
+    def row(method, route):
+        found = [line for line in _doc("api-rizin.md").splitlines() if line.startswith(f"| {method} | `{route}` |")]
+        assert len(found) == 1, (method, route, len(found))
+        return _plain(found[0])
+
+    delete = row("DELETE", "/api/rizin/<sid>/patch")
+    assert "waiting" in delete and "is not taken back" in delete and "stays in the project" in delete, delete
+    assert "waiting" in row("GET", "/api/rizin/<sid>/patches")
+
+
+def test_the_rizin_page_says_what_emulation_can_and_cannot_do():
+    """Task 14. The page about the tab has a section for the emulator, and it says what the feature is (no
+    process, the cache, the original untouched), what it is not (the Windows API, a step back) and what ends with
+    the session. The sentence it used to carry ("Static analysis only: no debugging, no patching") is gone.
+    The README names no route (docs/api.md has the one row each, see above), so this is checked on the page."""
+    rizin = _doc("rizin.md")
+    section = _plain(_section_of(rizin, "Emulation and patching"))   # the source wraps its lines anywhere
+    assert "no process" in section and "io.cache" in section
+    assert "the original file is never written" in section
+    assert "ESIL does not emulate the Windows API" in section
+    assert "what a run wrote ends with the session" in section
+    for part in ("The run strip", "The EMULATION pane", "Breakpoints", "API calls", "Patching",
+                 "What stays and what does not", "Re-analysing a decrypted range", "Export and the Submit tab"):
+        assert "\n### %s\n" % part in _section_of(rizin, "Emulation and patching"), "the emulation section lost %r" % part
+    assert "Static analysis only: no debugging, no patching" not in rizin
+    assert "Static analysis only: no debugging, no patching" not in README
+    # the tab table and the blurb of the README say the tab runs code now, and where
+    assert "**EMULATE**" in README and "no process" in README and "never writes the original" in README
+    # the console is no longer "no writing, no debugging"
+    assert "no writing, no debugging" not in _doc("configuration.md")
+    assert all("no debugging |" not in _doc(page) for page in API_PAGES)
+
+
+def test_the_limits_the_rizin_page_names_are_the_code():
+    """A limit named in prose and absent from the code, or the other way round. Every number is read from the source
+    (the pairs of QUOTED_NUMBERS above do the same for the page's other numbers), and every limit that names a
+    control is held against the markup that carries it."""
+    import rizin_emulation
+    import rizin_sessions
+    rizin = _plain(_doc("rizin.md"))
+    limits = _section_of(_doc("rizin.md"), "Limitations")
+    for phrase in ("No step back", "STOP leaves the emulation mode; it does not abort a running command",
+                   "No breakpoint on/off", "no watchpoints", "No assembling", "x86-64 and x86-32 only",
+                   "at most 2000 bytes", "4094", "x86 only", "One stop reason covers two causes",
+                   "do not leave the tab", "mine: false", "above 2^53", "cannot be reached with the keyboard"):
+        assert phrase in limits, "the limitations of docs/rizin.md lost %r" % phrase
+    # no step back: the strip has these buttons and the server these kinds, and no back
+    strip = HELP[HELP.index('id="rizin-run"'):HELP.index('id="rizin-run-pc"')]
+    assert re.findall(r'data-rizin-(?:run|act)="(\w+)"', strip) == ["cont", "step", "over", "skip", "to_call", "gotopc", "stop"]
+    assert sorted(rizin_emulation.STEP_COMMANDS) == ["cont", "over", "skip", "step", "to_call", "until"]
+    assert "aesb" not in " ".join(rizin_emulation.STEP_COMMANDS.values())
+    # no on/off: the pane's rows and the routes carry none, and no watchpoint or breakpoint command passes the console
+    rows = APP_JS[APP_JS.index("function rizinEmuBreakpointsHtml"):APP_JS.index("function rizinEmuPatchesHeadHtml")]
+    assert re.findall(r'data-rizin-act="([\w-]+)"', rows) == ["unbreak"], "a breakpoint row has a control besides its remove"
+    # the numbers of the page
+    assert rizin_emulation.MAX_PATCH_BYTES == 2000 and "RIZIN_PATCH = { kinds: ['nop', 'flip', 'always', 'nocall'], maxBytes: 2000," in APP_JS
+    assert rizin_emulation.ASSIST_ARCH == "x86" and "arch: 'x86' }" in APP_JS
+    assert rizin_emulation.PATCH_KINDS == ("nop", "flip", "always", "nocall")
+    assert "(4000 digits)" in HELP and "%d digits" % (2 * rizin_emulation.MAX_PATCH_BYTES) in _plain(HELP)
+    assert rizin_sessions.RIZIN_STACK_ROWS == 16 and "16 words from the stack pointer" in rizin
+    # the gutter and the lines of DISASSEMBLY have no way in for the keyboard
+    lines = APP_JS[APP_JS.index("function rizinDisasmHtml"):APP_JS.index("function rizinAnalysisText")]
+    assert 'class="rizin-gutter' in lines and "tabindex" not in lines
+    decompiler = APP_JS[APP_JS.index("function rizinDecompilerHtml"):APP_JS.index("function rizinDecompilerHolds")]
+    assert 'class="rizin-dec-gutter' in decompiler and "tabindex" not in decompiler
+    # rizin keeps 4094 characters of a stdin line and cuts what is longer (measured: 4093 and 4094 land, 4095 does not).
+    # The page says "longer than", and the cap leaves the longest `wx` the server sends well inside the line
+    assert "longer than 4094" in _plain(HELP) and "cuts what is longer" in rizin and "reaches 4094" not in rizin
+    longest = "wx %s @ %s" % ("ab" * rizin_emulation.MAX_PATCH_BYTES, "0x%016x" % (2 ** 64 - 1))
+    assert len(longest) <= 4094 < len("wx %s @ %s" % ("ab" * (rizin_emulation.MAX_PATCH_BYTES * 2), "0x%016x" % (2 ** 64 - 1))), \
+        "the cap no longer separates a command line that fits from one that is cut"
+
+
+def test_the_rizin_page_quotes_the_filter_as_it_words_its_refusals():
+    """The console section says which commands are open and which are refused, and quotes the one refusal a reader
+    meets most (the executing `d` commands). The page is held against check_console_command itself: what it calls
+    open is open, what it calls refused is, and the quoted sentence is the one the filter answers."""
+    import rizin_sessions
+    check = rizin_sessions.check_console_command
+    console = _section_of(_doc("rizin.md"), "Console without a shell")
+    said = "'d' commands are not allowed: emulation runs from the EMULATION tab"
+    assert said in console
+    for command in ("dp", "dc", "ds", "dm", "dk", "dd", "dbt"):
+        assert check(command) == said, command
+        assert "`%s`" % command in console
+    # ood is an `o` command: the family is refused, with its own words, and the page lists it under `o` rather than here
+    row = next(line for line in console.splitlines() if said in line)
+    assert check("ood") == "'o' commands are not allowed" and "`ood`" in console and "`ood`" not in row
+    for command in ("wci", "wc+", "wa nop", "dbc 0x10 x", "dbC 0x10 x", "dbx 0x10 x", "dbw 0x10", "wu x", "wf x",
+                    "aecc", "aecs", "aesuo call",
+                    "e esil.mdev.range=0x10", "e asm.assembler=x86.nasm"):
+        assert check(command), "the page says %r is refused; the filter lets it through" % command
+    for name in ("wci", "wc+", "wa", "dbc", "dbC", "dbx", "dbw", "aecc", "aecs", "aesuo"):
+        assert "`%s`" % name in console, "the console section does not name the refused %s" % name
+    # what the user reads on screen is what the page quotes, word for word
+    for command in ("wci", "wc+", "wa nop", "dbc 0x10 x", "dbC 0x10 x", "dbx 0x10 x", "dbw 0x10", "wu x", "wxf x", "wff x", "wfs x",
+                    "aecc", "aecs", "aesuo call"):
+        assert check(command) in console, "the page does not quote the refusal of %r: %s" % (command, check(command))
+    for command in ("db @ 0x10", "db- @ 0x10", "db-*", "dblj", "dbd @ 0x10", "wx 9090 @ 0x10", "wc- 0x10 0x11", "wc-*", "wcj",
+                    "e esil.timeout=3", "e io.cache=true", "aepc 0x10", "aei", "aeim", "aes", "aeso", "aess", "aesu 0x10",
+                    "aec", "aecu 0x10", "aecue rax,1,==", "aecb", "aesue rax,1,==", "aesou 0x10", "aesb",
+                    "ar rax=1", "af @ 0x10", "/zj [[:print:]]{4,} r ascii"):
+        assert check(command) is None, "the page says %r is open; the filter refuses it: %s" % (command, check(command))
+    assert rizin_sessions._FAMILIES.replace("", " ").split() == list("apifCs/?xtbewd")
+    assert "`a p i f C s / ? x t b e w d`" in console
+
+
+# What the tab shows and what the pages quote of it, word for word: the app, the in-tab help, the guide.
+UI_WORDS = [
+    ("Patched by hand: these bytes were written here", True),
+    ("Clear rizin's whole cache", True),
+    ("These bytes end with the session: they are not saved with the project and not in an export.", True),
+    ("rizin has one cache, and what a run wrote is back only by running it again.", False),
+    ("No stack words to show: the stack pointer is outside the stack the emulation mapped, or that map is gone. "
+     "Restarting the emulation (STOP, then EMULATE) maps it again.", True),
+    ("Stopped: an invalid memory access, or the PC is in memory that cannot be executed", True),
+    ("Stopped at a breakpoint", False),
+    ("Stopped by esil.timeout: the run took too long", False),
+    ("Stopped: rizin cannot decode the instruction here", False),
+    ("a run ends by itself (esil.timeout) and cannot be interrupted", False),
+]
+
+
+def test_the_pages_quote_the_tabs_words_as_the_tab_has_them():
+    """Where the guide or the help quotes a string the tab shows, it is that string: read from app.js, not copied from
+    a note. (Round 1 of Task 14 found the pane telling the reader to press START, in a toolbar whose button says
+    EMULATE; the words were corrected in the app and are held here.)"""
+    page, help_text = _plain(_doc("rizin.md")), _plain(HELP)
+    for words, in_help in UI_WORDS:
+        # the app joins long sentences from pieces: each sentence of the quote is one string of the source
+        for sentence in re.split(r"(?<=\.) ", words):
+            assert sentence in APP_JS, "the app no longer says %r" % sentence
+        assert words in page, "docs/rizin.md does not quote %r" % words
+        if in_help:
+            assert words in help_text, "the in-tab help does not quote %r" % words
+    # the button that begins an emulation is the one the sentences name
+    assert re.search(r'<button[^>]*id="rizin-emu-start"[^>]*>EMULATE</button>', HELP)
+    assert "START in the toolbar" not in APP_JS and "then START)" not in APP_JS
+    # the menu's entries, and the pane's buttons, as they read
+    for label in ("NOP out", "Flip the jump", "Always jump", "Kill the call", "Bytes…", "Run to here"):
+        assert ">%s</button>" % label in HELP and label in page and label in help_text, label
+    for label in ("Export", "Re-analyse", "To the Submit tab"):
+        assert label in APP_JS and label in page, label
+    for strip in ("CONT", "STEP", "OVER", "SKIP", "TO CALL", "GO TO PC", "STOP"):
+        assert ">%s</button>" % strip in HELP and strip in page, strip
+    assert "EMULATION</button>" in HELP and "SET BY HAND" in APP_JS and "WRITTEN BY THE RUN" in APP_JS
+    assert "SET BY HAND" in page and "WRITTEN BY THE RUN" in page
+    # the help is read on the VM: it says what the guide says about the file, and not "only reads" any more
+    assert "only reads the file" not in HELP and "the file is only read" not in HELP
+    assert "read-only)" not in HELP.split("RIZIN tab", 1)[-1][:200]
+
+
+def test_the_security_notes_say_why_the_original_is_never_written():
+    """Two guards that do not depend on each other, and what the export leaves behind: held against the code that
+    makes each one true."""
+    notes = _plain(_section_of(_doc("configuration.md"), "Security Notes"))
+    for promise in ("never written", "two guards", "wci", "wc+", "-w", "Error writing change at 0x", ".patch.txt",
+                    "both SHA-256 digests", "io.cache", "disarmed", "submits nothing"):
+        assert promise in notes, "the Security Notes do not say %r" % promise
+    sessions = open(os.path.join(ROOT, "webui", "rizin_sessions.py"), encoding="utf-8").read()
+    start = sessions[sessions.index('self.args = [exe, "-q0"'):]
+    assert '"-w"' not in start[:400], "rizin is started with -w: the second guard is gone"
+    assert 'RIZIN_NOTE_SUFFIX = ".patch.txt"' in APP
+    assert "wc[+i]" in sessions, "the allowlist no longer refuses wci and wc+"
+    assert "_disarm_breakpoints" in sessions
 
 
 def test_help_lists_every_pipe_interception_route():
@@ -181,3 +539,1202 @@ def test_restart_paths_only_stop_the_web_ui_python_processes():
         assert "Win32_Process" in flat and "Terminate" in flat, name
         assert "CommandLine LIKE ''% app.py%''" in flat, name
         assert "litterbox" not in flat.lower(), name
+
+
+def test_help_lists_every_firewall_route():
+    routes = set()
+    for m in re.finditer(r'@app\.route\("(/api/firewall/[^"]*)"(?:, methods=\[([^\]]*)\])?', APP):
+        for method in re.findall(r'"(\w+)"', m.group(2) or '"GET"'):
+            routes.add((method, _norm(m.group(1))))
+    assert len(routes) == 15
+    rows = {(m, _norm(p.replace("&lt;", "<").replace("&gt;", ">"))) for m, p in re.findall(
+        r'<td class="api-\w+">(\w+)</td><td><code>(/api/firewall/[^<]*)</code>', HELP)}
+    assert rows == routes
+
+
+# A reader lands on a page either from the index or from the "Next:" of the page
+# before it, so a page nobody links to is a page nobody reads. Shape: an H1, one
+# sentence saying what the page answers, and a single "Next:" at the end.
+NEXT = re.compile(r"^\*\*Next:\*\* \[[^\]]+\]\(([A-Za-z0-9_.-]+\.md)\)$", re.M)
+
+
+def _docs_pages():
+    """Every page of the guide. docs/superpowers/ holds designs and plans, not
+    the guide, so only the files directly under docs/ count."""
+    return sorted(f for f in os.listdir(DOCS)
+                  if f.endswith(".md") and os.path.isfile(os.path.join(DOCS, f)))
+
+
+def _page_links(text):
+    """Links to another page of the guide: a bare file name, so `../README.md`
+    (the repository README) and web links are left out."""
+    return re.findall(r"\]\(([A-Za-z0-9_-]+\.md)\)", text)
+
+
+def _docs_section(text, title):
+    start = text.index(title)
+    end = text.find("\n#", start)
+    return text[start:end if end != -1 else len(text)]
+
+
+def test_every_docs_page_is_reachable_and_shaped():
+    pages = _docs_pages()
+    assert "README.md" in pages, "docs/ needs an index page"
+    index = open(os.path.join(DOCS, "README.md"), encoding="utf-8").read()
+    linked = _page_links(index)
+    for page in pages:
+        if page != "README.md":
+            assert page in linked, "docs/%s is not linked from docs/README.md" % page
+    for target in set(linked):
+        assert target in pages, \
+            "docs/README.md links to docs/%s, which does not exist" % target
+    assert not NEXT.search(index), "the index starts the paths, it needs no Next"
+    for page in pages:
+        body = open(os.path.join(DOCS, page), encoding="utf-8").read()
+        lines = body.splitlines()
+        assert lines[0].startswith("# "), "docs/%s needs its title as the first line" % page
+        intro = ""
+        for line in lines[1:]:
+            if line.strip():
+                intro = (intro + " " + line.strip()).strip()
+            elif intro:
+                break
+        assert intro.endswith(".") and not intro.startswith(("#", "-", "|", ">", "*", "`")), \
+            "docs/%s needs a sentence under its title: %r" % (page, intro)
+        if page == "README.md":
+            continue
+        targets = NEXT.findall(body)
+        assert len(targets) == 1, \
+            "docs/%s needs exactly one **Next:** line, found %d" % (page, len(targets))
+        assert targets[0] in pages, \
+            "docs/%s points on to docs/%s, which does not exist" % (page, targets[0])
+        last = [l for l in lines if l.strip()][-1]
+        assert NEXT.match(last), "the **Next:** of docs/%s is not its last line: %r" % (page, last)
+
+
+def test_the_index_names_both_reading_paths():
+    index = open(os.path.join(DOCS, "README.md"), encoding="utf-8").read()
+    assert index.index("Set it up") < index.index("Work with it"), \
+        "setting it up comes before working with it"
+    assert _page_links(_docs_section(index, "Set it up")) == \
+        ["setup.md", "installation.md", "configuration.md"]
+    work = _page_links(_docs_section(index, "Work with it"))
+    assert work == ["workflow.md", "memory.md", "pipes.md", "rizin.md", "logs.md",
+                    "firewall.md", "updates.md", "web-ui.md", "api.md"], work
+
+
+# Every "##"/"###"/"####" title the README carried before the guide was split
+# out of it (commit 2d5aa41, 2367 lines), in its own order. Three are not in the
+# list, each because the design renames or drops the title itself, not what
+# stood under it: "Table of Contents", which was navigation and is the index's
+# job now; "Usage", which is the page docs/workflow.md; and "Features", which is
+# the showcase's "What it does" - the eight to ten features are held by
+# test_readme_is_a_showcase instead, which counts them and their pictures.
+OLD_README_SECTIONS = [
+    "Quick Start",
+    "Option A: Local UI Only (no VM)",
+    "Option B: Full VM (recommended for analysis)",
+    "Detection Engines",
+    "Web UI Tabs",
+    "Themes",
+    "Charts",
+    "Own dashboards",
+    "ETW Browser",
+    "Binary Analysis (PE / ELF)",
+    "Reverse Engineering Tools",
+    "Tests",
+    "Developer Experience",
+    "Architecture",
+    "Data Flow",
+    "Services",
+    "Platform Support",
+    "ARM64 Compatibility",
+    "Prerequisites",
+    "Windows Host",
+    "macOS Host (Apple Silicon)",
+    "Recommended Setup (UTM + automated provisioning)",
+    "Alternative: Vagrant/QEMU (headless, experimental)",
+    "Local Development Only",
+    "Installation",
+    "Using make / make.ps1",
+    "Manual Installation",
+    "Detonation Workflow",
+    "CLI Submission",
+    "Scanner Workflow",
+    "PE Analysis",
+    "ELF Analysis",
+    "Hunt-Sleeping-Beacons",
+    "Live Memory Analysis",
+    "What runs after a detonation",
+    "How findings become a verdict",
+    "Before the first detonation (clean box)",
+    "ARM64 hosts",
+    "Limitations",
+    "Named Pipes",
+    "A: Observation (passive, from Sysmon)",
+    "B: Interception (active, pipe-intercept style)",
+    "Rizin",
+    "Opening a file",
+    "One place in every view",
+    "Console without a shell",
+    "Sessions",
+    "Projects",
+    "Tool Updates",
+    "What is checked",
+    "Pinned tools",
+    "Maintenance mode",
+    "Scripts and logs",
+    "Logs",
+    "Demo",
+    "Service Dashboard (Telemetry theme)",
+    "Cyberpunk Theme (default)",
+    "Alerts",
+    "Dashboard & Alerts Charts",
+    "Own Dashboard Tiles",
+    "Detonation Results",
+    "Tracing Console & Alert Detail",
+    "Process Graph",
+    "PE Analysis, Hex Editor & File Map",
+    "Rizin (Reverse Engineering)",
+    "Live Process Memory",
+    "Sysmon & ETW",
+    "API Reference",
+    "Core",
+    "Submission & Detonation",
+    "Named Pipe Interception",
+    "Hex Editor & Binary Analysis",
+    "Sysmon",
+    "Scanner",
+    "Live Memory",
+    "Proxy Endpoints",
+    "Dashboards",
+    "MCP Server",
+    "Configuration",
+    "Environment Variables (Web UI)",
+    "Custom Detection Rules",
+    "Sysmon Pipe Events",
+    "Defender Exclusions",
+    "Detection Rules",
+    "File Structure",
+    "VM File Layout",
+    "Troubleshooting",
+    "Check service status",
+    "Services not starting",
+    "Port forwarding not working (Hyper-V)",
+    "Web UI not loading",
+    'Web UI answers 403 "Host not allowed" or "Cross-site request rejected"',
+    "Rustinel not detecting events",
+    "macOS: QEMU won't start",
+    "Local install fails",
+    "Security Notes",
+    "Web UI hardening",
+    "Credits",
+]
+
+HEADING = re.compile(r"^#{1,4} (.+?)\s*$")
+
+
+def _heading_titles(text):
+    """The headings of a markdown file, as written. Lines inside a fenced block
+    are not headings: the README's code samples are full of "# macOS / Linux"."""
+    out, fence = [], False
+    for line in text.splitlines():
+        if line.startswith("```"):
+            fence = not fence
+        elif not fence:
+            m = HEADING.match(line)
+            if m:
+                out.append(m.group(1))
+    return out
+
+
+def _headings(text):
+    """The same, lower-cased, for the "nothing was lost" comparison."""
+    return {t.lower() for t in _heading_titles(text)}
+
+
+def _slug(title):
+    """GitHub's anchor for a heading: lower case, everything but word
+    characters, spaces and hyphens dropped, then spaces as hyphens. "Sysmon &
+    ETW" is #sysmon--etw, because the & leaves its space behind."""
+    return re.sub(r"[^\w\s-]", "", title.strip().lower()).replace(" ", "-")
+
+
+ANCHOR_LINK = re.compile(r"\]\(([A-Za-z0-9_./-]*)#([A-Za-z0-9_-]+)\)")
+
+
+def test_every_anchor_link_points_at_a_heading():
+    """A pointer at a section has to land on that section. The guide's pages
+    point across files now - a screenshot named in rizin.md or logs.md lives in
+    web-ui.md, the routes behind the dashboards in api.md - and an anchor that
+    names no heading silently drops the reader at the top of the page instead.
+    On web-ui.md, 557 lines long, that is hundreds of lines from what was
+    meant, with nothing to say that it went wrong.
+
+    The file is checked too, not only the anchor: _page_links (the bare-link
+    regex the reachability test uses) does not match a link that carries an
+    anchor, so until this test resolved the path, a typo in the file name of an
+    anchored link - ](web-io.md#charts) - was held by no test at all."""
+    files = {"README.md": README}
+    for page in _docs_pages():
+        files["docs/" + page] = _doc(page)
+    slugs = {name: {_slug(t) for t in _heading_titles(text)} for name, text in files.items()}
+    checked, bad = 0, []
+    for name, text in files.items():
+        for target, anchor in ANCHOR_LINK.findall(text):
+            if target.startswith(("http:", "https:", "mailto:")):
+                continue
+            path = name if not target else \
+                os.path.normpath(os.path.join(os.path.dirname(name), target))
+            if path in slugs:
+                checked += 1
+                if anchor not in slugs[path]:
+                    bad.append("%s -> %s#%s: no heading of that name in %s"
+                               % (name, target or "this page", anchor, path))
+            elif path.startswith("..") or not os.path.isfile(os.path.join(ROOT, path)):
+                bad.append("%s -> %s#%s: there is no file %s"
+                           % (name, target, anchor, path))
+            # else: a file of the repository that is not a page of the guide,
+            # so there are no headings to match the anchor against
+    assert bad == [], bad
+    # Same-page anchors are cheap; the guide's pointers that can rot are the
+    # ones across files (22 of the 27 today), so both are counted. A floor
+    # under the total alone passed while every cross-file pointer lost its
+    # anchor, because one page's own table of contents made up the number.
+    cross = sum(1 for name, text in files.items()
+                for target, _ in ANCHOR_LINK.findall(text)
+                if target and not target.startswith(("http:", "https:", "mailto:"))
+                and (os.path.normpath(os.path.join(os.path.dirname(name), target)) in slugs))
+    assert checked >= 24 and cross >= 18, \
+        "only %d anchor links checked, %d of them into another file - " \
+        "did they lose their anchors?" % (checked, cross)
+
+
+# "see below", "described above": the README said this of sections that are in
+# docs/ now, so the words point at nothing. Any case, and the passive wording
+# too - the finding of round 1 was one prose "(see below)" that the sweep for
+# ](#anchor) links could not see.
+STALE_POINTER = re.compile(r"\b(?:see|described|shown|listed|explained)\s+(?:above|below)\b", re.I)
+
+
+def test_the_readme_points_at_the_guide_for_what_left_it():
+    """Ten cross-references of the tab table named a section of the README that
+    the split moved into docs/. Nine of them were anchors, which an anchor
+    sweep finds; the ETW row said "(see below)" in prose, so it kept pointing
+    at a section that is not in the file any more.
+
+    A link that names a section needs that section's anchor: its text says
+    "Charts" or "ETW Browser", and landing at the top of web-ui.md instead is
+    the defect, not the fix. A link whose text is the target page's own title
+    ("Logs" -> docs/logs.md) is already where it says it goes."""
+    start = README.index("### Web UI Tabs")
+    table = README[start:README.index("\n## ", start)]
+    stale = STALE_POINTER.search(table)
+    assert not stale, \
+        "the tab table says %r of a README section that moved into docs/" % (
+            stale.group(0) if stale else "")
+    rows = {m.group(1): m.group(0) for m in re.finditer(r"^\| \*\*([^*]+)\*\* \|.*$", table, re.M)}
+    titles = {"docs/" + p: _heading_titles(_doc(p))[0].lower() for p in _docs_pages()}
+    for tab in ("Dashboard", "Alerts", "LOGS", "ETW", "Rizin"):
+        links = re.findall(r"\[([^\]]+)\]\((docs/[a-z0-9-]+\.md)(#[a-z0-9-]*)?\)", rows[tab])
+        assert links, "the %s row has no link into the guide: %s" % (tab, rows[tab])
+        for text, page, anchor in links:
+            assert page in titles, "the %s row links %s, which is not a page" % (tab, page)
+            if text.lower() == titles[page]:
+                continue      # it names the whole page, which is where it lands
+            assert anchor not in ("", "#"), \
+                "the %s row points at %r of %s, a section, without its anchor" % (tab, text, page)
+
+
+# The help modal, as a reader sees it: without the tags, so a pointer split
+# over an element ("see <a ...>below</a>") is found like any other.
+HELP_TEXT = re.sub(r"\s+", " ", re.sub(r"<[^>]+>", " ", HELP))
+# The API page of the offline wiki, which is on the VM when the wiki is.
+WIKI_API_PAGE = "/static/wiki.html#api"
+
+
+def test_the_help_points_where_a_reader_on_the_vm_can_follow():
+    """The help modal and the built wiki are the only two documents a reader on
+    the VM has: that machine has no network, no GitHub and no checkout, and no
+    deploy path carries the README to it. A pointer in the help therefore has
+    to name something on that machine.
+
+    Round 4, Important 1: the API section said "the full reference with all
+    endpoints is in the README", and this branch moved the endpoint table into
+    docs/api.md (commit 225d09c) - so the sentence named a file the reader
+    cannot open for a table that is not in it either. The same gate the
+    README's tab table has (STALE_POINTER) runs over the help as well now, so
+    the next prose pointer at something that moved fails here.
+    """
+    assert "README" not in HELP, \
+        "the help points at the README, which is on no VM: %r" % (
+            HELP_TEXT[max(0, HELP_TEXT.index("README") - 120):
+                      HELP_TEXT.index("README") + 60] if "README" in HELP_TEXT else "")
+    stale = STALE_POINTER.search(HELP_TEXT)
+    assert not stale, \
+        "the help says %r of a section that may not be there any more" % (
+            stale.group(0) if stale else "")
+    api = HELP[HELP.index('id="help-api"'):HELP.index('id="help-architecture"')]
+    assert WIKI_API_PAGE in api, \
+        "the API section does not lead to the wiki's API page, the one reference a VM has"
+    assert "docs/api.md" in api, \
+        "the API section does not name the page in the repository, for a reader on the host"
+
+
+def test_the_help_and_the_guide_name_the_fibratus_path_the_installer_uses():
+    """Round 4, Important 1: the help's File Layout named C:\\tools\\fibratus\\,
+    a path that exists nowhere. scripts/install-fibratus.ps1 installs into
+    $env:ProgramFiles\\Fibratus, and webui/app.py and webui/tool_updates.py look
+    for the binary under C:\\Program Files\\Fibratus\\Bin. The same claim was
+    corrected in docs/troubleshooting.md and left standing in the help, which
+    is the document a reader on the VM has - so both are held here, against
+    the installer rather than against each other."""
+    install = open(os.path.join(ROOT, "scripts", "install-fibratus.ps1"),
+                   encoding="utf-8").read()
+    assert '$fibratusInstallDir = "$env:ProgramFiles\\Fibratus"' in install, \
+        "install-fibratus.ps1 installs somewhere else now; the documents follow it"
+    assert r"C:\Program Files\Fibratus\Bin\fibratus.exe" in APP, \
+        "webui/app.py no longer looks for Fibratus under Program Files"
+    for where, text in (("webui/templates/index.html", HELP),
+                        ("docs/troubleshooting.md", _doc("troubleshooting.md")),
+                        ("README.md", README)):
+        assert "tools\\fibratus" not in text.lower(), \
+            "%s names C:\\tools\\fibratus\\, where Fibratus is not installed" % where
+    for where, text in (("webui/templates/index.html", HELP),
+                        ("docs/troubleshooting.md", _doc("troubleshooting.md"))):
+        assert r"C:\Program Files\Fibratus" in text, \
+            "%s does not say where Fibratus is" % where
+
+
+# Every TDC_ setting the Web UI reads has a row in docs/configuration.md.
+# TDC_NO_BACKGROUND is the exception: it is a test hook (the suite sets it so
+# no loader thread starts), not something anybody deploys with. Only reads
+# count - webui/dev_server.py *sets* TDC_MOCK_SERVICES for its --mock flag,
+# which is not a setting a reader of the page would ever put in an environment.
+ENV_TEST_HOOKS = {"TDC_NO_BACKGROUND"}
+ENV_READ = re.compile(r'environ\.get\(\s*["\'](TDC_\w+)["\']'
+                      r'|environ\[\s*["\'](TDC_\w+)["\']\s*\](?!\s*=)')
+
+
+def test_the_configuration_page_documents_every_setting_the_code_reads():
+    """Round 4, Important 5: `TDC_VM_IP` is read in webui/app.py and stood in
+    no table, while `TDC_ALLOWED_HOSTS`, `TDC_VM_WEBUI` and
+    `TDC_VM_USER`/`TDC_VM_PASS` are documented - so the host-side set read as
+    complete and was not. Whoever set only `TDC_VM_WEBUI` got an instance whose
+    WinRM calls went to the hard-coded fallback.
+
+    Both directions: a setting the code reads needs its row, and a row needs a
+    setting that is read (the round-3 defect was a documented `VM_WEBUI_URL`
+    that nothing ever looked up)."""
+    read = set()
+    for name in sorted(os.listdir(os.path.join(ROOT, "webui"))):
+        if name.endswith(".py"):
+            source = open(os.path.join(ROOT, "webui", name), encoding="utf-8").read()
+            read |= {name for group in ENV_READ.findall(source) for name in group if name}
+    assert "TDC_VM_IP" in read, "webui/ no longer reads TDC_VM_IP; drop it from the page"
+    page = _doc("configuration.md")
+    rows = set()
+    for line in page.splitlines():
+        if line.startswith("| `"):
+            rows |= set(re.findall(r"`(TDC_\w+)`", line.split("|")[1]))
+    missing = sorted(read - rows - ENV_TEST_HOOKS)
+    assert missing == [], \
+        "docs/configuration.md has no row for %s, which webui/ reads" % missing
+    stale = sorted(rows - read)
+    assert stale == [], \
+        "docs/configuration.md documents %s, which nothing reads" % stale
+    # The fallback is the part that confuses people: an unset TDC_VM_IP does
+    # not mean "no VM", it means this address (webui/app.py's _detect_vm_ip)
+    fallback = re.search(r'VM_IP = "([\d.]+)"\s+# Fallback', APP)
+    assert fallback, "webui/app.py no longer falls back to a fixed VM address"
+    row = next(l for l in page.splitlines() if l.startswith("| `TDC_VM_IP`"))
+    assert fallback.group(1) in row, \
+        "the TDC_VM_IP row does not name the fallback %s: %s" % (fallback.group(1), row)
+
+
+def test_the_security_notes_are_reachable_from_the_vm():
+    """Round 4, Important 3: "treat it as compromised", "snapshot before each
+    detonation" and "the Web UI has no login - keep it on an isolated network"
+    stood in the README alone. The README is not a page of the guide and not a
+    page of the wiki, and no deploy path carries it - so the most operational
+    text in the repository was unreachable from the machine it is about.
+
+    The full text is a section of docs/configuration.md now, the page about how
+    the thing is run, and that section is the authority; the README keeps its
+    title, the one sentence that has to be read before anything else, and a
+    pointer at the page."""
+    page = _doc("configuration.md")
+    notes = _section_of(page, "Security Notes")
+    for promise in ("treat it as compromised", "snapshot", "isolated network",
+                    "no login", "Cross-site requests", "DNS rebinding",
+                    "TDC_ALLOWED_HOSTS", "WEBUI_HOST=127.0.0.1",
+                    "Rustinel active response"):
+        assert promise in notes, \
+            "the Security Notes of docs/configuration.md do not carry %r" % promise
+    assert "### Web UI hardening" in notes, \
+        "the hardening list is not a part of that section"
+    # The README keeps the title and the warning, and points at the page
+    section = _section_of(README, "Security Notes")
+    assert "treat it as compromised" in section, \
+        "the showcase drops the one sentence a reader has to see first"
+    assert re.search(r"\]\(docs/configuration\.md#security-notes\)", section), \
+        "the README's Security Notes do not point at the page that carries them"
+    assert "### " not in section, \
+        "the README keeps the short form; the hardening list lives on the page"
+    assert len([l for l in section.splitlines() if l.strip()]) <= 14, \
+        "the README's Security Notes are the short form, not the text again"
+
+
+def test_the_file_tree_names_every_web_ui_module():
+    """Round 4, Minor 4: the tree of docs/troubleshooting.md omitted
+    webui/dashboards.py, which all three deploy paths ship. Both directions,
+    which is cheap here: every webui/*.py on disk has a line in the tree, and
+    every .py the tree names is a file of this repository - so a module added
+    to the Web UI (and to the deploy paths, which
+    test_every_deploy_path_uploads_the_web_ui_modules holds) cannot be missing
+    from the one listing that claims to be the file structure."""
+    tree = _docs_section(_doc("troubleshooting.md"), "## File Structure")
+    modules = sorted(f for f in os.listdir(os.path.join(ROOT, "webui"))
+                     if f.endswith(".py"))
+    missing = [m for m in modules if m not in tree]
+    assert missing == [], \
+        "the file tree of docs/troubleshooting.md does not name webui/%s" % missing
+    on_disk = set()
+    for where, _, files in os.walk(ROOT):
+        if any(part.startswith((".", "node_modules")) for part in
+               os.path.relpath(where, ROOT).split(os.sep)):
+            continue
+        on_disk |= {f for f in files if f.endswith(".py")}
+    named = set(re.findall(r"([\w.-]+\.py)", tree))
+    assert named <= on_disk, \
+        "the file tree names %s, which is not a file of the repository" % sorted(named - on_disk)
+
+
+def test_the_make_table_names_targets_that_exist():
+    """Round 4, Minor 6: the table of docs/installation.md did not list `docs`,
+    the target that builds the one documentation a reader on the VM has. Every
+    target it names has to exist in the Makefile and in make.ps1's ValidateSet,
+    or the reader runs a command that answers with a usage message."""
+    page = _doc("installation.md")
+    table = _docs_section(page, "## Using make / make.ps1")
+    named = re.findall(r"^\| `([a-z][a-z-]*)", table, re.M)
+    assert "docs" in named, \
+        "the make table does not list `docs`, which builds the offline wiki"
+    make = open(os.path.join(ROOT, "Makefile"), encoding="utf-8").read()
+    targets = set(re.findall(r"^\.PHONY:\s*([\w-]+)", make, re.M))
+    ps1 = open(os.path.join(ROOT, "make.ps1"), encoding="utf-8").read()
+    start = ps1.index("[ValidateSet(")
+    allowed = set(re.findall(r"'([\w-]+)'", ps1[start:ps1.index(")]", start)]))
+    for target in named:
+        assert target in targets, \
+            "docs/installation.md names `make %s`, which the Makefile has not" % target
+        assert target in allowed, \
+            "docs/installation.md names `%s`, which make.ps1 refuses" % target
+
+
+def test_the_utm_deploy_keeps_the_date_of_every_file_it_copies():
+    """Round 4, Minor 7: the date preservation was written for the wiki and
+    applied to every deployed file. Keeping it is right - a copy that carries
+    the date of its original tells the truth about what is on the VM, for app.py
+    as much as for wiki.html - but then it is not a wiki-only rule, and the
+    help may not say that a deploy renews the date (it does on the Vagrant and
+    Hyper-V paths, not on this one). Held here so the next edit cannot narrow
+    it back to the wiki unnoticed: the mtime is read and written in the loop
+    over all files, not inside a branch for one of them."""
+    source = open(os.path.join(ROOT, "scripts", "deploy-utm.py"), encoding="utf-8").read()
+    tree = ast.parse(source)
+    deploy = next(n for n in tree.body
+                  if isinstance(n, ast.FunctionDef) and n.name == "do_deploy")
+    loop = next(n for n in ast.walk(deploy) if isinstance(n, ast.For)
+                and "FILES" in ast.dump(n.iter))
+    assigned = {}
+    for statement in loop.body:          # the loop's own body, no branch of it
+        if isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                if isinstance(target, ast.Name):
+                    assigned[target.id] = ast.dump(statement.value)
+    assert "mtime" in assigned and "getmtime" in assigned["mtime"], \
+        "the UTM deploy reads the host file's date somewhere else than once per file"
+    assert "ps" in assigned and "LastWriteTimeUtc" in assigned["ps"], \
+        "the remote command that stamps the copy is not built for every file"
+
+
+# --- The numbers the guide quotes -------------------------------------------
+# A page that writes a number out by hand goes stale silently when the constant
+# behind it moves, and on the VM there is no second source to check it against:
+# the exit-capture window alone stands in three places (docs/workflow.md,
+# docs/memory.md and a node of the detonation diagram). Pinned here is the
+# phrase, not only the number, so a page that drops the sentence fails as
+# loudly as one that keeps a stale number. Diagram nodes count: the phrase of
+# docs/workflow.md is inside its mermaid block.
+QUOTED_NUMBERS = [
+    ("webui/app.py", "EXIT_CAPTURE_WINDOW", lambda v: "%d" % v,
+     [("docs/workflow.md", "for a window of %s s"),
+      ("docs/memory.md", "Armed per image name for %s s")]),
+    ("webui/memory_evidence.py", "VERDICT_SUSPICIOUS", lambda v: "%.1f" % v,
+     [("docs/memory.md", "%s suspicious"),            # the verdict diagram
+      ("docs/memory.md", "score \u2265 %s SUSPICIOUS")]),
+    ("webui/memory_evidence.py", "VERDICT_MALICIOUS", lambda v: "%.1f" % v,
+     [("docs/memory.md", "%s malicious"),
+      ("docs/memory.md", "\u2265 %s MALICIOUS")]),
+    ("webui/rizin_sessions.py", "BIG_FILE", lambda v: "%d MB" % (v // (1024 * 1024)),
+     [("docs/rizin.md", "up to %s"),                  # prose and the state diagram
+      ("README.md", "up to %s")]),
+    ("webui/rizin_emulation.py", "MAX_PATCH_BYTES", lambda v: "%d" % v,
+     [("docs/rizin.md", "at most %s bytes")]),
+    ("webui/rizin_sessions.py", "ESIL_TIMEOUT", lambda v: "%d" % v,
+     [("docs/rizin.md", "`esil.timeout` (%s s,")]),
+    ("webui/rizin_sessions.py", "REANALYZE_SLACK", lambda v: "%d KB" % (v // 1024),
+     [("docs/rizin.md", "about %s of slack")]),
+    ("webui/rizin_sessions.py", "PROJECT_PATCH_CHARS", lambda v: "%d KB" % (v // 1024),
+     [("docs/rizin.md", "At most %s of patches")]),
+    ("webui/rizin_sessions.py", "ESIL_STACK_SIZE", lambda v: "%d KB" % (v // 1024),
+     [("docs/rizin.md", "The stack is %s")]),
+    ("webui/rizin_sessions.py", "MAX_REANALYZE_FUNCTIONS", lambda v: "%d" % v,
+     [("docs/rizin.md", "%s functions")]),
+    ("webui/pipe_proxy.py", "MAX_LIVE_SESSIONS", lambda v: "%d" % v,
+     [("docs/pipes.md", "at most %s live sessions"),
+      ("docs/api.md", "429 with %s live sessions")]),
+    ("webui/dashboards.py", "MAX_DASHBOARDS", lambda v: "%d" % v,
+     [("docs/logs.md", "**%s** dashboards"),
+      ("docs/api.md", "at most %s dashboards")]),
+    ("webui/dashboards.py", "MAX_PANELS", lambda v: "%d" % v,
+     [("docs/logs.md", "**%s** tiles per dashboard"),
+      ("docs/api.md", "%s tiles each")]),
+]
+
+
+def _constant(relative, name):
+    """The value of a module-level ``NAME = <number>`` of one source file."""
+    source = open(os.path.join(ROOT, *relative.split("/")), encoding="utf-8").read()
+    m = re.search(r"^%s = ([^#\n]+)" % re.escape(name), source, re.M)
+    assert m, "%s has no %s" % (relative, name)
+    value = eval(m.group(1).strip(), {"__builtins__": {}})   # 120, 2.0, 20 * 1024 * 1024
+    assert isinstance(value, (int, float)), "%s is not a number: %r" % (name, value)
+    return value
+
+
+def test_the_numbers_the_guide_quotes_come_from_the_code():
+    for relative, name, render, places in QUOTED_NUMBERS:
+        value = render(_constant(relative, name))
+        for page, phrase in places:
+            text = README if page == "README.md" else _doc(page[len("docs/"):])
+            assert (phrase % value) in text, \
+                "%s does not say %r - %s of %s says %s" % (
+                    page, phrase % value, name, relative, value)
+
+
+def test_no_readme_section_was_lost():
+    """The split moved text out of the README; it did not drop any. Every
+    section the old README had is a heading of the README or of a page of the
+    guide today - at any level, because a "## " section of the README became
+    the "# " title of a page, and in any case, because a page may title it the
+    way the index names it ("Option A: local UI only")."""
+    found = _headings(README)
+    for page in _docs_pages():
+        found |= _headings(_doc(page))
+    missing = [t for t in OLD_README_SECTIONS if t.lower() not in found]
+    assert missing == [], "sections of the old README that no page carries: %s" % missing
+
+
+# --- The four diagrams -------------------------------------------------------
+# The design replaces the README's ASCII box drawing and three prose walkthroughs
+# (Data Flow, the verdict chain, the life of a rizin session) with four mermaid
+# blocks. A diagram nobody can read is worse than the list it replaced, so each
+# one is checked for syntax a renderer accepts, for sitting on the page that
+# needs it, and for the prose that says the same thing in words.
+
+MERMAID_BLOCK = re.compile(r"^```mermaid[ \t]*\n(.*?)^```[ \t]*$", re.M | re.S)
+# Mermaid 10 (the vendored copy of the wiki) and GitHub both render these.
+MERMAID_TYPES = re.compile(
+    r"^(?:flowchart|graph)\s+(?:TB|TD|BT|RL|LR)$|^stateDiagram-v2$|^sequenceDiagram$")
+QUOTED = re.compile(r'"[^"]*"')
+ARROW = re.compile(r"-\.->|-->|---|==>|===|--[xo]")
+EDGE_LABEL = re.compile(r"^\|[^|]*\|")
+SENTENCE_END = re.compile(r"[.!?](?:\s|$)")
+BOX_DRAWING = re.compile(r"[\u2500-\u257F]")
+# A line that starts something other than a paragraph. Bold at the start of a
+# line ("**Full analysis** goes on ...") is prose, a bullet needs its space.
+NOT_PROSE = re.compile(r"^(?:#{1,6}\s|[-*+]\s|\d+\.\s|\||>|```|---\s*$|\*\*\*)")
+
+
+def _pages():
+    """The README and every page of the guide, by the name a message can use."""
+    pages = {"README.md": README}
+    for page in _docs_pages():
+        pages["docs/" + page] = _doc(page)
+    return pages
+
+
+def _mermaid(text):
+    """The mermaid blocks of a page: (body, the text that follows the block)."""
+    return [(m.group(1), text[m.end():]) for m in MERMAID_BLOCK.finditer(text)]
+
+
+def _prose_under(rest):
+    """The first paragraph after a block, if it is prose: not a heading, list,
+    table, blockquote or another fence."""
+    para = []
+    for line in rest.splitlines():
+        if not line.strip():
+            if para:
+                break
+            continue
+        if NOT_PROSE.match(line.lstrip()):
+            break
+        para.append(line.strip())
+    return " ".join(para)
+
+
+def _section_of(text, title):
+    """The lines of one "## " section, by its title."""
+    start = text.index("\n## " + title + "\n")
+    end = text.find("\n## ", start + 1)
+    return text[start:end if end != -1 else len(text)]
+
+
+def _table_rows(text, title):
+    """The rows of the first markdown table under a heading, as they stand.
+
+    The README writes the services as a "### " subsection and docs/README.md as
+    a "## " section, so the level is not part of the search.
+    """
+    m = re.search(r"^#{2,4} %s\s*$" % re.escape(title), text, re.M)
+    assert m, "no %s section" % title
+    rows = []
+    for line in text[m.end():].splitlines():
+        if line.startswith("|"):
+            rows.append(line.rstrip())
+        elif rows:
+            break
+    assert rows, "the %s section has no table" % title
+    return rows
+
+
+def test_every_mermaid_block_is_well_formed():
+    """No renderer ships with the repository yet (the wiki vendors Mermaid 10 in
+    a later step), so the blocks are checked here instead: every block starts
+    with a diagram type both Mermaid 10 and GitHub know, its brackets nest and
+    close, and no arrow has an empty end - a node id lost to a typo renders as
+    an edge into nowhere, or as the error box Mermaid draws instead of the
+    diagram."""
+    blocks = 0
+    for name, text in _pages().items():
+        for body, _ in _mermaid(text):
+            blocks += 1
+            lines = [l for l in body.splitlines() if l.strip()]
+            assert lines, "%s has an empty mermaid block" % name
+            head = lines[0].strip()
+            assert MERMAID_TYPES.match(head), \
+                "%s: %r is not a diagram type Mermaid 10 and GitHub both render" % (name, head)
+            plain = QUOTED.sub('""', body)
+            for raw in body.splitlines():
+                assert raw.count('"') % 2 == 0, \
+                    "%s: a label of the %s block has an unclosed quote: %r" % (name, head, raw.strip())
+            stack, pairs = [], {")": "(", "]": "[", "}": "{"}
+            for ch in plain:
+                if ch in "([{":
+                    stack.append(ch)
+                elif ch in pairs:
+                    assert stack and stack.pop() == pairs[ch], \
+                        "%s: the brackets of the %s block do not pair up" % (name, head)
+            assert not stack, "%s: the %s block leaves %s open" % (name, head, stack)
+            for raw in plain.splitlines():
+                line = raw.strip()
+                if not line or line.startswith("%%") or not ARROW.search(line):
+                    continue
+                for i, part in enumerate(ARROW.split(line)):
+                    end = part.strip()
+                    if i:
+                        end = EDGE_LABEL.sub("", end).strip()
+                    assert end, "%s: an arrow of the %s block ends in nothing: %r" % (
+                        name, head, raw.strip())
+    # The design sanctions four to six diagrams, and the architecture one is in
+    # both the README and the index, so the number of blocks is one more than
+    # the number of diagrams. A range, not a pin: a fifth diagram is allowed
+    # and must not fail three tests with a message that reads like an error
+    # (round 4, Minor 2).
+    assert 5 <= blocks <= 7, \
+        "the design wants four to six diagrams, the architecture one counted twice " \
+        "(README and docs/README.md): found %d blocks" % blocks
+
+
+def test_the_four_diagrams_are_where_they_belong():
+    """Each diagram belongs to the page whose text it replaces: the architecture
+    in the README (the showcase) and in docs/README.md (the index), where the
+    box drawing used to be, the detonation chain in the Data Flow section the
+    README gave up, the verdict model where memory.md explains it, and the rizin
+    session where rizin.md describes its sessions. Each one keeps two to three
+    sentences of prose under it, because a reader without a rendered diagram -
+    a plain-text view, a terminal, a screen reader - still has to be told what
+    it says."""
+    pages = _pages()
+    found = {}
+    for name, text in pages.items():
+        for body, rest in _mermaid(text):
+            found.setdefault(name, []).append((body, rest))
+            prose = _prose_under(rest)
+            assert len(SENTENCE_END.findall(prose)) >= 2, \
+                "%s: the %s block needs two sentences of prose under it, found %r" % (
+                    name, body.splitlines()[0].strip(), prose)
+
+    # 1. Architecture: the same drawing in both, so the two cannot drift apart
+    for name in ("README.md", "docs/README.md"):
+        assert len(found.get(name, [])) == 1, "%s needs the architecture diagram" % name
+        body = found[name][0][0]
+        assert body.splitlines()[0].strip().startswith("flowchart"), body.splitlines()[0]
+        for part in (":9000", "DetonatorAgent", "LitterBox", "Rustinel", "Aether"):
+            assert part in body, "%s: the architecture diagram does not name %s" % (name, part)
+    assert found["README.md"][0][0] == found["docs/README.md"][0][0], \
+        "the README and docs/README.md carry two different architecture diagrams"
+    # Round 4, Minor 1: the prose under the diagram and the services table are
+    # byte-identical in both files as well, and only the diagram was pinned -
+    # so one of the two copies could be corrected alone and the other stay
+    # wrong. The prose is what a reader without a rendered diagram gets, and
+    # the services table carries the ports.
+    assert _prose_under(found["README.md"][0][1]) == _prose_under(found["docs/README.md"][0][1]), \
+        "the README and docs/README.md say two different things under the same diagram"
+    assert _table_rows(README, "Services") == _table_rows(_doc("README.md"), "Services"), \
+        "the services table of the README and of docs/README.md have drifted apart"
+
+    # 2. The detonation chain, left to right, in the section the README lost
+    body, _ = found["docs/workflow.md"][0]
+    assert body.splitlines()[0].strip() == "flowchart LR", \
+        "the detonation chain runs left to right: %r" % body.splitlines()[0].strip()
+    assert "```mermaid" in _section_of(_doc("workflow.md"), "Data Flow"), \
+        "the detonation chain belongs in the Data Flow section of docs/workflow.md"
+    for part in ("/api/submit", "PID", "Exit", "verdict"):
+        assert part in body, "the detonation chain does not name %s" % part
+    assert "Data Flow" not in README, "the Data Flow section leaves the README"
+
+    # 3. How a memory finding becomes the shared verdict
+    body, _ = found["docs/memory.md"][0]
+    assert body.splitlines()[0].strip().startswith("flowchart"), body.splitlines()[0]
+    assert "```mermaid" in _section_of(_doc("memory.md"), "How findings become a verdict")
+    for part in ("baseline", "Persistence", "Corroboration", "verdict"):
+        assert part in body, "the verdict diagram does not name %s" % part
+
+    # 4. The life of a rizin session
+    body, _ = found["docs/rizin.md"][0]
+    assert body.splitlines()[0].strip() == "stateDiagram-v2", \
+        "the rizin session is a state diagram: %r" % body.splitlines()[0].strip()
+    assert "```mermaid" in _section_of(_doc("rizin.md"), "Sessions")
+    for part in ("aaa", "aa", "pagehide", "30 minutes", "another"):
+        assert part in body, "the rizin session diagram does not name %s" % part
+
+    assert sorted(found) == ["README.md", "docs/README.md", "docs/memory.md",
+                             "docs/rizin.md", "docs/workflow.md"], \
+        "these blocks are the design's four diagrams, each checked above; a new " \
+        "diagram is allowed (four to six) and needs its own check here: %s" % sorted(found)
+
+
+def test_no_ascii_box_drawing_is_left():
+    """The box drawing is gone, and no page draws a new one. The exemptions are
+    by location, never by character: the file tree of docs/troubleshooting.md,
+    which the design keeps as indented text, and the one line of prose that
+    names a control of the Web UI by the glyph on it - the \u2550 of the rizin
+    dock's grip, which webui/templates/index.html carries as that element's
+    text, allowed once per line and never inside a fence. The VM path list needs
+    no exemption of its own: it draws with no box-drawing character at all.
+    Everywhere else one character of U+2500..U+257F is one too many - the first
+    round allowed one per line on every page, which let a drawing in as long as
+    it was pasted one character per line. An exemption that covers nothing fails
+    as well, so none can go stale while a listing is rewritten."""
+    exempt = {("docs/troubleshooting.md", "File Structure"): None,     # a listing: any of them
+              ("docs/rizin.md", "One place in every view"): "\u2550"}  # a glyph: that one, once
+    bad, used = [], set()
+    for name, text in _pages().items():
+        section, fence = "", False
+        for number, line in enumerate(text.splitlines(), 1):
+            if line.startswith("```"):
+                fence = not fence
+                continue
+            if not fence:
+                m = HEADING.match(line)
+                if m:
+                    section = m.group(1)
+            hits = BOX_DRAWING.findall(line)
+            if not hits:
+                continue
+            key = (name, section)
+            if key not in exempt:
+                bad.append("%s:%d: a box drawing outside the listings that keep one" % (name, number))
+                continue
+            used.add(key)
+            glyph = exempt[key]
+            if glyph is not None and (fence or hits != [glyph]):
+                bad.append("%s:%d: %r is not the one %s this line may name"
+                           % (name, number, "".join(hits), glyph))
+    assert bad == [], bad
+    assert used == set(exempt), \
+        "an exemption that covers nothing: %s" % sorted(set(exempt) - used)
+
+
+# The architecture diagram's one timing claim, against the loop that makes it.
+ARCH_NODE = re.compile(r'(\w+)\["([^"]*)"\]')
+ARCH_EDGE = re.compile(r'^\s*(\w+)\s*(?:-->|-\.->)\s*(?:\|"([^"]*)"\|)?\s*(\w+)\b', re.M)
+
+
+def test_the_architecture_diagram_polls_only_what_the_loader_polls():
+    """Round 1, Important: the diagram ran all three detection engines into one
+    node and read that node "every 5 s". Only two of them are on that clock.
+    alert_loader_thread reloads Rustinel, Fibratus and LitterBox every five
+    seconds; Sysmon's Operational log is queried per request instead
+    (_read_sysmon_events through wevtutil, for the event list, the process tree,
+    the pipes and the counts), so a view can be minutes old or seconds old. The
+    engines that feed the node behind the "every 5 s" edge therefore have to be
+    exactly the ones the loader polls, and the prose must not promise the
+    cadence for Sysmon either."""
+    loader = APP[APP.index("def alert_loader_thread"):APP.index("# --- Routes: Pages ---")]
+    code = re.sub(r"#[^\n]*", "", loader)      # a comment of the loop names Sysmon; its code does not
+    polled = set(re.findall(r"load_(\w+?)_(?:alerts|results)\(\)", code))
+    assert polled == {"rustinel", "fibratus", "litterbox"}, \
+        "the 5 s loader changed what it reloads: %s" % sorted(polled)
+    assert "sysmon" not in code.lower(), "the 5 s loader reads Sysmon now; the diagram may say so"
+
+    for name in ("README.md", "docs/README.md"):
+        body, rest = _mermaid(_pages()[name])[0]
+        labels = dict(ARCH_NODE.findall(body))
+        edges = [(src, label or "", dst) for src, label, dst in ARCH_EDGE.findall(body)]
+        timed = [e for e in edges if "every 5 s" in e[1]]
+        assert len(timed) == 1, "%s: expected one timed edge, found %s" % (name, timed)
+        source = timed[0][0]
+        assert "sysmon" not in labels[source].lower(), \
+            "%s: %r is read every 5 s and names Sysmon" % (name, labels[source])
+        feeding = {labels[src].split(":")[0].split(",")[0].strip().lower()
+                   for src, _, dst in edges if dst == source}
+        assert feeding == {"rustinel", "fibratus"}, \
+            "%s: the node read every 5 s is fed by %s" % (name, sorted(feeding))
+        prose = _prose_under(rest)
+        if "five seconds" in prose:
+            assert re.search(r"Sysmon[^.]*\b(asks|request)", prose), \
+                "%s: the prose gives the five seconds without saying when Sysmon's log is read" % name
+
+
+# --- The README as a showcase ------------------------------------------------
+# The manual is in docs/ now, so what is left of the README has one job: say
+# what the tool is, show it, and point into the guide. The design fixes nine
+# sections in one order and about 400 lines (it was 2367); what it keeps is what
+# sells - the two theme images, the demo video and eight to ten features, each
+# with one sentence and one picture of itself. The video is linked, not
+# embedded: static/demo.gif is 10 MB, and embedded it loads before anybody has
+# decided to watch it.
+
+SHOWCASE_SECTIONS = ["What it does", "Architecture", "Web UI Tabs", "Quick Start",
+                     "Platform support", "Documentation", "Security Notes",
+                     "Credits", "License"]
+# A feature of the showcase: "**Named pipes** - one sentence." as a paragraph.
+FEATURE = re.compile(r"^\*\*([^*]+)\*\* \u2014 (.+?)\n[ \t]*\n", re.M | re.S)
+README_IMAGE = re.compile(r'<img src="(static/[^"]+)"')
+
+
+def test_readme_is_a_showcase():
+    lines = README.splitlines()
+    assert len(lines) < 500, \
+        "the README is %d lines; the showcase stays under 500" % len(lines)
+    titles = _heading_titles(README)
+    assert [t for t in titles if t in SHOWCASE_SECTIONS] == SHOWCASE_SECTIONS, \
+        "the showcase needs its nine sections in the design's order, found %s" % titles
+
+    assert "static/demo.gif" in README, "the README lost the way to the demo video"
+    assert '<img src="static/demo.gif"' not in README, \
+        "the demo video is linked, not embedded - it is 10 MB"
+    for shot in ("static/theme_cyberpunk.png", "static/theme_telemetry.png"):
+        assert shot in README, "the showcase keeps both theme images, %s is gone" % shot
+
+    section = _section_of(README, "What it does")
+    features = FEATURE.findall(section)
+    assert 8 <= len(features) <= 11, \
+        "the showcase names %d features, not the eight to eleven of the design: %s" % (
+            len(features), [n for n, _ in features])
+    for name, sentence in features:
+        one = " ".join(sentence.split())
+        assert one.endswith(".") and len(SENTENCE_END.findall(one)) == 1, \
+            "the %s feature is one sentence, not %r" % (name, one)
+    # What follows a feature, up to the next one, is its one picture
+    parts = FEATURE.split(section)[1:]
+    for name, rest in zip(parts[0::3], parts[2::3]):
+        shots = README_IMAGE.findall(rest)
+        assert len(shots) == 1, \
+            "the %s feature shows %s, and a feature shows exactly one picture" % (name, shots)
+        assert os.path.isfile(os.path.join(ROOT, shots[0])), shots[0]
+
+
+def test_the_documentation_map_links_every_page():
+    """The map is the way from the showcase into the guide: every page of docs/
+    (superpowers/ holds designs and plans, not the guide) is named there, with
+    the sentence that says what it answers, and every link resolves to a file
+    that is on disk. A page missing from the map is a page nobody finds."""
+    section = _section_of(README, "Documentation")
+    linked = set(re.findall(r"\]\((docs/[A-Za-z0-9_.-]+\.md)[^)]*\)", section))
+    for page in _docs_pages():
+        assert "docs/" + page in linked, \
+            "the documentation map does not link docs/%s" % page
+    for target in sorted(linked):
+        assert os.path.isfile(os.path.join(ROOT, target)), \
+            "the map links %s, which is not a file" % target
+    rows = {m.group(1): m.group(0) for m in
+            re.finditer(r"^\| \[[^\]]+\]\((docs/[^)#]+)[^)]*\).*$", section, re.M)}
+    for page in _docs_pages():
+        if page == "README.md":
+            continue      # the index: the sentence above the table takes it
+        row = rows.get("docs/" + page)
+        assert row, "docs/%s has no line of its own in the map" % page
+        cells = [c.strip() for c in row.strip("|").split("|")]
+        assert len(cells) == 2 and cells[1].endswith(("?", ".")), \
+            "the line of docs/%s needs the sentence it answers: %r" % (page, row)
+
+
+def test_the_documentation_map_shows_the_offline_wiki():
+    """The map is the way from the showcase into the guide, so it is where the
+    one offline file belongs: what builds it, where it lands, that the Web UI's
+    help links it - and a picture of it, like every other thing the README
+    shows. The VM has no network, so on that machine this file is the whole
+    documentation; a reader who never hears of it builds it never."""
+    section = _section_of(README, "Documentation")
+    assert "make docs" in section and ".\\make.ps1 docs" in section, \
+        "the map does not say what builds the wiki, on either host"
+    assert "webui/static/wiki.html" in section, "the map does not say where the wiki lands"
+    assert re.search(r"\bhelp\b", section), "the map does not say that the help links it"
+    shots = README_IMAGE.findall(section)
+    assert shots == ["static/wiki.png"], \
+        "the map shows %s; the wiki is the one picture of this section" % shots
+    assert os.path.isfile(os.path.join(ROOT, shots[0])), shots[0]
+
+
+def test_the_help_and_the_guide_say_the_same_where_they_say_it_twice():
+    """Ruling R71. The in-tab help is what a reader on the VM has: the markdown guide is not served to them, so the help
+    repeats the guide and cannot just point at it. Repeated text drifts: the help kept saying a project is "made only
+    once something is renamed or commented" after a patch and a breakpoint began to make one. So the claims that stand
+    in both are pinned here, each as the words both of them use; a change to one side alone fails the test.
+
+    The claims are the load-bearing ones: what is written and what runs, what is kept and what ends with the session,
+    and the limits a reader would otherwise find out the hard way."""
+    import html as htmllib
+    guide = re.sub(r"\s+", " ", _doc("rizin.md").replace("`", ""))    # markdown: no tags to strip, `<addr>` is text
+    help_text = htmllib.unescape(_plain(HELP))
+    shared = [
+        "the original file is never written",
+        "renamed, commented, patched by hand or given a breakpoint",    # what makes a project (the sentence R71 began with)
+        "patches set by hand",                                        # what comes back with it
+        "ESIL does not emulate the Windows API",
+        "x86-64 and x86-32 only",
+        "STOP leaves the emulation",
+        "no step back",
+        "at most 2000 bytes",
+        "4094 characters",
+        "about 4 KB of slack",
+        "WRITTEN BY THE RUN",
+        "These bytes end with the session",
+        "Clear rizin's whole cache",
+        "nothing is submitted",
+        "cannot be reached with the keyboard",
+        "above 2^53",
+        "db- @ <addr>",
+        "wc- <addr> <addr+1>",
+        "'d' commands are not allowed: emulation runs from the EMULATION tab",
+        "esil.timeout",
+        "no watchpoint",
+        "ignore esil.timeout",                                        # R74: the three unbounded ESIL commands
+        "set over bytes a run wrote carries a ⚠",                     # R72: a hand patch over run-written bytes
+        "on the lowest address of the line",                          # the gutter of DECOMPILER: where a click sets one
+        "belongs to several lines of C marks all of them",            # and that each of those lines shows it
+        "To stop at a call in the middle of a line, set the breakpoint in DISASSEMBLY",   # the one cost of that: where to go
+    ]
+    for claim in shared:
+        assert claim.lower() in help_text.lower(), "the in-tab help no longer says %r" % claim
+        assert claim.lower() in guide.lower(), "docs/rizin.md no longer says %r" % claim
+    # the sentence that went stale, in either voice
+    for stale in ("made only once something is renamed or commented", "renamed or commented)", "reaches 4094",
+                  "the file is only read", "only reads the file"):
+        assert stale not in help_text and stale not in guide, "a stale claim is back: %r" % stale
+    # the project sentence also names what is saved: the four causes in the help, the four in the guide's Projects
+    projects = re.sub(r"\s+", " ", _section_of(_doc("rizin.md"), "Projects"))
+    assert "renamed, commented, patched by hand or given a breakpoint" in projects
+    assert "Names, comments, patches set by hand and breakpoints are saved" in help_text
+
+
+def _subsection(text, title):
+    """The lines of one "### " subsection of a page, by its title."""
+    start = text.index("\n### " + title + "\n")
+    ends = [i for i in (text.find("\n### ", start + 1), text.find("\n## ", start + 1)) if i != -1]
+    return text[start:min(ends) if ends else len(text)]
+
+
+def test_the_guide_says_what_a_waiting_patch_is_and_how_a_session_comes_back():
+    """A patch set over bytes a run wrote used to be written at the open, into the file's still encrypted bytes, and
+    the next decryption XORed over it. The pages have to say what happens instead, in the words the tab uses: what a
+    waiting patch is and why it waits, its two exits (and that Apply now is the server's to offer), that the restore is
+    one press and why it is not automatic, that the SHA-256 is the proof and what a mismatch leaves, what spoils the
+    timeline, and why the decrypted bytes are not stored (64 KB read, 32 KB shared).
+
+    Three kinds of claim, each held against the thing it is about: the sentences both the help and the guide say
+    (word for word, in both), the sentences of the guide alone, and every string the guide quotes from the interface
+    (against rizin_sessions or app.js, so a reworded notice fails here and not in front of the user). The numbers are
+    the code's. The help is read in its Rizin entry only: another place cannot stand in for it."""
+    import html as htmllib
+    import rizin_emulation
+    import rizin_sessions
+
+    def words(text):
+        return re.sub(r"\s+", " ", htmllib.unescape(text).replace("`", ""))
+
+    guide = words(_subsection(_doc("rizin.md"), "Waiting patches and the way back"))
+    help_text = words(_plain(HELP[HELP.index("<h4>Rizin</h4>"):HELP.index("<h4>LitterBox</h4>")]))
+
+    shared = [
+        # what a waiting patch is, and why it waits
+        "A patch set over bytes a run wrote is not written when the file is opened",
+        "so it would land in the file's own, still encrypted bytes, and the next decryption would XOR over it",
+        "in a group of its own, WAITING",
+        # the two exits
+        "two ways out, and no third",
+        "\u2715 takes it out of the project",
+        "Apply now appears only where a run's bytes cover the address again, and the server decides that, not the pane",
+        # the restore is a press, and not an automatic one
+        "Restore the run, at the head of the right column of the EMULATION",
+        "one button press, and never on its own when a file is opened",
+        "because it runs the file's code in the emulator again and a run can take as long as esil.timeout (5 s)",
+        # the proof
+        "The SHA-256 is the proof",
+        "made over the bytes as the run left them",
+        "nothing is applied, and the cache is as it was when the file was opened",
+        # what spoils the timeline
+        "a run that ended at the time limit, a register set by hand, a console command that writes or sets, "
+        "a breakpoint that stands other than the timeline began with, a rizin that restarted, something taken out "
+        "of the cache, and a run with nothing to prove",
+        # why the bytes are not stored, with both numbers
+        "The decrypted bytes are not stored in the project",
+        "reads only the last 64 KB of the project file",
+        "share 32 KB of characters, the patches first",
+        "a timeline that does not fit is dropped whole",
+    ]
+    for claim in shared:
+        assert claim in help_text, "the in-tab help no longer says %r" % claim
+        assert claim in guide, "docs/rizin.md no longer says %r" % claim
+
+    guide_only = [
+        "in the order they were made in",                       # a patch of the decrypted code stands in the timeline
+        "the server checks it again when it is pressed",        # Apply now is drawn from the answer, decided on the press
+        "an Apply now that is always there would be the harm above with a button in front of it",
+        "the SHA-256 does not cover your patches",              # what the proof is over, and what it is not
+        "Taking back a patch that the timeline makes drops the timeline",
+        "A timeline that is spoiled is not offered and not saved",
+        "a timeline of the project that was clean before stays",
+        "the patches that wait still wait",                     # after a mismatch
+        "restore=dropped",                                      # the marker, so that the open can say it
+        "an emulation that runs",                               # when the button is off
+    ]
+    for claim in guide_only:
+        assert claim in guide, "docs/rizin.md no longer says %r" % claim
+
+    # the strings the tab shows, as the tab has them: the pane's from app.js (its long sentences are joined from
+    # pieces), the server's from the module that says them
+    pane = re.sub(r"[`'\"]\s*\n\s*\+\s*[`'\"]", "", APP_JS)
+    assert "Restore the run</button>" in pane, "the button of the pane is not called Restore the run any more"
+    pane_words = [
+        "Session restored: the saved timeline was replayed",
+        "and the bytes it left match the SHA-256 the project holds",
+        "Not restored:",
+        "The patches that wait still wait.",
+        "The way to this state is not kept in the project:",
+        "The project still holds an earlier timeline, which the restore button replays.",
+        "not applied \u00b7 kept with the project",
+        "These are not in rizin's cache: written into the file's own bytes, which are still encrypted, the next "
+        "decryption would run over them. Apply now is there once a run's bytes lie under a patch; \u2715 removes "
+        "one from the project.",
+        "This address cannot be sent exactly, so this patch cannot be removed from here",
+    ]
+    for text in pane_words:
+        assert text in pane, "the app no longer says %r" % text
+        assert text in guide, "docs/rizin.md does not quote %r" % text
+    # what the server says whole: the guide quotes the constant itself, as a cell of the table of causes (the whole
+    # cell: a guide that says more than the code does has drifted) or between quotation marks
+    reasons = [
+        rizin_sessions._RESTORE_HAND_REGISTER, rizin_sessions._RESTORE_HAND_WRITE,
+        rizin_sessions._RESTORE_HAND_EMULATION, rizin_sessions._RESTORE_HAND_SETUP,
+        rizin_sessions._RESTORE_HAND_SETTING, rizin_sessions._RESTORE_HAND_BREAKPOINT,
+        rizin_sessions._RESTORE_TIMEOUT, rizin_sessions._RESTORE_HALF,
+        rizin_sessions._RESTORE_TOO_LONG.format(count=rizin_emulation.RESTORE_MAX_ACTIONS),
+        rizin_sessions._RESTORE_UNREAD, rizin_sessions._RESTORE_FOREIGN, rizin_sessions._RESTORE_GONE,
+        rizin_sessions._RESTORE_RESTARTED, rizin_sessions._RESTORE_NOTHING,
+    ]
+    for text in reasons:
+        assert "| %s |" % text in guide, "the table of causes in docs/rizin.md does not say %r" % text
+    for text in (rizin_sessions._RESTORE_LOST_AT_OPEN, rizin_sessions._RESTORE_NO_RECORD):
+        assert '"%s"' % text in guide, "docs/rizin.md does not quote %r" % text
+    # and what it says around a placeholder: the words between them, which have to be the constant's
+    said = [v for v in vars(rizin_sessions).values() if isinstance(v, str)]
+    server_fragments = [
+        "Held back, not applied: ",
+        "The way to this state is not kept in the project: ",
+        "The project still holds an earlier timeline, which the restore button replays.",
+        "replaying the timeline left other bytes than the ones saved with it",
+        "the replay stopped at action",
+        ": nothing was applied, and the cache is as it was when the file was opened",
+    ]
+    for text in server_fragments:
+        assert any(text in v for v in said), "the server no longer says %r" % text
+    for text in server_fragments:
+        assert text in guide, "docs/rizin.md does not quote %r" % text
+
+    # The doors of the table of causes, as the code takes them. The loop above ties each reason to a cell; what it cannot see is a
+    # cell whose **cause** the code gives another reason (the console's wc- was documented as "taken out of the cache" and the
+    # code called it "a console command wrote to the cache"). So each console cause of the table is run through the code that
+    # decides it, and has to give the reason of its own row.
+    rows = {}
+    for line in _doc("rizin.md").replace("`", "").splitlines():
+        cells = [cell.strip() for cell in line.strip().strip("|").split(" | ")]
+        if line.startswith("| ") and len(cells) == 2:
+            rows[cells[0]] = cells[1]
+    doors = [
+        ("A console command that writes into the cache", "wx 90 @ 0x1000"),
+        ("A console command that writes into the cache", "wa nop @ 0x1000"),
+        ("A console command that sets a register or steps the emulation", "ar rax=1"),
+        ("A console command that sets a register or steps the emulation", "aes"),
+        ("A console command that arms the emulation", "aei"),
+        ("A console command that arms the emulation", "aeim"),
+        ("A console command that arms the emulation", "aepc 0x1000"),
+        ("A setting (e <key>=<value>)", "e asm.arch=x86"),
+        ("A setting (e <key>=<value>)", "ah 4 @ 0x1000"),
+        ("Something taken out of the cache", "wc- 0x1000 0x1001"),
+        ("Something taken out of the cache", "wc-*"),
+    ]
+    # a row of the table that names a console command and has no door above is one this test cannot drive: it would go unchecked
+    # as the table grows. So each row whose cause says "console" (or names a console command) has to be one of the doors'
+    # (two rows mention the console and are not decided by _console_spoils: the breakpoints, by _console_moves_breakpoints, and the
+    # cache that held writes before the start, by _restore_begin; tests/test_rizin.py drives both)
+    elsewhere = ("A breakpoint changed", "The cache already held writes of its own")
+    console_rows = [key for key in rows if ("console" in key.lower() or "(e <key>" in key) and not key.startswith(elsewhere)]
+    undriven = [key for key in console_rows if not any(key.startswith(cause) for cause, _ in doors)]
+    assert not undriven, "a console cause of the table of causes has no command in `doors` to run through the code: %r" % undriven
+    for cause, command in doors:
+        cell = [reason for key, reason in rows.items() if key.startswith(cause)]
+        assert len(cell) == 1, "the table of causes has no single row that begins %r" % cause
+        assert rizin_sessions._console_spoils(command) == cell[0], \
+            "the guide says %r is %r, and the code says %r" % (command, cell[0], rizin_sessions._console_spoils(command))
+
+    # the numbers: the code's own
+    assert rizin_emulation.RESTORE_MAX_ACTIONS == 500 and "at most 500 actions" in guide
+    assert rizin_sessions.RESTORE_BUDGET == 60 and "It has 60 s from its first command to its last action" in guide
+    assert rizin_sessions.ESIL_TIMEOUT == 5
+    assert rizin_sessions.PROJECT_PATCH_CHARS == 32 * 1024
+    assert "65536" in inspect.getsource(rizin_sessions._read_project_meta), "the project is no longer read from its last 64 KB"
+    assert "fh.seek(max(0, fh.tell() - 65536))" in inspect.getsource(rizin_sessions._read_project_meta)
+
+    # the API page keeps one row each and says what a waiting entry holds
+    row = [line for line in _doc("api-rizin.md").splitlines() if line.startswith("| GET | `/api/rizin/<sid>/patches` |")]
+    assert len(row) == 1 and "waiting: [{addr, after, reason, apply_now}]" in row[0]
+
+
+def test_the_api_page_names_only_methods_the_code_has():
+    # the page quotes the names of the server's own methods in places; nothing else checks that they are still there (the offer
+    # was called restore_offer in a row after it became _restore_offer)
+    import re
+    import rizin_sessions
+
+    page = "\n".join(_doc(name) for name in API_PAGES)
+    names = set(re.findall(r"`RizinSession\.(\w+)`", page)) | set(re.findall(r"`(_restore_\w+|restore_\w+)`", page))
+    assert names, "the page names no method of the session any more: this test has nothing to hold"
+    for name in names:
+        assert hasattr(rizin_sessions.RizinSession, name), "the API reference names RizinSession.%s, which is not there" % name

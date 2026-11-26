@@ -170,6 +170,36 @@ KINDS = {
         "baseline_exempt": True,
         "label": "Randomly named pipe",
     },
+    # Syscall stubs. A stub whose jump ends in private memory is weighed like a
+    # disk/memory diff and needs no second opinion. "Ends": a first hop into
+    # private memory is no finding by itself, because MinHook and Detours relay
+    # through private memory into their DLL, so the scan follows such relays
+    # and names the final owner. A hook into a module is what EDR products do to
+    # every process they watch: it is weak evidence, kept below
+    # CORROBORATION_MIN_WEIGHT so it can never vouch for another source. Known
+    # EDR hooks never get this far: the hook allowlist marks them in the scan
+    # result. Not baseline_exempt: unlike the pipe catalog, nothing here may
+    # outlive a clean-host baseline.
+    "syscall_stub_patched": {
+        "weight": 4.0, "evidence": EVIDENCE_STRUCTURAL, "corroborate": False,
+        "label": "Syscall stub redirected into private memory or a core Windows module",
+    },
+    "syscall_stub_hooked": {
+        "weight": 0.8, "evidence": EVIDENCE_BEHAVIORAL, "corroborate": True,
+        "label": "Syscall stub hooked by an unlisted module",
+    },
+    # A stub of intact shape that loads another syscall's number: a call of
+    # this function enters the kernel as a different one. No jump, so no
+    # owner to ask about, and no hooking product does it.
+    "syscall_stub_renumbered": {
+        "weight": 4.0, "evidence": EVIDENCE_STRUCTURAL, "corroborate": False,
+        "label": "Syscall stub carries the number of another syscall",
+    },
+    # A stub carried by the sample itself instead of calling ntdll.
+    "direct_syscall_stub": {
+        "weight": 4.0, "evidence": EVIDENCE_STRUCTURAL, "corroborate": False,
+        "label": "Syscall stub outside ntdll (direct syscall)",
+    },
     # Extracted artifacts
     "dumped_hidden_module": {
         "weight": 3.0, "evidence": EVIDENCE_ARTIFACT, "corroborate": False,
@@ -610,6 +640,202 @@ def from_hsb(result, process=""):
                 "needs_corroboration": True if (limited or not high) else KINDS["sleeping_beacon"].get("corroborate", True),
                 "limitation": result.get("limitation"),
             },
+        ))
+    return out
+
+
+def _hex(value):
+    return f"{value:#x}" if isinstance(value, int) and not isinstance(value, bool) else "an unknown number"
+
+
+def from_syscall_scan(result, process=""):
+    """Normalize a syscall scan (``syscall_scan.measure``) into findings.
+
+    A patched stub and a hook not on the allowlist score. The allowlist
+    verdict is read from each deviation's ``allowlisted`` flag: only the scan
+    knows the build and view it was measured against. ``diverged`` stays out on
+    purpose: with no resolvable jump target a hook cannot be told from a patch,
+    and a guess is worse than a gap. It remains visible in the scan's own map,
+    and the verdict names how many there are.
+
+    A stub that loads another syscall's number (``number_matches`` False)
+    scores on its own, whatever its state: it needs no jump target to be
+    understood and no hooking product does it, so no allowlist covers it.
+
+    Identity is the syscall and the module its jump lands in, never the RVA or
+    the target address, which move between builds and runs.
+    """
+    out = []
+    if not isinstance(result, dict):
+        return out
+    for dev in result.get("deviations") or []:
+        if not isinstance(dev, dict):
+            continue
+        name = dev.get("name") or ""
+        if dev.get("number_matches") is False:
+            out.append(MemoryFinding(
+                source="syscalls", kind="syscall_stub_renumbered", process=process,
+                detail=(f"{name} loads syscall number {_hex(dev.get('live_number'))}, "
+                        f"the baseline has {_hex(dev.get('number'))}"),
+                identity=(name.lower(),),
+                extra={
+                    "syscall": name,
+                    "module": dev.get("module"),
+                    "number": dev.get("number"),
+                    "live_number": dev.get("live_number"),
+                    "rva": dev.get("rva"),
+                    "expected": dev.get("expected"),
+                    "actual": dev.get("actual"),
+                    "number_matches": False,
+                    "build": result.get("build"),
+                    "view": result.get("view"),
+                },
+            ))
+        state = dev.get("state")
+        if state == "patched":
+            kind = "syscall_stub_patched"
+        elif state == "hooked" and not dev.get("allowlisted"):
+            kind = "syscall_stub_hooked"
+        else:
+            continue
+        owner = (dev.get("target_owner") or "").lower()
+        pattern = dev.get("pattern")
+        relay = dev.get("relay") if isinstance(dev.get("relay"), list) else []
+        via = f" via {len(relay)} relay{'s' if len(relay) != 1 else ''}" if relay else ""
+        out.append(MemoryFinding(
+            source="syscalls", kind=kind, process=process,
+            detail=f"{name} -> {owner or 'unresolved target'}"
+                   + (f" ({pattern})" if pattern else "") + via,
+            identity=(name.lower(), owner),
+            extra={
+                "syscall": name,
+                "module": dev.get("module"),
+                "number": dev.get("number"),
+                "rva": dev.get("rva"),
+                "pattern": pattern,
+                "target_owner": dev.get("target_owner"),
+                "relay": relay,
+                "expected": dev.get("expected"),
+                "actual": dev.get("actual"),
+                "number_matches": dev.get("number_matches"),
+                "build": result.get("build"),
+                "view": result.get("view"),
+            },
+        ))
+    return out
+
+
+def from_direct_stubs(hits, process=""):
+    """Normalize the hits of a stub search (``syscall_scan.find_stubs_in_bytes`` or
+    ``find_stubs_in_process``) into findings, one per syscall.
+
+    A stub whose function the sample does not import, judged against its import table
+    expanded through the Win32 to Nt table, is a proven bypass of the import path and
+    carries the kind's full weight. The scanner only says so for such a table
+    (``import_present`` False), and only for a syscall a curated row of that table leads
+    to; against a raw one, or for any other syscall, it says None. A stub whose function it
+    imports as well, or whose import table is unknown, or whose number this build does
+    not have, is a hint: the same kind of fact held with less certainty, so it asks for
+    a second source and scores at ``UNCORROBORATED`` until one agrees, and it does not
+    itself corroborate another source (``may_corroborate`` False). A second kind would
+    not say that.
+
+    Identity is the syscall's name, or the number when the build does not know it, never
+    an address: a repeated scan must match the same finding.
+
+    Copies of one syscall are one finding, and it says the weakest claim among them (True over
+    None over False), so a copy the file exports as its own code (``own_export``) is never
+    outvoted by one found before it; the detail then says which of its copies the file exports.
+    """
+    if not isinstance(hits, (list, tuple)):
+        return []
+    groups = {}
+    for hit in hits:
+        number = hit.get("number") if isinstance(hit, dict) else None
+        if not isinstance(number, int) or isinstance(number, bool):
+            continue
+        name = hit.get("syscall") if hit.get("number_known") else None
+        key = ("name", name.lower()) if isinstance(name, str) and name else ("number", number)
+        groups.setdefault(key, []).append(hit)
+    out = []
+    for key, group in groups.items():
+        first = group[0]
+        named = key[0] == "name"
+        name = first["syscall"] if named else None
+        # Ruling 72: the group says the weakest claim among its copies, whatever their order: True if any copy is
+        # True, else None if any is None, else False. A group may not claim more than its most forgiving member,
+        # and a copy the file exports as its own code must not be outvoted by a copy found before it. The ordering
+        # runs over the copies of one source: where the group holds copies from the sample file, those decide, as
+        # before. A process copy answers for every loaded module, never for the sample (its None is "unattributable",
+        # its True nearly always kernelbase), so letting it vote would switch off every file proof of a detonation
+        from_file = [h for h in group if "offset" in h]
+        deciding = from_file or group
+        first = deciding[0]
+        answers = [h.get("import_present") for h in deciding]
+        imported = True if any(a is True for a in answers) else None if any(a is None for a in answers) else False
+        exported = sum(1 for h in deciding if h.get("own_export") is True)
+        number = f"{first['number']:#x}"
+        proven = named and imported is False
+        # a process hit has an address, a file hit an offset: only the sentence follows from it
+        in_process = "address" in first and "offset" not in first
+        if not named:
+            detail = (f"stub for syscall number {number}, which this build does not have: "
+                      "built for another Windows build")
+        elif imported is False and in_process:
+            # judged against the doors of every module loaded there: that is what the proof establishes, not
+            # what the sample alone imports
+            detail = (f"{name} stub in process memory, and no module loaded in the process imports a door "
+                      "to it")
+        elif imported is False:
+            detail = f"{name} stub carried by the sample, which does not import it"
+        elif imported and in_process:
+            detail = f"{name} stub in process memory; a module loaded in the process imports a door to it as well"
+        elif imported and exported:
+            # Ruling 73: the rescue fired for these copies, a fact of each hit, not a judgment over the file.
+            # Ruling 76: the sentence speaks only for the copies it describes. It counts the copies in the file (the
+            # deciding ones), which `copies` does not: in a detonation that also counts the copies in process memory
+            in_file = len(deciding)
+            if exported == len(group):
+                detail = (f"{name} stub the file exports under its own name: the module's own code, not a stub "
+                          "carried past the documented path")
+            elif exported == in_file:
+                detail = (f"{name} stub the file exports under its own name, in each of its {in_file} copies in the "
+                          "file; a copy in process memory cannot be attributed to that export")
+            else:
+                detail = (f"{name} stub: {exported} of the {in_file} copies in the file are the bodies of its own "
+                          "export under that name and the others are not, so this is a hint rather than a proof; "
+                          "a file that exports a syscall stub under an Nt name deserves a look")
+        elif imported:
+            detail = f"{name} stub carried by the sample, which imports it as well"
+        else:
+            detail = (f"{name} stub outside ntdll; whether a door to it is imported is unknown: no curated "
+                      "door covers the syscall, the import table was not read, or the stub is in process "
+                      "memory, which cannot be attributed to the sample")
+        places = [h.get("address", h.get("offset")) for h in group]
+        extra = {
+            "syscall": name,
+            "number": first["number"],
+            "module": first.get("module"),
+            "view": first.get("view"),
+            "pattern": first.get("pattern"),
+            "stub_hex": first.get("stub_hex"),
+            "import_present": imported,
+            "number_known": named,
+            "copies": len(group),
+            "places": places[:20],
+            "needs_corroboration": not proven,
+        }
+        if not proven:
+            # a hint keeps the kind's weight, so the weight gate alone would let it lift
+            # the uncorroborated findings of every other source in the process
+            extra["may_corroborate"] = False
+        out.append(MemoryFinding(
+            source="syscalls", kind="direct_syscall_stub", process=process,
+            detail=detail,
+            # a file hit has an offset, not an address: the first copy that has one supplies it
+            address=next((h["address"] for h in group if h.get("address") is not None), None),
+            identity=key,
+            extra=extra,
         ))
     return out
 
@@ -1119,6 +1345,10 @@ def score(findings, baseline=None):
     for f in findings:
         if f.get("base_weight", 0) < CORROBORATION_MIN_WEIGHT:
             continue
+        # a hint holds its weight but asks for a second opinion itself: it must not
+        # give one. Only a finding that sets this opts out; none of the older scanners does.
+        if f.get("may_corroborate") is False:
+            continue
         if known(f):
             continue
         if f.get("corroboration_scope") == CORROBORATION_SCOPE_ENDPOINT or assumed(f):
@@ -1126,7 +1356,8 @@ def score(findings, baseline=None):
             continue
         sources_by_process.setdefault(proc_key(f), set()).add(f["source"])
     eligible = [f for f in findings
-                if f.get("base_weight", 0) >= CORROBORATION_MIN_WEIGHT and not known(f)]
+                if f.get("base_weight", 0) >= CORROBORATION_MIN_WEIGHT and not known(f)
+                and f.get("may_corroborate") is not False]
 
     def corroborators(f):
         if assumed(f):
@@ -1388,6 +1619,7 @@ def collect(results, process="", network_process=None):
     findings += from_process_dump(results.get("process_dump") or {}, process)
     findings += from_hsb(results.get("hunt_sleeping_beacons") or {}, process)
     findings += from_beaconeye(results.get("beaconeye") or {}, process)
+    findings += from_syscall_scan(results.get("syscall_scan"), process)
 
     # Exit-time dump analysis already produces normalized findings.
     exit_res = results.get("exit_capture_result") or {}

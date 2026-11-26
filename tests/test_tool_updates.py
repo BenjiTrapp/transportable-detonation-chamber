@@ -286,6 +286,44 @@ def test_rizin_reads_cutter_version_from_package_marker():
     assert entry["pinned"] == "2.5.0"
 
 
+NTSLEUTH_TAG = "v2025.08.30-2e15c17"
+NTSLEUTH_MARKER = NTSLEUTH_TAG + "\nntsleuth-arm64.exe sha256:" + "ab" * 32 + "\nntsleuth-x64.exe sha256:" + "cd" * 32 + "\n"
+NTSLEUTH_URL = ("GET", "https://api.github.com/repos/xaitax/NTSleuth/releases/latest")
+
+
+def test_catalog_has_ntsleuth_with_a_marker_and_no_version_cmd():
+    spec = spec_of("ntsleuth")
+    assert spec.kind == "release" and spec.repo == "xaitax/NTSleuth"
+    assert spec.marker == r"C:\tools\ntsleuth\tdc-release.txt" and spec.version_cmd is None
+    assert spec.script == "install-ntsleuth.ps1" and spec.script_args == ["-Force"]
+    assert spec.pinned is None and spec.consumers == []
+
+
+def test_ntsleuth_path_is_the_binary_of_the_host_architecture():
+    # the release has no plain ntsleuth.exe; the updater only tests the path for presence
+    assert tu.ntsleuth_exe_path("ARM64") == r"C:\tools\ntsleuth\ntsleuth-arm64.exe"
+    assert tu.ntsleuth_exe_path("AMD64") == r"C:\tools\ntsleuth\ntsleuth-x64.exe"
+    assert tu.ntsleuth_exe_path("aarch64") == r"C:\tools\ntsleuth\ntsleuth-arm64.exe"
+    assert spec_of("ntsleuth").path in (tu.ntsleuth_exe_path("ARM64"), tu.ntsleuth_exe_path("AMD64"))
+
+
+@pytest.mark.parametrize("latest,status", [(NTSLEUTH_TAG, "up_to_date"),
+                                           ("v2025.10.01-abcdef0", "update_available")])
+def test_ntsleuth_compares_the_date_tag_on_the_marker_first_line(latest, status):
+    spec = spec_of("ntsleuth")
+    env = FakeEnv(files={spec.marker: NTSLEUTH_MARKER}, paths=[spec.path], urls={NTSLEUTH_URL: js({"tag_name": latest})})
+    entry = tu.check_tool(spec, env)
+    assert entry["installed"] == "2025.08.30-2e15c17"
+    assert entry["status"] == status
+    assert not env.run_calls
+
+
+def test_ntsleuth_without_marker_is_updatable():
+    spec = spec_of("ntsleuth")
+    env = FakeEnv(paths=[spec.path], urls={NTSLEUTH_URL: js({"tag_name": NTSLEUTH_TAG})})
+    assert tu.check_tool(spec, env)["status"] == "update_available"
+
+
 def test_sysinternals_etag_compare_and_missing_marker():
     spec = spec_of("sysmon")
     url = "https://download.sysinternals.com/files/Sysmon.zip"

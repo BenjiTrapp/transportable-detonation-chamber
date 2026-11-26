@@ -19,9 +19,9 @@
             document.documentElement.dataset.theme = 'cyberpunk';
         }
     </script>
-    <link rel="stylesheet" href="/static/css/style.css?v=75">
-    <link rel="stylesheet" href="/static/css/theme-layout.css?v=1">
-    <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=30">
+    <link rel="stylesheet" href="/static/css/style.css?v=98">
+    <link rel="stylesheet" href="/static/css/theme-layout.css?v=13">
+    <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=39">
 </head>
 <body>
     <!-- Global loading overlay (shown on slow fetches) -->
@@ -87,12 +87,14 @@
                     <button class="tab" data-tab="pipes">Pipes</button>
                     <button class="tab" data-tab="network">Network</button>
                     <button class="tab" data-tab="sysmon">Sysmon</button>
+                    <button class="tab" data-tab="firewall">FIREWALL</button>
                     <button class="tab" data-tab="logs">LOGS</button>
                     <button class="tab" data-tab="threatscan">ThreatScan</button>
                     <button class="tab" data-tab="etw">ETW</button>
                     <button class="tab" data-tab="hexeditor">Hex</button>
                     <button class="tab" data-tab="filemap">FileMap</button>
                     <button class="tab" data-tab="rizin">Rizin</button>
+                    <button class="tab" data-tab="syscalls">SYSCALLS</button>
                     <button class="tab" data-tab="litterbox">LitterBox</button>
                     <button class="tab" data-tab="submit">Submit</button>
                 </nav>
@@ -136,10 +138,13 @@
                     <h2 data-info="Health of every service in the chamber, the loaded detection rules and the newest alerts. Click a tile to open what it counts, a service card for its details, or Launch to start a service that is offline.">Service Dashboard</h2>
                     <div class="header-actions">
                         <span class="header-meta" id="dashboard-time"></span>
-                        <button class="btn btn-sm" onclick="refreshDashboard()">Refresh</button>
+                        <button class="btn btn-sm" onclick="refreshDashboard({ panels: true })">Refresh</button>
                     </div>
                 </div>
-                <div class="dashboard-body">
+                <!-- The pages of the tab: SERVICES (the cards below) and one per own
+                     dashboard, written by renderDashboardPages() in app.js -->
+                <div class="dashboard-pages" id="dashboard-pages" role="group" aria-label="Dashboard pages"></div>
+                <div class="dashboard-body" id="dashboard-body">
                     <!-- Stats Strip -->
                     <div class="dashboard-stats" id="dashboard-stats">
                         <!-- Rendered by JS -->
@@ -210,6 +215,13 @@
                             <div class="activity-empty">No recent activity. Submit a sample to begin.</div>
                         </div>
                     </div>
+                </div>
+                <!-- An own dashboard: its head (name, the clock of the last run, ⋯)
+                     and its tiles, written by renderOwnDashboard() in app.js. It
+                     stands in the place of .dashboard-body, which is hidden then. -->
+                <div class="dashboard-own" id="dashboard-own" hidden>
+                    <div class="dashboard-own-head" id="dashboard-own-head"></div>
+                    <div class="dashboard-panels" id="dashboard-panels"></div>
                 </div>
             </div>
 
@@ -327,6 +339,7 @@
                     <span class="rtrace-stat" id="rtrace-stat-events">0 events</span>
                     <span class="rtrace-stat" id="rtrace-stat-duration">0m 0s</span>
                     <span class="rtrace-path" id="rtrace-path">--</span>
+                    <button type="button" class="btn btn-xs rtrace-firewall" id="rtrace-firewall" title="Show the connections of this process in the FIREWALL tab" onclick="rtraceOpenFirewall()" disabled>FIREWALL</button>
                 </div>
 
                 <!-- Severity Summary Bar: the counts as pills (CHART) or as a table
@@ -677,8 +690,59 @@
                 <div id="sysmon-table" class="events-table"></div>
             </div>
 
+            <!-- Firewall Tab: the connections of the chamber (initFirewall in app.js): the head with LIVE,
+                 ASK, ISOLATED and the range, the bands that say what is not enforced, the process tree,
+                 MAP | LIST | ASN | DECISIONS with the hunting hints and the secured samples, the summary -->
+            <div class="tab-content" id="tab-firewall">
+                <div class="content-header">
+                    <h2 data-info="Every connection the chamber made, by process, on a world map and with its tags, and the switches that block it in the Windows Firewall. Select a process or an endpoint for ready LOGS queries about it.">Firewall</h2>
+                    <div class="header-actions fw-head">
+                        <span class="fw-count" id="firewall-count" aria-live="polite"></span>
+                        <button type="button" class="btn btn-sm logs-live" id="firewall-live" data-fw-live aria-pressed="true" title="Ask again every 5 seconds while this tab is open"><span class="logs-live-dot" aria-hidden="true"></span>LIVE</button>
+                        <span class="fw-ask-wrap">
+                            <button type="button" class="btn btn-sm fw-ask-btn" id="firewall-ask-btn" data-fw-ask-menu aria-haspopup="true" aria-expanded="false" title="What TDC does when a process in the chamber fetches a file">ASK: Detonation &#9662;</button>
+                            <div class="fw-ask-menu" id="firewall-ask-menu" role="menu" hidden></div>
+                        </span>
+                        <button type="button" class="btn btn-sm fw-isolated" id="firewall-isolated" data-fw-isolated aria-pressed="false" title="Block outbound connections of the chamber and switch off Windows&#39; own outbound Allow rules; loopback stays open">ISOLATED</button>
+                        <span class="fw-range" id="firewall-range"></span>
+                    </div>
+                </div>
+                <div class="fw-bands" id="firewall-bands" role="status"></div>
+                <div class="fw-grid">
+                    <aside class="fw-tree-pane" aria-label="Processes">
+                        <div class="fw-pane-head">
+                            <h3 class="chart-card-title" data-info="Each process with its endpoints, the most severe first; the colour is that of its most severe tag. TDC's own processes and local addresses have groups of their own.">PROCESSES</h3>
+                        </div>
+                        <input type="text" class="filter-input fw-search" id="firewall-search" placeholder="Filter process, domain, IP..." aria-label="Filter processes, domains and addresses" spellcheck="false" autocomplete="off">
+                        <div class="fw-tree" id="firewall-tree"><div class="fw-empty">Loading connections&hellip;</div></div>
+                    </aside>
+                    <section class="fw-center" aria-label="Destinations">
+                        <div class="chart-card fw-view-card">
+                            <div class="chart-card-head">
+                                <h3 class="chart-card-title" data-info="MAP draws an arc from the chamber to every public destination, as wide as its connections and coloured by its most severe tag. LIST is the same set as a table, ASN groups it by owner, DECISIONS lists who decided what about a download, and when.">DESTINATIONS</h3>
+                                <span class="chart-range fw-views" id="firewall-views" role="group" aria-label="View"></span>
+                            </div>
+                            <div class="fw-view" id="firewall-view"></div>
+                        </div>
+                        <div class="chart-card fw-hints" id="firewall-hints"></div>
+                        <div class="chart-card fw-captures" id="firewall-captures"></div>
+                    </section>
+                    <aside class="fw-summary" aria-label="Summary and the network cut">
+                        <div class="fw-summary-body" id="firewall-summary"></div>
+                        <section class="chart-card fw-cut-card" aria-label="Cut the network">
+                            <div class="chart-card-head">
+                                <h3 class="chart-card-title" data-info="The panic button: one press shuts every way out of the chamber in seconds, without a question, and it says its stage; leaving asks first, and the ISOLATED switch above is the same state.">NETWORK CUT</h3>
+                            </div>
+                            <div class="fw-cut-slot" id="firewall-cut-slot"><button type="button" id="firewall-cut" class="btn-skull fw-cut" data-fw-cut aria-pressed="false" disabled title="The firewall's state is being read"><span class="btn-skull-label">CUT THE NETWORK</span></button></div>
+                            <p class="fw-cut-note" id="firewall-cut-note" aria-live="polite"></p>
+                        </section>
+                    </aside>
+                </div>
+            </div>
+
             <!-- Logs Tab: search the log store (initLogs in app.js): the search bar with its range,
-                 sources and live switch, EVENTS OVER TIME, the fields of the matches, the result -->
+                 sources and live switch, EVENTS OVER TIME, the COMMANDS card and the fields of the
+                 matches on the left, the result on the right -->
             <div class="tab-content" id="tab-logs">
                 <div class="content-header">
                     <h2 data-info="Search the PowerShell, access, MCP, NetFlow, DNS and firewall logs in one place with a Splunk-like query. A click on a source, a bar or a field value narrows the search.">Logs</h2>
@@ -687,7 +751,8 @@
                         <button type="button" class="btn btn-sm logs-live" id="logs-live" aria-pressed="false" title="Search again every 10 seconds while this tab is open" onclick="toggleLogsLive()"><span class="logs-live-dot" aria-hidden="true"></span>LIVE</button>
                     </div>
                 </div>
-                <div class="logs-bar">
+                <div class="logs-bar" id="logs-bar">
+                    <div class="logs-back-row" id="logs-back" hidden></div>
                     <div class="logs-search">
                         <div class="logs-input-wrap">
                             <div class="logs-hl" id="logs-hl" aria-hidden="true"></div>
@@ -697,7 +762,7 @@
                             <button type="button" class="btn btn-sm logs-menu-btn" id="logs-menu-btn" aria-haspopup="true" aria-expanded="false" title="Example and recent searches" onclick="toggleLogsMenu()">EXAMPLES &#9662;</button>
                             <div class="logs-menu" id="logs-menu" role="menu" hidden></div>
                         </span>
-                        <button type="button" class="btn btn-sm logs-syntax" id="logs-syntax" aria-label="Search syntax" title="Search syntax">?</button>
+                        <button type="button" class="btn btn-sm logs-syntax" id="logs-syntax" aria-label="Search commands" aria-expanded="false" aria-controls="logs-commands" title="Show the commands the search knows" onclick="toggleLogsCommands()">?</button>
                         <button type="button" class="btn btn-sm btn-primary logs-go" onclick="submitLogsSearch()">SEARCH</button>
                     </div>
                     <div class="logs-error" id="logs-error" role="alert" hidden></div>
@@ -714,16 +779,54 @@
                     <div class="logs-histogram chart-clickable" id="logs-histogram" onclick="onLogsHistogramClick(event)"></div>
                 </div>
                 <div class="logs-body">
-                    <aside class="logs-fields" aria-label="Fields">
-                        <div class="logs-fields-head">
-                            <h3 class="chart-card-title" data-info="The fields of the events that match, with how many have them. Open a field for its most frequent values; a click on a value adds it to the search.">FIELDS</h3>
-                            <span class="logs-fields-count" id="logs-fields-count"></span>
-                        </div>
-                        <input type="text" class="filter-input logs-fields-filter" id="logs-fields-filter" placeholder="Filter fields..." aria-label="Filter fields" oninput="onLogsFieldFilter(this.value)">
-                        <div class="logs-field-list" id="logs-field-list"></div>
-                    </aside>
+                    <div class="logs-side" id="logs-side">
+                        <section class="logs-commands is-shut" id="logs-commands" aria-label="Search commands">
+                            <div class="logs-commands-head" data-logs-cmd-card>
+                                <h3 class="chart-card-title" data-info="Every command the log search knows, in groups. A click puts one into the search box instead of replacing what is there, so you can finish the field name and press Enter; only a source row is different: it replaces the source the query has and searches, as a source chip does.">COMMANDS</h3>
+                                <button type="button" class="logs-commands-toggle" id="logs-commands-toggle" aria-expanded="false" aria-controls="logs-commands-list" aria-label="Show or hide the search commands" title="Show or hide the commands"><span class="logs-caret" aria-hidden="true"></span></button>
+                            </div>
+                            <div class="logs-commands-list" id="logs-commands-list"></div>
+                        </section>
+                        <aside class="logs-fields" aria-label="Fields">
+                            <div class="logs-fields-head">
+                                <h3 class="chart-card-title" data-info="The fields of the events that match, with how many have them. Open a field for its most frequent values; a click on a value adds it to the search.">FIELDS</h3>
+                                <span class="logs-fields-count" id="logs-fields-count"></span>
+                            </div>
+                            <input type="text" class="filter-input logs-fields-filter" id="logs-fields-filter" placeholder="Filter fields..." aria-label="Filter fields" oninput="onLogsFieldFilter(this.value)">
+                            <div class="logs-field-list" id="logs-field-list"></div>
+                        </aside>
+                    </div>
                     <div class="logs-main">
+                        <div class="logs-result-head" id="logs-result-head">
+                            <div class="logs-tabs" id="logs-tabs" role="tablist" aria-label="Result view">
+                                <button type="button" class="logs-tab" id="logs-tab-events" role="tab" data-logs-view="events" aria-selected="true" aria-disabled="false" aria-controls="logs-results" onclick="setLogsView('events')">EVENTS</button>
+                                <button type="button" class="logs-tab" id="logs-tab-statistics" role="tab" data-logs-view="statistics" aria-selected="false" aria-disabled="false" aria-controls="logs-results" onclick="setLogsView('statistics')">STATISTICS</button>
+                                <button type="button" class="logs-tab" id="logs-tab-visualization" role="tab" data-logs-view="visualization" aria-selected="false" aria-disabled="false" aria-controls="logs-results" onclick="setLogsView('visualization')">VISUALIZATION</button>
+                            </div>
+                            <div class="logs-forms" id="logs-forms" role="group" aria-label="Chart form" hidden>
+                                <button type="button" class="logs-form" id="logs-form-table" data-logs-form="table" aria-pressed="false" aria-disabled="false" onclick="setLogsForm('table')">TABLE</button>
+                                <button type="button" class="logs-form" id="logs-form-pie" data-logs-form="pie" aria-pressed="false" aria-disabled="false" onclick="setLogsForm('pie')">PIE</button>
+                                <button type="button" class="logs-form" id="logs-form-bars" data-logs-form="bars" aria-pressed="false" aria-disabled="false" onclick="setLogsForm('bars')">BARS</button>
+                                <button type="button" class="logs-form" id="logs-form-line" data-logs-form="line" aria-pressed="false" aria-disabled="false" onclick="setLogsForm('line')">LINE</button>
+                                <button type="button" class="logs-form" id="logs-form-sankey" data-logs-form="sankey" aria-pressed="false" aria-disabled="false" onclick="setLogsForm('sankey')">SANKEY</button>
+                            </div>
+                            <button type="button" class="logs-save-btn" id="logs-save-btn" aria-disabled="true" title="needs a pipe such as | stats count by field" onclick="openLogsSave()">SAVE</button>
+                        </div>
                         <div class="logs-results" id="logs-results"><div class="logs-empty">Searching the logs&hellip;</div></div>
+                    </div>
+                </div>
+                <!-- The result as a tile on one of the own dashboards (openLogsSave in
+                     app.js): the dialog after the pattern of the help window, a backdrop
+                     and the content beside it. It stands in the tab, so it goes away with
+                     it; JS writes its fields into #logs-save-body. -->
+                <div class="logs-save hidden" id="logs-save" role="dialog" aria-modal="true" aria-labelledby="logs-save-title">
+                    <div class="logs-save-backdrop" onclick="closeLogsSave()"></div>
+                    <div class="logs-save-content">
+                        <div class="logs-save-head">
+                            <h3 class="logs-save-title" id="logs-save-title">SAVE ON A DASHBOARD</h3>
+                            <button type="button" class="btn btn-sm btn-close" aria-label="Close" onclick="closeLogsSave()">&#x2715;</button>
+                        </div>
+                        <div class="logs-save-body" id="logs-save-body"></div>
                     </div>
                 </div>
             </div>
@@ -1051,7 +1154,7 @@
                  address from data-addr. -->
             <div class="tab-content" id="tab-rizin">
                 <div class="content-header">
-                    <h2 data-info="Reverse engineering of a file on the VM in a rizin session of this browser tab; OPEN takes a submitted sample, a dump, an upload or a path. A click on a function, an instruction or a jump target moves every view there, and ◀ ▶ walk back and forth.">Rizin</h2>
+                    <h2 data-info="Reverse engineering of a file on the VM; OPEN takes a sample, a dump, an upload or a path, and a click moves every view to the same place. EMULATE runs the code in rizin's emulator without a process, and the file on disk is never written.">Rizin</h2>
                     <span class="content-subtitle" id="rizin-subtitle">Reverse engineering with rizin on the analysis VM</span>
                 </div>
                 <div class="rizin-toolbar" id="rizin-toolbar">
@@ -1075,11 +1178,29 @@
                     <span class="rizin-state" id="rizin-state" role="status" hidden></span>
                     <button type="button" class="btn btn-sm btn-primary rizin-state-btn" id="rizin-state-btn" onclick="rizinReopen()" hidden>Reopen</button>
                     <span class="rizin-toolbar-gap"></span>
+                    <button type="button" class="btn btn-sm rizin-emu-start" id="rizin-emu-start" title="Start the emulation (ESIL) at the current address; nothing of the file runs on the VM" onclick="rizinEmuStart()" disabled>EMULATE</button>
                     <label class="rizin-seek-label" for="rizin-seek">SEEK</label>
                     <input type="text" id="rizin-seek" class="filter-input rizin-seek-input" placeholder="address, function or flag" autocomplete="off" spellcheck="false" onkeydown="if (event.key === 'Enter') rizinGo()">
                     <button type="button" class="btn btn-sm btn-primary" id="rizin-go" onclick="rizinGo()">GO</button>
                     <button type="button" class="btn btn-sm rizin-history" id="rizin-back" title="Back" aria-label="Back" onclick="rizinHistoryStep(-1)" disabled>◀</button>
                     <button type="button" class="btn btn-sm rizin-history" id="rizin-forward" title="Forward" aria-label="Forward" onclick="rizinHistoryStep(1)" disabled>▶</button>
+                </div>
+                <!-- The emulation's run line: only while it runs (rizinRenderRunStrip). One delegated click handler;
+                     there is no BACK (rizin's aesb restores no memory) and no UNTIL (it needs an address) -->
+                <div class="rizin-run" id="rizin-run" role="toolbar" aria-label="Emulation" onclick="rizinOnRunClick(event)" hidden>
+                    <div class="rizin-run-buttons">
+                        <button type="button" class="btn btn-sm btn-primary rizin-run-btn" data-rizin-run="cont" title="Run until a breakpoint, a trap or esil.timeout">CONT</button>
+                        <button type="button" class="btn btn-sm btn-primary rizin-run-btn" data-rizin-run="step" title="Run one instruction">STEP</button>
+                        <button type="button" class="btn btn-sm btn-primary rizin-run-btn" data-rizin-run="over" title="Run one instruction, a call as a whole">OVER</button>
+                        <button type="button" class="btn btn-sm btn-primary rizin-run-btn" data-rizin-run="skip" title="Skip the instruction; at a call the offered answer is applied">SKIP</button>
+                        <button type="button" class="btn btn-sm btn-primary rizin-run-btn" data-rizin-run="to_call" title="Run to the next call and stop before it">TO CALL</button>
+                        <button type="button" class="btn btn-sm rizin-run-btn" id="rizin-run-gotopc" data-rizin-act="gotopc" title="Show the PC in every view">GO TO PC</button>
+                        <button type="button" class="btn btn-sm rizin-run-btn" id="rizin-run-stop" data-rizin-act="stop" title="Leave the emulation">STOP</button>
+                    </div>
+                    <span class="rizin-run-pc" id="rizin-run-pc"></span>
+                    <span class="rizin-run-regs" id="rizin-run-regs"></span>
+                    <span class="rizin-run-why" id="rizin-run-why" role="status"></span>
+                    <span class="rizin-run-assist" id="rizin-run-assist" hidden></span>
                 </div>
                 <div class="rizin-work" id="rizin-work">
                     <div class="rizin-main">
@@ -1135,8 +1256,9 @@
                                 <button type="button" class="rizin-tab" role="tab" aria-selected="false" aria-controls="rizin-xrefs" data-rizin-tab="xrefs">XREFS</button>
                                 <button type="button" class="rizin-tab" role="tab" aria-selected="false" aria-controls="rizin-strings" data-rizin-tab="strings">STRINGS</button>
                                 <button type="button" class="rizin-tab" role="tab" aria-selected="false" aria-controls="rizin-imports" data-rizin-tab="imports">IMPORTS</button>
+                                <button type="button" class="rizin-tab" role="tab" aria-selected="false" aria-controls="rizin-emulation" data-rizin-tab="emulation">EMULATION</button>
                             </div>
-                            <span class="rizin-dock-note" data-info="The console runs rizin commands where the views are and moves them when it seeks; ↑ ↓ walk the history and Tab completes commands and names. XREFS, STRINGS and IMPORTS list references, strings and imports: a click jumps there, and an import shows its references."><span id="rizin-dock-note">follows the views</span></span>
+                            <span class="rizin-dock-note" data-info="The console runs rizin commands where the views are and moves them when it seeks; Tab completes. XREFS, STRINGS and IMPORTS list references, strings and imports and a click jumps there; EMULATION shows the registers, stack, breakpoints and patches."><span id="rizin-dock-note">follows the views</span></span>
                             <div class="rizin-dock-tools rizin-quick" id="rizin-quick" data-rizin-tools="console" role="toolbar" aria-label="Quick commands" onclick="rizinOnQuickClick(event)">
                                 <button type="button" class="rizin-tool" data-cmd="afl" title="afl: the functions">afl</button>
                                 <button type="button" class="rizin-tool" data-cmd="pdf" title="pdf: the current function's disassembly">pdf</button>
@@ -1162,7 +1284,7 @@
                         </div>
                         <div class="rizin-dock-body" id="rizin-dock-body">
                             <div class="rizin-view rizin-console" id="rizin-console" role="tabpanel" data-rizin-pane="console">
-                                <div class="rizin-console-out" id="rizin-console-out" role="log" aria-label="Console output"><div class="rizin-console-entry rizin-console-hint">rizin commands run where the views are, and a seek moves them; ↑ ↓ walk the history, Tab completes, ? lists the commands. Programs, the shell and other files are not available.</div></div>
+                                <div class="rizin-console-out" id="rizin-console-out" role="log" aria-label="Console output"><div class="rizin-console-entry rizin-console-hint">rizin commands run where the views are, and a seek moves them; ↑ ↓ walk the history, Tab completes, ? lists the commands. Programs, the shell, other files and writing to the file are not available.</div></div>
                                 <div class="rizin-console-line">
                                     <label class="rizin-prompt" id="rizin-prompt" for="rizin-console-input">[-]&gt;</label>
                                     <input type="text" id="rizin-console-input" class="rizin-console-input" placeholder="type a rizin command — ↑↓ history · Tab completes · ? help" aria-label="A rizin command" autocomplete="off" spellcheck="false" onkeydown="rizinOnConsoleKey(event)">
@@ -1171,15 +1293,28 @@
                             <div class="rizin-view rizin-xrefs" id="rizin-xrefs" role="tabpanel" data-rizin-pane="xrefs" hidden onclick="rizinOnDockClick(event, 'xrefs')"></div>
                             <div class="rizin-view rizin-list" id="rizin-strings" role="tabpanel" data-rizin-pane="strings" hidden onclick="rizinOnDockClick(event, 'strings')"></div>
                             <div class="rizin-view rizin-list" id="rizin-imports" role="tabpanel" data-rizin-pane="imports" hidden onclick="rizinOnDockClick(event, 'imports')"></div>
+                            <!-- EMULATION: registers (each one editable), the stack, the breakpoints and the patches in the two groups
+                                 that decide what survives the session (rizinRenderEmuPane); one delegated handler each for clicks
+                                 and for a register field that was changed -->
+                            <div class="rizin-view rizin-emu-pane" id="rizin-emulation" role="tabpanel" data-rizin-pane="emulation" hidden onclick="rizinOnEmuPaneClick(event)" onchange="rizinOnEmuPaneChange(event)"></div>
                         </div>
                     </section>
                 </div>
-                <!-- Rename and Comment for the function, line or block right-clicked (rizinOnContextMenu) -->
+                <!-- The right-click menu (rizinOnContextMenu): Rename and Comment for the function, line or block, and, on a line
+                     of the disassembly, the patches that act on its one instruction (what applies to its type is shown, rizinOpenMenu),
+                     Bytes… and, while the emulation runs, Run to here -->
                 <div class="rizin-menu" id="rizin-menu" hidden onclick="rizinOnMenuClick(event)" onkeydown="rizinOnMenuKey(event)">
                     <div class="rizin-menu-head" id="rizin-menu-head"></div>
-                    <div class="rizin-menu-items" id="rizin-menu-items" role="menu" aria-label="Rename and comment">
+                    <div class="rizin-menu-items" id="rizin-menu-items" role="menu" aria-label="Rename, comment, patch and run to here">
                         <button type="button" class="rizin-menu-item" role="menuitem" id="rizin-menu-rename" data-action="rename">Rename function…</button>
                         <button type="button" class="rizin-menu-item" role="menuitem" id="rizin-menu-comment" data-action="comment">Comment…</button>
+                        <div class="rizin-menu-sep" id="rizin-menu-sep" role="separator" hidden></div>
+                        <button type="button" class="rizin-menu-item" role="menuitem" id="rizin-menu-nop" data-action="nop" hidden>NOP out</button>
+                        <button type="button" class="rizin-menu-item" role="menuitem" id="rizin-menu-flip" data-action="flip" hidden>Flip the jump</button>
+                        <button type="button" class="rizin-menu-item" role="menuitem" id="rizin-menu-always" data-action="always" hidden>Always jump</button>
+                        <button type="button" class="rizin-menu-item" role="menuitem" id="rizin-menu-nocall" data-action="nocall" hidden>Kill the call</button>
+                        <button type="button" class="rizin-menu-item" role="menuitem" id="rizin-menu-bytes" data-action="bytes" hidden>Bytes…</button>
+                        <button type="button" class="rizin-menu-item" role="menuitem" id="rizin-menu-until" data-action="until" hidden>Run to here</button>
                     </div>
                     <div class="rizin-menu-form" id="rizin-menu-form" role="group" aria-labelledby="rizin-menu-label" hidden>
                         <label class="rizin-menu-label" id="rizin-menu-label" for="rizin-menu-input"></label>
@@ -1188,7 +1323,177 @@
                             <button type="button" class="btn btn-sm" data-action="cancel">Cancel</button>
                             <button type="button" class="btn btn-sm btn-primary" id="rizin-menu-save" data-action="save">Save</button>
                         </div>
-                        <div class="rizin-menu-note" id="rizin-menu-note" role="status"></div>
+                    </div>
+                    <div class="rizin-menu-note" id="rizin-menu-note" role="status"></div>
+                </div>
+            </div>
+
+            <!-- SYSCALLS Tab: the map of every syscall of ntdll.dll and win32u.dll, one cell each, a band per
+                 module (block SYSCALLS of app.js). The toolbar in one line that wraps, the notices (no baseline,
+                 NTSleuth missing), the line a scan leaves, then the work area: the map with its legend and the
+                 catalog under it, each scrolling in itself. The detail panel stands to the right of them, the deviations
+                 and the known hooks under them; below 1400px the map and the detail panel take turns. GRAPH puts the
+                 binary graph's answers in the map's place: a query bar, the layered paths and their legend. -->
+            <div class="tab-content" id="tab-syscalls">
+                <div class="content-header">
+                    <h2 data-info="Every syscall of ntdll.dll and win32u.dll as one cell, from the NTSleuth baseline of this build. Choose a process and SCAN to colour each cell with the state its stub is in.">Syscalls</h2>
+                    <span class="content-subtitle" id="syscalls-subtitle">Syscall baseline and live stub measurement</span>
+                    <div class="header-actions">
+                        <button type="button" class="btn btn-sm" id="syscall-refresh" onclick="syscallRefresh(true)" title="Read the status and the baseline again">Refresh</button>
+                    </div>
+                </div>
+                <div class="syscall-toolbar" id="syscall-toolbar">
+                    <span class="chart-range syscall-switch" role="group" aria-label="Surface">
+                        <button type="button" class="chart-range-btn" id="syscall-view-map" aria-pressed="true" onclick="syscallSetView('map')">MAP</button>
+                        <button type="button" class="chart-range-btn" id="syscall-view-graph" aria-pressed="false" title="The import graph of System32: follow an import down to its syscall" onclick="syscallSetView('graph')">GRAPH</button>
+                    </span>
+                    <span class="chart-range syscall-switch syscall-pane-switch" role="group" aria-label="Pane">
+                        <button type="button" class="chart-range-btn" id="syscall-pane-map" aria-pressed="true" onclick="syscallSetPane('map')">MAP</button>
+                        <button type="button" class="chart-range-btn" id="syscall-pane-detail" aria-pressed="false" onclick="syscallSetPane('detail')">DETAIL</button>
+                    </span>
+                    <div class="syscall-group syscall-target-group">
+                        <select id="syscall-target" class="filter-select" aria-label="Process to scan" onchange="syscallOnTarget()">
+                            <option value="">-- select a process --</option>
+                        </select>
+                        <label class="syscall-check" title="win32u stubs exist only in GUI processes, so a scan leaves them out unless asked for"><input type="checkbox" id="syscall-win32u"> win32u</label>
+                        <button type="button" class="btn btn-sm btn-primary" id="syscall-scan" onclick="runSyscallScan()" disabled title="Choose a process first">SCAN</button>
+                        <button type="button" class="btn btn-sm" id="syscall-stubs-run" onclick="runSyscallStubs()" disabled title="Choose a process first">STUBS</button>
+                        <select id="syscall-past" class="filter-select" aria-label="A past measurement to look at" onchange="syscallOnPast()" title="Look at a measurement the scan history kept, a detonation's among them: it is drawn as it was measured then, nothing is measured again">
+                            <option value="">— a past measurement —</option>
+                        </select>
+                    </div>
+                    <div class="syscall-group syscall-filter-group">
+                        <input type="text" id="syscall-filter" class="filter-input" placeholder="Filter by name or number" aria-label="Filter syscalls by name or number" autocomplete="off" spellcheck="false" oninput="syscallOnFilter()">
+                        <select id="syscall-module-filter" class="filter-select" aria-label="Module" onchange="syscallOnFilter()">
+                            <option value="">both modules</option>
+                            <option value="ntdll.dll">ntdll.dll</option>
+                            <option value="win32u.dll">win32u.dll</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="syscall-notice syscall-past-banner" id="syscall-past-banner" role="status" hidden></div>
+                <div class="syscall-notices" id="syscall-notices" hidden></div>
+                <div class="syscall-scan-result" id="syscall-scan-result" role="status" hidden></div>
+                <div class="syscall-work" id="syscall-work" data-pane="map">
+                    <div class="syscall-main" id="syscall-surface-map">
+                        <div class="syscall-map-panel">
+                            <div class="syscall-legend" id="syscall-legend"></div>
+                            <div class="syscall-map" id="syscall-map"></div>
+                            <div class="syscall-tip" id="syscall-tip" role="tooltip" hidden></div>
+                        </div>
+                        <div class="syscall-catalog">
+                            <div class="syscall-catalog-head" id="syscall-catalog-head">Catalog</div>
+                            <div class="syscall-rows" id="syscall-rows"></div>
+                        </div>
+                    </div>
+                    <div class="syscall-main binary-graph" id="syscall-surface-graph" hidden>
+                        <div class="binary-graph-panel">
+                            <div class="binary-graph-modes">
+                                <span class="chart-range syscall-switch" role="group" aria-label="Graph view">
+                                    <button type="button" class="chart-range-btn" id="binary-graph-mode-path" aria-pressed="true" title="One question, drawn as a path from left to right" onclick="binaryGraphSetMode('path')">PATH</button>
+                                    <button type="button" class="chart-range-btn" id="binary-graph-mode-explore" aria-pressed="false" title="Start from one binary and open its neighbours node by node" onclick="binaryGraphSetMode('explore')">EXPLORE</button>
+                                </span>
+                                <button type="button" class="btn btn-sm binary-graph-max" id="binary-graph-max" aria-pressed="false" title="Give the graph the height of the figures table" aria-label="Give the graph the height of the figures table" onclick="binaryGraphToggleMax()">⇱</button>
+                            </div>
+                            <div class="binary-graph-pathview" id="binary-graph-path">
+                            <form class="binary-graph-bar" id="binary-graph-bar" onsubmit="binaryGraphSubmit(event)">
+                                <h3 class="syscall-panel-title" data-info="One question to the import graph of this system's System32, drawn left to right with one layer per hop. A solid edge is read from the binaries, a dashed one marked curated comes from the hand-curated Win32 to Nt table.">BINARY GRAPH</h3>
+                                <select id="binary-graph-query" class="filter-select" aria-label="Query" onchange="binaryGraphOnQuery()">
+                                    <option value="path-to-syscall">path to syscall</option>
+                                    <option value="importers">importers</option>
+                                    <option value="imports">imports</option>
+                                    <option value="syscall-callers">syscall callers</option>
+                                    <option value="forwarders">forwarders</option>
+                                    <option value="shared">shared dependencies</option>
+                                </select>
+                                <input type="text" id="binary-graph-module" class="filter-input" placeholder="Module, such as kernel32.dll" aria-label="Start node" autocomplete="off" spellcheck="false">
+                                <input type="text" id="binary-graph-function" class="filter-input" placeholder="Function, such as OpenProcess" aria-label="Function" autocomplete="off" spellcheck="false">
+                                <button type="submit" class="btn btn-sm btn-primary" id="binary-graph-run">QUERY</button>
+                            </form>
+                            <div class="binary-graph-status" id="binary-graph-status" role="status" hidden></div>
+                            <div class="binary-graph-canvas" id="binary-graph-canvas"></div>
+                            <div class="syscall-legend binary-graph-legend" id="binary-graph-legend"></div>
+                            </div>
+                            <div class="binary-explore" id="binary-explore" hidden>
+                                <form class="binary-graph-bar" id="binary-explore-bar" onsubmit="binaryGraphExploreSubmit(event)">
+                                    <h3 class="syscall-panel-title" data-info="One binary drawn alone, then opened node by node: EXPAND draws the modules it imports from, with the functions counted on each edge, and the modules that import it. FUNCTIONS draws the functions; a disc grows with its importers, and 400 nodes are the most drawn.">EXPLORE</h3>
+                                    <input type="text" id="binary-explore-start" class="filter-input" placeholder="Binary to start from, such as kernel32.dll" aria-label="Binary to start from" autocomplete="off" spellcheck="false">
+                                    <button type="submit" class="btn btn-sm btn-primary" id="binary-explore-run">START</button>
+                                    <span class="binary-explore-depth-label">DEPTH</span>
+                                    <span class="chart-range syscall-switch" id="binary-explore-depth" role="group" aria-label="Hops opened by one expansion">
+                                        <button type="button" class="chart-range-btn" id="binary-explore-depth-1" aria-pressed="true" onclick="binaryGraphSetDepth(1)">1</button>
+                                        <button type="button" class="chart-range-btn" id="binary-explore-depth-2" aria-pressed="false" onclick="binaryGraphSetDepth(2)">2</button>
+                                        <button type="button" class="chart-range-btn" id="binary-explore-depth-3" aria-pressed="false" onclick="binaryGraphSetDepth(3)">3</button>
+                                    </span>
+                                    <button type="button" class="btn btn-sm" id="binary-explore-expand" disabled title="Open the neighbours of the chosen node" onclick="binaryGraphExpand(binaryGraphExplore.selected)">EXPAND</button>
+                                    <button type="button" class="btn btn-sm" id="binary-explore-functions" disabled title="Draw the functions the chosen module imports, one node each" onclick="binaryGraphOpenFunctions(binaryGraphExplore.selected)">FUNCTIONS</button>
+                                    <span class="binary-explore-view">
+                                        <button type="button" class="btn btn-sm" title="Zoom in" onclick="binaryGraphZoom(1.25)">+</button>
+                                        <span class="binary-explore-zoom" id="binary-explore-zoom">100%</span>
+                                        <button type="button" class="btn btn-sm" title="Zoom out" onclick="binaryGraphZoom(0.8)">&minus;</button>
+                                        <button type="button" class="btn btn-sm" title="Bring every node into view" onclick="binaryGraphFit()">FIT</button>
+                                        <button type="button" class="btn btn-sm" title="Lay every node out again" onclick="binaryGraphRelayout()">LAYOUT</button>
+                                    </span>
+                                </form>
+                                <div class="binary-graph-status" id="binary-explore-status" role="status" hidden></div>
+                                <div class="binary-explore-stage" id="binary-explore-stage">
+                                    <canvas class="binary-explore-canvas" id="binary-explore-canvas" width="600" height="400" aria-label="The import graph, opened node by node"></canvas>
+                                </div>
+                                <div class="binary-explore-info" id="binary-explore-info"></div>
+                                <div class="syscall-legend binary-graph-legend" id="binary-explore-legend"></div>
+                            </div>
+                            <section class="binary-graph-metrics" aria-label="Figures of the whole stock">
+                                <div class="binary-graph-bar">
+                                    <h3 class="syscall-panel-title" data-info="The figures of the whole System32 graph, which as a cloud of nodes would be unreadable. A number opens the list behind it in the detail panel, a row of that list starts an exploration from it, and a figure of zero has no list.">FIGURES</h3>
+                                    <button type="button" class="btn btn-sm" id="binary-graph-metrics-reload" title="Read the figures again" onclick="binaryGraphMetricsLoad(true)">RELOAD</button>
+                                </div>
+                                <div class="binary-graph-status" id="binary-graph-metrics-status" role="status" hidden></div>
+                                <div class="view-table-wrap binary-graph-metrics-wrap">
+                                    <table class="view-table" data-sortable data-sort-id="binary-graph-metrics">
+                                        <thead><tr><th>FIGURE</th><th>VALUE</th><th>MEANING</th></tr></thead>
+                                        <tbody id="binary-graph-metrics-body"></tbody>
+                                    </table>
+                                </div>
+                            </section>
+                        </div>
+                    </div>
+                    <section class="syscall-panel syscall-detail" id="syscall-detail" aria-label="Syscall detail">
+                        <div class="syscall-panel-head">
+                            <h3 class="syscall-panel-title" data-info="The syscall chosen on the map, in the catalog or in the graph: number, address, signature and parameters from the baseline, and after a scan the stub bytes with the differences marked. A module, function or edge chosen in the graph is described here too.">DETAIL</h3>
+                        </div>
+                        <div class="syscall-detail-body" id="syscall-detail-body"></div>
+                        <div class="syscall-draft" id="syscall-draft" hidden></div>
+                    </section>
+                    <div class="syscall-lower" id="syscall-lower">
+                        <div class="syscall-lower-bar">
+                            <button type="button" class="syscall-lower-fold" id="syscall-lower-fold" aria-expanded="true" aria-controls="syscall-lower-body" title="Fold the panels of the last scan away" aria-label="Fold the panels of the last scan away" onclick="syscallToggleLower()">▾</button>
+                            <span class="syscall-lower-note" id="syscall-lower-note"></span>
+                        </div>
+                        <div class="syscall-lower-body" id="syscall-lower-body">
+                        <div class="syscall-lower-left">
+                            <section class="syscall-panel syscall-deviations" aria-label="Deviations">
+                                <div class="syscall-panel-head">
+                                    <h3 class="syscall-panel-title" data-info="Every stub of the last scan that is not as the baseline has it, the loudest first, with the bytes expected and read, the jump target and what it added to the evidence score. Draft rule makes a signature entry from a stub and writes nothing.">DEVIATIONS</h3>
+                                    <span class="syscall-panel-note" id="syscall-deviations-head"></span>
+                                </div>
+                                <div class="syscall-panel-body" id="syscall-deviations"></div>
+                            </section>
+                            <section class="syscall-panel syscall-stubs" id="syscall-stubs" aria-label="Syscall stubs of the sample" hidden>
+                                <div class="syscall-panel-head">
+                                    <h3 class="syscall-panel-title" data-info="Syscall stubs the chosen process carries itself, in its private executable memory and its image file: one in the file whose function the file does not import, by the curated Win32 to Nt table, is a proven bypass, the rest are hints. Draft rule makes a YARA rule for its bytes and writes nothing.">DIRECT SYSCALL STUBS</h3>
+                                    <span class="syscall-panel-note" id="syscall-stubs-head"></span>
+                                </div>
+                                <div class="syscall-panel-body" id="syscall-stubs-body"></div>
+                            </section>
+                        </div>
+                        <section class="syscall-panel syscall-hooks" aria-label="Known hooks">
+                            <div class="syscall-panel-head">
+                                <h3 class="syscall-panel-title" data-info="Hooks recorded as known, as pairs of syscall and owning module for one build and view; a known hook stays on the map and in the list but no longer counts as evidence. Record them only on a host you believe is clean.">KNOWN HOOKS</h3>
+                                <span class="syscall-panel-note" id="syscall-hooks-head"></span>
+                            </div>
+                            <div class="syscall-panel-body" id="syscall-hooks"></div>
+                        </section>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -1346,6 +1651,21 @@
                     <h3>What is Detonation Chamber?</h3>
                     <p>A pre-configured <strong>Windows 11 VM</strong> for detonating samples and watching them with several EDR-style engines at once. This web UI combines their telemetry with live-memory forensics into one verdict per detonation.</p>
 
+                    <!-- The way to the offline guide. Both lines start hidden;
+                         initHelpWiki() asks /api/wiki and shows the one that is
+                         true for this machine (app.js). The date is the file's
+                         own mtime, which is what the server can know - the
+                         Vagrant and Hyper-V deploys write the copy with the
+                         deploy's clock, the UTM deploy hands it the date of the
+                         file it copied, so it is dated, not called built; the
+                         build stamp and the commit are in the wiki's own
+                         footer. The age in days is there so an old wiki looks
+                         old instead of staying silently wrong. -->
+                    <div class="help-wiki" id="help-wiki" hidden>
+                        <p id="help-wiki-link" hidden><strong>The full guide, offline:</strong> <a href="/static/wiki.html" target="_blank" rel="noopener">open the wiki</a> &mdash; every page of <code>docs/</code> in one file, with navigation, search, the screenshots and the diagrams, and it needs no network. <span id="help-wiki-date" hidden>The file here is dated <span id="help-wiki-built"></span> &mdash; that is when this copy was written, which a deploy can renew; the wiki's own footer carries the date it was built and the commit it was built from.</span> <code>make docs</code> on the host builds it again.</p>
+                        <p id="help-wiki-missing" hidden><strong>The full guide is not on this machine.</strong> Build it on the host with <code>make docs</code> (or <code>.\make.ps1 docs</code>) and deploy again: that writes <code>static/wiki.html</code>, the whole documentation in one file that opens without a network.</p>
+                    </div>
+
                     <h4>Key Capabilities</h4>
                     <div class="help-grid">
                         <div class="help-card">
@@ -1368,6 +1688,11 @@
                             <div class="help-card-title">Binary Analysis</div>
                             <div class="help-card-desc">PE/ELF parsing, packer detection, entropy, file map, hex editor; reverse engineering with rizin and rz-ghidra</div>
                         </div>
+                        <div class="help-card">
+                            <div class="help-card-icon" style="color:var(--accent-green)">&#x1F4DC;</div>
+                            <div class="help-card-title">Log Search &amp; Dashboards</div>
+                            <div class="help-card-desc">Six log sources in one Splunk-like search, drawn as a table, pie, bars, line or Sankey, and kept as tiles on dashboards of your own</div>
+                        </div>
                     </div>
 
                     <h4>Workflow</h4>
@@ -1383,7 +1708,7 @@
                     <p>Windows reuses PIDs. The UI tracks every process instance separately: <code>1234</code> is the newest process with PID 1234, <code>1234@1789372861</code> an earlier one. Alerts, events and children belong to the instance that was running at the time.</p>
 
                     <h4>Reverse engineering</h4>
-                    <p>The <strong>Rizin</strong> tab opens a submitted sample, a dump, an upload or a path in rizin 0.9.1 on the VM and only reads the file: the functions, the disassembly, the control flow graph, rz-ghidra's C and the bytes all show one current address, which a click or a seek moves, with a console for rizin commands below. The server lets the console start no programs and touch no other files; renames and comments are kept in a project for the file. Each browser tab has a session of its own, three at most at a time.</p>
+                    <p>The <strong>Rizin</strong> tab opens a submitted sample, a dump, an upload or a path in rizin 0.9.1 on the VM and never writes the file: the functions, the disassembly, the control flow graph, rz-ghidra's C and the bytes all show one current address, which a click or a seek moves, with a console for rizin commands below. The server lets the console start no programs, touch no other files and write nothing to the file; EMULATE runs the code in rizin's ESIL emulator, which starts no process, with breakpoints, byte patches and an export of the patched copy for the Submit tab; renames, comments, patches and breakpoints are kept in a project for the file. Each browser tab has a session of its own, three at most at a time.</p>
 
                     <h4>Themes and card controls</h4>
                     <p><strong>✶</strong> switches between the Telemetry and the Cyberpunk theme at once, without reloading the page: the open tab, an open detail view, filters and drilldown steps, the graph and running interception sessions stay as they are. This browser remembers the choice; without one the UI starts in Cyberpunk, the default. Both themes have the same top bar: ✶ is at its right end (and again below "? Help" in the drawer), ☰ PROCESSES opens the process list and the timeline, "…" holds the tabs that do not fit and "n/m ONLINE" lists the five services of the status row (Rustinel, Sysmon, Fibratus, Agent, LitterBox); the SERVICES ONLINE tile also counts the Detonator.</p>
@@ -1401,6 +1726,8 @@
                         <div class="help-guide-item">
                             <h4>Dashboard</h4>
                             <p>Stats strip (alerts, processes, services, rules, tools; TOTAL ALERTS and PROCESSES TRACKED with 45-day sparklines), ALERT ACTIVITY (alerts stacked by severity) with the SEVERITY and CATEGORY donuts of its range, one card per service with launch buttons, Tool Updates (Check for updates looks for a newer version of every installed tool, Update all or the Update button of a row installs it; a pinned tool asks first, and while updates run a banner says that detonations, scans and uploads are paused), recent activity. A tile opens what it counts (the high / med / low counts of TOTAL ALERTS open the Alerts tab filtered by severity); a bar or a segment opens the Alerts tab filtered to it, and a drag across the bars narrows the donuts to the range drawn.</p>
+                            <p>Under the header a row of pages: SERVICES is everything above, and beside it one page per own dashboard, with + NEW for another one. An own page draws its tiles, each the search it was saved from in the LOGS tab, one tile after the other &mdash; the 10 s poll leaves them alone, as does a click on the page that is already open, and the clock on a tile says how old its numbers are; leaving the Dashboard tab abandons the run, and coming back computes every tile of the open page again. Refresh in the header computes every tile of the page again, the &#8635; of a tile only that one; the &#8943; of a tile opens it in LOGS, renames it, changes its form (which recomputes that tile), moves it or deletes it, and the &#8943; beside the name of the page renames or deletes the whole dashboard.</p>
+                            <p>A tile keeps only its name, its query, its form and its range (the moving one of the tab or a window frozen in UTC); the numbers come from <code>/api/logs/search</code> each time it runs, at most 1000 rows for a chart and 20 shown rows for a table. A form the columns can no longer carry falls back to the table and says why, and a refused search shows the server's message on that tile while the others keep their numbers. At most 10 dashboards, 12 tiles each, names of 1 to 60 characters; the dashboards live in <code>dashboards.json</code> beside the web UI, so they survive a restart, and every change is written at once &mdash; a second browser tab on the same page is corrected by the next write.</p>
                         </div>
                         <div class="help-guide-item">
                             <h4>Alerts</h4>
@@ -1427,8 +1754,14 @@
                             <p>Sysmon events with search, type and PID filters, and the Windows Event IDs each event corresponds to. EVENTS OVER TIME and the Sankey PROCESS &rarr; EVENT TYPE count the events of the filters, all but the time window, which the bars mark (it narrows the table): a click on a bar sets a time window (Shift+click widens it to another bar), on a legend row or a node an event type or image, each a chip in the filter bar.</p>
                         </div>
                         <div class="help-guide-item">
+                            <h4>FIREWALL</h4>
+                            <p>Every connection of the chamber, bundled per process and endpoint and tagged by what is suspicious about it (IOC, beaconing, a hard-coded address, a download, a LOLBin, a DGA-like name&hellip;); the colour of a row or an arc is its most severe tag. On the left the process tree with a filter, each process with its activity and its endpoints; TDC's own processes and local addresses are groups of their own. In the middle MAP (an arc from the chamber to each public destination), LIST (a sortable table) ASN (the destinations by the organisation that owns them) and DECISIONS (the open decisions with their answers, then those of the last 24 h: when, which process, the defanged URL, what was taken and by whom, the block and the fetch with its capture). Below, the summary counts connections, blocks, open decisions and secured samples; there are no byte figures, because Sysmon records none. ALLOW / DENY blocks a process or one endpoint of it in the Windows Firewall (a rule <code>TDC-FW-&hellip;</code>, checked before it counts as blocked) and shows the protocol of the rule; a selected endpoint can also be blocked for every program, and KILL on a selected process ends it with <code>taskkill /F</code> (after a confirmation; never TDC's own). A click selects; <strong>in LOGS &#9656;</strong> on the selected row, on its point of the map and above the hints opens the logs about it. ASK sets what happens when a process in the chamber fetches a file: Detonation (default) blocks it and asks, All does so for every process, Off only tags. The question is a toast on every tab, with CUT + FETCH, CUT ONLY and ALLOW and a countdown to what TDC does by itself when nobody answers (it keeps the block and fetches the file; only cuts while a block for every program stands on the address); closing the page changes nothing. What TDC decided while nobody answered stays as a toast until it is closed, and a summary says what came while the page was not looked at. CUT THE NETWORK, the red skull under the summary, is the panic button, and the ISOLATED switch in the head is the same state and the same press. It cuts without a confirmation: one outbound Block rule for every program shuts the egress in a few seconds, because a Block rule beats every Allow rule; loopback and this web UI stay reachable. Then, in the background, Windows' own outbound Allow rules (Core Networking's DNS among them) are switched off and the default set to Block, and the rule goes. The button says the stage: CUT &middot; SECURING&hellip; while that runs, CUT &middot; NOT SECURED when it did not get through (the band says what), ISOLATED once it is done and read back, CUT &middot; NO FETCH where something a group policy allows cannot be switched off and the rule has to stay, and ISOLATED &middot; OPEN when an outbound Allow rule is enabled again later. One rule decides a press: what is not confirmed closed (ISOLATED &middot; OPEN, CUT &middot; NOT CONFIRMED when the cut rule was not read back or, read again within 10 s, no longer stands, ISOLATED &middot; NOT CONFIRMED) is cut again, without a question, and the band offers LEAVE ISOLATED beside it; what is confirmed closed is left. While a firewall profile is off nothing is enforced: the button is disabled and says CUT &middot; FIREWALL OFF (or ISOLATED &middot; FIREWALL OFF), and the off band holds LEAVE ISOLATED beside TURN THE FIREWALL ON. The card stays in view while the column scrolls. In every cut stage TDC cannot secure a sample, and the note under the button says whether it can, cannot, or whether that is not known yet. Leaving works from any stage, after a confirmation: it stops the background work and switches exactly what ISOLATED switched off on again; <code>scripts/tdc-unisolate.ps1</code> on the VM is the way back if the web UI is gone. While a Windows Firewall profile is off nothing can be enforced: the switches are disabled and a red band says so, with TURN THE FIREWALL ON (after a confirmation, because it changes what the sample sees). A switch that cannot know whether it blocks, because the rules are not read yet or could not be, shows ?. HUNT FURTHER lists ready LOGS queries for the selection; SECURED SAMPLES opens a fetched file in Rizin, Hex or ThreatScan, never runs it.</p>
+                        </div>
+                        <div class="help-guide-item">
                             <h4>LOGS</h4>
                             <p>Search the PowerShell, access, MCP, NetFlow, DNS and firewall logs with a Splunk-like query: words, "phrases", <code>field=value</code>, AND / OR / NOT and pipes such as <code>| stats count by tool</code>, <code>| top</code> or <code>| timechart span=5m count by source</code>. The range buttons (15M to ALL) set the time; EVENTS OVER TIME zooms by a range drawn across its bars. A source chip searches one source (a grey one says why it has no data), a field value on the left adds <code>field="value"</code>, and a click on an event unfolds its fields and raw text. LIVE searches again every 10 s. EXAMPLES lists searches to start from and your last ten.</p>
+                            <p>The <strong>?</strong> beside EXAMPLES opens the COMMANDS card: the whole search language in four groups, one open at a time. A click on a row adds that command to the search box instead of replacing what is there and does not search &mdash; a pipe behind the query, a term before the first pipe &mdash; so you can finish the field name and press Enter; only a source row replaces the source and searches, as a chip does. A click on the head of the card folds it away.</p>
+                            <p>Over the result EVENTS, STATISTICS and VISUALIZATION switch between the matches, the table of the pipes and one chart: PIE, BARS, LINE or SANKEY, whichever the columns of the result can carry &mdash; column 0 is the name, the first column after it whose values are all numbers is the value, so a pie or bars need one of each, a Sankey two name columns, and a timechart draws as a line or as bars. What a result cannot carry stays in the row, grey, with the reason in its tooltip. A chart shows the twelve largest groups plus <em>other</em> (a line the series of the server) out of at most 1000 rows, and says under itself when that is less than the whole result; a click on that line adds <code>| sort -count | head 20</code> and searches again (on a timechart, whose periods must not be cut, the line is only a note). SAVE at the end of the row puts the result on one of your own dashboards as a tile, with its query, its form and either the range of the tab or the window on screen.</p>
                         </div>
                         <div class="help-guide-item">
                             <h4>ThreatScan</h4>
@@ -1448,7 +1781,16 @@
                         </div>
                         <div class="help-guide-item">
                             <h4>Rizin</h4>
-                            <p>Reverse engineering with rizin on the VM, one session per browser tab; the file is only read, nothing is written into it or next to it. OPEN ▾ lists the submitted samples, the dumps and the uploads, and takes an upload or a path in the folders the download serves; the toolbar shows the file with its format, architecture and size, the SHA256 (in full on hover) and the analysis, which starts at once (<code>aaa</code>, <code>aa</code> above 20 MB). FUNCTIONS lists the functions by address with name and size (the address on hover), filtered by name or address, and « folds it away; DISASSEMBLY shows the current function with the current address marked, calls, jumps and symbols in colour. GRAPH beside it shows the control flow graph of the function with the block of the current address marked: green edges are taken jumps, red ones the fall-through, dim ones unconditional, and loops run around the outside. Drag to move the graph, scroll or use − + to zoom and FIT to see it whole; from 200 blocks it starts as an overview without the instructions, which a click zooms into. ⇱ gives one half the whole width, the line between the halves can be dragged (← → when it has the focus, a double click puts it back), and below 1400 px of window width the two halves are tabs. A click on a function, an instruction, a jump or call target or a block, or SEEK with an address, a function or a flag name and GO, moves every view there; ◀ ▶ walk back and forth through the jumps. Once the analysis is done the tab jumps to <code>main</code> if there is one. While rizin works on an analysis step the toolbar says busy, and the views load once the step is over. The dock below holds the CONSOLE for rizin commands at the current address (the prompt shows it): a seek there (<code>s</code>, <code>pdf @ …</code>) moves every view, ↑ ↓ walk the history, Tab completes commands, functions and flags, and the quick commands above it run <code>afl</code>, <code>pdf</code>, <code>pdg</code>, <code>iz</code>, <code>ii</code>, <code>axt</code> and <code>?</code>; the server lets no command start a program, read or write a file, open another one or debug, settings are limited to <code>asm.*</code>, <code>analysis.*</code> and <code>bin.demangle</code>, whole-program analysis (<code>aa</code>, <code>aaa</code> …) runs from Full analysis instead, and a refused command says why in one line. XREFS lists the references to the current address and from it, at a function's start from the whole function; STRINGS and IMPORTS come in pages, filtered on the VM, and a click jumps there and, on an import, shows its references. ═ drags the dock's height and ▾ folds it away. A right-click on a function, an instruction or a block renames the function or comments the address (an empty comment removes it), also with <code>afn</code> and <code>CC</code> in the console; both are refused (busy) until the analysis is done, because a later step could change them, are saved 3 s later in a project for the file on the VM (<code>webui\rizin_projects\&lt;sha256&gt;.rzdb</code>, made only once something is renamed or commented) and are back when the file is opened again, under any path. DECOMPILER beside DISASSEMBLY shows the function in C from rz-ghidra with the line of the current address marked, and a click on a line goes there; HEX shows 512 bytes from the current address with their ASCII, and Open in Hex tab opens the file in the Hex tab at that byte. Scrolling down a long function loads its next instructions; outside functions the disassembly stops after 2000 instructions, and a later address in SEEK reads on. A function whose decompile took too long and ended the session is not decompiled again on its own in that file: Decompile again asks once more. A file over 20 MB is analysed with <code>aa</code>: Full analysis runs <code>aaa</code>'s steps one by one, the views usable between them; an analysis stops at the next step after 10 minutes and says why, what it found stays usable, and Full analysis goes on with the steps left. The same file opened in another browser tab takes the session there, and this tab offers Take it back; a session that ended (30 minutes unused, its page closed, rizin stopped) comes back with Reopen, at the same place. At most three sessions run at once, and a fourth ends the one unused longest; every command has a time limit (views 30 s, the console 60 s, a decompile 120 s), and a rizin that does not answer in time is ended without holding up the rest of the web UI. The Rizin buttons of the Submit history, Process Dump, Exit Capture, ThreatScan (its result and its history) and the Hex tab open their file here.</p>
+                            <p>Reverse engineering with rizin on the VM, one session per browser tab; the original file is never written, and nothing of it runs. OPEN ▾ lists the submitted samples, the dumps and the uploads, and takes an upload or a path in the folders the download serves; the toolbar shows the file with its format, architecture and size, the SHA256 (in full on hover) and the analysis, which starts at once (<code>aaa</code>, <code>aa</code> above 20 MB). FUNCTIONS lists the functions by address with name and size (the address on hover), filtered by name or address, and « folds it away; DISASSEMBLY shows the current function with the current address marked, calls, jumps and symbols in colour. GRAPH beside it shows the control flow graph of the function with the block of the current address marked: green edges are taken jumps, red ones the fall-through, dim ones unconditional, and loops run around the outside. Drag to move the graph, scroll or use − + to zoom and FIT to see it whole; from 200 blocks it starts as an overview without the instructions, which a click zooms into. ⇱ gives one half the whole width, the line between the halves can be dragged (← → when it has the focus, a double click puts it back), and below 1400 px of window width the two halves are tabs. A click on a function, an instruction, a jump or call target or a block, or SEEK with an address, a function or a flag name and GO, moves every view there; ◀ ▶ walk back and forth through the jumps. Once the analysis is done the tab jumps to <code>main</code> if there is one. While rizin works on an analysis step the toolbar says busy, and the views load once the step is over. The dock below holds the CONSOLE for rizin commands at the current address (the prompt shows it): a seek there (<code>s</code>, <code>pdf @ …</code>) moves every view, ↑ ↓ walk the history, Tab completes commands, functions and flags, and the quick commands above it run <code>afl</code>, <code>pdf</code>, <code>pdg</code>, <code>iz</code>, <code>ii</code>, <code>axt</code> and <code>?</code>; the server lets no command start a program, read a file, write to the file (writes may only go into rizin's cache), open another file or debug for real (<code>d</code> is the breakpoint list only: <code>'d' commands are not allowed: emulation runs from the EMULATION tab</code>), settings are limited to <code>asm.*</code>, <code>analysis.*</code>, <code>esil.*</code>, <code>bin.demangle</code> and <code>io.cache</code>, whole-program analysis (<code>aa</code>, <code>aaa</code> …) runs from Full analysis instead, and <code>aecc</code>, <code>aecs</code> and <code>aesuo</code> are refused because they ignore <code>esil.timeout</code> and would run until rizin is killed and the session with it (TO CALL does this; <code>aec</code>, <code>aecu</code>, <code>aes</code>, <code>aesu</code>, <code>aess</code>, <code>aeso</code> and <code>aesb</code> all stop at the timeout and stay open), and a refused command says why in one line. XREFS lists the references to the current address and from it, at a function's start from the whole function; STRINGS and IMPORTS come in pages, filtered on the VM, and a click jumps there and, on an import, shows its references. ═ drags the dock's height and ▾ folds it away. A right-click on a function, an instruction or a block renames the function or comments the address (an empty comment removes it), also with <code>afn</code> and <code>CC</code> in the console; both are refused (busy) until the analysis is done, because a later step could change them. Names, comments, patches set by hand and breakpoints are saved 3 s later in a project for the file on the VM (<code>webui\rizin_projects\&lt;sha256&gt;.rzdb</code>, made once something is renamed, commented, patched by hand or given a breakpoint, or the emulation has run) and are back when the file is opened again, under any path. DECOMPILER beside DISASSEMBLY shows the function in C from rz-ghidra with the line of the current address marked, and a click on a line goes there; HEX shows 512 bytes from the current address with their ASCII, and Open in Hex tab opens the file in the Hex tab at that byte. Scrolling down a long function loads its next instructions; outside functions the disassembly stops after 2000 instructions, and a later address in SEEK reads on. A function whose decompile took too long and ended the session is not decompiled again on its own in that file: Decompile again asks once more. A file over 20 MB is analysed with <code>aa</code>: Full analysis runs <code>aaa</code>'s steps one by one, the views usable between them; an analysis stops at the next step after 10 minutes and says why, what it found stays usable, and Full analysis goes on with the steps left. The same file opened in another browser tab takes the session there, and this tab offers Take it back; a session that ended (30 minutes unused, its page closed, rizin stopped) comes back with Reopen, at the same place. At most three sessions run at once, and a fourth ends the one unused longest; every command has a time limit (views 30 s, the console 60 s, a decompile 120 s), and a rizin that does not answer in time is ended without holding up the rest of the web UI. The Rizin buttons of the Submit history, Process Dump, Exit Capture, ThreatScan (its result and its history) and the Hex tab open their file here.</p>
+                            <p><strong>EMULATE</strong> in the toolbar runs the file's code from the current address in rizin's ESIL emulator: no process starts, and what the code writes goes into rizin's write cache (<code>io.cache</code>), in memory, so the original file is never written. A run strip appears with CONT (until a breakpoint, a trap or <code>esil.timeout</code>), STEP, OVER (a call as a whole), SKIP, TO CALL (it stops before the next call), GO TO PC and STOP, the PC, the registers the last step changed (Δ) and why the run stopped; Run to here is in the right-click menu of a disassembly line. There is no step back: rizin's <code>aesb</code> restores no memory. STOP leaves the emulation instead of aborting a running command, which rizin cannot do under Windows; a run ends by itself after <code>esil.timeout</code> (5 s). An invalid memory access and a jump into memory that cannot execute are one stop reason: "Stopped: an invalid memory access, or the PC is in memory that cannot be executed". The EMULATION tab of the dock holds the registers (each one editable), the stack, the breakpoints and the patches. When the stack pointer leaves the stack the emulation mapped, it says "No stack words to show: the stack pointer is outside the stack the emulation mapped, or that map is gone. Restarting the emulation (STOP, then EMULATE) maps it again."</p>
+                            <p>A click in the gutter left of an address sets or removes a breakpoint (●). The gutter is the narrow column at the left edge of every line, a faint ○ where there is none (stronger under the pointer); the cell between it and the address is for the ≠ of a patched line, and is not a button. DECOMPILER has the same gutter before the C of each line that has an address (the signature and a brace have none): a click sets the breakpoint on the lowest address of the line, so a run stops before this line, and the hover text names that address; if another address of the line has one already, a click removes that one. An instruction that belongs to several lines of C marks all of them, and a click on any of them removes it. To stop at a call in the middle of a line, set the breakpoint in DISASSEMBLY. There is no on/off and no watchpoint (<code>dbw</code> hangs rizin). The gutters and the lines of DISASSEMBLY and DECOMPILER cannot be reached with the keyboard: <code>db @ &lt;addr&gt;</code> in the console sets one. ESIL does not emulate the Windows API, so at a call the strip says what SKIP will do (the API's name, a value for the return register that you can edit, a buffer to map or a copy to make), the way a clean machine would answer; at 32-bit stdcall SKIP also corrects the stack. A buffer a memory API answers with is mapped readable, writable <em>and</em> executable, so code copied or decrypted into it really runs: <code>aeim</code> alone maps it rw-, where a jump into it would stop with a trap. That covers x86-64 and x86-32 only; on another architecture the assistant switches itself off and says so, and the rest keeps working.</p>
+                            <p>A right-click on an instruction offers NOP out, Flip the jump, Always jump and Kill the call (x86 only, each where it applies) and Bytes…: hex digits, an even number, at most 2000 bytes (4000 digits), because rizin cuts a command line longer than 4094 characters without a word. Nothing assembles. A line with bytes written by hand shows ≠ ("Patched by hand: these bytes were written here"). PATCHES keeps what was set by hand (kept with the project, exported, taken back one at a time with ✕) apart from WRITTEN BY THE RUN, which says "These bytes end with the session: they are not saved with the project and not in an export."; a <code>wx</code> typed in the console is in that group too. A patch set over bytes a run wrote carries a ⚠: rizin reports as the bytes before it what the run wrote, which need not be what the file holds, so the group says so and the export's note names the row with the file's own bytes. Taking such a patch back drops the run's whole write with it (rizin removes a write whole) and the pane names what went. "Clear rizin's whole cache" clears both groups after asking, and is also the way to remove words that an earlier run left in the stack after a restart. Re-analyse analyses the range a run wrote again, with about 4 KB of slack past its end, so that FUNCTIONS and STRINGS see what it decrypted; what it finds ends with the session too. Export writes a copy of the file with the patches set by hand into <code>%TEMP%\rizin_uploads</code>, named <code>….patched.…</code>, with a <code>….patch.txt</code> note beside it (the original's path, both SHA-256 digests, the time and one line per patch, with the file's own bytes there, read from the original); a patch that has no place in the file is named and left out. "To the Submit tab" is a second click that puts the copy into the Submit tab, which says which patches are missing from it; nothing is submitted until you press Detonate there. In a kernel or complete memory dump, a breakpoint or patch row above 2^53 shows ? and cannot be clicked: remove it in the console with <code>db- @ &lt;addr&gt;</code> or <code>wc- &lt;addr&gt; &lt;addr+1&gt;</code>.</p>
+                            <p>A patch set over bytes a run wrote is saved with a mark (the ⚠). A patch set over bytes a run wrote is not written when the file is opened again: opening happens before any run, so it would land in the file's own, still encrypted bytes, and the next decryption would XOR over it. It waits instead: PATCHES shows it in a group of its own, WAITING (not applied · kept with the project), with its reason, and the session's note names it once when the file is opened. A waiting patch has two ways out, and no third: ✕ takes it out of the project, and Apply now writes it into the cache. Apply now appears only where a run's bytes cover the address again, and the server decides that, not the pane; the server checks it again when it is pressed, and says why not. Restore the run, at the head of the right column of the EMULATION tab, replays the timeline the project keeps of the emulation (the start, the runs, each skipped call with the answer that was applied, and your patches, in the order they were made in) and then writes the patches that waited and that a run's bytes cover again. It is one button press, and never on its own when a file is opened, because it runs the file's code in the emulator again and a run can take as long as <code>esil.timeout</code> (5 s). The SHA-256 is the proof: the project holds one for each range the run decrypted, made over the bytes as the run left them (so not over your patches), and the replay is checked against them. If the bytes differ, nothing is applied, and the cache is as it was when the file was opened; the notice says so, and so it does when an action is refused or the replay needs more than 60 s. The timeline is not kept, and the button says why it is off, after a run that ended at the time limit, a register set by hand, a console command that writes or sets, a breakpoint that stands other than the timeline began with, a rizin that restarted, something taken out of the cache, and a run with nothing to prove. The decrypted bytes are not stored in the project: the web UI reads only the last 64 KB of the project file, and the patches and the timeline share 32 KB of characters, the patches first. What is saved is the timeline, with a SHA-256 for each range, at most 500 actions; a timeline that does not fit is dropped whole, and the next open says so.</p>
+                        </div>
+                        <div class="help-guide-item">
+                            <h4>SYSCALLS</h4>
+                            <p>Aether does not look at <code>ntdll.dll</code>: it skips everything under <code>C:\Windows\</code>, and its disk comparison answers only yes or no, without a name, an address or bytes. This tab fills that gap with a baseline of what every syscall stub should look like, and names what differs. The map of every syscall of <code>ntdll.dll</code> and <code>win32u.dll</code>, one cell each in the order of its number, a band per module, comes from the NTSleuth baseline of this Windows build and view (arm64, x64). Without a scan the cells carry the baseline in one quiet tone and the map is the catalog. Choose a process, tick win32u if it is a GUI process (ntdll alone is scanned otherwise; the box is off, with the reason, when the baseline holds no win32u syscalls, as the x64 view of an ARM64 host has, and the map then has no win32u band) and press SCAN: the stubs are read from the process and each cell takes the state it was measured in, with the legend counting them. <em>intact</em>: as the baseline has it; <em>hooked (file-backed module)</em>: the jump ends in a loaded module other than ntdll that a file backs, which is what an EDR does and so normal on a host with one, weak evidence, but also what a DLL the sample loaded or a legitimate DLL it overwrote in place would look like; <em>patched</em>: the jump ends in private memory, a section no file backs or a mapped view of a file (no loaded module, whatever file it maps), or in a core Windows module such as kernelbase.dll (a code cave), which no hooking product explains, so who owns the target tells the two apart and not the instruction. A first jump into private memory is followed when it is itself a jump, up to two relays, because MinHook and Detours hook through such a relay; the detail names the relay. A relay that leads back into ntdll is patched too, as no jump of ntdll's own goes out and back; <em>diverged</em>: the bytes differ but the jump is neither of those or cannot be resolved, which is never guessed at; <em>unreadable</em>: no stub could be read. A single deviation among the cells (some 2,000 of them in an arm64 baseline) stands out by its colour and a ring. The filter takes a name, a decimal or hex number, and the module menu narrows it to one module: cells that do not match are dimmed, not removed, so a cell stays where it is. Hover a cell for its name and number, click it to mark it; the catalog under the map lists the first 300 matches. DETAIL shows the chosen syscall with its parameters, its signature to copy, the stub bytes of the baseline and, after a scan, the bytes read with the differences marked, and links to ntdoc and WinGraph (at its root, nothing is fetched from it); Open in Rizin appears for the native view only. DEVIATIONS lists every stub of the last scan that is not intact, the loudest first, with what it added to the evidence score; Draft rule makes a signature entry and writes nothing. STUBS searches the chosen process, and its file, for syscall stubs it carries itself, a way round ntdll: each hit names its syscall, and Draft rule makes a YARA rule that names the build and view. APPLY TO THIS VM writes that rule where Rustinel reads its rules, which should load it within about two seconds (not yet verified on a VM) and is gone with the VM; DOWNLOAD FOR THE REPO gives the file to commit under <code>rules/yara/</code>, to keep it in version control; whether a committed rule is loaded again after a rebuild is not yet verified. Nothing is written before one of them is pressed. KNOWN HOOKS holds the hooks of this host as pairs of syscall and owning module: record them once on a host you believe is clean, and they stay on the map and in the list but no longer count as evidence. A patch is never recorded. <strong>A past measurement</strong>, the one a detonation made among them, is looked at with the list after STUBS, <em>&mdash; a past measurement &mdash;</em>, which names each syscall scan the scan history kept by process, PID, time and view; in the Memory tab of a detonation, <em>Show on the syscall map</em> beside the raw button opens the measurement of that run. Choosing one measures nothing: it is drawn as it was measured then, under a banner that says PAST MEASUREMENT, the process and PID, when it was measured (by the chamber's clock, with no time zone), its build and view and that it is not a scan of now, with BACK TO LIVE at its end. While it is on the map SCAN and STUBS are off, so that the map never holds half of then and half of now, the live scan and stub search are put away, recording hooks is not offered (it measures the process again, now), and DEVIATIONS says whose deviations it lists and when they were measured. The history keeps the counts and the deviations, not the stubs: the map is rebuilt from the baseline of the measurement's own build and view, and an intact stub has no bytes to show, because none were kept. Where it cannot be rebuilt (this system has no baseline for that build and view, as after a Windows update, the baseline is unusable, or the numbers do not place), or it was measured on another build than the one whose baseline the map holds, no cells are drawn: the banner turns to the error tone and says why, and the figures and deviations it recorded are shown all the same. The notices over the map say what is missing: NTSleuth not installed, no baseline for this build and view yet (it is extracted in the background), and, on an ARM64 host, an x64 view that cannot be told from the arm64 one under emulation, whose baseline is discarded on purpose and which so cannot measure emulated x64 processes; that is not a fault, and it is not the same as no baseline.</p>
+                            <p><strong>GRAPH</strong>, beside MAP, draws the import graph of <code>C:\Windows\System32</code> in the map's place: what each of the binaries there (3,999 on the build this was measured on) imports and exports, with every forwarder followed to the module that defines it. It is made on this VM from the files themselves, offline, by <code>scripts/build-binary-graph.ps1</code> at provisioning; when it is missing the web UI builds it in the background and the tab says so. <em>PATH</em> asks one question, <em>path to syscall</em>, <em>importers</em>, <em>imports</em>, <em>syscall callers</em>, <em>forwarders</em> or <em>shared dependencies</em>, and draws the answer from left to right, one layer per hop: from an import such as <code>kernel32.dll</code> and <code>WriteProcessMemory</code> down to the syscall number of this build's baseline. <em>EXPLORE</em> starts at one binary and opens its neighbours node by node: EXPAND opens the modules it imports from and the ones that import it, as many hops as DEPTH says, and FUNCTIONS the functions it imports, always one hop; at most 400 nodes are drawn, and the line above the canvas says what was left out. <em>FIGURES</em> counts the whole stock, and a number opens the list behind it. The graph gets the room: in GRAPH the panels of the last scan (DEVIATIONS, DIRECT SYSCALL STUBS, KNOWN HOOKS) are folded away, with a bar that names them, carries each one's count as it is written, says when a stub search was not complete or the hook list could not be read, and opens them again in one click, and <strong>&#8689;</strong> folds the rows of the figures table too, which on the chamber takes the canvas from 240 to 647 px. EXPLORE, which works on the canvas, starts with those rows folded; PATH, whose answer is short, keeps them beside it. The figures' own line stays either way, the one that says how many binaries had a table cut short and how many files were not read at all, and a fold or unfold by hand is kept from then on. The canvas zooms with the wheel and the + and &minus; buttons, FIT brings every node into view, LAYOUT lays them out again, and dragging moves a node or the view. A <strong>solid edge is read from the binaries</strong>. The last hop from a Win32 function to its Nt counterpart is not in any binary: it comes from a hand-curated table, and it is a <strong>dashed edge marked curated</strong>, at most one per path and always the last. The step from a Zw name of ntdll to its Nt name is curated too, a naming convention that no binary states, in a path and in the syscall callers alike, and so are the rows of the table that FIGURES lists as curated transitions. A path that ends in an Nt name which ntdll or win32u exports is derived throughout. Where a table of a binary was cut short when it was read, the answer says so: the counts of the exploration and the figures are lower bounds, and any other answer is not certain. WinGraph is only linked to, never queried.</p>
                         </div>
                         <div class="help-guide-item">
                             <h4>LitterBox</h4>
@@ -1464,7 +1806,7 @@
                 <!-- API Reference -->
                 <div class="help-section" id="help-api">
                     <h3>API</h3>
-                    <p class="help-muted">Served on port <code>9000</code>, JSON. No login (keep the VM on an isolated network); state-changing requests from other web sites are refused. The full reference with all endpoints is in the README; the MCP server (<code>mcp/server.py</code>, 47 tools) wraps the same API.</p>
+                    <p class="help-muted">Served on port <code>9000</code>, JSON. No login (keep the VM on an isolated network); state-changing requests from other web sites are refused. The full reference with all endpoints is the API page of the offline wiki (<a href="/static/wiki.html#api" target="_blank" rel="noopener">open it here</a> &mdash; Overview says whether that file is on this machine), and <code>docs/api.md</code> in the repository, with the RIZIN tab's routes in <code>docs/api-rizin.md</code>; the MCP server (<code>mcp/server.py</code>, 49 tools) wraps the same API.</p>
 
                     <h4>Core</h4>
                     <table class="help-api-table">
@@ -1512,6 +1854,20 @@
                             <tr><td class="api-post">POST</td><td><code>/api/scan/beacons</code></td><td>Hunt-Sleeping-Beacons (also <code>beaconeye</code>)</td></tr>
                             <tr><td class="api-post">POST</td><td><code>/api/memory/sweep</code></td><td>Scan every process (or capture the baseline)</td></tr>
                             <tr><td class="api-get">GET</td><td><code>/api/memory/baseline</code></td><td>Host memory baseline status</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/syscalls/status</code></td><td>NTSleuth installed, baselines per build and view, background extraction</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/syscalls/baseline</code></td><td>Syscall catalog, paged. Params: <code>view</code>, <code>query</code>, <code>module</code>, <code>offset</code>, <code>limit</code></td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/syscalls/&lt;name&gt;</code></td><td>One syscall with parameters and stub, found under its Nt or its Zw name (the baseline holds one of the two; a stub hit names it by its Nt name). Param: <code>view</code></td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/syscalls/scan</code></td><td>Measure the syscall stubs of a PID against the baseline. Params: <code>pid</code>, <code>modules</code></td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/syscalls/measurements</code></td><td>The syscall scans the scan history kept, newest first: each named by <code>id</code>, time, PID, process, build, view and counts; the list carries no measurement</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/syscalls/measurement</code></td><td>One of them in the shape of a scan, with <code>live</code> false and <code>measured_at</code>; <code>states</code> rebuilt against the baseline of its own build and view, or null with a <code>problem</code>. Param: <code>id</code></td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/syscalls/stubs</code></td><td>Syscall stubs outside ntdll, in a PID or a file, each named by its Nt name. Params: <code>pid</code> or <code>path</code> with <code>view</code></td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/syscalls/hook-baseline</code></td><td>Known hooks (also <code>POST</code> to record a PID's hooks on a clean host, <code>DELETE</code> to forget)</td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/syscalls/rule</code></td><td>Draft a YARA rule from a stub hit, or a signature from a deviation. Writes nothing. Params: <code>hit</code> or <code>deviation</code>, <code>view</code>, <code>build</code></td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/syscalls/rule/apply</code></td><td>Write a YARA draft where Rustinel reads its rules; it should load within about two seconds (not yet verified on a VM)</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/binary-graph/query</code></td><td>One query over the System32 import graph, cut at 400 nodes. <code>q=path-to-syscall</code> follows an import (<code>module</code>, <code>function</code>) down to a syscall number. The edge from a Win32 function to its syscall is curated, the word of a hand-made table and not read from any binary: at most one per path, always the last. The other answers with curated edges are <code>q=syscall-callers</code>, whose step from a Zw name of ntdll to its Nt syscall is curated, a naming convention, and the list of the table's own rows, <code>q=metric</code> with <code>metric=curated_transitions</code>, each the table's word. Every other edge is derived, and a direct Nt import is derived throughout; a Zw name reaches its Nt name by a curated edge too, a naming convention that is not read from any binary. A sample outside the graph does not descend: give the DLL it imports from, such as <code>kernel32.dll</code>, as <code>module</code>. The answer has <code>total</code> (how many importers, chains or modules there were before the cut) and <code>partial</code>: true when a table it read was cut short when it was read, so a negative or a count is not certain. <code>q=metric</code> with <code>metric</code> lists what is behind one figure of <code>/api/binary-graph/metrics</code>: its rows as <code>nodes</code>, <code>total</code> of them (<code>binaries</code>, <code>edges</code>, <code>api_sets_resolved</code>, <code>forwarders</code>, <code>isolated</code>, <code>circular_pairs</code>, <code>curated_transitions</code>, <code>most_imported</code>, <code>skipped</code>, <code>partial</code>); an unknown figure is 400. Params: <code>q</code>, <code>module</code>, <code>function</code>, <code>syscall</code>, <code>other</code>, <code>metric</code></td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/binary-graph/node</code></td><td>Imports, exports, forwarders and in-degree of one binary or api set. Param: <code>name</code></td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/binary-graph/metrics</code></td><td>The figures of the whole stock of the import graph as numbers: binaries, edges (the imports of every binary), resolved api sets, forwarded exports, isolated binaries, circular pairs, curated Win32 to Nt transitions (null where the table cannot be read), the most imported modules, skipped files and the binaries with a table (import, delay-load or export) cut short. The list behind each is the query <code>metric</code> of <code>/api/binary-graph/query</code></td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/syscalls/rule/download</code></td><td>A YARA draft as a file for <code>rules/yara/</code>. Params: <code>name</code>, <code>text</code></td></tr>
                         </tbody>
                     </table>
 
@@ -1571,6 +1927,28 @@
                             <tr><td class="api-get">GET</td><td><code>/api/logs/sources</code></td><td>The six log sources with event count, last event, status and hint</td></tr>
                         </tbody>
                     </table>
+
+                    <h4>Firewall</h4>
+                    <table class="help-api-table">
+                        <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
+                        <tbody>
+                            <tr><td class="api-get">GET</td><td><code>/api/firewall/connections</code></td><td>Bundled flows with tags, severity, geo, state (<code>allowed</code>, <code>blocked</code>, <code>pending</code>) and rule. Params: <code>since</code>, <code>until</code> (ISO-8601 or epoch), <code>process</code>, <code>tag</code>, <code>state</code>, <code>max</code> (1-5000, default 500); most severe first, with <code>count</code> and <code>truncated</code></td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/firewall/summary</code></td><td>Totals, blocked and pending flows, top processes, endpoints and countries of the same window; open decisions, captures, <code>geo_available</code>. No byte counts: Sysmon has none</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/firewall/geo</code></td><td>One offline lookup: <code>ip</code> gives country and AS, never an online query</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/firewall/rules</code></td><td>The <code>TDC-FW-*</code> rules that stand, with <code>blocking</code> for those that really block</td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/firewall/block</code></td><td><code>{scope, image, ip, port, protocol}</code>: <code>endpoint</code> (this program to <code>ip</code>), <code>endpoint_all</code> (every program, TDC's fetch included) or <code>process</code>. Blocked only once the rule reads back; 409 while a firewall profile is off</td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/firewall/unblock</code></td><td><code>{rule_id}</code>; every rule of the same key goes</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/firewall/isolate</code></td><td>ISOLATED's state: <code>isolated</code>, <code>stage</code> (<code>open</code>, <code>cut</code>, <code>isolated</code>, <code>cut_policy</code>), <code>converging</code> (the background work runs) with <code>converge_note</code>, <code>verified</code>, <code>can_fetch</code> (<code>null</code>: not known), the outbound action before it, <code>profiles_off</code>, <code>residual</code> (what stays open), <code>fetch_paths_open</code></td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/firewall/isolate</code></td><td><code>{on}</code>: on answers after the cut (one catch-all outbound Block rule, read back: <code>stage</code> <code>cut</code>) and switches Windows' own outbound Allow rules off and the default to Block in the background; off goes back from any stage (exactly those switched on again, the cut rule removed). GET has <code>allowed_out</code>: the outbound Allow rules still enabled, read back. 409 while a profile is off; <code>scripts/tdc-unisolate.ps1</code> is the way back without the web UI</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/firewall/pending</code></td><td>Open download decisions with <code>remaining</code> seconds and <code>can_fetch</code>, the last 24 h as <code>history</code>, <code>ask_mode</code>, <code>decide_seconds</code>, <code>isolated</code> and <code>startup</code> (what the firewall was like at this server's start, toasted once on every tab)</td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/firewall/decide</code></td><td><code>{id, action}</code> with <code>allow</code>, <code>block</code> or <code>block_fetch</code>. Takes no URL; an id works once</td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/firewall/ask</code></td><td><code>{mode}</code>: <code>detonation</code>, <code>all</code> or <code>off</code></td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/firewall/enable</code></td><td>Switch the Windows Firewall on for every profile (TDC never does it by itself)</td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/firewall/kill</code></td><td><code>{pid}</code>: <code>taskkill /F</code> for a process with connections in the tab, never one of TDC's own</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/firewall/captures</code></td><td>The secured samples, newest first; never executed</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/firewall/capture/&lt;id&gt;</code></td><td>One capture with its metadata and whether its file still exists</td></tr>
+                        </tbody>
+                    </table>
                 </div>
 
                 <!-- Architecture -->
@@ -1587,7 +1965,7 @@ Web UI :9000 ──submit──▶ DetonatorAgent :8080 ──runs──▶ samp
      │
      ├──── named pipes ──▶ Sysmon EID 17/18 (observe) · pipe proxy (intercept)
      │
-     └──── RIZIN tab ────▶ rizin + rz-ghidra, one process per file (read-only)</pre>
+     └──── RIZIN tab ────▶ rizin + rz-ghidra, one process per file (the file is never written)</pre>
 
                     <h4>Data Flow</h4>
                     <ol class="help-steps">
@@ -1603,7 +1981,7 @@ Web UI :9000 ──submit──▶ DetonatorAgent :8080 ──runs──▶ samp
                     <h4>File Layout</h4>
                     <pre class="help-code">C:\DetonationChamberUI\           Web UI (this interface), memory_results\, pipe_sessions\, rizin_projects\, baseline
 C:\tools\rustinel\                Rustinel ETW engine
-C:\tools\fibratus\                Fibratus kernel tracer
+C:\Program Files\Fibratus\        Fibratus kernel tracer (Bin\fibratus.exe)
 C:\DetonatorAgent\                .NET execution agent
 C:\LitterBox\                     Analysis sandbox
 C:\tools\Aether\                  Memory forensics scanner + rules
@@ -1677,6 +2055,12 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
          in app.js); set as text, never as markup -->
     <div id="info-popover" class="info-popover" role="status" hidden></div>
 
-    <script src="/static/js/app.js?v=110"></script>
+    <!-- Toasts (showToast in app.js); the firewall decisions stand above the others, until they are
+         answered (showDecisionToast) -->
+    <div id="toast-container" class="toast-container">
+        <div id="decision-toasts" class="decision-stack" role="region" aria-label="Firewall decisions"></div>
+    </div>
+
+    <script src="/static/js/app.js?v=166"></script>
 </body>
 </html>

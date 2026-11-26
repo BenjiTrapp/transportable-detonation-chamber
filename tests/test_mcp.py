@@ -340,3 +340,62 @@ def test_logs_search_formats_a_table_and_errors(monkeypatch):
     monkeypatch.setattr(server, "_call", lambda *a, **k: {"error": "Unknown command bogus", "pos": 9})
     out = server.tdc_logs_search("x | bogus")
     assert out.startswith("Search error: Unknown command bogus") and "9" in out
+
+
+def test_firewall_connections_sends_the_filters_and_defangs(monkeypatch):
+    sent = _record_httpx(monkeypatch, {
+        "count": 7, "truncated": True, "isolated": True, "ask_mode": "detonation", "rules_error": None,
+        "connections": [{"image": "C:\\Users\\a\\loader.exe", "pid": 4242, "protocol": "tcp", "dst_ip": "203.0.113.7",
+                         "dst_port": 8443, "dst_hostname": "evil.example.com", "count": 12, "severity": "critical",
+                         "state": "blocked", "rule_id": "TDC-FW-abc", "tags": ["beacon", "detonated"], "fw_dropped": 3,
+                         "last_seen": "2026-11-16T10:05:00Z", "self": False,
+                         "geo": {"scope": "public", "cc": "NL", "asn": 64500, "as_org": "EXAMPLE-AS"}}]})
+    out = server.tdc_firewall_connections(since="-2h", tag="beacon", process="loader", limit=20)
+    call = sent[0]
+    assert call["args"][0] == "GET" and call["args"][1].endswith("/api/firewall/connections")
+    assert call["params"]["max"] == 20 and call["params"]["tag"] == "beacon" and call["params"]["process"] == "loader"
+    assert float(call["params"]["since"]) > 0               # the server takes epoch or ISO, not -2h
+    assert call["headers"]["X-TDC-MCP-Tool"] == "tdc_firewall_connections"
+    assert "7 connections, the 1 most severe shown" in out and "ISOLATED on" in out
+    assert "loader.exe (PID 4242)" in out and "203.0.113.7:8443" in out and "TDC-FW-abc" in out
+    assert "evil[.]example[.]com" in out and "evil.example.com" not in out
+    assert "NL AS64500 EXAMPLE-AS" in out and "beacon,detonated" in out and "endpoint_dropped=3" in out
+
+
+def test_firewall_connections_passes_iso_and_all_and_reports_errors(monkeypatch):
+    sent = _record_httpx(monkeypatch, {"count": 0, "connections": []})
+    server.tdc_firewall_connections(since="2026-11-16T00:00:00Z")
+    server.tdc_firewall_connections(since="all")
+    assert sent[0]["params"]["since"] == "2026-11-16T00:00:00Z" and "since" not in sent[1]["params"]
+    monkeypatch.setattr(server, "_call", lambda *a, **k: {"error": "since must be an ISO-8601 time or epoch seconds"})
+    assert server.tdc_firewall_connections(since="yesterday").startswith("Error: since must be")
+
+
+def test_firewall_captures_lists_the_newest_with_a_defanged_url(api):
+    fake = api({"/api/firewall/captures": {"captures": [
+        {"fetched_at": "2026-11-16T10:06:00Z", "sha256": "ab" * 32, "size": 73802, "magic": "MZ",
+         "url": "http://203.0.113.7:8443/stage2.exe", "dst_ip": "203.0.113.7", "dst_port": 8443,
+         "image": "C:\\Users\\a\\loader.exe", "pid": 4242, "path": "C:\\tdc\\samples\\ab\\" + "ab" * 32},
+        {"fetched_at": "2026-11-16T09:00:00Z", "sha256": "cd" * 32, "url": "https://x.example/a"}]}})
+    # review m-1: the forms Task 7 m-4 fixed in the UI's fwDefang, a scheme with backslashes and no scheme at all
+    assert server._defang("http:\\\\evil.example\\a.exe") == "hxxp:\\\\evil[.]example\\a.exe"
+    assert server._defang("//evil.example/a") == "//evil[.]example/a"
+    assert server._defang("javascript:alert(1).x") == "javascript[:]alert(1)[.]x"
+    assert server._defang("evil.example:8080/x.exe") == "evil[.]example:8080/x.exe"
+    out = server.tdc_firewall_captures(limit=1)
+    assert fake.calls[0][0] == "/api/firewall/captures"
+    assert "2 captures, the newest 1 shown" in out and "ab" * 32 in out and "cd" * 32 not in out
+    assert "hxxp://203[.]0[.]113[.]7:8443/stage2.exe" in out and "http://" not in out
+    assert "C:\\tdc\\samples\\ab\\" in out and "MZ" in out
+
+
+def test_no_firewall_tool_changes_state():
+    """The FIREWALL tools are read-only on purpose: a model must not take the chamber off the network, lift a block,
+    answer a decision, kill a process or switch the firewall on by itself."""
+    import inspect
+    source = inspect.getsource(server)
+    for route in ("/api/firewall/block", "/api/firewall/unblock", "/api/firewall/isolate", "/api/firewall/decide",
+                  "/api/firewall/ask", "/api/firewall/enable", "/api/firewall/kill"):
+        assert route not in source, route
+    names = sorted(n for n in dir(server) if n.startswith("tdc_firewall"))
+    assert names == ["tdc_firewall_captures", "tdc_firewall_connections"]

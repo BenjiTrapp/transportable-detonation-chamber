@@ -53,18 +53,31 @@ x86-64-Blob mit einer XOR-Entschlüsselungsschleife und einem `call` ins Leere.
 | `px 8 @ 0x1000` zeigte nach dem Lauf die **entschlüsselten** Bytes | HEX und DISASSEMBLY zeigen das Ergebnis von allein — keine neue Plumbing-Schicht. **FUNCTIONS und STRINGS nicht:** die baut rizin beim Laden aus den Sektionen (siehe §7) |
 | **Ohne `io.cache=true` sind die Schreibzugriffe verloren** (`px` zeigte weiter das Original) | `io.cache=true` ist für die Emulation *zwingend*, nicht optional. Emulation und Patching hängen am selben Mechanismus |
 | SHA-256 der Datei vor und nach dem Lauf **identisch** | Das Anti-Ziel „Sample wird auf der Platte verändert" hält |
-| `wcj` liefert die Patch-Liste als JSON: `{idx, addr, size, before, after, written}` | Fertige Datenquelle für die Patch-Ansicht, mit before/after |
-| `wc- <addr>` nimmt einen Patch zurück, `wc-*` alle | Zurücknehmen ist nativ, einzeln und ganz |
+| `wcj` liefert pro **Schreibvorgang** eine Zeile (nicht pro Byte): `wx 9090 @ 0x0e` gibt eine mit `size 2`, `before 8036`, `after 9090`, vier Einzelbyte-Schreibvorgänge geben vier | Die Patch-Ansicht zeigt Schreibvorgänge, und die Zeilen tragen `size` samt vollem Hex in `before`/`after` |
+| `wc-` **löscht blockweise, nicht einzeln**: nach Patches auf 0x100, 0x180 und 0x300 entfernte `wc- 0x100` auch den bei 0x180 (der ganze 0x100-Block), 0x300 blieb. Die Bereichsform `wc- 0x100 0x101` trifft genau **einen Eintrag** — aber jeden, der den Bereich überlappt, also fällt ein 4096-Byte-Patch ganz, wenn man ein Byte daraus zurücknimmt | Einen Patch zurücknehmen heißt `wc- <addr> <addr+1>`. Mit `wc- <addr>` allein hätte das bis zu 255 fremde Bytes stumm mitgelöscht. Die Oberfläche nimmt Schreibvorgänge zurück, nicht Bytes |
+| `wc-*` setzt alles zurück | Alles zurücknehmen ist nativ |
+| **`wcj` ist in 0.9.1 kein gültiges JSON**: kommagetrennte Objekte ohne umschließende `[ ]` | Die Liste wird als Text gelesen und selbst geparst, nicht mit `cmdj` *(Korrektur: eine frühere Messung notierte „als JSON", obwohl ihre eigene Ausgabe die Klammern schon nicht zeigte)* |
+| `pdj` nennt kein `mnemonic` | Die Patch-Bytes werden aus `size`, `bytes` und `type` berechnet |
 | `db @ <addr>` setzt, `dblj` listet als JSON (`addr`, `enabled`, `cond`, `hw`), `aec` hält an: `[ESIL] hit breakpoint at 0x14` | Echte Breakpoints, vom ESIL-Motor beachtet. `db` **ohne** `@` nimmt kein Argument |
-| `aec` auf einem Breakpoint stehend trifft **denselben wieder** | Der Server muss vorher einmal einzeln steppen |
-| `aecc` / `aesuo call` läuft **bis zum nächsten Call** | Die Assistenz-Schleife ist ein einziger Befehl |
+| `aec` von einem Breakpoint aus läuft **weiter**, er trifft ihn nicht erneut: Haltepunkt auf 0x19 (einmal erreicht), das erste `aec` hält dort, das zweite läuft bis `esil.timeout`. rizin prüft Breakpoints *nach* dem Befehl | **Kein Step-off nötig.** *(Korrektur einer früheren Messung, die den Haltepunkt mitten in eine vierfache Schleife setzte und die vier Durchläufe als vier Treffer derselben Stelle las.)* |
+| `dbd` verhindert das Anhalten **nicht** — nur `db-` entfernt einen Breakpoint wirksam | Ein ausgeschalteter Breakpoint hält trotzdem: die Oberfläche bietet kein „aus" an, oder löst es über `db-` |
+| `aecc` läuft über `call qword [import]` (Typ `ircall`) **hinweg** und ignoriert `esil.timeout`: ohne Call lief es über 15 s. **`aecs` und `aesuo <optype>` ignorieren `esil.timeout` genauso** (gemessen mit `esil.timeout=2` an einem `jmp $`: alle drei über 15 s und erst vom `timeout` beendet, während `aesu`, `aecu`, `aecue`, `aesue`, `aess`, `aeso`, `aesou` und `aecb` bei 2,1 s stehenblieben) | `aecc` ist unbrauchbar. „Bis zum nächsten Call" baut der Server aus `aesu`-Sprüngen, begrenzt durch `ESIL_TIMEOUT`. *(Ergänzung R74: in der Konsole sind alle drei **verboten**, denn dort begrenzt nur `CONSOLE_TIMEOUT` (60 s), nach dem die Pipe rizin tötet — und mit ihm die Sitzung samt der Bytes des Laufs. Siehe §10.)* |
+| `aess` und `aeso` behandeln `ircall` ebenfalls falsch und laufen in den Aufgerufenen hinein | Bei einem `ircall` setzt der Server den PC selbst: `aepc` für SKIP, `aesu <pc+size>` für OVER |
+| **`aeim <addr> <size> <name>` legt eine `rw-`-Karte an** (gemessen in `oml`), und mit `esil.exectrap` *nach* `aei` gesetzt bricht ein Schritt auf einer Adresse darin mit „ERROR: core: esil: Trap, trying to execute on non-executable memory" ab, ohne den PC zu bewegen. `omf rwx @ <addr>` macht dieselbe Karte `rwx`, und derselbe Befehl läuft dann (beides gemessen, mit Kontrolle in beide Richtungen) | Der Server schickt nach jedem `aeim` eines Assistenten-Puffers ein `omf rwx` für dessen Karte — sonst scheitert das erste Ziel „entpackten Code durchlaufen" am ersten Befehl von Stage 2. *(Ergänzung R73; §4 und §9 hatten Kartenrechte nie bedacht.)* |
+| `esil.exectrap` vor `aei` gesetzt wirkt nicht | Die Schutzschalter werden vor jedem Lauf erneut gesetzt |
+| Ohne `esil.verbose=1` hält ein I/O-Trap `aec` **stumm** an | `esil.verbose=1` gehört zu den Startwerten, sonst nennt kein Lauf diesen Grund |
+| `aesb` stellt Register wieder her, **aber nicht den Speicher**. Der Schritt danach **führt den Befehl aus, ohne den PC zu bewegen**: nach `aesb` auf 0x7 lief `aes` den `xor` erneut (rsi änderte sich, rip blieb 0x7), ein weiteres `aes` noch einmal | **BACK fällt ganz weg** (R20). Ein Rückwärtsschritt, der den Speicher nicht zurücknimmt und dessen Folgeschritt die Entschlüsselung doppelt anwendet, ist keine Funktion, sondern eine Falle |
 | `aess` übersprang den `call` (rip 0x1a → 0x1f) | So kommt man an einem API-Call vorbei |
 | `aes` *in* einen `call` auf nicht gemappten Speicher läuft **stumm weiter** und „emuliert" Nullen | Ohne Schutz lügt die Oberfläche; siehe die nächsten zwei Zeilen |
-| `esil.breakoninvalid`, `esil.exectrap`, `esil.iotrap`, `esil.nonull` | Damit **hält** die Emulation an, statt ins Nichts zu laufen |
+| `esil.breakoninvalid`, `esil.exectrap`, `esil.iotrap` | Damit **hält** die Emulation an, statt ins Nichts zu laufen |
+| `esil.nonull=true` hält **nicht** beim Nullzeiger: ein Lesen *und* ein Schreiben auf Adresse 0 werden stumm **ausgeführt** (gemessen: `mov rax,[rbx]` mit `rbx=0` las die Bytes der Datei an Offset 0, `mov [rbx],rax` legte eine `wcj`-Zeile auf Adresse 0 an, beides genau wie mit `esil.nonull=false`), und der Lauf läuft bis `esil.timeout` weiter. Liegt 0 in keiner Karte — der Normalfall bei einer PE —, hält `esil.iotrap` („WARNING: core: TRAP") | Der Schalter bleibt gesetzt, er kostet nichts, aber die Schutzwirkung beim Nullzeiger kommt von `esil.iotrap`. *(Korrektur R75: die frühere Zeile und §9 behaupteten beide, `nonull` halte beim Nullzeiger; nachgemessen stimmt das nicht. Auf PEs harmlos, weil der Schalter, der greift, der richtige ist — aber der Befund muss wahr sein.)* |
 | `esil.timeout=3` beendete ein `jmp $` nach 3,02 s mit „esil: timeout exceeded", rizin lebte weiter | Native Endlosschleifen-Sicherung — der Server braucht keine eigene Schrittzähler-Schleife |
-| `aesb` (Schritt zurück) funktioniert nach `aets+` | Rückwärts gehen ist möglich |
+| `aets+` startet die Trace-Sitzung, die `aesb` braucht | Nur noch Hintergrund: BACK fällt weg (siehe die Zeile oben) |
+| **`esil.verbose=1` flutet stderr**: ein `int3`/`int N` druckt `WARNING: $ returned 0` je Ausführung — 148 025 Zeilen in einer Sekunde gemessen. `_stderr_until` behält die **ersten** 64 KB, also fiel die abschließende `timeout exceeded`-Zeile heraus und der Lauf meldete „step" | Der Haltegrund wird am **Ende** von stderr gesucht, nicht am Anfang. `int3`-Schleifen sind Standard-Anti-Debug in genau diesen Samples |
 | **`dbw` (Watchpoint) + `aec` hängt rizin endlos** (im `timeout` gestorben) | Watchpoints bleiben draußen |
 | **`Ps` speichert den Patch-Cache nicht** (nur `io.cache=true` landete im Projekt, keine Bytes) | TDC muss Patches selbst behalten |
+| **Breakpoints speichert rizin dagegen selbst**, in `/core/debug/breakpoints`, und `Poo` stellt sie wirksam wieder her (gemessen: `db @ 0x1a`, `Ps`, neu geöffnet, `dblj` listet ihn wieder) | `/tdc` trägt **nur** die Patches. Kein `breakpoints=` und kein `db`-Replay — TDCs Aufgabe ist nur, das Projekt überhaupt schreiben zu lassen |
+| **Ein Breakpoint kann einen rizin-Befehl tragen, und das Projekt speichert ihn**: `dbc CC pwned` an der Haltestelle ergibt `"data":"CC pwned"` in `dblj` und genau so in `/core/debug/breakpoints` | Beim Treffer führt rizin diesen Befehl aus. `_make_safe` muss beim Laden `data` und `cond` jedes Breakpoints leeren — dieselbe Gefahr wie die `cmd.*`-Hooks, die es schon zurücksetzt (R24) |
 | **rizin 0.9.1 hat kein `wt`/`wtf`** (nur `wu`, `wf` — beide lesen Dateien) | Der Export entsteht in Python |
 | `aepc <addr>` wird von der heutigen Allowlist-Regel `aep` fälschlich mitgeblockt | Fehlalarm, der zu beheben ist |
 | `esil.romem` und `io.cache` sind beide standardmäßig `false` | Die Startwerte stimmen; der Server setzt beide bewusst |
@@ -80,7 +93,7 @@ x86-64-Blob mit einer XOR-Entschlüsselungsschleife und einem `call` ins Leere.
   Er setzt `io.cache=true`, die `esil.*`-Schutzschalter, `aei`, `aeim` und
   `aepc` auf die aktuelle Adresse.
 - **Lauf-Zeile**, die *nur* im Emulationsmodus über dem Code erscheint:
-  - **CONT**, **STEP**, **OVER**, **SKIP**, **BACK**, **TO CALL**, **STOP**;
+  - **CONT**, **STEP**, **OVER**, **SKIP**, **TO CALL**, **STOP**;
   - der PC;
   - die Register, die der **letzte Schritt verändert hat** — beim Steppen
     zählt, was sich bewegt hat, nicht achtzehn unveränderte Werte.
@@ -88,6 +101,11 @@ x86-64-Blob mit einer XOR-Entschlüsselungsschleife und einem `call` ins Leere.
   Das kann rizin unter Windows nicht (siehe Befunde), und mit `esil.timeout`
   endet ein Lauf ohnehin nach wenigen Sekunden von selbst. Die Oberfläche darf
   deshalb kein Abbrechen versprechen.
+- **Es gibt kein BACK.** `aesb` stellt den Speicher nicht zurück, und der
+  Schritt danach führt den Befehl erneut aus, ohne den PC zu bewegen — auf
+  einer Entschlüsselungsschleife würde das den `xor` doppelt anwenden und
+  dabei einen sauberen Zustand melden (beides gemessen). Die Lauf-Zeile trägt
+  also **CONT, STEP, OVER, SKIP, TO CALL, STOP** und keinen Rückwärtsschritt.
 - **Laufen bis hierher**: Im Rechtsklick-Menü der Disassembly, über
   `aesu <addr>` — der natürliche Partner der Breakpoints.
 - **PC-Markierung** in der Disassembly (eigene Markierung, deutlich von der
@@ -112,17 +130,27 @@ Neben CONSOLE, XREFS, STRINGS und IMPORTS, mit dem vollen Zustand:
 - **Stack**, ab dem Stackzeiger (`rsp` bzw. `esp`) abwärts, mit Adresse, Wert
   und — wo es passt — dem Hinweis, dass der Wert auf eine bekannte Funktion
   oder einen String zeigt.
-- **Breakpoints**, als Liste mit Adresse, Funktion, an/aus, löschen.
+- **Breakpoints**, als Liste mit Adresse, Funktion und Löschen — ohne „an/aus",
+  weil `dbd` das Anhalten nicht verhindert (gemessen, siehe Befunde).
 - **Patches**, als Liste mit Adresse, before/after, einzeln zurücknehmen,
   und den Knöpfen **Export** und **Alle zurücknehmen**.
 
 ### 3. Breakpoints
 
 - Ein Klick in die Randspalte der Disassembly setzt und entfernt einen.
-- Server: `db @ <addr>`, `db- @ <addr>`, `db-*`, `dbl`/`dblj` zum Lesen,
-  `dbd`/`dbe` für an/aus.
-- **CONT** steppt zuerst einmal einzeln (sonst trifft `aec` denselben
-  Breakpoint wieder) und läuft dann `aec`.
+- Server: `db @ <addr>`, `db- @ <addr>`, `db-*`, `dbl`/`dblj` zum Lesen.
+- **Kein An- und Ausschalten.** `dbd` verhindert das Anhalten nicht
+  (gemessen), also gibt es in der Oberfläche kein „aus": ein Breakpoint ist
+  gesetzt oder entfernt.
+- **CONT ist ein einfaches `aec`.** Ein Step-off davor braucht es nicht:
+  rizin prüft Breakpoints nach dem Befehl, also läuft `aec` von einem
+  Haltepunkt aus weiter (gemessen; eine frühere Messung hatte das Gegenteil
+  behauptet, weil ihr Haltepunkt in einer Schleife lag).
+- **TO CALL baut der Server selbst**, aus `aesu`-Sprüngen über `pdj`, begrenzt
+  durch `ESIL_TIMEOUT`. `aecc` ist unbrauchbar: es läuft über einen
+  `call qword [import]` hinweg und ignoriert `esil.timeout` (über 15 s
+  gemessen), was die Sitzung beenden würde — weshalb es nach R74 auch in der
+  Konsole verboten ist, zusammen mit `aecs` und `aesuo` (§10).
 - Breakpoints **bleiben** wie die Patches (siehe 5).
 - **Keine Watchpoints** (`dbw` hängt rizin, gemessen).
 - **Kein** `dbc`, `dbC`, `dbx` — sie führen rizin-Befehle aus, wenn ein
@@ -140,7 +168,10 @@ bedienbaren Schritt:
   **vorab, was passieren wird**, z. B. `; skip → rax = 0x140008000 (neuer
   Puffer, 64 KB)`.
 - **SKIP** führt es aus: `aess`, dann `ar <ret>=<wert>`, bei Speicher-APIs
-  zusätzlich ein `aeim <addr> <size> <name>` für den Puffer.
+  zusätzlich ein `aeim <addr> <size> <name>` für den Puffer **und ein
+  `omf rwx @ <addr>` für dessen Karte** — `aeim` legt sie `rw-` an, und unter
+  `esil.exectrap` bricht der erste Befehl im Puffer sonst mit einem Trap ab
+  (gemessen; *Ergänzung R73*, §4 und §9 hatten Kartenrechte nie bedacht).
 - **Jeder angebotene Wert ist editierbar**, bevor er angewandt wird, und ein
   Register lässt sich jederzeit im `EMULATION`-Reiter von Hand setzen. Das ist
   das „beides", das der Nutzer wollte: Vorschlag **und** Eingriff.
@@ -169,8 +200,8 @@ bedienbaren Schritt:
 
   | Gruppe | Beispiele | Angebotene Antwort |
   |--------|-----------|--------------------|
-  | Speicher | `VirtualAlloc`, `VirtualAllocEx`, `HeapAlloc`, `LocalAlloc`, `GlobalAlloc`, `malloc` | Ein frisch gemappter Puffer in der ESIL-Speicherkarte, seine Adresse im Rückgaberegister |
-  | Speicherschutz | `VirtualProtect` | Erfolg; die Karte bleibt beschreibbar |
+  | Speicher | `VirtualAlloc`, `VirtualAllocEx`, `HeapAlloc`, `LocalAlloc`, `GlobalAlloc`, `malloc` | Ein frisch gemappter Puffer in der ESIL-Speicherkarte — lesbar, beschreibbar **und ausführbar** (`omf rwx`, R73) —, seine Adresse im Rückgaberegister |
+  | Speicherschutz | `VirtualProtect` | Erfolg; die Karte bleibt beschreibbar. Ein Puffer des Assistenten ist von Anfang an ausführbar, also deckt das denselben Weg ab (R73) |
   | Loader | `LoadLibraryA/W`, `GetModuleHandleA/W`, `GetProcAddress` | Ein Pseudo-Handle bzw. die Adresse des Imports, wenn die Datei ihn kennt, sonst eine erkennbare Pseudo-Adresse |
   | Anti-Debug | `IsDebuggerPresent`, `CheckRemoteDebuggerPresent`, `NtQueryInformationProcess` | „nicht beobachtet" |
   | Zeit | `GetTickCount`, `GetTickCount64`, `QueryPerformanceCounter`, `GetSystemTimeAsFileTime` | Ein plausibel steigender Wert, so dass Zeitmessungen keinen Debugger vermuten |
@@ -200,7 +231,8 @@ bedienbaren Schritt:
   - **Call ausknipsen** — den `call` zu `nop`s, Länge erhalten.
   Dazu ein Feld für Bytes von Hand, das auch über mehrere Befehle reicht.
 - **Patch-Liste** aus `wcj`: Adresse, Größe, before, after, die Funktion
-  dazu. Einzeln zurücknehmen (`wc- <addr>`), alle (`wc-*`).
+  dazu. Einzeln zurücknehmen (`wc- <addr> <addr+1>` — die Bereichsform, weil
+  `wc- <addr>` allein einen ganzen 0x100-Block löscht), alle (`wc-*`).
 - Patches und Emulations-Schreibzugriffe landen **im selben Cache** — rizin
   hat nur einen. Die Liste **muss deshalb beide auseinanderhalten**: TDC kennt
   die Adressen seiner eigenen `wx`-Aufrufe, alles andere im Cache kommt vom
@@ -208,16 +240,40 @@ bedienbaren Schritt:
   exportiert wird und was bleibt (§6 und §8).
 - Dass ein Lauf Bytes ändert, ist dabei ein *Feature*: nach einer
   Entschlüsselung lässt sich der entpackte Bereich neu analysieren (§7).
+- **Ein Patch von Hand *über* Bytes, die ein Lauf geändert hat** — also der
+  Anti-VM-Check in frisch entschlüsseltem Code, genau der Arbeitsgang, zu dem
+  dieses Feature einlädt — ist ein eigener Fall (*Ergänzung R72; §5 und §8
+  sagten dazu nichts*). Zwei Dinge folgen daraus, und beide muss die
+  Oberfläche sagen:
+  - `wcj` nennt als `before` dieser Zeile **das Byte des Laufs**, nicht das
+    der Datei (gemessen: Datei `73317331`, `wx 41 @ 1` des Laufs, dann
+    `wx 90 @ 1` von Hand → zweite Zeile mit `before: "41"`, `p8` zeigt
+    `73907331`). Die Patch-Liste **markiert** so eine Zeile, und der Export
+    liest die Datei selbst (§8).
+  - `wc- <addr> <addr+1>` löscht **jeden** überlappenden Schreibvorgang, also
+    nimmt das ✕ dieser Zeile die ganze Zeile des Laufs mit — bis zu einer
+    kopierten Stage (gemessen: 4-Byte-Zeile des Laufs plus 1-Byte-Patch
+    darüber, `wc- 0x1 0x2` leerte den Cache). Die Antwort **nennt** die
+    mitgelöschten fremden Zeilen, statt nur „Patch zurückgenommen" zu melden.
 - **Die Originaldatei wird nie geschrieben.** `wci` und `wc+` (Cache
   committen) bleiben verboten — auch und besonders in der Konsole.
 
 ### 6. Was bleibt und was nicht
 
-- **Von Hand gesetzte Patches und Breakpoints bleiben.** Sie werden im
-  **`/tdc`-Namensraum des rizin-Projekts** gespeichert, dort, wo heute schon
-  `level`, `mode` und `done` stehen (`_sanitize_project`). Das rizin-Projekt
-  selbst speichert den Cache nicht — gemessen.
-- Beim Öffnen derselben Datei werden sie mit `wx` bzw. `db` wieder angewandt,
+- **Von Hand gesetzte Patches bleiben**, im **`/tdc`-Namensraum des
+  rizin-Projekts**, dort, wo heute schon `level`, `mode` und `done` stehen
+  (`_sanitize_project`). Das rizin-Projekt selbst speichert den Cache nicht —
+  gemessen.
+- **Breakpoints speichert rizin selbst** (`/core/debug/breakpoints`), und
+  `Poo` stellt sie wirksam wieder her — gemessen. `/tdc` trägt sie also
+  nicht, und es gibt kein `db`-Replay; TDCs Aufgabe ist nur, das Projekt
+  wegen eines Breakpoints überhaupt schreiben zu lassen.
+- **Ein geladenes Projekt wird entwaffnet:** `_make_safe` leert `data` und
+  `cond` jedes Breakpoints, denn beide tragen einen rizin-Befehl, den rizin
+  beim Treffer ausführt, und das Projekt speichert sie (gemessen:
+  `"data":"CC pwned"`). Das ist dieselbe Gefahr wie die `cmd.*`-Hooks und die
+  ESIL-Hinweise, die `_make_safe` schon zurücksetzt.
+- Beim Öffnen derselben Datei werden die Patches mit `wx` wieder angewandt,
   bevor die Ansichten laden.
 - Ein Projekt entsteht damit künftig auch durch einen Patch oder einen
   Breakpoint, nicht mehr nur durch Umbenennen oder Kommentieren.
@@ -266,6 +322,17 @@ das Hauptziel auf halbem Weg stehen bleiben.
   Namen, der sie als gepatcht erkennbar macht, und einer Notiz daneben:
   SHA-256 von Original und Kopie, Pfad des Originals, Zeit, und die
   Patch-Liste mit before/after.
+- **Das „before" der Notiz kommt aus der Datei, nicht aus `wcj`**
+  (*Ergänzung R72; §5 und §8 sagten dazu nichts*). Bei einem Patch über Bytes,
+  die ein Lauf geändert hat, ist `wcj`s `before` das Byte des Laufs; die Notiz
+  behauptete damit, die Datei enthalte es. Der Export vergleicht jede
+  platzierte Zeile mit den Bytes des Originals an ihrem `paddr` — die Datei
+  ist für die Kopie sowieso offen —, schreibt **die echten Datei-Bytes** in die
+  Notiz und **nennt jede Zeile, bei der beide auseinandergehen**: rundherum
+  trägt die Kopie die Bytes der Datei, der Patch sitzt also in Bytes, die auf
+  der Platte noch verschlüsselt sind. Ohne diesen Satz trifft die Kopie zwei
+  Anti-Ziele auf einmal („eine Kopie, deren Änderungen man nicht kennt" und
+  „man verliert den Überblick, welche Bytes aus der Datei kommen").
 - **Gebaut wird die Kopie in Python**, nicht von rizin: Original kopieren,
   dann die Patch-Bytes an ihren **physischen** Offsets setzen. Die
   Umrechnung von virtueller auf Datei-Adresse gibt es schon
@@ -285,7 +352,7 @@ das Hauptziel auf halbem Weg stehen bleiben.
 
 ### 9. Schutzschalter
 
-Beim Start der Emulation setzt der Server:
+Beim Start der Emulation **und vor jedem Lauf** setzt der Server:
 
 | Einstellung | Wert | Wofür |
 |-------------|------|-------|
@@ -293,12 +360,31 @@ Beim Start der Emulation setzt der Server:
 | `esil.timeout` | ein paar Sekunden | Endlosschleife beendet den Lauf, nicht die Sitzung (gemessen: 3 s → 3,02 s) |
 | `esil.breakoninvalid` | `true` | Hält an einem ungültigen Befehl, statt Nullen zu emulieren |
 | `esil.exectrap` | `true` | Hält, wenn der PC in nicht ausführbaren Speicher läuft |
-| `esil.iotrap` | `true` | Hält bei ungültigem Lesen oder Schreiben |
-| `esil.nonull` | `true` | Hält beim Nullzeiger, statt weiterzulaufen |
+| `esil.iotrap` | `true` | Hält bei ungültigem Lesen oder Schreiben — und bei einer PE auch am Nullzeiger, weil 0 dort in keiner Karte liegt |
+| `esil.nonull` | `true` | *(Korrektur R75: hält **nicht** beim Nullzeiger. Gemessen wird ein Lesen oder Schreiben auf Adresse 0 stumm ausgeführt und der Lauf läuft bis `esil.timeout` weiter, genau wie mit `false`. Der Schalter bleibt gesetzt, weil er nichts kostet; der Schutz kommt von `esil.iotrap`.)* |
+| `esil.verbose` | `1` | Ohne sie hält ein I/O-Trap `aec` **stumm** an (gemessen), und der Lauf könnte seinen Grund nicht nennen |
 | `esil.romem` | `false` | Sonst könnte die Emulation nichts entschlüsseln |
 
 `esil.mdev.range` bleibt unberührt: es hängt an `cmd.esil.mdev`, das
 rizin-Befehle ausführt und wie die übrigen `cmd.*`-Hooks leer bleibt.
+
+Vor **jedem** Lauf erneut, nicht nur beim Start: `esil.exectrap` wirkt nicht,
+wenn es vor `aei` gesetzt wurde (gemessen), und die Konsole kann `io.cache`
+jederzeit abschalten — ein Lauf ohne sie schreibt nichts und sähe aus, als
+täte die Entschlüsselung nichts.
+
+**Kartenrechte** (*Ergänzung R73; diese Tabelle hatte sie nie bedacht*):
+`esil.exectrap` prüft die Rechte der Karte, in der der PC steht, und `aeim`
+legt eine Karte `rw-` an. Ein Puffer des API-Assistenten bekommt deshalb
+direkt nach dem `aeim` ein **`omf rwx @ <addr>`** für genau diese Karte —
+ohne das bricht der kanonische Entpacker (Puffer anlegen, hineinkopieren oder
+entschlüsseln, hineinspringen) am ersten Befehl von Stage 2 ab, und das erste
+Ziel dieses Features wäre nicht erreichbar. `VirtualProtect` hilft nicht
+weiter, weil es nur „Erfolg" meldet und keine Rechte ändert, und die Konsole
+kommt nicht heran (`o` und `om` sind verboten, die Schalter werden vor jedem
+Lauf neu gesetzt). Alles außerhalb dieser Puffer bleibt von `esil.exectrap`
+geschützt — ein echtes `VirtualAlloc(PAGE_EXECUTE_READWRITE)` wäre ebenso
+ausführbar.
 
 ### 10. Konsole und Allowlist
 
@@ -308,9 +394,13 @@ ist also keine Öffnung nötig. Trotzdem soll die Konsole mitkommen, damit man
 weiterarbeiten kann, wo die Oberfläche aufhört:
 
 - **Schon heute erlaubt, nichts zu tun** (gemessen): die `ae*`-Lauf- und
-  Schrittbefehle (`aei`, `aeim`, `aes`, `aeso`, `aess`, `aesu`, `aesuo`,
-  `aec`, `aecc`, `aets+`, `aesb`), `ar` zum Lesen und Setzen, und die
-  Neuanalyse mit `af` und `/zj`.
+  Schrittbefehle (`aei`, `aeim`, `aes`, `aeso`, `aess`, `aesu`, `aesue`,
+  `aecu`, `aecue`, `aecb`, `aec`, `aets+`, `aesb`), `ar` zum Lesen und
+  Setzen, und die Neuanalyse mit `af` und `/zj`. *(Korrektur R74: `aecc` und
+  `aesuo` standen hier in der Liste der erlaubten Befehle und widersprachen
+  damit dem eigenen Anti-Ziel „ein Lauf … tötet die Sitzung" — beide ignorieren
+  `esil.timeout`, siehe die Befund-Zeile. Sie gehören in die Verbotsliste
+  unten, zusammen mit `aecs`.)*
 - **Neu zu erlauben:** die Schreibbefehle, die in den Cache gehen (`wx`,
   `wo`, `wz`, `w`), die Cache-Befehle `wc` und `wc-`, die Breakpoint-*Liste*
   (`db`, `db-`, `dbl`, `dbd`, `dbe`, `dbs`, `dbn`), und `esil.*` sowie
@@ -322,6 +412,14 @@ weiterarbeiten kann, wo die Oberfläche aufhört:
   gehören hinter den Knopf), und die ganze übrige `d`-Familie, also alles, was
   einen Prozess startet oder sich an einen hängt (`ood`, `dp`, `dc`, `ds`,
   `dm`, `dk`, `dd`, `dbt` …).
+- **Neu verboten (R74):** `aecc`, `aecs` und `aesuo`. Alle drei ignorieren
+  `esil.timeout` (gemessen, siehe Befunde), also begrenzt sie in der Konsole
+  nur `CONSOLE_TIMEOUT` (60 s) — danach tötet die Pipe rizin, und mit ihm
+  gehen die Sitzung und die Bytes des Laufs. Die Begründung nennt den Ersatz:
+  `'aecc', 'aecs' and 'aesuo' ignore esil.timeout and run until rizin is
+  killed: TO CALL does this`. Die bei `esil.timeout` haltenden Nachbarn
+  (`aec`, `aecu`, `aecue`, `aecb`, `aes`, `aesu`, `aesue`, `aess`, `aeso`,
+  `aesou`, `aesb`) bleiben offen.
 - **Fehlalarm beheben:** `aepc` ist heute von der `aep`-Regel mitgeblockt.
   `aep*` (ESIL-Pin-Befehle) bleibt verboten, `aepc` wird erlaubt.
 - Die Tabelle „Console without a shell" im README wird entsprechend
@@ -418,8 +516,10 @@ weiterarbeiten kann, wo die Oberfläche aufhört:
   Wartungssperre bei Tool-Updates.
 - **Tests:** Die CI kennt kein rizin. `tests/fake_rizin.py` muss die neuen
   Befehle beantworten (`aei`, `aeim`, `aepc`, `aes`, `aeso`, `aess`, `aesu`,
-  `aec`, `aecc`, `aesb`, `ar`, `db`, `dblj`, `wx`, `wcj`, `wc-`, `af`,
-  `/zj`), mitsamt den gemessenen Eigenheiten: `aec` trifft denselben
+  `aec`, `aesb`, `ar`, `db`, `dblj`, `wx`, `wcj`, `wc-`, `af`, `/zj`, und
+  `omf` für die Kartenrechte aus R73; `aecc` **nicht** mehr, es ist nach R74
+  in der Konsole verboten und der Server schickt es nie), mitsamt den
+  gemessenen Eigenheiten: `aec` trifft denselben
   Breakpoint wieder, ein `aes` in nicht gemappten Speicher läuft weiter,
   `esil.timeout` greift, und ohne `io.cache` ist ein Schreibzugriff verloren.
   Ein 32-bit-Modus gehört dazu, sonst ist die Stack-Korrektur ungetestet.

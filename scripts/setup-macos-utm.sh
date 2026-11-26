@@ -331,7 +331,9 @@ SCRIPTS=(
     "install-capa.ps1"
     "install-re-tools.ps1"
     "install-rizin.ps1"
+    "install-ntsleuth.ps1"
     "install-webui.ps1"
+    "build-binary-graph.ps1"
     "configure-logging.ps1"
     "configure-services.ps1"
 )
@@ -390,6 +392,16 @@ sys.exit(1)
 " 2>/dev/null
 }
 
+# Seconds a provisioning script may run before setup stops waiting for it (900 unless it is one that takes longer).
+# build-binary-graph.ps1 waits up to 1800 s for its own build; 2400 leaves it room for the check before and the report
+# after, so that setup does not move on to configure-logging.ps1 while the build still runs in its scheduled task.
+provision_timeout() {
+    case "$1" in
+        build-binary-graph.ps1) echo 2400 ;;
+        *) echo 900 ;;
+    esac
+}
+
 total=${#SCRIPTS[@]}
 current=0
 
@@ -397,7 +409,7 @@ for script in "${SCRIPTS[@]}"; do
     current=$((current + 1))
     info "[$current/$total] Running $script..."
 
-    if run_provision_script "$script"; then
+    if run_provision_script "$script" "$(provision_timeout "$script")"; then
         ok "[$current/$total] $script completed"
     else
         warn "[$current/$total] $script had issues (non-critical, continuing)"

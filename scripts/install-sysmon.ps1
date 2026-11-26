@@ -98,6 +98,54 @@ function Set-PipeEventExclude {
     }
 }
 
+# The upstream config logs EID 3 (NetworkConnect) only for images under C:\Users, C:\ProgramData and the like, for
+# a list of LOLBins and for a few ports. The FIREWALL tab needs the connection of every download it is to catch:
+# System32's curl.exe, the BITS service (svchost.exe), and TDC's own python (the tdc-anomaly net) are not on that
+# list, so a curl or BITS download could never become a finding. Add them to every include-mode NetworkConnect
+# filter; a config without one (exclude mode, the minimal config) logs them already.
+# Each comes as a Rule with Initiated=true: EID 3 is written for accepted connections too, and the reader takes
+# every EID 3 as outbound, so without it the analyst's own browser on port 9000 would become TDC python flows
+# tagged tdc-anomaly, and RDP or SMB into the VM svchost flows.
+function Set-NetworkConnectIncludes {
+    param([string]$Path)
+    $wanted = @(
+        @{ Name = 'TDC firewall tab: curl'; Condition = 'image'; Value = 'curl.exe' },
+        @{ Name = 'TDC firewall tab: python'; Condition = 'image'; Value = 'python.exe' },
+        @{ Name = 'TDC firewall tab: pythonw'; Condition = 'image'; Value = 'pythonw.exe' },
+        @{ Name = 'TDC firewall tab: svchost (BITS)'; Condition = 'is'; Value = 'C:\Windows\System32\svchost.exe' }
+    )
+    try {
+        [xml]$cfg = Get-Content -Path $Path -Raw
+        $includes = @($cfg.SelectNodes("//NetworkConnect[@onmatch='include']"))
+        foreach ($node in $includes) {
+            # an earlier version added plain Image entries, which also logged inbound connections
+            foreach ($old in @($node.SelectNodes("Image[@name='TDC firewall tab']"))) { [void]$node.RemoveChild($old) }
+            foreach ($w in $wanted) {
+                $have = @($node.SelectNodes("Rule") | Where-Object { $_.GetAttribute('name') -eq $w.Name })
+                if ($have.Count -gt 0) { continue }
+                $rule = $cfg.CreateElement('Rule')
+                $rule.SetAttribute('name', $w.Name)
+                $rule.SetAttribute('groupRelation', 'and')
+                $image = $cfg.CreateElement('Image')
+                $image.SetAttribute('condition', $w.Condition)
+                $image.InnerText = $w.Value
+                [void]$rule.AppendChild($image)
+                $initiated = $cfg.CreateElement('Initiated')
+                $initiated.SetAttribute('condition', 'is')
+                $initiated.InnerText = 'true'
+                [void]$rule.AppendChild($initiated)
+                [void]$node.AppendChild($rule)
+            }
+        }
+        $cfg.Save($Path)
+        if ($includes.Count -gt 0) {
+            Write-Host "[+] NetworkConnect also logs the outbound connections of curl.exe, python.exe and svchost.exe (BITS)" -ForegroundColor Green
+        }
+    } catch {
+        Write-Host "[!] NetworkConnect post-processing failed - curl and BITS downloads may never become a FIREWALL finding: $_" -ForegroundColor Red
+    }
+}
+
 function Set-SysmonLogSize {
     # 512 MB so pipe events do not rotate out short detonations
     wevtutil sl Microsoft-Windows-Sysmon/Operational /ms:536870912
@@ -380,6 +428,7 @@ if ($sysmonSvc -and $sysmonSvc.Status -eq "Running" -and -not $Force) {
         $configEtag = Get-ETag $response
         Move-Item -Path $configTmp -Destination $configPath -Force -ErrorAction Stop
         Set-PipeEventExclude -Path $configPath
+        Set-NetworkConnectIncludes -Path $configPath
         $installedNow = Get-InstalledSysmon
         $configExe = if ($installedNow -and $installedNow.Exe) { $installedNow.Exe } else { $sysmonExe }
         & $configExe -c $configPath 2>$null
@@ -522,6 +571,7 @@ try {
     }
 }
 Set-PipeEventExclude -Path $configPath
+Set-NetworkConnectIncludes -Path $configPath
 
 # Same or older version already running: keep it, only apply the new config
 $downloadedVersion = Get-BinaryVersion -Path $sysmonExe

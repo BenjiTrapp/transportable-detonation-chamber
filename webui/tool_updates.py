@@ -24,6 +24,7 @@ import json
 import logging
 import ntpath
 import os
+import platform
 import re
 import signal
 import subprocess
@@ -194,6 +195,16 @@ class ToolSpec:
 
 
 SEMVER = r"(\d+\.\d+\.\d+)"
+NTSLEUTH_DIR = "C:\\tools\\ntsleuth"
+
+
+def ntsleuth_exe_path(machine: str) -> str:
+    """The NTSleuth binary of a host architecture. The release has no plain ntsleuth.exe; an ARM64 host
+    installs the x64 one as well, so the updater only needs the one that matches the host to test for presence."""
+    view = "arm64" if machine.upper() in ("ARM64", "AARCH64") else "x64"
+    return "%s\\ntsleuth-%s.exe" % (NTSLEUTH_DIR, view)
+
+
 SYSMON_MARKER = "C:\\tools\\sysmon\\tdc-source.json"
 
 CATALOG: List[ToolSpec] = [
@@ -249,6 +260,8 @@ CATALOG: List[ToolSpec] = [
     ToolSpec("rizin", "Rizin (Cutter)", "release", "C:\\tools\\cutter\\rizin.exe", repo="rizinorg/cutter",
              version_regex=r"Cutter-v(\S+?)-Windows", marker="C:\\tools\\cutter\\tdc-package.txt",
              script="install-rizin.ps1", script_args=[], pinned="2.5.0", consumers=["rizin_sessions"]),
+    ToolSpec("ntsleuth", "NTSleuth", "release", ntsleuth_exe_path(platform.machine()), repo="xaitax/NTSleuth",
+             marker=NTSLEUTH_DIR + "\\tdc-release.txt", script="install-ntsleuth.ps1", script_args=["-Force"]),
     ToolSpec("sysmon", "Sysmon", "sysinternals", "C:\\tools\\sysmon", marker=SYSMON_MARKER,
              script="install-sysmon.ps1", script_args=["-Force"],
              url=SYSMON_BINARY_URL, etag_key="binary_etag"),

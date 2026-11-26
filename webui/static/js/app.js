@@ -38,6 +38,19 @@ function showToast(type, title, detail, duration) {
     }, autoDismiss);
 }
 
+// The second form of a toast: a firewall decision (block FIREWALL, fwApplyPending). Unlike showToast it has
+// no throttle, which would drop a second decision for the same title, and it never dismisses itself: it stays
+// until the decision is answered here or the server's answer replaces it. `item` is an item of
+// GET /api/firewall/pending; the toast joins the stack (#decision-toasts) and its element is returned, or
+// null while it waits behind the ones shown (FW_TOASTS_VISIBLE).
+function showDecisionToast(item) {
+    const entry = fwTrackDecision(item, Date.now());
+    if (!entry) return null;
+    fwRenderDecisions();
+    fwDecisionClockOn();
+    return entry.el || null;
+}
+
 // --- State ---
 let state = {
     alerts: [],
@@ -142,6 +155,10 @@ function onThemeChange() {
     _themeColorCache.clear();
     if (state.activeTab === 'graph') renderGraph();
     if (state.activeTab === 'tracing') renderRtraceTimeline();
+    if (state.activeTab === 'syscalls') {
+        renderSyscallMap();
+        renderBinaryGraph();
+    }
     renderDashboard();
     FileMapView.repaint();
 }
@@ -379,6 +396,7 @@ document.addEventListener('DOMContentLoaded', () => {
     initAlertsTab();
     initSysmonTab();
     initDashboardCharts();
+    initDashboardPages();
     initUpload();
     initHexDropZone();
     initHexResizeHandle();
@@ -399,6 +417,8 @@ document.addEventListener('DOMContentLoaded', () => {
     });
     loadScanToolStatus();
     loadScanHistory();
+    fwInitDecisions();
+    initHelpWiki();
 });
 
 // --- Tab navigation ---
@@ -415,6 +435,10 @@ function switchTab(tabName) {
     // Guard: an unknown name used to deactivate every tab and then throw,
     // leaving the main area blank.
     if (!document.getElementById(`tab-${tabName}`)) return;
+    // The tiles of an own dashboard page belong to the tab on screen: leaving
+    // it abandons the searches that are running, so their answers draw
+    // nothing. Coming back starts them again (dashboardTabShown).
+    if (state.activeTab === 'dashboard' && tabName !== 'dashboard') dashboardStopPanels();
     state.activeTab = tabName;
     document.querySelectorAll('.sidebar-tabs .tab').forEach(t => t.classList.remove('active'));
     document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
@@ -424,12 +448,17 @@ function switchTab(tabName) {
     updateTabOverflow();
     if (tabName === 'dashboard') {
         renderDashboardCharts();
+        // and the pages beside them: the tiles of the one that is open
+        dashboardTabShown();
     }
     if (tabName === 'alerts') {
         renderAlertsTab();
     }
     if (tabName === 'sysmon' && sysmonEvents.length === 0) {
         refreshSysmon();
+    }
+    if (tabName === 'firewall') {
+        firewallTabShown();
     }
     if (tabName === 'logs') {
         logsTabShown();
@@ -464,6 +493,7 @@ function switchTab(tabName) {
     if (tabName === 'rizin') {
         rizinTabShown();
     }
+    if (tabName === 'syscalls') syscallsTabShown();
 }
 
 // Fetch scanner/EMBER tool availability and update badges + dashboard state.
@@ -531,7 +561,7 @@ async function refreshAll() {
     );
 }
 
-async function refreshDashboard() {
+async function refreshDashboard(opts) {
     try {
         const [statusResp, rustinelResp] = await Promise.all([
             fetch('/api/status'),
@@ -555,6 +585,10 @@ async function refreshDashboard() {
     } catch (e) {
         showToast('error', 'Dashboard unreachable', e.message || 'Connection to server lost', 6000);
     }
+    // The Refresh button of the header passes {panels: true}: on an own page it
+    // computes its tiles again, one after the other. The 10 s poll calls this
+    // without it, so nothing on a dashboard recomputes by itself.
+    if (opts && opts.panels && dashboardOwnPage()) await loadPanels();
 }
 
 let _alertsInFlight = null;
@@ -1255,6 +1289,737 @@ function redrawDashboardChartsOnResize() {
     _drawDashboardBars(drawn);
 }
 
+// --- Own dashboard pages ---
+// Under the header of the Dashboard tab stands a row of pages: SERVICES (the
+// stats, the charts and the service cards, unchanged) and one page per own
+// dashboard, plus "+ NEW". An own page draws its tiles: each tile is a search
+// of the LOGS tab that was saved with a name, a form and a range
+// (webui/dashboards.py keeps them). The tiles compute one after the other,
+// never at the same time — eight tiles are eight searches over up to 10,000
+// matches on the VM that also detonates — and nothing recomputes by itself:
+// Refresh in the header computes every tile of the page again, the ↻ of a
+// tile only that one, and the clock in its head says how old its numbers are.
+const DASHBOARD_PAGE_KEY = 'tdc.dashboard.page';
+const DASHBOARD_SERVICES = 'services';
+// The rows a table tile shows, so no unbounded raw log text stands on the
+// front page, and the room a tile's chart is drawn for
+const DASHBOARD_PANEL_ROWS = 20;
+const DASHBOARD_PANEL_HEIGHT = 190;
+// Forms that read better over the whole row than beside another tile
+const DASHBOARD_PANEL_WIDE = ['table', 'line', 'sankey'];
+// From this window width the tiles stand in two columns (the style sheet says
+// the same; the chart is drawn for the room it then has)
+const DASHBOARD_PANEL_COLUMNS = 1100;
+// Characters of the query under a tile; the whole one stands in its title
+const DASHBOARD_QUERY_MAX = 140;
+// What a tile says before its numbers are there
+const DASHBOARD_PANEL_WAIT = { queued: 'Queued', loading: 'Loading…' };
+// The entries of a tile's ⋯ menu, in this order; "Change form" is the row of
+// form switches between Rename and Move up
+const DASHBOARD_PANEL_ACTIONS = [
+    { action: 'open', label: 'Open in LOGS', hint: 'The search of this tile in the LOGS tab' },
+    { action: 'rename', label: 'Rename', hint: 'Another name for this tile' },
+    { action: 'up', label: 'Move up', hint: 'One place earlier on the page' },
+    { action: 'down', label: 'Move down', hint: 'One place later on the page' },
+    { action: 'delete', label: 'Delete', hint: 'Take this tile off the dashboard' },
+];
+// The pages: the dashboards of the server, the page on screen ('services' or
+// a dashboard id), whether a run of tiles is on its way and the number of
+// that run (an answer of an older run draws nothing)
+let dashboardPages = { list: [], page: DASHBOARD_SERVICES, loading: false, at: 0 };
+// What is known about a tile: {state: 'queued'|'loading'|'ready'|'error',
+// result, error, at (the clock of the answer), menu (its ⋯ is open)}
+let dashboardPanelState = new Map();
+let dashboardQueue = [];              // the tiles waiting for their turn, in order
+let dashboardAbort = null;            // the AbortController of the request on its way
+let dashboardPageRead = false;        // the page of the last visit has been taken over once
+let dashboardOwnMenu = false;         // the ⋯ beside the name of the page is open
+let dashboardDrawnWidth = 0;          // the width the tiles on screen were drawn for
+// The tile whose request is really on its way ('' for none): a run that starts
+// meanwhile leaves that one its turn, and an abandoned request clears it
+let dashboardFlight = '';
+
+// The dashboard of the page on screen, null on SERVICES or for one that is gone
+function dashboardOwnPage() {
+    if (dashboardPages.page === DASHBOARD_SERVICES) return null;
+    return dashboardPages.list.find(board => board && board.id === dashboardPages.page) || null;
+}
+
+// A tile by its id: its dashboard, the tile and its place on the page. A tile
+// id is unique across the whole file, so the open page is enough to look in.
+function dashboardPanelOf(pid) {
+    const want = String(pid ?? '');
+    const open = dashboardOwnPage();
+    const list = open && Array.isArray(open.panels) ? open.panels : [];
+    const index = list.findIndex(tile => tile && tile.id === want);
+    return index < 0 ? null : { dashboard: open, panel: list[index], index, count: list.length };
+}
+
+// What is known about a tile; a tile that was never computed is queued
+function panelState(pid) {
+    const key = String(pid ?? '');
+    if (!dashboardPanelState.has(key)) {
+        dashboardPanelState.set(key, { state: 'queued', result: null, error: '', at: 0, menu: false });
+    }
+    return dashboardPanelState.get(key);
+}
+
+// A change to what is known about a tile, and that tile drawn again (the
+// clock of the page follows the newest tile)
+function panelSet(pid, change) {
+    const record = Object.assign(panelState(pid), change || {});
+    renderPanelCard(pid);
+    renderOwnClock();
+    return record;
+}
+
+// The clock in the head of the page: the newest numbers on it
+function renderOwnClock() {
+    const slot = document.getElementById('dashboard-own-time');
+    const open = dashboardOwnPage();
+    if (!slot || !open) return false;
+    const times = (Array.isArray(open.panels) ? open.panels : [])
+        .map(tile => (tile && tile.id ? panelState(tile.id).at : 0)).filter(at => at > 0);
+    slot.textContent = times.length ? new Date(Math.max(...times)).toLocaleTimeString('en-GB') : '—';
+    return true;
+}
+
+// The id of a tile's card element: a tile id is d-/p- plus hex, so it is safe
+// in an id and in a selector
+function dashboardPanelId(pid) {
+    return `dashboard-panel-${cssToken(pid)}`;
+}
+
+// The sort state of a tile's table (tableSortState). Every table of one id
+// takes the order of a click on any of them, so a tile needs its own — the
+// result of the LOGS tab and a second tile must not reorder it.
+function dashboardPanelSortId(pid) {
+    return `logs-tile-${cssToken(pid)}`;
+}
+
+// The room a tile of this form has for its chart: the whole row for a table, a
+// line or a sankey, half of it for a pie or bars, and the whole row in one
+// column (a narrow window). The style sheet puts two tiles in a row from
+// DASHBOARD_PANEL_COLUMNS of window width, so the same number decides here —
+// a chart drawn for more room than its tile has would push its legend out.
+function dashboardPanelWidth(form) {
+    const total = logsWidth('dashboard-panels') - 28;        // the padding of the card
+    const room = typeof window !== 'undefined' && window.innerWidth > 0 ? window.innerWidth : total + 280;
+    const wide = room < DASHBOARD_PANEL_COLUMNS || DASHBOARD_PANEL_WIDE.includes(form);
+    return Math.max(wide ? total : Math.floor((total - 12) / 2), 240);
+}
+
+// The range of a tile as a word for its head: the range of the tab it was
+// saved with, which moves with the clock, or the window it keeps
+function dashboardRangeWord(panel) {
+    const tile = panel || {};
+    const earliest = String(tile.earliest ?? ''), latest = String(tile.latest ?? '');
+    if (!earliest && !latest) return 'all time';
+    const span = /^-(\d+)([mhd])$/.exec(earliest);
+    if (span && !latest) return `last ${span[1]} ${LOGS_RANGE_UNITS[span[2]]}`;
+    return chartRangeLabel(Date.parse(earliest), Date.parse(latest)) || 'a window';
+}
+
+// The forms a tile's columns can carry. Before its first answer every form is
+// offered: which ones fit is only known once the columns are there.
+function panelFormsFor(state) {
+    const result = (state || {}).result;
+    if (!result) return { table: true, pie: true, bars: true, line: true, sankey: true, why: {} };
+    return logsFormsFor(logsResultShape(result));
+}
+
+// The line under a tile that stands for less than the whole result. A tile's
+// query cannot be changed from here (the store keeps it; LOGS is where a
+// search is sharpened), so the line of the LOGS tab, which writes into its
+// search box, becomes plain text here.
+function panelNoteHtml(shape, query) {
+    const note = logsTruncNoteHtml(shape, query);
+    const button = /^<button[^>]*>([\s\S]*)<\/button>$/.exec(note);
+    return button ? `<div class="logs-trunc">${button[1]}</div>` : note;
+}
+
+// The body of a tile: what it is waiting for, the message of a search that was
+// refused, or its result in the form it was saved with. A form that no longer
+// fits the columns — the server answers other columns than when it was saved —
+// shows the table and says what the form would need. A tile that is being
+// computed again keeps the numbers it has, with the word of its turn over
+// them: the Refresh of the header would otherwise blank the whole page.
+function panelBodyHtml(panel, state) {
+    const tile = panel || {}, s = state || {};
+    const waiting = s.state === 'queued' || s.state === 'loading';
+    const result = s.result;
+    if (waiting && !result) {
+        return `<div class="dashboard-panel-wait">${escapeHtml(DASHBOARD_PANEL_WAIT[s.state])}</div>`;
+    }
+    if (!waiting && s.error) return `<div class="dashboard-panel-error">${escapeHtml(s.error)}</div>`;
+    if (!result) return `<div class="dashboard-panel-wait">${escapeHtml(DASHBOARD_PANEL_WAIT.queued)}</div>`;
+    const again = waiting
+        ? `<div class="dashboard-panel-wait is-again">${escapeHtml(DASHBOARD_PANEL_WAIT[s.state])}</div>` : '';
+    const form = LOGS_FORMS.includes(tile.form) ? tile.form : 'table';
+    const shape = logsResultShape(result);
+    const note = panelNoteHtml(shape, tile.query);
+    if (form !== 'table') {
+        const chart = logsChartHtml(result, form, { width: s.width > 0 ? s.width : dashboardPanelWidth(form),
+            height: DASHBOARD_PANEL_HEIGHT });
+        if (chart) return `${again}<div class="logs-chart">${chart}</div>${note}`;
+    }
+    // The rows as a table: at most twenty of them, so no sample's raw text
+    // fills the front page. The count goes down with them, so logsTableHtml
+    // offers no "Show up to 1000" — that button belongs to the LOGS tab,
+    // whose page size it raises. Each tile sorts under its own id: every table
+    // of one id takes the order of a click on any of them.
+    const rows = Array.isArray(result.rows) ? result.rows : [];
+    const shown = rows.slice(0, DASHBOARD_PANEL_ROWS);
+    const cut = { ...result, rows: shown, count: shown.length };
+    const table = logsTableHtml(cut, { sortId: dashboardPanelSortId(tile.id) });
+    const why = form === 'table' ? '' : `<div class="dashboard-panel-why">`
+        + `${escapeHtml(`saved as ${form}, which ${panelFormsFor(s).why[form] || LOGS_LOCKED.columns}`)}</div>`;
+    const more = rows.length > DASHBOARD_PANEL_ROWS
+        ? `<div class="dashboard-panel-why">${escapeHtml(`the first ${DASHBOARD_PANEL_ROWS} of ${logsNumber(rows.length)} rows`)}</div>`
+        : '';
+    // The note belongs under the table as well: a tile that fell back to it
+    // still stands for less than the whole result
+    return `${again}${table}${why}${more}${note}`;
+}
+
+// A tile as markup: pure, so a card can be drawn again from what is known
+// about it. `state` is its record (panelState), with `first` / `last` (its
+// place on the page, which locks Move up and Move down) and `width` (the room
+// its chart has) added by the caller.
+function panelCardHtml(panel, state) {
+    const tile = panel || {}, s = state || {};
+    const pid = String(tile.id ?? '');
+    const form = LOGS_FORMS.includes(tile.form) ? tile.form : 'table';
+    const wide = DASHBOARD_PANEL_WIDE.includes(form);
+    const forms = panelFormsFor(s);
+    const clock = s.at > 0 ? new Date(s.at).toLocaleTimeString('en-GB') : '—';
+    const items = DASHBOARD_PANEL_ACTIONS.map(entry => {
+        const locked = (entry.action === 'up' && s.first) || (entry.action === 'down' && s.last);
+        return `<button type="button" class="dashboard-panel-item" data-panel-action="${entry.action}"`
+            + ` aria-disabled="${!!locked}" title="${escapeHtml(locked ? 'It is already there' : entry.hint)}"`
+            + ` onclick="panelMenu(${jsArg(pid)}, ${jsArg(entry.action)})">${escapeHtml(entry.label)}</button>`;
+    });
+    const switches = LOGS_FORMS.map(name => `<button type="button" class="dashboard-panel-form"`
+        + ` data-panel-form="${name}" aria-pressed="${name === form}" aria-disabled="${!forms[name]}"`
+        + ` title="${escapeHtml(forms[name] ? LOGS_FORM_HINTS[name] : forms.why[name] || LOGS_LOCKED.columns)}"`
+        + ` onclick="panelMenu(${jsArg(pid)}, ${jsArg(`form-${name}`)})">${escapeHtml(name.toUpperCase())}</button>`).join('');
+    const menu = `<div class="dashboard-panel-menu" role="group" aria-label="This tile"${s.menu ? '' : ' hidden'}>`
+        + items.slice(0, 2).join('')
+        + `<div class="dashboard-panel-head-row">Change form</div>`
+        + `<div class="dashboard-panel-forms">${switches}</div>`
+        + items.slice(2).join('') + `</div>`;
+    const query = String(tile.query ?? '');
+    return `<div class="chart-card dashboard-panel dashboard-panel-${cssToken(form)}${wide ? ' dashboard-panel-wide' : ''}"`
+        + ` id="${dashboardPanelId(pid)}" data-panel="${escapeHtml(pid)}">`
+        + `<div class="chart-card-head dashboard-panel-head">`
+        + `<h3 class="chart-card-title dashboard-panel-title" title="${escapeHtml(tile.name)}">${escapeHtml(tile.name)}</h3>`
+        + `<span class="chart-card-tools dashboard-panel-tools">`
+        + `<span class="dashboard-panel-range">${escapeHtml(dashboardRangeWord(tile))}</span>`
+        + `<span class="dashboard-panel-time" title="The clock of the numbers on this tile">${escapeHtml(clock)}</span>`
+        + `<button type="button" class="dashboard-panel-tool" aria-disabled="false"`
+        + ` title="Compute this tile again" aria-label="Compute this tile again"`
+        + ` onclick="refreshPanel(${jsArg(pid)})">↻</button>`
+        + `<span class="dashboard-menu-wrap">`
+        + `<button type="button" class="dashboard-panel-tool" aria-disabled="false" aria-haspopup="true"`
+        + ` aria-expanded="${!!s.menu}" title="What can be done with this tile" aria-label="Tile menu"`
+        + ` onclick="togglePanelMenu(${jsArg(pid)})">⋯</button>${menu}</span>`
+        + `</span></div>`
+        + `<div class="dashboard-panel-body">${panelBodyHtml(tile, s)}</div>`
+        + `<div class="dashboard-panel-foot"><code class="dashboard-panel-query" title="${escapeHtml(query)}">`
+        + `${escapeHtml(_chartEllipsis(query, DASHBOARD_QUERY_MAX))}</code></div>`
+        + `</div>`;
+}
+
+// One tile drawn again, in its place: only that card, so the charts of the
+// others are not redrawn. Without a card of its own the page is drawn again.
+function renderPanelCard(pid) {
+    const at = dashboardPanelOf(pid);
+    if (!at) return false;
+    const card = document.getElementById(dashboardPanelId(pid));
+    if (!card) return renderOwnDashboard();
+    card.outerHTML = panelCardHtml(at.panel, dashboardPanelView(at));
+    return true;
+}
+
+// What a card is drawn from: what is known about the tile, its place on the
+// page and the room its chart has
+function dashboardPanelView(at) {
+    const tile = at.panel || {};
+    const form = LOGS_FORMS.includes(tile.form) ? tile.form : 'table';
+    return { ...panelState(tile.id), first: at.index === 0, last: at.index === at.count - 1,
+        width: dashboardPanelWidth(form) };
+}
+
+// The head of the open page (its name, the clock of its newest tile and the ⋯
+// that renames or deletes it) and its tiles
+function renderOwnDashboard() {
+    const head = document.getElementById('dashboard-own-head'), host = document.getElementById('dashboard-panels');
+    if (!head || !host) return false;
+    const open = dashboardOwnPage();
+    if (!open) {
+        head.innerHTML = '';
+        host.innerHTML = '';
+        return false;
+    }
+    const list = (Array.isArray(open.panels) ? open.panels : []).filter(tile => tile && typeof tile.id === 'string');
+    const times = list.map(tile => panelState(tile.id).at).filter(at => at > 0);
+    const clock = times.length ? new Date(Math.max(...times)).toLocaleTimeString('en-GB') : '—';
+    head.innerHTML = `<h3 class="dashboard-own-title" title="${escapeHtml(open.name)}">${escapeHtml(open.name)}</h3>`
+        + `<span class="dashboard-own-count">${escapeHtml(`${list.length} of ${LOGS_TILE_MAX} tiles`)}</span>`
+        + `<span class="dashboard-own-tools">`
+        + `<span class="dashboard-own-time" id="dashboard-own-time" title="The clock of the newest numbers on this page">${escapeHtml(clock)}</span>`
+        + `<span class="dashboard-menu-wrap">`
+        + `<button type="button" class="dashboard-panel-tool" id="dashboard-own-menu-btn" aria-disabled="false"`
+        + ` aria-haspopup="true" aria-expanded="${dashboardOwnMenu}" title="What can be done with this dashboard"`
+        + ` aria-label="Dashboard menu" onclick="toggleDashboardMenu()">⋯</button>`
+        + `<div class="dashboard-menu" role="group" aria-label="This dashboard"${dashboardOwnMenu ? '' : ' hidden'}>`
+        + `<button type="button" class="dashboard-menu-item" title="Another name for this dashboard"`
+        + ` onclick="renameDashboard(${jsArg(open.id)})">Rename</button>`
+        + `<button type="button" class="dashboard-menu-item" title="This dashboard and every tile on it"`
+        + ` onclick="deleteDashboard(${jsArg(open.id)})">Delete</button>`
+        + `</div></span></span>`;
+    host.innerHTML = list.length
+        ? list.map((tile, index) => panelCardHtml(tile, dashboardPanelView({ panel: tile, index, count: list.length }))).join('')
+        : `<div class="dashboard-own-empty">No tiles yet. Search in the LOGS tab and press SAVE to put a result here.</div>`;
+    dashboardDrawnWidth = logsWidth('dashboard-panels');
+    return true;
+}
+
+// The tiles for the room a new window width gives them: the legend of a pie or
+// of bars keeps a column of its own, which does not scale with the svg, so a
+// chart drawn for another width has to be drawn again. Nothing is computed
+// again — the cards come from the numbers that are already there.
+function redrawPanelsOnResize() {
+    const now = logsWidth('dashboard-panels');
+    if (!now || now === dashboardDrawnWidth || !dashboardOwnPage()) return false;
+    renderOwnDashboard();
+    return true;
+}
+
+// The row of pages, and which of the two bodies is on screen
+function renderDashboardPages() {
+    const row = document.getElementById('dashboard-pages');
+    if (!row) return false;
+    const page = dashboardPages.page;
+    const list = dashboardPages.list.filter(board => board && typeof board.id === 'string');
+    const buttons = [`<button type="button" class="dashboard-page" id="dashboard-page-services"`
+        + ` data-dashboard-page="${DASHBOARD_SERVICES}" aria-pressed="${page === DASHBOARD_SERVICES}"`
+        + ` aria-disabled="false" title="The services of the chamber, its alerts and its tiles"`
+        + ` onclick="setDashboardPage(${jsArg(DASHBOARD_SERVICES)})">SERVICES</button>`];
+    for (const board of list) {
+        const tiles = Array.isArray(board.panels) ? board.panels.length : 0;
+        buttons.push(`<button type="button" class="dashboard-page" data-dashboard-page="${escapeHtml(board.id)}"`
+            + ` aria-pressed="${board.id === page}" aria-disabled="false"`
+            + ` title="${escapeHtml(`${tiles} of ${LOGS_TILE_MAX} tiles`)}"`
+            + ` onclick="setDashboardPage(${jsArg(board.id)})">${escapeHtml(board.name)}</button>`);
+    }
+    const room = list.length < LOGS_DASH_MAX;
+    buttons.push(`<button type="button" class="dashboard-page dashboard-page-new" id="dashboard-page-new"`
+        + ` aria-disabled="${!room}" title="${escapeHtml(room ? 'A new, empty dashboard' : LOGS_SAVE_LOCKED.dashboards)}"`
+        + ` onclick="addDashboard()">+ NEW</button>`);
+    row.innerHTML = buttons.join('');
+    const services = page === DASHBOARD_SERVICES;
+    const body = document.getElementById('dashboard-body'), own = document.getElementById('dashboard-own');
+    if (body) body.hidden = !services;
+    if (own) own.hidden = services;
+    renderOwnDashboard();
+    return true;
+}
+
+// The page of the last visit ('' where nothing was stored or storage is blocked)
+function dashboardStoredPage() {
+    try {
+        const stored = localStorage.getItem(DASHBOARD_PAGE_KEY);
+        return typeof stored === 'string' ? stored : '';
+    } catch (e) {
+        return '';
+    }
+}
+
+// One of the pages. A dashboard that is not there (deleted in another browser
+// tab, or an id from an older visit) falls back to SERVICES. The tiles of the
+// page that was open are abandoned, and the tiles of the new one start.
+function setDashboardPage(id) {
+    const want = String(id ?? '');
+    const known = want === DASHBOARD_SERVICES || dashboardPages.list.some(board => board && board.id === want);
+    const page = known ? want : DASHBOARD_SERVICES;
+    // The page that is already open, with its tiles: the buttons behave like
+    // tabs, where a click on the open one does nothing. Stopping and queueing
+    // them again would be up to twelve searches for numbers that are on
+    // screen. The other callers always change the page, so this is their way
+    // through: a page whose tiles have never run has no record yet.
+    if (page === dashboardPages.page && dashboardPanelState.size) return known;
+    dashboardPages.page = page;
+    try {
+        localStorage.setItem(DASHBOARD_PAGE_KEY, page);
+    } catch (e) {
+        // storage blocked: the page is not kept for the next visit
+    }
+    dashboardStopPanels();
+    closeDashboardMenus();
+    renderDashboardPages();
+    if (page !== DASHBOARD_SERVICES) loadPanels();
+    return known;
+}
+
+// The dashboards of the server: one GET brings every tile of every page. Every
+// write reads them again, so a second browser tab cannot leave this one
+// working from a list that is out of date.
+async function loadDashboardPages() {
+    let list = null, why = '';
+    try {
+        const resp = await fetch('/api/dashboards');
+        const data = await resp.json().catch(() => ({}));
+        if (resp.ok) list = Array.isArray(data && data.dashboards) ? data.dashboards : [];
+        else why = logsSaveMessage(resp.status, data);
+    } catch (e) {
+        why = `the dashboards could not be read: ${e && e.message ? e.message : e}`;
+    }
+    // A list that could not be read is no answer about the dashboards: what is
+    // known stays, the page stays, and the storage is not written. Only a
+    // dashboard the server really does not have any more falls back to
+    // SERVICES — a blip must not lose the page of the last visit.
+    if (why) {
+        renderDashboardPages();
+        showToast('error', 'Dashboards unreachable', why, 6000);
+        return false;
+    }
+    dashboardPages.list = list || [];
+    // Only the tiles the server still has keep their record: one holds a whole
+    // result, so a tile or a dashboard deleted in another browser tab would
+    // leave up to 1000 rows behind for the life of the page
+    const alive = new Set();
+    for (const page of dashboardPages.list) {
+        for (const tile of (page && page.panels) || []) alive.add(String(tile && tile.id));
+    }
+    for (const pid of [...dashboardPanelState.keys()]) {
+        if (!alive.has(String(pid))) dashboardPanelState.delete(pid);
+    }
+    if (!dashboardPageRead) {
+        // The page of the last visit, once: a click since then wins
+        dashboardPageRead = true;
+        const stored = dashboardStoredPage();
+        if (stored) dashboardPages.page = stored;
+    }
+    if (dashboardPages.page !== DASHBOARD_SERVICES && !dashboardOwnPage()) {
+        setDashboardPage(DASHBOARD_SERVICES);
+    } else {
+        renderDashboardPages();
+    }
+    return true;
+}
+
+// The tiles that were waiting are let go of and the request on its way is
+// abandoned: a page or a tab that is left takes its searches with it. The tile
+// that was waiting for that answer is waiting for its turn again — nothing is
+// on its way for it, so the next run has to pick it up.
+function dashboardStopPanels() {
+    dashboardPages.at++;
+    dashboardQueue = [];
+    dashboardPages.loading = false;
+    dashboardFlight = '';
+    if (dashboardAbort) {
+        dashboardAbort.abort();
+        dashboardAbort = null;
+    }
+    for (const [pid, record] of dashboardPanelState) {
+        if (record.state === 'loading') panelSet(pid, { state: 'queued' });
+    }
+}
+
+// The tiles of the open page, one after the other: `ids` are the tiles to
+// compute (every one of them without it). A tile that is already waiting is
+// not queued twice, and a run that is on its way takes the new ones over.
+async function loadPanels(ids) {
+    const open = dashboardOwnPage();
+    if (!open) return 0;
+    const list = (Array.isArray(open.panels) ? open.panels : [])
+        .filter(tile => tile && typeof tile.id === 'string'
+            && (!Array.isArray(ids) || ids.map(String).includes(tile.id)));
+    if (!list.length) return 0;
+    for (const tile of list) {
+        // The tile whose answer is really on its way keeps its turn: queueing
+        // it again would let that answer land as its result and search it a
+        // second time. Its state alone must not decide that — a tile whose
+        // request was abandoned keeps `loading` until a run reaches it, and
+        // inferring it from there left such a tile waiting for ever.
+        if (tile.id === dashboardFlight) continue;
+        panelSet(tile.id, { state: 'queued', error: '' });
+        if (!dashboardQueue.includes(tile.id)) dashboardQueue.push(tile.id);
+    }
+    if (dashboardPages.loading || !dashboardQueue.length) return 0;
+    const run = ++dashboardPages.at, page = dashboardPages.page;
+    dashboardPages.loading = true;
+    let done = 0;
+    try {
+        while (dashboardQueue.length) {
+            if (run !== dashboardPages.at || page !== dashboardPages.page) break;
+            const pid = dashboardQueue.shift();
+            if (!dashboardPanelOf(pid)) continue;
+            if (await loadOnePanel(pid, run, page)) done++;
+        }
+    } finally {
+        if (run === dashboardPages.at) {
+            dashboardPages.loading = false;
+            dashboardAbort = null;
+        }
+    }
+    return done;
+}
+
+// One tile: its own search, with the limit of its form (200 for a table, 1000
+// for a picture — a chart stands for every group the server will give) and the
+// signal of its run. `dashboardFlight` is this tile while its request is on
+// its way, so a run that starts meanwhile leaves it its turn and nothing else.
+// An answer is only drawn while its page and its run are still the ones on
+// screen.
+async function loadOnePanel(pid, run, page) {
+    const at = dashboardPanelOf(pid);
+    if (!at) return false;
+    const tile = at.panel;
+    panelSet(pid, { state: 'loading', error: '' });
+    const controller = typeof AbortController === 'function' ? new AbortController() : null;
+    dashboardAbort = controller;
+    dashboardFlight = String(pid);
+    const query = String(tile.query ?? '').trim() || '*';
+    const params = new URLSearchParams({ q: query, earliest: String(tile.earliest ?? ''),
+        limit: String(logsChartLimit(tile.form)) });
+    if (tile.latest) params.set('latest', String(tile.latest));
+    let result = null, error = '';
+    try {
+        const resp = await fetch(`/api/logs/search?${params.toString()}`,
+            controller ? { signal: controller.signal } : undefined);
+        const data = await resp.json().catch(() => ({}));
+        if (resp.ok) result = data;
+        else error = data && data.error ? String(data.error) : `The search failed (HTTP ${resp.status}).`;
+    } catch (e) {
+        if (e && e.name === 'AbortError') return false;
+        error = `The search could not be loaded: ${e && e.message ? e.message : e}`;
+    } finally {
+        if (dashboardFlight === String(pid)) dashboardFlight = '';
+    }
+    if (run !== dashboardPages.at || page !== dashboardPages.page) return false;
+    // Another table: the order a click left on this tile means nothing in it
+    const columns = JSON.stringify((result && result.columns) || []);
+    const had = panelState(pid).columns;
+    if (had !== undefined && had !== columns) delete tableSortState[dashboardPanelSortId(pid)];
+    panelSet(pid, { state: error ? 'error' : 'ready', error, result, at: Date.now(), columns });
+    return !error;
+}
+
+// The ↻ of one tile: that tile alone, which is one search
+async function refreshPanel(pid) {
+    if (!dashboardPanelOf(pid)) return 0;
+    closeDashboardMenus();
+    return loadPanels([String(pid)]);
+}
+
+// Open in LOGS: the tab with the search of the tile, the range it keeps and
+// the form it was saved with. The query, the window and the form are put in
+// place first and the tab is shown afterwards: the tab searches when it is
+// shown (logsTabShown, initLogs on a first visit), and that one search is the
+// one of the tile.
+function openPanelInLogs(pid) {
+    const at = dashboardPanelOf(pid);
+    if (!at) return false;
+    const tile = at.panel;
+    closeDashboardMenus();
+    const earliest = String(tile.earliest ?? ''), latest = String(tile.latest ?? '');
+    const label = logsRangeLabel(earliest, latest);
+    logsLimit = LOGS_PAGE;
+    logsState.earliest = earliest;
+    logsState.latest = latest;
+    if (label) logsRememberRange(label);
+    logsSetQuery(String(tile.query ?? ''));
+    logsWantForm = LOGS_FORMS.includes(tile.form) ? tile.form : '';
+    logsOpenPending = true;
+    // A jump from FIREWALL still waiting, its note and its way back belong to
+    // another search than the tile's
+    logsPending = null;
+    logsRangeNote = '';
+    logsBack = null;
+    renderLogsBack();
+    renderLogsRange();
+    switchTab('logs');
+    return true;
+}
+
+// The ⋯ of a tile: one menu at a time, so two of them never stand open
+function togglePanelMenu(pid) {
+    const want = String(pid ?? '');
+    if (!dashboardPanelOf(want)) return false;
+    const open = !panelState(want).menu;
+    closeDashboardMenus();
+    if (open) panelSet(want, { menu: true });
+    return open;
+}
+
+// The ⋯ beside the name of the page
+function toggleDashboardMenu() {
+    const open = !dashboardOwnMenu;
+    closeDashboardMenus();
+    dashboardOwnMenu = open;
+    renderOwnDashboard();
+    return open;
+}
+
+// Every ⋯ menu of the page shut: a click elsewhere, a page change and every
+// entry that was chosen close them
+function closeDashboardMenus() {
+    const had = dashboardOwnMenu;
+    dashboardOwnMenu = false;
+    const open = [...dashboardPanelState].filter(([, record]) => record.menu).map(([pid]) => pid);
+    for (const pid of open) panelState(pid).menu = false;
+    if (had) renderOwnDashboard();
+    else for (const pid of open) renderPanelCard(pid);
+    return had || open.length > 0;
+}
+
+// One write of the dashboard routes: {ok, status, data}. A refusal says so as
+// a toast with the sentence of the server — the tile or the page it belongs to
+// stays on screen, so there is nowhere else to put it.
+async function dashboardWrite(url, method, body) {
+    let status = 0, data = {};
+    try {
+        const opts = { method, headers: { 'Content-Type': 'application/json' } };
+        if (body !== undefined) opts.body = JSON.stringify(body);
+        const resp = await fetch(url, opts);
+        status = resp.status;
+        data = (await resp.json().catch(() => ({}))) || {};
+        if (resp.ok) return { ok: true, status, data };
+        showToast('error', 'The dashboard was not changed', logsSaveMessage(status, data), 6000);
+    } catch (e) {
+        showToast('error', 'The dashboard was not changed',
+            `the change did not reach the server: ${e && e.message ? e.message : e}`, 6000);
+    }
+    return { ok: false, status, data };
+}
+
+// A name the analyst typed, or '' where it cannot be used (and why, as a
+// toast); null where the question was cancelled
+function dashboardAskName(question, value, why) {
+    const answer = typeof prompt === 'function' ? prompt(question, value) : null;
+    if (answer === null || answer === undefined) return null;
+    const name = String(answer).trim();
+    if (!name || name.length > LOGS_NAME_MAX) {
+        showToast('error', 'The name was not taken', why, 6000);
+        return '';
+    }
+    return name;
+}
+
+// + NEW in the row of pages: an empty dashboard, which then opens
+async function addDashboard() {
+    if (dashboardPages.list.length >= LOGS_DASH_MAX) {
+        showToast('error', 'No room for another dashboard', LOGS_SAVE_LOCKED.dashboards, 6000);
+        return false;
+    }
+    const name = dashboardAskName('Name of the new dashboard', logsSaveBoardName(dashboardPages.list),
+        LOGS_SAVE_LOCKED.dashboard);
+    if (!name) return false;
+    const made = await dashboardWrite('/api/dashboards', 'POST', { name });
+    const fresh = made.ok && made.data.dashboard ? String(made.data.dashboard.id || '') : '';
+    await loadDashboardPages();
+    if (fresh) setDashboardPage(fresh);
+    return !!fresh;
+}
+
+// Rename of the open dashboard, from its ⋯
+async function renameDashboard(id) {
+    const board = dashboardPages.list.find(item => item && item.id === String(id ?? ''));
+    if (!board) return false;
+    closeDashboardMenus();
+    const name = dashboardAskName('Name of the dashboard', board.name, LOGS_SAVE_LOCKED.dashboard);
+    if (!name) return false;
+    const done = await dashboardWrite(`/api/dashboards/${encodeURIComponent(board.id)}`, 'PATCH', { name });
+    await loadDashboardPages();
+    return done.ok;
+}
+
+// Delete of the open dashboard, from its ⋯: it asks once and names the tiles
+// that go with it
+async function deleteDashboard(id) {
+    const board = dashboardPages.list.find(item => item && item.id === String(id ?? ''));
+    if (!board) return false;
+    closeDashboardMenus();
+    const tiles = Array.isArray(board.panels) ? board.panels.length : 0;
+    const question = `Delete '${board.name}' and its ${tiles} ${tiles === 1 ? 'tile' : 'tiles'}?`;
+    if (typeof confirm !== 'function' || !confirm(question)) return false;
+    const done = await dashboardWrite(`/api/dashboards/${encodeURIComponent(board.id)}`, 'DELETE');
+    await loadDashboardPages();
+    return done.ok;
+}
+
+// One entry of a tile's ⋯ menu: 'open', 'rename', 'up', 'down', 'delete' or
+// 'form-<name>'. Every write sends exactly the one field it is about (the
+// query and the range of a tile cannot change: that is a new tile from LOGS)
+// and reads the list again afterwards.
+async function panelMenu(pid, action) {
+    const at = dashboardPanelOf(pid);
+    if (!at) return false;
+    const tile = at.panel, what = String(action ?? '');
+    if (what === 'open') return openPanelInLogs(pid);
+    closeDashboardMenus();
+    const url = `/api/dashboards/${encodeURIComponent(at.dashboard.id)}`
+        + `/panels/${encodeURIComponent(tile.id)}`;
+    let body = null;
+    if (what === 'rename') {
+        const name = dashboardAskName('Name of the tile', tile.name, LOGS_SAVE_LOCKED.name);
+        if (!name) return false;
+        body = { name };
+    } else if (what === 'up' || what === 'down') {
+        if ((what === 'up' && at.index === 0) || (what === 'down' && at.index === at.count - 1)) return false;
+        body = { move: what };
+    } else if (what === 'delete') {
+        if (typeof confirm !== 'function' || !confirm(`Delete the tile '${tile.name}'?`)) return false;
+        const gone = await dashboardWrite(url, 'DELETE');
+        // Only a tile that is really gone lets go of its numbers: a refused
+        // delete leaves the tile standing, with what it had on it
+        if (gone.ok) dashboardPanelState.delete(tile.id);
+        await loadDashboardPages();
+        return gone.ok;
+    } else if (what.startsWith('form-')) {
+        const form = what.slice(5);
+        if (!LOGS_FORMS.includes(form)) return false;
+        // A form the columns of the last answer cannot carry is grey in the
+        // menu, and that is all aria-disabled is: a click on it stores a form
+        // the tile can never draw and pays a search for it
+        if (!panelFormsFor(panelState(tile.id))[form]) return false;
+        body = { form };
+    } else {
+        return false;
+    }
+    const done = await dashboardWrite(url, 'PATCH', body);
+    await loadDashboardPages();
+    // Another form may need rows the last search did not ask for (200 or 1000)
+    if (done.ok && body.form) await refreshPanel(tile.id);
+    return done.ok;
+}
+
+// The pages and the tiles of the one that is open: the Dashboard tab was
+// shown (switchTab draws its charts beside this) or the page has just loaded
+// with that tab open. The list is read again every time — another browser tab
+// may have added, renamed or deleted a dashboard since the last look.
+function dashboardTabShown() {
+    return loadDashboardPages().then(() => (dashboardOwnPage() ? loadPanels() : 0));
+}
+
+// A click outside a ⋯ menu shuts it, as the menu of the LOGS tab does; the
+// tab stands open when the page loads, so its pages are read right away
+function initDashboardPages() {
+    if (!document.getElementById('dashboard-pages')) return;
+    document.addEventListener('click', event => {
+        const wrap = event.target && typeof event.target.closest === 'function'
+            ? event.target.closest('.dashboard-menu-wrap') : null;
+        if (!wrap) closeDashboardMenus();
+    });
+    const host = document.getElementById('dashboard-panels');
+    if (host && typeof ResizeObserver !== 'undefined') {
+        new ResizeObserver(() => requestAnimationFrame(redrawPanelsOnResize)).observe(host);
+    }
+    if (state.activeTab === 'dashboard') dashboardTabShown();
+}
+
 // --- A range drawn across bars ---
 // ALERT ACTIVITY of the dashboard and OVER TIME of the Alerts tab take a
 // range drawn across their bars (mouse, pen or finger) by the same code.
@@ -1842,6 +2607,33 @@ function openAlertsTab(filter) {
     switchTab('alerts');
     const tab = document.getElementById('tab-alerts');
     if (tab) tab.scrollTop = 0;
+}
+
+// Opens the LOGS tab on this search over this range (earliest and latest as
+// the server takes them: -1h or ISO; earliest left out keeps the tab's range),
+// from the first page, and searches. `back` is the way back the tab shows as a
+// chip (logsBackOf), none clears an old one. The search goes to logsPending,
+// which the tab takes when it is shown: on its first opening initLogs takes it
+// instead of the last search, so that one never runs. The values in `query`
+// are the caller's to quote (logsQuote). False, and nothing changes, for an
+// empty query or one longer than the server takes. `note` is shown beside the
+// range for as long as it stands: that it runs to now, or is a fallback.
+function openLogsTab(query, earliest, latest, back, note) {
+    const q = String(query ?? '').trim();
+    if (!q) return false;
+    if (Array.from(q).length > LOGS_QUERY_MAX) {
+        showToast('error', 'Not opened in LOGS', `The search would be longer than the ${LOGS_QUERY_MAX} characters LOGS takes.`);
+        return false;
+    }
+    logsPending = { query: q, earliest: earliest === undefined ? null : String(earliest ?? ''), latest: String(latest ?? ''),
+        note: String(note ?? '') };
+    logsBack = logsBackOf(back);
+    logsOpenPending = false;           // a tile opened before it is not the search to run
+    logsWantForm = '';
+    logsLimit = LOGS_PAGE;
+    switchTab('logs');
+    if (logsReady && logsPending) logsTakePending();
+    return true;
 }
 
 // --- The drilldown: the steps that narrowed the tab ---
@@ -2940,6 +3732,8 @@ const CHART_PALETTE = ['var(--accent-pink)', 'var(--accent-cyan)', 'var(--accent
 const CHART_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 // A clock set to the year 9999 must not give a chart millions of bins
 const CHART_MAX_BINS = 1000;
+// Characters of a label a tooltip repeats (a value from a log can be 64 KB)
+const CHART_LABEL_MAX = 200;
 
 // --- Counting ---
 // An alert's category in lower case: the first of a list (["registry"]) or
@@ -3370,6 +4164,79 @@ function sparklineSvg(values, opts) {
         + `<polyline class="chart-spark-line" points="${points}" fill="none" style="stroke:${color}"/></svg>`;
 }
 
+// Lines over time, one per series [{key, label, color, points: [[t, value],
+// …]}] (the LINE of a timechart): a grid under them, the highest value of all
+// series at the top left, labels of times or dates under the plot (`unit` and
+// `step` of the buckets, else hours, days or weeks by their length). A
+// series' points are drawn by their time, whatever order they come in; a
+// value that is none (null, '') is skipped and the line goes on to the next
+// one, so a bucket the server left out is no count of 0. A series of at most
+// 30 points also gets a dot per value, which names its period and its count.
+// Each line is a <path class="chart-line" data-key> whose <title> names its
+// series, the span of its values and their sum, each dot a <circle
+// class="chart-point" data-key data-value data-time>; colours come from
+// _chartColor by the place in `series`, so a line and its legend row match.
+// A label is cut to CHART_LABEL_MAX for those tooltips, which repeat it once
+// per series and once per dot. A series without a drawable point draws
+// nothing, and when none has one the answer is '', as with the other drawers.
+function lineSvg(series, opts) {
+    opts = opts || {};
+    // Number(null) is 0: a bucket without events must stay a gap, not a count
+    const value = v => (v === null || v === undefined || v === '' ? NaN : Number(v));
+    const list = (Array.isArray(series) ? series : []).map((s, i) => ({
+        key: s?.key, label: _chartEllipsis(String(s?.label ?? s?.key ?? ''), CHART_LABEL_MAX),
+        color: _chartColor(s?.color, i),
+        points: (s?.points || []).map(p => [value(p?.[0]), value(p?.[1])])
+            .filter(([t, v]) => Number.isFinite(t) && Number.isFinite(v))
+            .sort((a, b) => a[0] - b[0]),
+    })).filter(s => s.points.length);
+    let max = 0;                                    // not Math.max(...): a tile may hold thousands of points
+    for (const s of list) for (const [, v] of s.points) max = Math.max(max, v);
+    if (!(max > 0)) return '';
+    const width = opts.width > 0 ? Number(opts.width) : 560, height = opts.height > 0 ? Number(opts.height) : 140;
+    const top = 12, plotH = Math.max(height - top - 16, 10), bottom = top + plotH;
+    const times = [...new Set(list.flatMap(s => s.points.map(([t]) => t)))].sort((a, b) => a - b);
+    const gaps = times.slice(1).map((t, i) => t - times[i]);
+    const step = opts.step > 0 ? Number(opts.step) : gaps.length ? Math.min(...gaps) : 0;
+    const unit = ['second', 'minute', 'hour', 'day', 'week'].includes(opts.unit) ? opts.unit
+        : step <= 2 * 3600000 ? 'hour' : step <= 2 * 86400000 ? 'day' : 'week';
+    // A dot or a line cap on the first or last time stays inside the chart
+    const inset = 3, plotW = Math.max(width - 2 * inset, 1);
+    const first = times[0], last = times[times.length - 1];
+    const xOf = t => (last > first ? inset + plotW * (t - first) / (last - first) : width / 2);
+    const yOf = v => bottom - plotH * Math.min(Math.max(v, 0), max) / max;
+    const period = t => _chartPeriodLabel(t, step > 0 ? t + step : _chartPeriodNext(t, unit, step), unit);
+    let svg = [0.25, 0.5, 0.75, 1].map(f => {
+        const y = _chartCoord(bottom - plotH * f);
+        return `<line class="chart-grid" x1="0" x2="${width}" y1="${y}" y2="${y}"/>`;
+    }).join('') + `<text class="chart-ymax" x="0" y="${top - 3}">${_chartNumber(max)}</text>`;
+    for (const s of list) {
+        const values = s.points.map(([, v]) => v);
+        let lo = values[0], hi = values[0], total = 0;
+        for (const v of values) { lo = Math.min(lo, v); hi = Math.max(hi, v); total += v; }
+        const span = lo === hi ? _chartNumber(hi) : `${_chartNumber(lo)}–${_chartNumber(hi)}`;
+        const title = `${s.label}: ${span} per point, ${_chartNumber(total)} in all`;
+        // A single point is no line: its path draws nothing, its dot shows it
+        const d = s.points.map(([t, v], i) => `${i ? 'L' : 'M'}${_chartCoord(xOf(t))} ${_chartCoord(yOf(v))}`).join('');
+        svg += `<path class="chart-line" data-key="${escapeHtml(s.key)}" data-total="${total}" d="${d}"`
+            + ` fill="none" stroke-width="2" style="stroke:${s.color}"><title>${escapeHtml(title)}</title></path>`;
+        if (s.points.length > 30) continue;         // more dots than that are a thick line, not values
+        for (const [t, v] of s.points) {
+            svg += `<circle class="chart-point" data-key="${escapeHtml(s.key)}" data-value="${v}" data-time="${t}"`
+                + ` cx="${_chartCoord(xOf(t))}" cy="${_chartCoord(yOf(v))}" r="3" style="fill:${s.color}">`
+                + `<title>${escapeHtml(`${s.label} · ${period(t)}: ${_chartNumber(v)}`)}</title></circle>`;
+        }
+    }
+    svg += `<line class="chart-axis" x1="0" x2="${width}" y1="${bottom}" y2="${bottom}"/>`;
+    const bins = times.map(t => ({ start: t, end: t + Math.max(step, 0) }));
+    for (const { i, text } of _chartTicks(bins, unit, plotW / times.length, step)) {
+        const x = xOf(times[i]);
+        if (x + text.length * 5.6 > width) continue;     // it would run past the right edge
+        svg += `<text class="chart-tick" x="${_chartCoord(x)}" y="${height - 3}">${escapeHtml(text)}</text>`;
+    }
+    return `<svg class="chart-svg chart-lines" width="${width}" height="${height}" viewBox="0 0 ${width} ${height}">${svg}</svg>`;
+}
+
 // Points [{x, y, color, title, key}] along x (a time or a rank) at height y
 // (a score; above yMax at the top edge). A point without a score (y null) sits
 // in a lane "no score" under the axis. thresholds [{y, label}] are dashed
@@ -3698,6 +4565,197 @@ function sankeySvg(layout, opts) {
     return `<svg class="chart-svg chart-sankey" width="${width}" height="${height + 12}" viewBox="0 -6 ${width} ${height + 12}">${svg}</svg>`;
 }
 
+// --- World map (FIREWALL tab) ---
+// The part of the world the map shows: equirectangular, 2 px per degree, cut
+// at 82° N and 58° S. The chamber is no place on it: the host's location is
+// never determined (that would mean asking a service where it is), so it is
+// a device in a strip of its own, WORLD_DOCK px under the map, outside
+// everything project() can return.
+const WORLD_BOX = { lon0: -180, lon1: 180, lat0: 82, lat1: -58, w: 720, h: 280 };
+const WORLD_DOCK = 40;
+const WORLD_CHAMBER_ID = '@chamber';
+
+// lon/lat to x/y of the box, not cut to it (the land beyond is cut by the SVG)
+function _worldXY(lon, lat, box) {
+    return [(lon - box.lon0) * box.w / (box.lon1 - box.lon0), (box.lat0 - lat) * box.h / (box.lat0 - box.lat1)];
+}
+
+// lon/lat to [x, y] in the box (default WORLD_BOX), cut to its edges; null
+// when either is missing or no number (a destination without geo is not at 0°/0°)
+function project(lon, lat, box) {
+    box = box || WORLD_BOX;
+    const num = v => (v === null || v === undefined || v === '' ? NaN : Number(v));
+    const lo = num(lon), la = num(lat);
+    if (!Number.isFinite(lo) || !Number.isFinite(la)) return null;
+    const [x, y] = _worldXY(lo, la, box);
+    return [Math.min(Math.max(x, 0), box.w), Math.min(Math.max(y, 0), box.h)];
+}
+
+// The chamber's device in the strip under the map of `box`: its frame and
+// the port at the middle of its top edge, where every arc leaves. Taken from
+// the size of the box alone, never from a lon/lat: below box.h, where no
+// projected point can be.
+function _worldChamber(box) {
+    const w = 104, h = 22, top = box.h + (WORLD_DOCK - h) / 2;
+    return { x: box.w / 2 - w / 2, y: top, w, h, port: [box.w / 2, top] };
+}
+
+// A tone as the class suffix of its severity; anything else (data of the VM) is info
+function _worldTone(tone) {
+    const t = String(tone ?? '').toLowerCase();
+    return ALERT_SEVERITIES.includes(t) ? t : 'info';
+}
+
+// A quadratic Bézier from a to b whose control point stands off the middle by
+// `bend` times the length, on the upper side (to the right for a vertical
+// arc), and inside the box: the curve stays in the triangle of its three
+// points, so it never leaves the map and its strip. '' for an arc too short to see.
+function _worldArcPath(a, b, bend, box) {
+    const dx = b[0] - a[0], dy = b[1] - a[1], len = Math.hypot(dx, dy);
+    if (len < 1) return '';
+    let nx = -dy / len, ny = dx / len;
+    if (ny > 0 || (ny === 0 && nx < 0)) { nx = -nx; ny = -ny; }
+    const cx = Math.min(Math.max((a[0] + b[0]) / 2 + nx * len * bend, 0), box.w);
+    const cy = Math.min(Math.max((a[1] + b[1]) / 2 + ny * len * bend, 0), box.h);
+    const c = _chartCoord;
+    return `M${c(a[0])} ${c(a[1])} Q${c(cx)} ${c(cy)} ${c(b[0])} ${c(b[1])}`;
+}
+
+// Malware text for a label or a tooltip without bidi controls: an AS name
+// with U+202E would show the analyst its characters in another order
+function _worldText(value) {
+    return String(value ?? '').replace(/[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]/g, '');
+}
+
+// The width of a label in the map's 9 px monospace: a wide script (CJK,
+// Arabic, …) takes more than the 5.6 px of a Latin character
+function _worldTextWidth(text) {
+    return Array.from(text).reduce((w, ch) => w + (ch.codePointAt(0) < 0x0370 ? 5.6 : 9.5), 0);
+}
+
+// The pill of a label `width` wide beside a dot of radius r at x/y, on its
+// right or (side 'left') its left, moved inside the box where it would cross an edge
+function _worldLabelBox(x, y, r, width, side, box) {
+    const h = 12;
+    const left = side === 'left' ? x - r - 3 - width : x + r + 3;
+    return { x: Math.min(Math.max(left, 0), box.w - width), y: Math.min(Math.max(y - h / 2, 0), box.h - h), w: width, h };
+}
+
+// The world map of the FIREWALL tab: the graticule and the land of opts.world
+// (world.json: {scale, shapes: [[lon0, lat0, lon1, lat1, …], …]}, filled
+// even-odd so a hole stays open), cut to the map; under it the strip with the
+// chamber (WORLD_CHAMBER_ID), a framed device and no point of the map; then
+// the arcs, the points and the device. points [{id, lon, lat, label, tone, r,
+// title}]: one without a position is left out, and so are the arcs to it; a
+// point with the chamber's id is refused (the chamber has no coordinate).
+// arcs [{to, tone, weight, pending, id, title}] leave the chamber (one with
+// another `from` is left out): as wide as the square root of their share of
+// the heaviest (1-4 px), the thinnest on top; arcs to one position (one
+// destination, or two at the same place) fan out so none hides another; only
+// `pending: true` gets the travelling dash (.fw-arc-pending). Labels are
+// placed by severity, then size, and one that would cover another is left
+// out (the <title> still has it); labels and titles lose their bidi controls.
+// Colours are classes (.fw-tone-<severity>), so a theme switch needs no
+// redraw. Every point and arc is a <g data-fw-id> (an arc: its id, else its
+// `to`), the device too.
+function worldMapSvg(points, arcs, opts) {
+    opts = opts || {};
+    const box = opts.box || WORLD_BOX;
+    const c = _chartCoord;
+    let map = '';
+    // Graticule: every 30 degrees
+    let grat = '';
+    for (let lon = Math.ceil(box.lon0 / 30) * 30; lon <= box.lon1; lon += 30) {
+        const [x] = _worldXY(lon, 0, box);
+        grat += `M${c(x)} 0V${box.h}`;
+    }
+    for (let lat = Math.floor(box.lat0 / 30) * 30; lat >= box.lat1; lat -= 30) {
+        const [, y] = _worldXY(0, lat, box);
+        grat += `M0 ${c(y)}H${box.w}`;
+    }
+    map += `<path class="fw-grat" d="${grat}"/>`;
+    const scale = Number(opts.world?.scale) > 0 ? Number(opts.world.scale) : 10;
+    let land = '';
+    for (const ring of opts.world?.shapes || []) {
+        if (!Array.isArray(ring) || ring.length < 6) continue;
+        const values = ring.map(Number);
+        if (!values.every(Number.isFinite)) continue;
+        for (let i = 0; i + 1 < values.length; i += 2) {
+            const [x, y] = _worldXY(values[i] / scale, values[i + 1] / scale, box);
+            land += `${i ? 'L' : 'M'}${c(x)} ${c(y)}`;
+        }
+        land += 'Z';
+    }
+    if (land) map += `<path class="fw-land" fill-rule="evenodd" d="${land}"/>`;
+    // The map in a viewport of its own, which cuts the land (Antarctica) off at its lower edge
+    let svg = `<svg class="fw-world" x="0" y="0" width="${box.w}" height="${box.h}" viewBox="0 0 ${box.w} ${box.h}">${map}</svg>`;
+    const dev = _worldChamber(box);
+    svg += `<rect class="fw-dock" x="0" y="${box.h}" width="${box.w}" height="${WORLD_DOCK}"/>`
+        + `<path class="fw-dock-edge" d="M0 ${box.h}H${box.w}"/>`
+        + `<text class="fw-dock-note" x="8" y="${c(box.h + WORLD_DOCK / 2 + 3)}">location not determined</text>`;
+
+    const byId = new Map();
+    (points || []).forEach((p, order) => {
+        const id = String(p?.id ?? '');
+        const xy = p ? project(p.lon, p.lat, box) : null;
+        if (!xy || id === WORLD_CHAMBER_ID || byId.has(id)) return;
+        const label = _worldText(p.label ?? id);
+        const r = Math.min(Math.max(Number(p.r) || 3, 2), 8);
+        byId.set(id, { id, xy, label, title: _worldText(p.title ?? label), r, tone: _worldTone(p.tone), order });
+    });
+
+    const drawn = [], fans = new Map();           // position of the far end -> arcs so far to it
+    let heaviest = 0;
+    for (const arc of arcs || []) {
+        if (!arc || (arc.from !== undefined && String(arc.from) !== WORLD_CHAMBER_ID)) continue;
+        const to = byId.get(String(arc.to ?? ''));
+        if (!to) continue;
+        const at = to.xy.map(v => Math.round(v)).join(' ');
+        const k = fans.get(at) || 0;
+        fans.set(at, k + 1);
+        const d = _worldArcPath(dev.port, to.xy, 0.17 + 0.1 * k, box);
+        const weight = Number(arc.weight) > 0 && Number.isFinite(Number(arc.weight)) ? Number(arc.weight) : 0;
+        heaviest = Math.max(heaviest, weight);
+        drawn.push({ id: String(arc.id ?? to.id), d, weight, tone: _worldTone(arc.tone), pending: arc.pending === true,
+            title: _worldText(arc.title ?? `CHAMBER → ${to.label}`) });
+    }
+    drawn.forEach(a => { a.width = 1 + (heaviest > 0 ? 3 * Math.sqrt(a.weight / heaviest) : 0); });
+    drawn.sort((a, b) => b.width - a.width);
+    for (const a of drawn) {
+        svg += `<g class="fw-arc fw-tone-${a.tone}${a.pending ? ' fw-arc-pending' : ''}" data-fw-id="${escapeHtml(a.id)}"><title>${escapeHtml(a.title)}</title>`
+            + `<path class="fw-arc-hit" d="${a.d}"/><path class="fw-arc-line" d="${a.d}" stroke-width="${c(a.width)}"/></g>`;
+    }
+
+    // Labels: the most severe and largest first; one that would cover another is left out
+    const rank = p => ALERT_SEVERITIES.indexOf(p.tone);
+    const placed = [];
+    const overlaps = (a, b) => a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h;
+    const list = [...byId.values()];
+    for (const p of [...list].sort((a, b) => rank(a) - rank(b) || b.r - a.r || a.order - b.order)) {
+        p.text = _chartEllipsis(p.label, 28);
+        const width = _worldTextWidth(p.text) + 8;
+        p.pill = ['right', 'left'].map(side => _worldLabelBox(p.xy[0], p.xy[1], p.r, width, side, box))
+            .find(pill => !placed.some(other => overlaps(pill, other))) || null;
+        if (p.pill) placed.push(p.pill);
+    }
+    // Dots: the least severe first, so the most severe is on top
+    for (const p of list.sort((a, b) => rank(b) - rank(a) || a.r - b.r || b.order - a.order)) {
+        svg += `<g class="fw-point fw-tone-${p.tone}" data-fw-id="${escapeHtml(p.id)}"><title>${escapeHtml(p.title)}</title>`
+            + `<circle class="fw-dot" cx="${c(p.xy[0])}" cy="${c(p.xy[1])}" r="${c(p.r)}"/>`
+            + (p.pill ? `<rect class="fw-pill" x="${c(p.pill.x)}" y="${c(p.pill.y)}" width="${c(p.pill.w)}" height="${p.pill.h}" rx="3"/>`
+                + `<text class="fw-label" x="${c(p.pill.x + 4)}" y="${c(p.pill.y + p.pill.h - 3)}">${escapeHtml(p.text)}</text>` : '')
+            + '</g>';
+    }
+    // The device over the start of its arcs: a frame with two lights and its name, no dot
+    svg += `<g class="fw-chamber" data-fw-id="${WORLD_CHAMBER_ID}"><title>CHAMBER: this host. Its location is never determined, so it is not on the map.</title>`
+        + `<rect class="fw-device" x="${c(dev.x)}" y="${c(dev.y)}" width="${dev.w}" height="${dev.h}" rx="3"/>`
+        + `<rect class="fw-device-led" x="${c(dev.x + 7)}" y="${c(dev.y + 8)}" width="4" height="6"/>`
+        + `<rect class="fw-device-led" x="${c(dev.x + 13)}" y="${c(dev.y + 8)}" width="4" height="6"/>`
+        + `<text class="fw-device-label" x="${c(dev.x + 24)}" y="${c(dev.y + dev.h / 2 + 3.5)}">CHAMBER</text></g>`;
+    const h = box.h + WORLD_DOCK;
+    return `<svg class="chart-svg fw-map" width="${box.w}" height="${h}" viewBox="0 0 ${box.w} ${h}">${svg}</svg>`;
+}
+
 // =============================================
 // RUSTINEL TRACE ANALYSIS CONSOLE
 // =============================================
@@ -3828,9 +4886,18 @@ function updateRtraceInfoBar() {
     document.getElementById('rtrace-stat-events').textContent = `${alertCount} events`;
     document.getElementById('rtrace-stat-duration').textContent = duration || '0m 0s';
     document.getElementById('rtrace-path').textContent = proc.image || proc.command_line || '--';
+    const fwButton = document.getElementById('rtrace-firewall');
+    if (fwButton) fwButton.disabled = !proc.image;
 
     // Update severity bar
     updateRtraceSeverityBar(proc);
+}
+
+// FIREWALL in the info bar: the process's connections in the FIREWALL tab
+function rtraceOpenFirewall() {
+    const proc = state.processes[state.rtraceSelectedPid] || state.processes[String(state.rtraceSelectedPid)];
+    if (!proc || !proc.image) return false;
+    return openFirewallTab({ image: proc.image, pid: proc.pid ?? null });
 }
 
 function updateRtraceSeverityBar(proc) {
@@ -8739,9 +9806,7 @@ function renderDetonationPanels(data) {
     }
 
     // Memory scanning tab (beacon scanners + live-memory forensics + dumps)
-    const hasBeaconResults = data.hunt_sleeping_beacons || data.beaconeye
-        || data.aether || data.process_dump || data.exit_capture_result
-        || (data.network_beaconing && (data.network_beaconing.evidence_findings || []).length);
+    const hasBeaconResults = detHasMemoryResults(data);
     if (hasBeaconResults) {
         let body = '';
         // The aggregated, cross-source verdict comes first: it is what the
@@ -8798,6 +9863,9 @@ function renderDetonationPanels(data) {
         }
         if (data.process_dump) {
             body += renderProcessDumpBlock(data.process_dump);
+        }
+        if (data.syscalls) {
+            body += renderSyscallStageBlock(data.syscalls);
         }
         if (data.exit_capture_result) {
             body += renderExitCaptureBlock(data.exit_capture_result);
@@ -8864,10 +9932,12 @@ function renderDetonationPanels(data) {
                 // No aggregated block yet: fall back to the raw tool counts.
                 const raw = (data.hunt_sleeping_beacons?.suspicious_count || 0)
                     + (data.beaconeye?.beacons_found || 0);
+                const sys = data.syscalls && typeof data.syscalls === 'object' ? data.syscalls : null;
                 icon.innerHTML = raw > 0 ? '&#x26A0;' : '&#x2705;';
-                detail.textContent = raw > 0
+                detail.textContent = (raw > 0
                     ? `${raw} beacon indicator(s) found`
-                    : 'Scan complete — no beacons detected';
+                    : 'Scan complete — no beacons detected')
+                    + (sys && (sys.skipped || sys.error) ? ' · syscall stage skipped, see the Memory tab' : '');
             }
         }
     }
@@ -11140,6 +12210,13 @@ function graphActivityMixHtml(node) {
         + '<span class="gd-mix-threats-note">&middot; alerts, not part of the ring</span></div></div>';
 }
 
+// FIREWALL on a network node: the endpoint in the FIREWALL tab, who talks to it and the switch that cuts it
+function graphFirewallButtonHtml(node) {
+    return '<div class="gd-actions"><button type="button" class="gd-focus-btn" '
+        + `data-fw-endpoint-ip="${escapeHtml(String(node.ip ?? ''))}" data-fw-endpoint-port="${escapeHtml(String(node.port ?? ''))}" `
+        + 'title="Show this endpoint in the FIREWALL tab: the processes that talk to it, its tags and the switch that cuts it">FIREWALL</button></div>';
+}
+
 function showGraphDetail(node) {
     const panel = document.getElementById('graph-detail-panel');
     const header = document.getElementById('graph-detail-header');
@@ -11258,6 +12335,7 @@ function showGraphDetail(node) {
                 if (src) html += `<div class="gd-conn-item"><span class="gd-conn-icon proc"></span><a class="gd-link" data-node-id="${escapeHtml(src.id)}">${escapeHtml(src.label)} (${escapeHtml(String(src.pid ?? ''))})</a></div>`;
             });
         }
+        html += graphFirewallButtonHtml(node);
     } else if (node.type === 'dns') {
         headerText = `DNS: ${node.label}`;
         html += `<div class="gd-field"><span class="gd-label">Query</span><span class="gd-value">${escapeHtml(node.label)}</span></div>`;
@@ -11298,6 +12376,9 @@ function showGraphDetail(node) {
 
     const pipeBtn = body.querySelector('.gd-focus-btn[data-pipe-name]');
     if (pipeBtn) pipeBtn.addEventListener('click', () => pipesInterceptFrom(pipeBtn.dataset.pipeName));
+
+    const fwBtn = body.querySelector('.gd-focus-btn[data-fw-endpoint-ip]');
+    if (fwBtn) fwBtn.addEventListener('click', () => openFirewallTab({ ip: fwBtn.dataset.fwEndpointIp, port: fwBtn.dataset.fwEndpointPort || null }));
 
     // Re-root the drilldown on the selected process
     const focusBtn = body.querySelector('.gd-focus-btn[data-focus-pid]');
@@ -12222,13 +13303,15 @@ function initSysmonTab() {
 // LOGS (search the log store: PowerShell, access, MCP, NetFlow, DNS, firewall)
 // =============================================
 // One search box in a Splunk-like language (free words, "phrases", field=value,
-// AND / OR / NOT, pipes such as | stats count by tool; the cheat sheet in
-// LOGS_SYNTAX_HINT). Under it the sources as chips (a click searches one),
-// EVENTS OVER TIME stacked by source (a range drawn across the bars zooms in),
-// the fields of the matches on the left (a value adds field="value" to the
-// search) and the result: a list of events that a click unfolds, or, after
-// stats / table / top / rare / timechart, a sortable table (timechart: a chart
-// too). Everything in a log is written by the sample or the VM, a script block
+// AND / OR / NOT, pipes such as | stats count by tool; the whole language sits
+// in LOGS_COMMANDS, which draws the COMMANDS card the ? button opens). Under
+// the box the sources as chips (a click searches one), EVENTS OVER TIME stacked
+// by source (a range drawn across the bars zooms in), the COMMANDS card and the
+// fields of the matches on the left (a value adds field="value" to the
+// search) and the result in one of three tabs: EVENTS (the matches, a click
+// unfolds one), STATISTICS (the table of the pipes) and VISUALIZATION (the
+// result as a pie, bars, a line or a sankey, whichever its columns carry).
+// Everything in a log is written by the sample or the VM, a script block
 // above all, so every text goes through escapeHtml or logsHighlight (which
 // escapes what it does not mark).
 const LOGS_RANGES = ['15m', '1h', '4h', '24h', '7d', 'All'];
@@ -12242,6 +13325,8 @@ const LOGS_PAGE = 200;
 // characters of a whole event (fetched after a search cut it) shown raw
 const LOGS_RAW_FULL_LIMIT = 1000000;
 const LOGS_PAGE_MAX = 1000;
+// The longest query the server takes (MAX_QUERY_LEN of log_search.py), in characters as Python counts them
+const LOGS_QUERY_MAX = 4000;
 const LOGS_EXAMPLES = [
     { label: 'PowerShell script blocks', query: 'source=powershell' },
     { label: 'MCP calls per tool', query: 'source=mcp | stats count by tool' },
@@ -12255,13 +13340,113 @@ const LOGS_SOURCE_COLORS = {
     powershell: 'var(--accent-cyan)', access: 'var(--accent-green)', mcp: 'var(--accent-pink)',
     netflow: 'var(--c-purple-500)', dns: 'var(--c-blue-400)', firewall: 'var(--c-amber-400)',
 };
-const LOGS_SYNTAX_HINT = [
-    'Search: words, "a phrase", field=value, field!=value, field>5, AND / OR / NOT, ( ), * as wildcard',
-    'Pipes: | head N | tail N | sort -field | dedup f | table f1,f2 | stats count by f',
-    '       | top f | rare f | timechart span=5m count by f',
-    'Time: earliest=-15m latest=now (or use the range buttons)',
-    'Example: source=mcp | stats count by tool',
-].join('\n');
+const LOGS_COMMANDS_KEY = 'tdc.logs.commands';
+const LOGS_COMMANDS_GROUP_KEY = 'tdc.logs.commands.group';
+// Below this window width the card lies over the results and starts closed
+const LOGS_COMMANDS_WIDE = 1100;
+// The whole language of the search box, group by group, for the COMMANDS card:
+// the command as it goes into the query, a half sentence on what it does, and
+// how a click puts it in — a pipe behind the query, a term where the search
+// part ends, a source in the place of the source the query has.
+const LOGS_COMMANDS = [
+    { group: 'SEARCH', items: [
+        { text: 'word', hint: 'any event that holds the word', kind: 'term' },
+        { text: '"a phrase"', hint: 'the words in that order', kind: 'term' },
+        { text: 'field=value', hint: 'only events whose field is that', kind: 'term' },
+        { text: 'field!=value', hint: 'everything but that value', kind: 'term' },
+        { text: 'field>5', hint: 'a number above five', kind: 'term' },
+        { text: 'AND', hint: 'both sides have to match', kind: 'term' },
+        { text: 'OR', hint: 'either side matches', kind: 'term' },
+        { text: 'NOT', hint: 'drops what follows', kind: 'term' },
+        { text: '( )', hint: 'brackets group a condition', kind: 'term' },
+        { text: '*', hint: 'stands for anything', kind: 'term' },
+    ] },
+    { group: 'PIPES', items: [
+        { text: '| head 20', hint: 'the first twenty rows', kind: 'pipe' },
+        { text: '| tail 20', hint: 'the last twenty rows', kind: 'pipe' },
+        { text: '| sort -count', hint: 'the largest count first', kind: 'pipe' },
+        { text: '| dedup field', hint: 'one row per value', kind: 'pipe' },
+        { text: '| table f1, f2', hint: 'these columns as a table', kind: 'pipe' },
+        { text: '| fields f1', hint: 'keeps these fields only', kind: 'pipe' },
+        { text: '| stats count by field', hint: 'how many per value', kind: 'pipe' },
+        { text: '| top field', hint: 'the most frequent values', kind: 'pipe' },
+        { text: '| rare field', hint: 'the least frequent values', kind: 'pipe' },
+        { text: '| timechart span=5m count by source', hint: 'a count per five minutes', kind: 'pipe' },
+    ] },
+    { group: 'TIME', items: [
+        { text: 'earliest=-15m', hint: 'the last fifteen minutes', kind: 'term' },
+        { text: 'latest=now', hint: 'up to this moment', kind: 'term' },
+    ] },
+    { group: 'SOURCES', items: [
+        { text: 'source=powershell', hint: 'script blocks and the event logs', kind: 'source' },
+        { text: 'source=access', hint: 'requests to the web UI', kind: 'source' },
+        { text: 'source=mcp', hint: 'calls of the MCP tools', kind: 'source' },
+        { text: 'source=netflow', hint: 'connections of the VM', kind: 'source' },
+        { text: 'source=dns', hint: 'names the VM looked up', kind: 'source' },
+        { text: 'source=firewall', hint: 'what it let through or dropped', kind: 'source' },
+    ] },
+];
+// --- The result area: the three tabs, the form of the chart ---
+// EVENTS (the matches), STATISTICS (the table of the pipes) and VISUALIZATION
+// (one chart). Which tab can be used hangs on the type of the answer, which
+// form on its columns: column 0 is the name, the first column after it whose
+// values are all numbers is the value.
+const LOGS_VIEWS = ['events', 'statistics', 'visualization'];
+const LOGS_FORMS = ['table', 'pie', 'bars', 'line', 'sankey'];
+// Without a single row the name of a column says whether it holds numbers
+const LOGS_NUMBER_COLUMN = /^(?:count|percent)$|^(?:avg|sum|dc|min|max)\(/i;
+// Groups a pie, bars or a side of a sankey show on their own; the rest is one part
+const LOGS_CHART_TOP = 12;
+const LOGS_CHART_OTHER = 'other';
+// Characters of a group name a chart draws (a value in a log can be 64 KB)
+const LOGS_CHART_NAME_MAX = 200;
+const LOGS_SORT_PIPE = '| sort -count | head 20';
+// Why a tab or a form cannot be used; the text stands in its title. Every
+// reason of a *form* begins with "needs": a tile whose saved form no longer
+// fits reads it as "saved as <form>, which <reason>" (panelBodyHtml). `table`
+// is the reason of the EVENTS tab, which that line never uses.
+const LOGS_LOCKED = {
+    pipe: 'needs a pipe such as | stats count by field',
+    table: 'the pipes made a table; remove them to see events',
+    columns: 'needs one name column and one number column',
+    timechart: 'needs a timechart, such as | timechart span=5m count by source',
+    pie: 'needs groups rather than periods; a timechart draws as a line or as bars',
+    sankey: 'needs two name columns and one number column, as | stats count by a, b',
+};
+const LOGS_VIEW_HINTS = {
+    events: 'The events that match the search',
+    statistics: 'The result of the pipes as a table',
+    visualization: 'The result of the pipes as a chart',
+};
+const LOGS_FORM_HINTS = {
+    table: 'The rows as they are',
+    pie: 'The groups as slices of a disc',
+    bars: 'A bar per group, a stack per period for a timechart',
+    line: 'A line per series over time',
+    sankey: 'The flow from the first name column to the second',
+};
+// --- SAVE: the result as a tile on one of the own dashboards ---
+// What a range button stands for, as milliseconds and as a word of the dialog
+const LOGS_RANGE_MS = { m: 60000, h: 3600000, d: 86400000 };
+const LOGS_RANGE_UNITS = { m: 'min', h: 'h', d: 'd' };
+// The caps of the store (webui/dashboards.py); the dialog locks what is full
+const LOGS_NAME_MAX = 60;
+const LOGS_DASH_MAX = 10;
+const LOGS_TILE_MAX = 12;
+const LOGS_SAVE_WORD = '+ New';
+const LOGS_SAVE_HINT = 'Put this result on a dashboard as a tile';
+// The fields of the dialog that keep the focus through a re-render
+const LOGS_SAVE_FOCUS = ['logs-save-name', 'logs-save-new', 'logs-save-go'];
+// Why a save cannot be made: the SAVE button, a dashboard switch, the dialog
+const LOGS_SAVE_LOCKED = {
+    dashboards: `at most ${LOGS_DASH_MAX} dashboards; delete one first`,
+    tiles: `at most ${LOGS_TILE_MAX} tiles per dashboard; delete one first`,
+    full: `every one of the ${LOGS_DASH_MAX} dashboards holds its ${LOGS_TILE_MAX} tiles: delete a tile or a whole dashboard to make room`,
+    name: `the tile needs a name of 1 to ${LOGS_NAME_MAX} characters`,
+    dashboard: `the new dashboard needs a name of 1 to ${LOGS_NAME_MAX} characters`,
+    busy: 'a save is still on its way; wait for its answer',
+    maintenance: 'a tool update is running; the dashboards cannot be changed until it has finished',
+};
 // What is searched and what came back; openIds holds the ids of the unfolded events
 let logsState = { query: '*', earliest: '-24h', latest: '', live: false, result: null, openIds: new Set(), full: new Map() };
 let logsSeq = 0;                       // a response older than the last request is dropped
@@ -12276,6 +13461,23 @@ let logsFieldsOpen = new Set(['source']);
 let logsSources = [];
 let logsQueryError = null;
 let logsColumnsKey = '';              // the columns of the table on screen
+let logsPending = null;                // a search another tab opened LOGS with ({query, earliest, latest}), not yet run
+let logsRangeNote = '';                // what LOGS says about a range a jump brought (it runs to now, it is a fallback)
+let logsBack = null;                   // the way back to the tab it came from ({tab, label, filter}), a chip over the search line
+let logsCommandsGroup = 'SEARCH';     // the one open group of the COMMANDS card ('' for none)
+let logsView = { view: '', form: '' };  // the tab on screen and the form of its chart ('' for none)
+let logsViewKey = '';                 // type and columns the view and the form were chosen for
+let logsAsked = LOGS_PAGE;            // the limit of the request the rows on screen came from
+let logsAskedQuery = '';              // the query it brought them for: another one is no answer about its form
+let logsWantForm = '';                // a form asked for from outside (a tile opened in LOGS), for its first answer
+let logsOpenPending = false;          // its query and window are in the state already: the tab's setup keeps them
+// The save dialog: whether it is open, the dashboards of the server, the one
+// chosen ('' for a new one) and whether the tile keeps the window instead of
+// the range
+let logsSave = { open: false, dashboards: [], dashboard: '', fixed: false };
+let logsSaveWhy = '';                 // why the last save was refused ('' for nothing)
+let logsSaveBusy = false;             // a save is on its way: no second one, whatever the dialog does
+let logsSaveSeq = 0;                  // the opening a save belongs to: a later one is not its dialog
 
 // Searches whose bars a range drawn across them zooms to
 const LOGS_BARS_BRUSH = {
@@ -12445,6 +13647,21 @@ function logsPipeIndex(query) {
     return -1;
 }
 
+// The query without a pipe dangling at its end (one outside a string, so
+// `a "b |"` keeps its own): appending `| head 20` to `a |` would otherwise
+// make the invalid `a | | head 20`
+function logsTrimTrailingPipe(query) {
+    const q = String(query ?? '').trimEnd();
+    let quoted = false, last = -1;
+    for (let i = 0; i < q.length; i++) {
+        const c = q[i];
+        if (quoted && c === '\\' && q[i + 1] === '"') i++;
+        else if (c === '"') quoted = !quoted;
+        else if (c === '|' && !quoted) last = i;
+    }
+    return last === q.length - 1 ? q.slice(0, last).trimEnd() : q;
+}
+
 // A value as a string of the language: quotes escaped; one that ends in a
 // backslash would escape the closing quote, so a * stands after it
 function logsQuote(value) {
@@ -12522,7 +13739,8 @@ function logsRangeHtml() {
         const text = Number.isFinite(from) || Number.isFinite(to) ? chartRangeLabel(from, to) : 'custom range';
         chip = filterChipHtml({ value: text, title: `Remove the range ${text}: back to ${logsBase.toUpperCase()}` }, `logsSetRange(${jsArg(logsBase)})`);
     }
-    return `<span class="chart-range" role="group" aria-label="Time range">${buttons}</span>${chip}`;
+    const note = logsRangeNote ? `<span class="logs-range-note" role="note">${escapeHtml(logsRangeNote)}</span>` : '';
+    return `<span class="chart-range" role="group" aria-label="Time range">${buttons}</span>${chip}${note}`;
 }
 
 function renderLogsRange() {
@@ -12530,17 +13748,23 @@ function renderLogsRange() {
     if (host) host.innerHTML = logsRangeHtml();
 }
 
-// One of the range buttons: the search runs again for it
-function logsSetRange(label) {
-    if (!LOGS_RANGES.includes(label)) return false;
-    logsState.earliest = label === 'All' ? '' : `-${label}`;
-    logsState.latest = '';
+// The range the tab keeps, which a zoom goes back to
+function logsRememberRange(label) {
     logsBase = label;
     try {
         localStorage.setItem(LOGS_RANGE_KEY, label);
     } catch (e) {
         // storage blocked
     }
+}
+
+// One of the range buttons: the search runs again for it
+function logsSetRange(label) {
+    if (!LOGS_RANGES.includes(label)) return false;
+    logsRangeNote = '';
+    logsState.earliest = label === 'All' ? '' : `-${label}`;
+    logsState.latest = '';
+    logsRememberRange(label);
     renderLogsRange();
     runLogsSearch();
     return true;
@@ -12549,6 +13773,7 @@ function logsSetRange(label) {
 // A range drawn across the bars (epoch ms, `to` not included)
 function logsZoom(from, to) {
     if (!Number.isFinite(from) || !Number.isFinite(to) || !(to > from)) return false;
+    logsRangeNote = '';
     logsState.earliest = logsIso(from);
     logsState.latest = logsIso(to);
     renderLogsRange();
@@ -12578,7 +13803,8 @@ async function runLogsSearch(opts) {
     const silent = !!(opts && opts.silent);
     const seq = ++logsSeq;
     const query = logsState.query.trim() ? logsState.query : '*';
-    const params = new URLSearchParams({ q: query, earliest: logsState.earliest, limit: String(logsLimit) });
+    const limit = Math.max(logsLimit, logsNextLimit(query));
+    const params = new URLSearchParams({ q: query, earliest: logsState.earliest, limit: String(limit) });
     if (logsState.latest) params.set('latest', logsState.latest);
     const results = document.getElementById('logs-results');
     if (results && !silent) results.classList.add('is-loading');
@@ -12589,21 +13815,27 @@ async function runLogsSearch(opts) {
     } catch (e) {
         if (seq !== logsSeq) return null;
         if (results) results.classList.remove('is-loading');
+        logsWantForm = '';             // no answer, so no form to put it on
         renderLogsError({ error: `The search could not be loaded: ${e && e.message ? e.message : e}` }, query);
         return null;
     }
     if (seq !== logsSeq) return null;
     if (results) results.classList.remove('is-loading');
     if (!resp.ok) {
+        logsWantForm = '';
         renderLogsError(data && data.error ? data : { error: `The search failed (HTTP ${resp.status}).` }, query);
         return null;
     }
     logsQueryError = null;
     renderLogsError(null);
     const sig = JSON.stringify([data.type, data.count, data.matched, (data.events || []).map(ev => ev && ev.id), data.rows]);
-    const same = silent && sig === logsLastSig;
+    // The same answer as the one on screen is only the summary again — unless a
+    // form is waiting for it, which only the result draws
+    const same = silent && !logsWantForm && sig === logsLastSig;
     logsLastSig = sig;
     logsState.result = data;
+    logsAsked = limit;                 // the rows on screen are the ones this limit brought
+    logsAskedQuery = query;
     if (!silent) {
         logsRemember(logsState.query);
         logsRememberLast(logsState.query);
@@ -12649,11 +13881,22 @@ function renderLogsResult(result) {
     renderLogsSources(logsSources);
 }
 
+// The result in the tab that is open: the list of events, the table of the
+// pipes, or one chart in the form that was chosen (with the line that says
+// what the chart leaves out). The form is chosen here, so the search again
+// where it needs rows the last request did not bring belongs here too: a
+// timechart typed into the box opens as a line, which wants every period.
 function renderLogsResultBody(result) {
+    const r = result || {};
+    const shape = logsSyncView(r);
+    // `logsAsked` is the limit the rows came from, so this asks once and the
+    // answer of the second request ends it, whatever the server gives
+    const short = shape.count > shape.rows || shape.truncated;
+    if (short && logsChartLimit(logsView.form) > logsAsked) runLogsSearch({ silent: true });
     const host = document.getElementById('logs-results');
     if (!host) return;
-    const r = result || {};
-    if (r.type === 'events') {
+    if (logsView.view === 'events') {
+        // No table on screen: the order of the one before it still means something
         host.innerHTML = logsEventsHtml(r.events || [], logsQueryTerms(logsState.query), r);
         return;
     }
@@ -12663,7 +13906,13 @@ function renderLogsResultBody(result) {
         delete tableSortState['logs-result'];
         logsColumnsKey = key;
     }
-    host.innerHTML = (r.type === 'timechart' ? logsTimechartHtml(r) : '') + logsTableHtml(r);
+    if (logsView.view === 'statistics') {
+        host.innerHTML = logsTableHtml(r);
+        return;
+    }
+    const chart = logsChartHtml(r, logsView.form, { width: logsWidth('logs-results') - 24, height: 220 });
+    host.innerHTML = `<div class="chart-card logs-chart-card"><div class="logs-chart">`
+        + `${chart || chartEmptyHtml('No chart for this result')}</div>${logsTruncNoteHtml(shape)}</div>`;
 }
 
 function renderLogsSummary(result) {
@@ -12857,7 +14106,9 @@ function logsEventsHtml(events, terms, result) {
             + `<span class="logs-msg">${logsHighlight(String(ev.message ?? '').slice(0, 600), terms)}</span></button>`
             + (open ? logsEventDetailHtml(ev, terms) : '') + '</div>';
     }).join('');
+    // Only while a search can bring more: a chart's 1000 rows are already the ceiling
     const more = result && Number(result.count) > events.length && logsLimit < LOGS_PAGE_MAX
+        && events.length < LOGS_PAGE_MAX
         ? `<button type="button" class="btn btn-sm logs-more" data-logs-more>Show up to ${LOGS_PAGE_MAX}</button>` : '';
     return `<div class="logs-events" role="list">${rows}</div>${more}`;
 }
@@ -12875,7 +14126,8 @@ function toggleLogsEvent(id) {
 }
 
 // A click in the list or in the field bar: an event unfolds, a value goes
-// into the search, a field shows its values, "Show up to" asks for more rows
+// into the search, a field shows its values, the line under a chart adds the
+// pipe it names, "Show up to" asks for more rows
 function onLogsClick(event) {
     const target = event && event.target && typeof event.target.closest === 'function' ? event.target : null;
     if (!target) return;
@@ -12897,6 +14149,10 @@ function onLogsClick(event) {
         toggleLogsEvent(row.getAttribute('data-logs-toggle'));
         return;
     }
+    if (target.closest('[data-logs-sort]')) {
+        logsAddSortPipe();
+        return;
+    }
     if (target.closest('[data-logs-more]')) {
         logsLimit = LOGS_PAGE_MAX;
         runLogsSearch({ silent: true });
@@ -12912,42 +14168,451 @@ function logsCellHtml(column, value) {
     return `<td title="${escapeHtml(text)}">${escapeHtml(text.length > 400 ? `${text.slice(0, 400)}…` : text)}</td>`;
 }
 
-function logsTableHtml(result) {
+// The rows as a table. `opts.sortId` is the table's sort id: every table of
+// the same id on the page takes the order of a click on one of them
+// (sortTableBy), so a tile has to bring its own — otherwise two table tiles
+// and the result of the LOGS tab would reorder each other.
+function logsTableHtml(result, opts) {
     const columns = result.columns || [], rows = result.rows || [];
     if (!columns.length) return '<div class="logs-empty">The search has no result table.</div>';
+    const sortId = (opts && opts.sortId) || 'logs-result';
     const head = columns.map(c => `<th>${escapeHtml(c)}</th>`).join('');
     const body = rows.map(row => `<tr>${columns.map((c, i) => logsCellHtml(c, row[i])).join('')}</tr>`).join('')
         || `<tr data-sort-skip><td colspan="${columns.length}" class="logs-cell-empty">No rows.</td></tr>`;
-    const more = Number(result.count) > rows.length && logsLimit < LOGS_PAGE_MAX
+    const more = Number(result.count) > rows.length && logsLimit < LOGS_PAGE_MAX && rows.length < LOGS_PAGE_MAX
         ? `<button type="button" class="btn btn-sm logs-more" data-logs-more>Show up to ${LOGS_PAGE_MAX}</button>` : '';
-    return `<div class="logs-table-wrap"><table class="logs-table" data-sortable data-sort-id="logs-result"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>${more}`;
+    return `<div class="logs-table-wrap"><table class="logs-table" data-sortable data-sort-id="${escapeHtml(sortId)}"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div>${more}`;
 }
 
-// The bars of a timechart: a bar per row, the series (the first 10 and OTHER) stacked
-function logsTimechartHtml(result) {
-    const columns = result.columns || [], rows = result.rows || [];
-    if (columns[0] !== '_time' || columns.length < 2 || !rows.length) return '';
-    const starts = rows.map(row => Date.parse(row[0]));
-    if (starts.some(t => !Number.isFinite(t))) return '';
+// --- The result: the tabs, the forms and their charts ---
+// Whether column `i` of `rows` holds numbers only: a cell without a value is
+// no text, and without a single value anywhere the name decides (count,
+// percent, avg(x), sum(x), dc(x), min(x), max(x)), so an empty answer locks
+// no form.
+function logsNumberColumn(rows, i, name) {
+    let seen = false;
+    for (const row of rows) {
+        const v = Array.isArray(row) ? row[i] : undefined;
+        if (v === null || v === undefined || v === '') continue;
+        const n = typeof v === 'number' ? v : typeof v === 'string' && v.trim() !== '' ? Number(v) : NaN;
+        if (!Number.isFinite(n)) return false;
+        seen = true;
+    }
+    return seen || LOGS_NUMBER_COLUMN.test(String(name ?? ''));
+}
+
+// What a result can carry: its type, the column of the name (0) and the first
+// column after it whose values are all numbers (`value`), the name columns
+// before that one (`labels`; a sankey needs two), and how much of the whole
+// it holds (`rows` of `count`, `truncated` when the pipes saw only the newest
+// 10,000 matches).
+function logsResultShape(result) {
+    const r = result || {};
+    const type = r.type === 'table' || r.type === 'timechart' ? r.type : 'events';
+    const columns = Array.isArray(r.columns) ? r.columns : [];
+    const rows = Array.isArray(r.rows) ? r.rows : [];
+    let value = null;
+    for (let i = 1; i < columns.length; i++) {
+        if (logsNumberColumn(rows, i, columns[i])) {
+            value = i;
+            break;
+        }
+    }
+    const label = columns.length ? 0 : null;
+    const labels = label === null ? [] : Array.from({ length: value === null ? 1 : value }, (_, i) => i);
+    return { type, label, value, labels, rows: rows.length, count: Number(r.count) || 0, truncated: !!r.truncated };
+}
+
+// The forms the columns of a result can carry, each locked one with its
+// reason: the table always, a pie and bars with one name and one number
+// column, a line only over time, a sankey with two name columns.
+function logsFormsFor(shape) {
+    const s = shape || {};
+    const named = s.label !== null && s.value !== null;
+    const out = { table: true, pie: false, bars: false, line: false, sankey: false, why: {} };
+    if (s.type === 'events') {
+        for (const form of ['pie', 'bars', 'line', 'sankey']) out.why[form] = LOGS_LOCKED.pipe;
+        return out;
+    }
+    if (s.type === 'timechart') {
+        out.line = out.bars = named;
+        if (!named) out.why.line = out.why.bars = LOGS_LOCKED.columns;
+        out.why.pie = LOGS_LOCKED.pie;
+        out.why.sankey = LOGS_LOCKED.sankey;
+        return out;
+    }
+    out.pie = out.bars = named;
+    if (!named) out.why.pie = out.why.bars = LOGS_LOCKED.columns;
+    out.why.line = LOGS_LOCKED.timechart;
+    out.sankey = named && (s.labels || []).length >= 2;
+    if (!out.sankey) out.why.sankey = LOGS_LOCKED.sankey;
+    return out;
+}
+
+// The tabs a result can use, each locked one with its reason: a search
+// without a pipe has events only, a result of the pipes has no events, and
+// VISUALIZATION needs columns that carry a chart.
+function logsViewsFor(shape) {
+    const s = shape || {};
+    const forms = logsFormsFor(s);
+    const events = s.type === 'events';
+    const drawable = LOGS_FORMS.some(form => form !== 'table' && forms[form]);
+    const why = {};
+    if (events) why.statistics = why.visualization = LOGS_LOCKED.pipe;
+    else why.events = LOGS_LOCKED.table;
+    if (!events && !drawable) why.visualization = forms.why.bars || LOGS_LOCKED.columns;
+    return { events, statistics: !events, visualization: !events && drawable, why };
+}
+
+// The tab a result opens in: the events of a search, the table of the pipes,
+// a timechart as its chart (so nothing of what was shown before hides behind a click)
+function logsViewFor(shape) {
+    const type = (shape || {}).type;
+    return type === 'timechart' ? 'visualization' : type === 'table' ? 'statistics' : 'events';
+}
+
+// The form VISUALIZATION opens with: the line of a timechart, else the first
+// form the columns carry
+function logsFormFor(shape, forms) {
+    const order = (shape || {}).type === 'timechart' ? ['line', 'bars'] : ['pie', 'bars', 'sankey'];
+    return order.find(form => forms[form]) || 'table';
+}
+
+// The rows a form asks the server for: a chart needs every group (the
+// server's ceiling), a list or a table the page that is shown
+function logsChartLimit(form) {
+    return form && form !== 'table' && LOGS_FORMS.includes(form) ? LOGS_PAGE_MAX : LOGS_PAGE;
+}
+
+// The commands of the pipes of a query: the first word behind each `|` that is
+// not inside a string, so `a "b | stats c"` is a phrase and no pipe at all
+function logsQueryPipeNames(query) {
+    const q = String(query ?? '');
+    const names = [];
+    let quoted = false;
+    for (let i = 0; i < q.length; i++) {
+        const c = q[i];
+        if (quoted && c === '\\' && q[i + 1] === '"') i++;
+        else if (c === '"') quoted = !quoted;
+        else if (c === '|' && !quoted) names.push((/^\s*([A-Za-z_]+)/.exec(q.slice(i + 1)) || ['', ''])[1].toLowerCase());
+    }
+    return names;
+}
+
+// What a query will answer, read from its text before the server says so: the
+// last command that sets the shape of the result decides, as it does in
+// log_search.py — `timechart` makes a timechart, the other table commands a
+// table, and pipes that only cut rows (`head`, `sort`, …) leave a list of events
+function logsQueryShape(query) {
+    const last = logsQueryPipeNames(query)
+        .filter(name => ['stats', 'top', 'rare', 'table', 'fields', 'timechart'].includes(name)).pop();
+    return last === 'timechart' ? 'timechart' : last ? 'table' : 'events';
+}
+
+// The rows the next search asks for. The form on screen counts for the query
+// it was chosen for — LIVE, a zoom and a second Enter keep it — while a new
+// query is read from its own pipes: a timechart opens as a line and wants
+// every period (1000), a table its page (200). A tile opened in LOGS brings
+// its form with it. Where the guess is too low, the render path asks again.
+function logsNextLimit(query) {
+    const q = String(query ?? '');
+    if (logsWantForm) return logsChartLimit(logsWantForm);
+    if (q === logsAskedQuery) return logsChartLimit(logsView.form);
+    return logsQueryShape(q) === 'timechart' ? LOGS_PAGE_MAX : LOGS_PAGE;
+}
+
+// The tab and the form that fit this result, before it is drawn: the chosen
+// ones hold while type and columns stay the same, a tab that becomes
+// unusable falls back to the first usable one, and other columns open their
+// own default again. Returns the shape, which the caller draws from.
+function logsSyncView(result) {
+    const shape = logsResultShape(result);
+    const views = logsViewsFor(shape), forms = logsFormsFor(shape);
+    const columns = result && Array.isArray(result.columns) ? result.columns : [];
+    // A timechart carries the same forms whatever its series, and LIVE brings a
+    // series more or less with every tick: its key must not hold their names
+    const key = shape.type === 'timechart' ? JSON.stringify(['timechart', columns[0] ?? null])
+        : JSON.stringify([shape.type, columns]);
+    const same = key === logsViewKey;
+    logsViewKey = key;
+    // A form asked for from outside (a tile opened in LOGS, the click on the
+    // warning line) counts for this one answer and only where its columns
+    // carry it; afterwards the chosen form holds as any other does
+    const want = logsWantForm;
+    logsWantForm = '';
+    const wanted = want && forms[want] ? want : '';
+    let view = wanted ? (wanted === 'table' ? 'statistics' : 'visualization')
+        : same && views[logsView.view] ? logsView.view : logsViewFor(shape);
+    if (!views[view]) view = LOGS_VIEWS.find(name => views[name]) || 'events';
+    const held = same && logsView.form && logsView.form !== 'table' && forms[logsView.form];
+    const form = view === 'events' ? '' : view === 'statistics' ? 'table'
+        : wanted || (held ? logsView.form : logsFormFor(shape, forms));
+    logsView = { view, form };
+    renderLogsTabs(shape);
+    return shape;
+}
+
+// The tab row and the form switches: the chosen one marked, every one the
+// result cannot use aria-disabled with its reason in the title. The switches
+// are hidden where there is no form at all (a search without a pipe).
+function renderLogsTabs(shape) {
+    const views = logsViewsFor(shape), forms = logsFormsFor(shape);
+    const set = (el, mark, on, ok, hint, why) => {
+        if (!el) return;
+        el.setAttribute(mark, String(ok && on));
+        el.setAttribute('aria-disabled', String(!ok));
+        el.setAttribute('title', ok ? hint : why || LOGS_LOCKED.pipe);
+    };
+    for (const name of LOGS_VIEWS) {
+        set(document.getElementById(`logs-tab-${name}`), 'aria-selected', name === logsView.view,
+            !!views[name], LOGS_VIEW_HINTS[name], views.why[name]);
+    }
+    const host = document.getElementById('logs-forms');
+    if (host) host.hidden = !views.statistics && !views.visualization;
+    for (const name of LOGS_FORMS) {
+        const ok = !!forms[name] && (name === 'table' ? views.statistics : views.visualization);
+        set(document.getElementById(`logs-form-${name}`), 'aria-pressed', name === logsView.form,
+            ok, LOGS_FORM_HINTS[name], forms.why[name]);
+    }
+    // SAVE can only put a form on a dashboard: without one (a search without a
+    // pipe) it is locked and names the reason, like a tab or a form switch
+    const save = document.getElementById('logs-save-btn');
+    if (save) {
+        save.setAttribute('aria-disabled', String(!logsView.form));
+        save.setAttribute('title', logsView.form ? LOGS_SAVE_HINT : LOGS_LOCKED.pipe);
+    }
+}
+
+// One of the three tabs: the form follows it (the table in STATISTICS, the
+// chart that was chosen last or the default in VISUALIZATION)
+function setLogsView(view) {
+    const shape = logsResultShape(logsState.result);
+    const views = logsViewsFor(shape);
+    if (!views[view]) return false;
+    const forms = logsFormsFor(shape);
+    const held = logsView.form && logsView.form !== 'table' && forms[logsView.form];
+    const form = view === 'events' ? '' : view === 'statistics' ? 'table'
+        : held ? logsView.form : logsFormFor(shape, forms);
+    return logsShowView(view, form);
+}
+
+// One of the form switches: the table stands in STATISTICS, every chart in VISUALIZATION
+function setLogsForm(form) {
+    const shape = logsResultShape(logsState.result);
+    const view = form === 'table' ? 'statistics' : 'visualization';
+    if (!LOGS_FORMS.includes(form) || !logsFormsFor(shape)[form] || !logsViewsFor(shape)[view]) return false;
+    return logsShowView(view, form);
+}
+
+// The tab and the form on screen: the result again, which renderLogsResultBody
+// draws — and which asks for more rows where the new form needs them (a result
+// that holds every group already draws exactly, and going back to the table
+// keeps the rows that are there; the next search asks for 200 again)
+function logsShowView(view, form) {
+    logsView = { view, form };
+    renderLogsResultBody(logsState.result);
+    return true;
+}
+
+// The line under a chart that stands for less than the whole: how many groups
+// of how many it shows, and the pipe that cuts the search down to the largest
+// ones, which a click adds (`query`, the search the result came from, defaults
+// to the one of the tab). It is plain text where that pipe would not help: a
+// timechart has no groups to sort and no count to sort by, and a search that
+// already ends in the pipe would only run again.
+function logsTruncNoteHtml(shape, query) {
+    const s = shape || {};
+    if (s.type !== 'table' && s.type !== 'timechart') return '';
+    const rows = Number(s.rows) || 0, count = Number(s.count) || 0;
+    const more = count > rows;
+    if (!more && !s.truncated) return '';
+    const what = s.type === 'timechart' ? 'periods' : 'groups';
+    const text = more ? `only ${logsNumber(rows)} of ${logsNumber(count)} ${what} shown`
+        : 'only the newest 10,000 matches went into the pipes';
+    const head = logsTrimTrailingPipe(query === undefined ? logsState.query : query);
+    if (s.type === 'timechart' || head.endsWith(LOGS_SORT_PIPE)) {
+        return `<div class="logs-trunc">${escapeHtml(text)}</div>`;
+    }
+    return `<button type="button" class="logs-trunc" data-logs-sort title="Add ${LOGS_SORT_PIPE} to the search and run it">`
+        + `${escapeHtml(text)} &mdash; add <code>${escapeHtml(LOGS_SORT_PIPE)}</code></button>`;
+}
+
+// The warning line was clicked: the query keeps its search and gets the pipe
+// that leaves the twenty largest groups, and it runs. The picture on screen is
+// what the click is for, so the search asks for its rows and it stays.
+function logsAddSortPipe() {
+    const head = logsTrimTrailingPipe(logsCurrentQuery()) || '*';
+    const query = head.endsWith(LOGS_SORT_PIPE) ? head : `${head} ${LOGS_SORT_PIPE}`;
+    logsSetQuery(query);
+    logsWantForm = logsView.form;
+    submitLogsSearch();
+    return true;
+}
+
+// The name of a group as text: a value the server did not give is "(none)",
+// a value longer than a tooltip can show is cut (a log value can be 64 KB)
+function logsChartName(value) {
+    const text = logsFieldText(value);
+    return text === '' ? '(none)' : _chartEllipsis(text, LOGS_CHART_NAME_MAX);
+}
+
+// The groups of a table result as items of a pie or of bars: the name column
+// and the number column, equal names added up, the largest first, the twelve
+// largest on their own and the rest as "other" (topWithOther, which keeps a
+// thirteenth group rather than hiding a single one behind "other").
+function logsChartGroups(result, shape) {
+    const r = result || {}, s = shape || logsResultShape(r);
+    if (s.label === null || s.value === null) return [];
+    const sums = new Map();
+    for (const row of Array.isArray(r.rows) ? r.rows : []) {
+        if (!Array.isArray(row)) continue;
+        const n = Number(row[s.value]);
+        if (!Number.isFinite(n)) continue;
+        const name = logsChartName(row[s.label]);
+        sums.set(name, (sums.get(name) || 0) + n);
+    }
+    const counts = [...sums].map(([key, count]) => ({ key, count })).sort((a, b) => b.count - a.count);
+    const { keep } = topWithOther(counts, LOGS_CHART_TOP, LOGS_CHART_OTHER);
+    const items = counts.filter(c => keep.has(c.key)).map(c => ({ key: c.key, label: c.key, value: c.count }));
+    const rest = counts.filter(c => !keep.has(c.key)).reduce((sum, c) => sum + c.count, 0);
+    if (rest > 0) items.push({ key: LOGS_CHART_OTHER, label: LOGS_CHART_OTHER, value: rest });
+    return items;
+}
+
+// The two name columns and the number column of a table result as a flow for
+// layoutSankey: per side the twelve largest names on their own and the rest
+// as "other", the rows as the bands. An id carries its side ("0:<name>"), so
+// the same name on both sides stays two nodes.
+function logsSankeyData(result, shape) {
+    const r = result || {}, s = shape || logsResultShape(r);
+    const at = [(s.labels || [])[0], (s.labels || [])[1]];
+    const empty = { columns: [[], []], links: [], labels: {} };
+    if (at[0] === undefined || at[1] === undefined || s.value === null) return empty;
+    const pairs = [];
+    for (const row of Array.isArray(r.rows) ? r.rows : []) {
+        if (!Array.isArray(row)) continue;
+        const n = Number(row[s.value]);
+        if (!(n > 0) || !Number.isFinite(n)) continue;
+        pairs.push([logsChartName(row[at[0]]), logsChartName(row[at[1]]), n]);
+    }
+    const sides = [0, 1].map(side => {
+        const sums = new Map();
+        for (const pair of pairs) sums.set(pair[side], (sums.get(pair[side]) || 0) + pair[2]);
+        const counts = [...sums].map(([key, count]) => ({ key, count })).sort((a, b) => b.count - a.count);
+        const { label } = topWithOther(counts, LOGS_CHART_TOP, LOGS_CHART_OTHER);
+        return { label, order: counts.map(c => label(c.key)) };
+    });
+    const labels = Object.create(null);
+    const columns = sides.map(({ order }, side) => {
+        const ids = [];
+        for (const name of order) {
+            const id = `${side}:${name}`;
+            if (!ids.includes(id)) {
+                ids.push(id);
+                labels[id] = name;
+            }
+        }
+        return ids;
+    });
+    // layoutSankey adds up the rows that run between the same two nodes
+    const links = pairs.map(pair => ({ source: `0:${sides[0].label(pair[0])}`,
+        target: `1:${sides[1].label(pair[1])}`, value: pair[2] }));
+    return { columns, links, labels };
+}
+
+// The rows of a timechart as bins for stackedBarsSvg: a bin per row, the
+// series in the order of the columns (so a series keeps the colour of its
+// line and of its legend row), the length of a bucket from the times (the
+// span of the histogram where there is only one row)
+function logsChartBins(result) {
+    const r = result || {};
+    const columns = Array.isArray(r.columns) ? r.columns : [], rows = Array.isArray(r.rows) ? r.rows : [];
+    const keys = [...new Set(columns.slice(1).map(logsChartName))];
+    const none = { bins: [], keys, step: 0, unit: 'hour' };
+    if (columns[0] !== '_time' || !keys.length || !rows.length) return none;
+    const starts = rows.map(row => Date.parse(Array.isArray(row) ? row[0] : null));
+    if (starts.some(t => !Number.isFinite(t))) return none;
     const gaps = starts.slice(1).map((t, i) => t - starts[i]).filter(d => d > 0);
-    const step = gaps.length ? Math.min(...gaps) : (Number(result.histogram && result.histogram.span_s) || 60) * 1000;
-    const series = columns.slice(1);
+    const step = gaps.length ? Math.min(...gaps) : (Number(r.histogram && r.histogram.span_s) || 60) * 1000;
     const bins = rows.map((row, i) => {
         const counts = Object.create(null);
         let total = 0;
-        series.forEach((name, j) => {
-            const n = Number(row[j + 1]) || 0;
-            counts[name] = n;
+        columns.slice(1).forEach((name, j) => {
+            const key = logsChartName(name), n = Number(Array.isArray(row) ? row[j + 1] : 0) || 0;
+            counts[key] = (counts[key] || 0) + n;
             total += n;
         });
         return { start: starts[i], end: starts[i] + step, counts, total };
     });
-    const stack = series.slice().reverse();
-    const svg = stackedBarsSvg(bins, { width: logsWidth('logs-results') - 2, height: 150, keys: stack,
-        unit: logsBinUnit(step), step });
-    if (!svg) return '';
-    const legend = series.map(name => `<span class="logs-legend-item"><span class="logs-legend-swatch" style="background:${_chartColor(undefined, stack.indexOf(name))}"></span>${escapeHtml(name)}</span>`).join('');
-    return `<div class="chart-card logs-timechart"><div class="chart-card-head"><h3 class="chart-card-title">TIMECHART</h3></div>${svg}<div class="logs-legend">${legend}</div></div>`;
+    return { bins, keys, step, unit: logsBinUnit(step) };
+}
+
+// The series of a timechart as lines for lineSvg, in the order of the columns
+function logsChartSeries(result) {
+    const r = result || {};
+    const columns = Array.isArray(r.columns) ? r.columns : [], rows = Array.isArray(r.rows) ? r.rows : [];
+    return columns.slice(1).map((name, c) => ({
+        key: logsChartName(name), label: logsChartName(name),
+        points: rows.map(row => (Array.isArray(row) ? [Date.parse(row[0]), row[c + 1]] : [NaN, NaN])),
+    }));
+}
+
+// The legend of a timechart: a chip per series in its colour, with its total
+function logsSeriesLegendHtml(keys, bins) {
+    const rows = keys.map((name, i) => {
+        const total = bins.reduce((sum, bin) => sum + (Number(bin.counts[name]) || 0), 0);
+        return `<span class="logs-legend-item" title="${escapeHtml(name)}">`
+            + `<span class="logs-legend-swatch" style="background:${_chartColor(undefined, i)}"></span>`
+            + `${escapeHtml(name)} <span class="logs-legend-count">${logsNumber(total)}</span></span>`;
+    }).join('');
+    return rows ? `<div class="logs-legend">${rows}</div>` : '';
+}
+
+// The bars of a timechart: a bar per row, the series of the columns stacked
+function logsTimechartHtml(result, opts) {
+    const o = opts || {};
+    const { bins, keys, step, unit } = logsChartBins(result);
+    if (!bins.length) return '';
+    const svg = stackedBarsSvg(bins, { width: o.width > 0 ? Number(o.width) : 720,
+        height: o.height > 0 ? Number(o.height) : 220, keys, unit, step });
+    return svg ? svg + logsSeriesLegendHtml(keys, bins) : '';
+}
+
+// The result as one chart in the form that was chosen: pure, and '' where the
+// form does not fit the result (so a caller can fall back to another one).
+// Where the form fits but there is nothing to draw, the hint of an empty
+// chart stands in the chart's place. opts {width, height} is the room it has.
+function logsChartHtml(result, form, opts) {
+    const o = opts || {}, r = result || {};
+    const shape = logsResultShape(r);
+    if (!LOGS_FORMS.includes(form) || form === 'table' || !logsFormsFor(shape)[form]) return '';
+    const width = o.width > 0 ? Math.floor(Number(o.width)) : 720;
+    const height = o.height > 0 ? Math.floor(Number(o.height)) : 220;
+    // A query that simply matched nothing, whatever the form: the words of the
+    // spec, which the timechart has always used
+    const empty = chartEmptyHtml('No events in this range');
+    if (shape.type === 'timechart') {
+        if (form === 'bars') return logsTimechartHtml(r, { width, height }) || empty;
+        const { bins, keys, step, unit } = logsChartBins(r);
+        const svg = lineSvg(logsChartSeries(r), { width, height, unit, step });
+        return svg ? svg + logsSeriesLegendHtml(keys, bins) : empty;
+    }
+    const items = logsChartGroups(r, shape);
+    if (form === 'sankey') {
+        const flow = logsSankeyData(r, shape);
+        // A sankey of two columns reads better narrow than drawn out over a wide card
+        const layout = layoutSankey(flow.columns, flow.links, { width: Math.min(width, 900), height });
+        return sankeySvg(layout, { labels: flow.labels }) || empty;
+    }
+    const legend = chartLegendHtml(items);
+    if (form === 'pie') {
+        const svg = pieSvg(items, { size: Math.max(Math.min(height, width), 80) });
+        return svg ? `<div class="chart-split">${svg}${legend}</div>` : empty;
+    }
+    // The bars leave the room of the legend beside them
+    const bars = verdictBarsSvg(items.map(item => ({ key: item.key, y: item.value,
+        title: `${item.label}: ${logsNumber(item.value)}` })), { width: Math.max(width - 340, 160), height });
+    return bars ? `<div class="chart-split">${bars}${legend}</div>` : empty;
 }
 
 // --- Sources ---
@@ -13005,6 +14670,132 @@ function onLogsMenuClick(event) {
     submitLogsSearch();
 }
 
+// --- The COMMANDS card ---
+// The language of the search box, drawn from LOGS_COMMANDS: every group with
+// its rows, one group open at a time (the others are folded away by CSS), and
+// every row a button that carries its command in data attributes (no inline
+// handler, so no command can break out of one).
+function logsCommandsHtml() {
+    return LOGS_COMMANDS.map(group => {
+        const open = group.group === logsCommandsGroup;
+        const rows = group.items.map(item => `<li><button type="button" class="logs-cmd" data-logs-cmd="${escapeHtml(item.text)}" data-logs-kind="${escapeHtml(item.kind)}">`
+            + `<code class="logs-cmd-text">${escapeHtml(item.text)}</code><span class="logs-cmd-hint">${escapeHtml(item.hint)}</span></button></li>`).join('');
+        return `<div class="logs-cmd-group${open ? ' is-open' : ''}">`
+            + `<button type="button" class="logs-cmd-head" data-logs-cmd-head="${escapeHtml(group.group)}" aria-expanded="${open}">`
+            + `<span class="logs-caret" aria-hidden="true"></span><span class="logs-cmd-group-name">${escapeHtml(group.group)}</span>`
+            + `<span class="logs-cmd-count">${group.items.length}</span></button>`
+            + `<ul class="logs-cmd-list">${rows}</ul></div>`;
+    }).join('');
+}
+
+function renderLogsCommands() {
+    const host = document.getElementById('logs-commands-list');
+    if (host) host.innerHTML = logsCommandsHtml();
+}
+
+// Was the card open last time? A window too narrow for the column starts closed
+function logsCommandsOpen() {
+    try {
+        const stored = localStorage.getItem(LOGS_COMMANDS_KEY);
+        if (stored === '1') return true;
+        if (stored === '0') return false;
+    } catch (e) {
+        // storage blocked
+    }
+    const width = typeof window !== 'undefined' ? window.innerWidth : 0;
+    return !(width && width < LOGS_COMMANDS_WIDE);
+}
+
+function logsRememberCommands(open) {
+    try {
+        localStorage.setItem(LOGS_COMMANDS_KEY, open ? '1' : '0');
+    } catch (e) {
+        // storage blocked: the card opens as it did
+    }
+    return !!open;
+}
+
+// The ? button and the card's own head: the card open or shut. Shut, the card
+// keeps its head — one line that says what it is and opens it again. `remember`
+// false sets the state without storing it, for the first draw of the tab.
+function toggleLogsCommands(force, remember) {
+    const card = document.getElementById('logs-commands');
+    if (!card) return false;
+    const open = typeof force === 'boolean' ? force : card.classList.contains('is-shut');
+    if (open) renderLogsCommands();
+    if (open) card.classList.remove('is-shut');
+    else card.classList.add('is-shut');
+    for (const id of ['logs-syntax', 'logs-commands-toggle']) {
+        document.getElementById(id)?.setAttribute('aria-expanded', String(open));
+    }
+    if (remember !== false) logsRememberCommands(open);
+    return open;
+}
+
+// A group head: that group open and every other shut, the open one again shuts it
+function toggleLogsCommandGroup(name) {
+    const group = LOGS_COMMANDS.some(g => g.group === name) && name !== logsCommandsGroup ? name : '';
+    logsCommandsGroup = group;
+    try {
+        localStorage.setItem(LOGS_COMMANDS_GROUP_KEY, group);
+    } catch (e) {
+        // storage blocked: the group opens as it did
+    }
+    renderLogsCommands();
+    return group;
+}
+
+// A command of the card into the query: it is added, never substituted, and
+// the search does not run — a pipe or a term usually needs a field name first
+function logsInsertCommand(text, kind) {
+    const command = String(text ?? '');
+    if (!command.trim()) return false;
+    if (kind === 'source') return logsAddSource(command.replace(/^\s*source\s*=\s*/i, ''));
+    const query = logsCurrentQuery();
+    if (kind === 'pipe') {
+        const head = logsTrimTrailingPipe(query) || '*';
+        logsSetQuery(`${head} ${command}`);
+        logsFocusQuery(head.length + 1 + command.length);
+        return true;
+    }
+    if (kind === 'term') {
+        const cut = logsPipeIndex(query);
+        const before = (cut < 0 ? query : query.slice(0, cut)).trim();
+        logsSetQuery(logsInsertTerm(query, command));
+        logsFocusQuery((before === '' || before === '*' ? 0 : before.length + 1) + command.length);
+        return true;
+    }
+    return false;
+}
+
+// The caret in the search box at `at`, so the next keystroke lands behind the
+// command that was just put in
+function logsFocusQuery(at) {
+    const input = document.getElementById('logs-query');
+    if (!input) return;
+    if (typeof input.focus === 'function') input.focus();
+    if (typeof input.setSelectionRange === 'function') input.setSelectionRange(at, at);
+    renderLogsQueryHighlight();
+}
+
+function onLogsCommandsClick(event) {
+    const target = event && event.target && typeof event.target.closest === 'function' ? event.target : null;
+    if (!target) return;
+    const group = target.closest('[data-logs-cmd-head]');
+    if (group) {
+        toggleLogsCommandGroup(group.getAttribute('data-logs-cmd-head'));
+        return;
+    }
+    const row = target.closest('[data-logs-cmd]');
+    if (row) {
+        logsInsertCommand(row.getAttribute('data-logs-cmd'), row.getAttribute('data-logs-kind'));
+        return;
+    }
+    // The head of the card: the second way to open and shut it (the (i) button
+    // inside it stops its own click before it gets here)
+    if (target.closest('[data-logs-cmd-card]')) toggleLogsCommands();
+}
+
 // --- Live ---
 function toggleLogsLive() {
     logsState.live = !logsState.live;
@@ -13028,6 +14819,440 @@ function logsLiveTick() {
     return true;
 }
 
+// --- SAVE: the result as a tile on one of the own dashboards ---
+// The tile keeps the query, the form on screen and a range; the server
+// (webui/dashboards.py) keeps the dashboards and checks every value again.
+// SAVE is locked while the result has no form, which is exactly a search
+// without a pipe: a raw list of events never becomes a tile.
+
+// The name a tile starts with: the fields the query groups by, else the field
+// of `top`/`rare`, else the first word of the search, and a word for a result
+// over time. Control characters (which the store refuses) become blanks, and
+// the name is cut to 60 characters. The analyst can write over it.
+function logsSaveName(query, shape) {
+    const q = String(query ?? '').replace(/[\x00-\x1f\x7f]+/g, ' ');
+    const cut = logsPipeIndex(q);
+    // A field name is a word or a string, commas and pipes separate them
+    const tokens = text => text.match(/"(?:\\"|[^"])*"?|[^\s,|]+|\|/g) || [];
+    const bare = token => (token.startsWith('"') ? token.slice(1).replace(/"$/, '').replace(/\\"/g, '"') : token)
+        .replace(/"/g, '');
+    let pick = [], taking = '', command = false;
+    for (const token of tokens(cut < 0 ? '' : q.slice(cut))) {
+        if (token === '|') {
+            command = true;
+            taking = '';
+            continue;
+        }
+        const word = token.toLowerCase();
+        // `top` and `rare` carry their field, `by` the fields of a grouping;
+        // the last of them is the one the columns on screen came from
+        if (command && (word === 'top' || word === 'rare')) {
+            command = false;
+            taking = 'top';
+            pick = [];
+            continue;
+        }
+        command = false;
+        if (word === 'by') {
+            taking = 'by';
+            pick = [];
+        } else if (taking === 'by') {
+            pick.push(bare(token));
+        } else if (taking === 'top' && !(pick.length === 0 && /^\d+$/.test(token))) {
+            pick = [bare(token)];
+            taking = '';
+        }
+    }
+    let name = pick.join(', ').trim();
+    if (!name) {
+        const head = tokens(cut < 0 ? q : q.slice(0, cut));
+        name = head.length ? bare(head[0]) : '';
+    }
+    name = name.replace(/\s+/g, ' ').trim();
+    if ((shape || {}).type === 'timechart' && name && `${name} over time`.length <= LOGS_NAME_MAX) {
+        name = `${name} over time`;
+    }
+    return name.slice(0, LOGS_NAME_MAX).trim();
+}
+
+// The two ranges a tile can keep: the range of the tab, which moves with the
+// clock (`relative` is null for a window the tab is zoomed into — there is no
+// range to keep then), and the window on screen, frozen in UTC.
+function logsSaveRanges() {
+    const label = logsRangeLabel(logsState.earliest, logsState.latest);
+    const now = Date.now();
+    const span = /^-(\d+)([mhd])$/.exec(logsState.earliest || '');
+    const from = span ? now - Number(span[1]) * LOGS_RANGE_MS[span[2]] : Date.parse(logsState.earliest);
+    const to = logsState.latest ? Date.parse(logsState.latest) : now;
+    const fixed = {
+        earliest: Number.isFinite(from) ? logsIso(from) : '',
+        latest: Number.isFinite(to) ? logsIso(to) : '',
+        label: chartRangeLabel(from, to) || 'everything',
+    };
+    const count = /^(\d+)([mhd])$/.exec(label || '');
+    const relative = !label ? null : {
+        earliest: logsState.earliest,
+        latest: '',
+        label: count ? `last ${count[1]} ${LOGS_RANGE_UNITS[count[2]]}` : 'all time',
+    };
+    return { relative, fixed };
+}
+
+// The tiles a dashboard of the server holds
+function logsSaveTiles(dashboard) {
+    return dashboard && Array.isArray(dashboard.panels) ? dashboard.panels.length : 0;
+}
+
+// The dashboard a tile goes on by default: the first one that still has room,
+// else a new one
+function logsSavePickDefault(list) {
+    const open = (Array.isArray(list) ? list : []).find(d => d && logsSaveTiles(d) < LOGS_TILE_MAX);
+    return open ? String(open.id) : '';
+}
+
+// The name a new dashboard starts with, so the first one is one click away
+function logsSaveBoardName(list) {
+    return `Dashboard ${(Array.isArray(list) ? list.length : 0) + 1}`;
+}
+
+// The fields of the dialog: the name, the dashboards as a row of switches with
+// "+ New" and its own name field, the form that is on screen and the range the
+// tile keeps. `pick` is the id of the chosen dashboard, '' for a new one; a
+// dashboard with twelve tiles and "+ New" beyond ten dashboards are locked
+// with their reason, the caps of the store.
+function logsSaveHtml(dashboards, pick) {
+    const list = (Array.isArray(dashboards) ? dashboards : []).filter(d => d && typeof d.id === 'string');
+    const fresh = !list.some(d => d.id === pick);
+    const ranges = logsSaveRanges();
+    const fixed = logsSave.fixed || !ranges.relative;
+    const switches = list.map(d => {
+        const tiles = logsSaveTiles(d), full = tiles >= LOGS_TILE_MAX;
+        return `<button type="button" class="logs-save-pick" data-logs-dash="${escapeHtml(d.id)}"`
+            + ` aria-pressed="${!fresh && d.id === pick}" aria-disabled="${full}"`
+            + ` title="${escapeHtml(full ? LOGS_SAVE_LOCKED.tiles : `${tiles} of ${LOGS_TILE_MAX} tiles`)}"`
+            + ` onclick="logsSavePick(${jsArg(d.id)})">${escapeHtml(d.name)}</button>`;
+    }).join('');
+    const room = list.length < LOGS_DASH_MAX;
+    const newPick = `<button type="button" class="logs-save-pick" data-logs-dash=""`
+        + ` aria-pressed="${fresh}" aria-disabled="${!room}"`
+        + ` title="${escapeHtml(room ? 'A new dashboard for this tile' : LOGS_SAVE_LOCKED.dashboards)}"`
+        + ` onclick="logsSavePick(&quot;&quot;)">${escapeHtml(LOGS_SAVE_WORD)}</button>`;
+    const relative = !ranges.relative ? '' : `<button type="button" class="logs-save-pick" data-logs-range="relative"`
+        + ` aria-pressed="${!fixed}" aria-disabled="false"`
+        + ` title="The range of the tab: the tile moves with the clock"`
+        + ` onclick="logsSaveFixed(false)">${escapeHtml(ranges.relative.label)}</button>`;
+    const frozen = `<button type="button" class="logs-save-pick" data-logs-range="fixed"`
+        + ` aria-pressed="${fixed}" aria-disabled="false"`
+        + ` title="${escapeHtml(`${ranges.fixed.earliest || 'the oldest event'} to ${ranges.fixed.latest || 'now'}`)}"`
+        + ` onclick="logsSaveFixed(true)">${escapeHtml(ranges.fixed.label)}</button>`;
+    return `<label class="logs-save-field" for="logs-save-name"><span class="logs-save-label">NAME</span>`
+        + `<input type="text" class="filter-input logs-save-input" id="logs-save-name" maxlength="${LOGS_NAME_MAX}"`
+        + ` autocomplete="off" spellcheck="false"`
+        + ` value="${escapeHtml(logsSaveName(logsState.query, logsResultShape(logsState.result)))}"></label>`
+        + `<div class="logs-save-field"><span class="logs-save-label">DASHBOARD</span>`
+        + `<div class="logs-save-picks" role="group" aria-label="Dashboard">${switches}${newPick}</div>`
+        + `<input type="text" class="filter-input logs-save-input" id="logs-save-new" maxlength="${LOGS_NAME_MAX}"`
+        + ` autocomplete="off" spellcheck="false" aria-label="Name of the new dashboard"`
+        + ` placeholder="Name of the new dashboard" value="${escapeHtml(logsSaveBoardName(list))}"`
+        + `${fresh ? '' : ' hidden'}></div>`
+        + `<div class="logs-save-field"><span class="logs-save-label">FORM</span>`
+        + `<span class="logs-save-form">${escapeHtml(String(logsView.form || '').toUpperCase())}</span></div>`
+        + `<div class="logs-save-field"><span class="logs-save-label">RANGE</span>`
+        + `<div class="logs-save-picks" role="group" aria-label="Time range">${relative}${frozen}</div></div>`
+        + `<div class="logs-save-error" id="logs-save-error" role="alert" hidden></div>`
+        + `<div class="logs-save-actions">`
+        + `<button type="button" class="btn btn-sm" onclick="closeLogsSave()">CANCEL</button>`
+        + `<button type="button" class="btn btn-sm btn-primary" id="logs-save-go" onclick="submitLogsSave()">SAVE</button>`
+        + `</div>`;
+}
+
+// Why the last save was refused, in the dialog itself: it stays open, so the
+// analyst can pick another dashboard or another name instead of starting again
+function renderLogsSaveError(text) {
+    logsSaveWhy = String(text ?? '');
+    const line = document.getElementById('logs-save-error');
+    if (line) {
+        line.innerHTML = escapeHtml(logsSaveWhy);
+        line.hidden = !logsSaveWhy;
+    }
+    return !!logsSaveWhy;
+}
+
+// The fields of the dialog again. `prefill` starts them from the query (a
+// fresh dialog); without it the two names stay as they were typed, which is
+// what a click on another dashboard or on a range must not throw away.
+function renderLogsSave(prefill) {
+    const body = document.getElementById('logs-save-body');
+    if (!body) return false;
+    const typed = document.getElementById('logs-save-name'), board = document.getElementById('logs-save-new');
+    const keep = prefill ? null : { name: typed ? typed.value : '', fresh: board ? board.value : '' };
+    // Writing the body takes the fields off the page, and a browser leaves the
+    // focus on the body then: whichever field had it gets it back, with its
+    // caret, or what is typed after the list of dashboards arrived falls out of
+    // the dialog. A switch that was pressed is followed by logsSaveFocusPick.
+    const had = document.activeElement;
+    const hadId = had && LOGS_SAVE_FOCUS.includes(had.id) ? had.id : '';
+    const caret = hadId ? [had.selectionStart, had.selectionEnd] : null;
+    body.innerHTML = logsSaveHtml(logsSave.dashboards, logsSave.dashboard);
+    const name = document.getElementById('logs-save-name'), fresh = document.getElementById('logs-save-new');
+    if (name) name.value = keep ? keep.name : logsSaveName(logsState.query, logsResultShape(logsState.result));
+    if (fresh) fresh.value = keep ? keep.fresh : logsSaveBoardName(logsSave.dashboards);
+    // A save of an earlier opening may still be on its way: then this SAVE is
+    // no more pressable than the one that started it
+    const go = document.getElementById('logs-save-go');
+    if (go) go.disabled = logsSaveBusy;
+    renderLogsSaveError(logsSaveWhy);
+    const back = hadId ? document.getElementById(hadId) : null;
+    if (back) {
+        back.focus();
+        if (caret && caret[0] != null && typeof back.setSelectionRange === 'function') {
+            back.setSelectionRange(caret[0], caret[1] == null ? caret[0] : caret[1]);
+        }
+    }
+    return true;
+}
+
+// The switch that was pressed is another element after the re-render: the
+// focus follows it, so Tab goes on from there and a reader hears the change
+function logsSaveFocusPick(attr, value) {
+    const body = document.getElementById('logs-save-body');
+    const list = body && typeof body.querySelectorAll === 'function'
+        ? Array.from(body.querySelectorAll(`[${attr}]`)) : [];
+    const pick = list.find(el => el && el.getAttribute(attr) === String(value ?? ''));
+    if (pick && typeof pick.focus === 'function') pick.focus();
+    return !!pick;
+}
+
+// SAVE in the tab row: the dialog over the result, the focus in the name
+// field. Nothing opens while the result has no form (a search without a pipe).
+function openLogsSave() {
+    const modal = document.getElementById('logs-save');
+    if (!modal || !logsView.form) return false;
+    logsSave.open = true;
+    logsSave.fixed = !logsSaveRanges().relative;
+    logsSaveWhy = '';
+    logsSaveSeq++;
+    // logsSaveBusy belongs to the request, not to the dialog: a save that is
+    // still on its way keeps SAVE locked here too, or it would write twice
+    renderLogsSave(true);
+    modal.classList.remove('hidden');
+    // The name is a suggestion: it is selected, so typing writes a name of
+    // one's own instead of growing the prefilled one from its first character.
+    const name = document.getElementById('logs-save-name');
+    name?.focus();
+    name?.setSelectionRange(0, (name.value || '').length);
+    logsSaveDashboards();
+    return true;
+}
+
+// The dialog is done with: its fields go, so the next opening starts from the
+// search that is on screen then, and the focus goes back to SAVE. A save that
+// is on its way keeps running — the server cannot be called back — but its
+// answer finds another opening (logsSaveSeq) and so changes nothing here.
+function closeLogsSave() {
+    logsSave.open = false;
+    logsSaveWhy = '';
+    logsSaveSeq++;
+    const modal = document.getElementById('logs-save');
+    if (modal) modal.classList.add('hidden');
+    const body = document.getElementById('logs-save-body');
+    if (body) body.innerHTML = '';
+    const inside = modal && document.activeElement && typeof modal.contains === 'function'
+        && modal.contains(document.activeElement);
+    if (inside) document.getElementById('logs-save-btn')?.focus();
+    return true;
+}
+
+// The dashboards of the server, once per opening: the list of the dialog. The
+// chosen one holds while it is there and has room, else the default takes
+// over. A list that could not be read is no list — only "+ New" is left
+// beside the reason, so what is on screen says what is known.
+async function logsSaveDashboards() {
+    let list = null, why = '';
+    try {
+        const resp = await fetch('/api/dashboards');
+        const data = await resp.json().catch(() => ({}));
+        if (resp.ok) list = Array.isArray(data && data.dashboards) ? data.dashboards : [];
+        else why = logsSaveMessage(resp.status, data);
+    } catch (e) {
+        why = `the dashboards could not be read: ${e.message}`;
+    }
+    logsSave.dashboards = list || [];
+    const chosen = logsSave.dashboards.find(d => d && d.id === logsSave.dashboard);
+    if (!chosen || logsSaveTiles(chosen) >= LOGS_TILE_MAX) {
+        logsSave.dashboard = logsSavePickDefault(logsSave.dashboards);
+    }
+    // A reason of its own only; one that stands already (a refused save) holds
+    if (why) renderLogsSaveError(why);
+    if (logsSave.open) renderLogsSave();
+    return !why;
+}
+
+// One of the dashboard switches, '' for a new one: a full dashboard and a new
+// one beyond the tenth cannot be chosen (the switch says so in its title)
+function logsSavePick(id) {
+    const want = String(id ?? '');
+    const board = logsSave.dashboards.find(d => d && d.id === want);
+    if (want === '' ? logsSave.dashboards.length >= LOGS_DASH_MAX
+        : !board || logsSaveTiles(board) >= LOGS_TILE_MAX) return false;
+    logsSave.dashboard = want;
+    logsSaveWhy = '';
+    renderLogsSave();
+    logsSaveFocusPick('data-logs-dash', want);
+    return true;
+}
+
+// The range the tile keeps: the one of the tab, or the window frozen in UTC
+function logsSaveFixed(on) {
+    logsSave.fixed = !!on || !logsSaveRanges().relative;
+    renderLogsSave();
+    logsSaveFocusPick('data-logs-range', logsSave.fixed ? 'fixed' : 'relative');
+    return logsSave.fixed;
+}
+
+// What a refused write says. The server answers a sentence in English, which
+// is shown as it is; a tool update answers every write with 503 and a text
+// about detonations, so the dialog says what it means here.
+function logsSaveMessage(status, data) {
+    const d = data || {};
+    if (status === 503 || d.maintenance) return LOGS_SAVE_LOCKED.maintenance;
+    const error = typeof d.error === 'string' ? d.error.trim() : '';
+    return error || `the server refused the save (HTTP ${status})`;
+}
+
+// One write of the dashboard routes: {ok, status, data} and, where the request
+// did not get through at all, `failed` with the reason
+async function logsSavePost(url, body) {
+    try {
+        const resp = await fetch(url, {
+            method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+        });
+        const data = await resp.json().catch(() => ({}));
+        return { ok: resp.ok, status: resp.status, data: data || {} };
+    } catch (e) {
+        return { ok: false, status: 0, data: {}, failed: `the save did not reach the server: ${e.message}` };
+    }
+}
+
+// SAVE in the dialog: the tile on the chosen dashboard, with the query of the
+// search on screen, the form that is open and the range that is chosen. "+ New"
+// is two writes, the dashboard first — a refused tile then leaves the dashboard
+// standing, so the list and the switch row take it over and a second press
+// writes the tile instead of a second dashboard of the same name. A refusal
+// stays in the dialog; only a save that worked closes it and says so as a toast.
+// A save whose dialog was closed or opened again while it was on its way
+// (logsSaveSeq) leaves that dialog alone: its tile is on the dashboard, so it
+// still says so, but it neither closes nor writes into what is open now.
+async function submitLogsSave() {
+    if (!logsSave.open || !logsView.form) return false;
+    if (logsSaveBusy) {
+        renderLogsSaveError(LOGS_SAVE_LOCKED.busy);
+        return false;
+    }
+    const form = logsView.form;
+    const name = (document.getElementById('logs-save-name')?.value || '').trim();
+    if (!name || name.length > LOGS_NAME_MAX) {
+        renderLogsSaveError(LOGS_SAVE_LOCKED.name);
+        return false;
+    }
+    let did = logsSave.dashboard;
+    const board = did === '' ? (document.getElementById('logs-save-new')?.value || '').trim() : '';
+    if (did === '' && (!board || board.length > LOGS_NAME_MAX)) {
+        renderLogsSaveError(LOGS_SAVE_LOCKED.dashboard);
+        return false;
+    }
+    // No dashboard with room and no room for one more: say what makes room,
+    // which the cap of the server ("at most 10 dashboards") does not
+    if (did === '' && logsSave.dashboards.length >= LOGS_DASH_MAX) {
+        renderLogsSaveError(LOGS_SAVE_LOCKED.full);
+        return false;
+    }
+    const ranges = logsSaveRanges();
+    const range = logsSave.fixed || !ranges.relative ? ranges.fixed : ranges.relative;
+    const seq = logsSaveSeq;
+    logsSaveBusy = true;
+    renderLogsSaveError('');
+    const go = document.getElementById('logs-save-go');
+    if (go) go.disabled = true;
+    try {
+        if (did === '') {
+            const made = await logsSavePost('/api/dashboards', { name: board });
+            if (!made.ok) {
+                if (seq !== logsSaveSeq) return false;
+                renderLogsSaveError(made.failed || logsSaveMessage(made.status, made.data));
+                return false;
+            }
+            const fresh = made.data.dashboard || {};
+            did = String(fresh.id || '');
+            // Only this dialog's list takes it: one that was opened again in
+            // the meantime has read the list of the server itself, which holds
+            // the new dashboard already — adding it would be a second switch
+            // for the same id
+            if (seq === logsSaveSeq) {
+                logsSave.dashboards = [...logsSave.dashboards, fresh];
+                logsSave.dashboard = did;
+            }
+        }
+        const saved = await logsSavePost(`/api/dashboards/${encodeURIComponent(did)}/panels`, {
+            name, query: logsState.query, form, earliest: range.earliest, latest: range.latest,
+        });
+        if (!saved.ok) {
+            if (seq !== logsSaveSeq) return false;
+            renderLogsSaveError(saved.failed || logsSaveMessage(saved.status, saved.data));
+            // Gone from under us (another tab deleted it): the list again.
+            // Otherwise the fields again, which the dashboard of a "+ New"
+            // that worked has to reach — it is the chosen one now.
+            if (saved.status === 404) await logsSaveDashboards();
+            else renderLogsSave();
+            return false;
+        }
+        const on = logsSave.dashboards.find(d => d && d.id === did);
+        const where = on && on.name ? on.name : board;
+        // The title names the tile: showToast drops a second toast of the same
+        // type and title within 15 s, and a dashboard is built tile by tile
+        showToast('success', `Saved ${name}`, `as a ${form} tile on ${where}`);
+        if (seq === logsSaveSeq) closeLogsSave();
+        return true;
+    } finally {
+        logsSaveBusy = false;
+        const button = document.getElementById('logs-save-go');
+        if (button) button.disabled = false;
+    }
+}
+
+// The keys of the dialog: Enter in a field saves, Tab stays inside it. Escape
+// is the key of the page (handleGlobalKeydown), which closes the top layer.
+function onLogsSaveKeydown(event) {
+    if (!event || !logsSave.open) return false;
+    const stop = () => {
+        if (typeof event.preventDefault === 'function') event.preventDefault();
+    };
+    const target = event.target || {};
+    if (event.key === 'Enter' && target.tagName === 'INPUT') {
+        stop();
+        submitLogsSave();
+        return true;
+    }
+    if (event.key !== 'Tab') return false;
+    const modal = document.getElementById('logs-save');
+    const able = modal && typeof modal.querySelectorAll === 'function'
+        ? Array.from(modal.querySelectorAll('button, input')).filter(
+            el => !el.hidden && !el.disabled && el.getAttribute('aria-disabled') !== 'true') : [];
+    if (able.length < 2) return false;
+    const first = able[0], last = able[able.length - 1];
+    if (!event.shiftKey && document.activeElement === last) {
+        stop();
+        first.focus();
+        return true;
+    }
+    if (event.shiftKey && document.activeElement === first) {
+        stop();
+        last.focus();
+        return true;
+    }
+    return false;
+}
+
 // --- The tab ---
 // Set up once, when the tab is first opened: the last search and range come back, and it runs
 function initLogs() {
@@ -13035,8 +15260,6 @@ function initLogs() {
     const input = document.getElementById('logs-query');
     if (!input) return;
     logsReady = true;
-    const help = document.getElementById('logs-syntax');
-    if (help) help.title = LOGS_SYNTAX_HINT;
     input.addEventListener('keydown', event => {
         if (event.key === 'Enter') {
             event.preventDefault();
@@ -13049,11 +15272,23 @@ function initLogs() {
     input.addEventListener('scroll', renderLogsQueryHighlight);
     for (const id of ['logs-results', 'logs-field-list']) document.getElementById(id)?.addEventListener('click', onLogsClick);
     document.getElementById('logs-menu')?.addEventListener('click', onLogsMenuClick);
+    document.getElementById('logs-commands')?.addEventListener('click', onLogsCommandsClick);
+    document.getElementById('logs-save')?.addEventListener('keydown', onLogsSaveKeydown);
+    try {
+        const group = localStorage.getItem(LOGS_COMMANDS_GROUP_KEY);
+        if (group === '' || LOGS_COMMANDS.some(g => g.group === group)) logsCommandsGroup = group;
+    } catch (e) {
+        // storage blocked: the first group is open
+    }
+    toggleLogsCommands(logsCommandsOpen(), false);
     document.addEventListener('click', event => {
         const wrap = event.target && typeof event.target.closest === 'function' ? event.target.closest('.logs-menu-wrap') : null;
         if (!wrap) closeLogsMenu();
     });
     initBarsBrush(LOGS_BARS_BRUSH);
+    const bar = document.getElementById('logs-bar'), side = document.getElementById('logs-side');
+    // The search bar is sticky too: the card stands under it, not over it
+    if (bar && side && typeof ResizeObserver !== 'undefined') _followBarHeight(bar, side, '--logs-bar-height');
     const histogram = document.getElementById('logs-histogram');
     if (histogram && typeof ResizeObserver !== 'undefined') {
         let width = 0;
@@ -13071,22 +15306,38 @@ function initLogs() {
     } catch (e) {
         // storage blocked
     }
-    logsBase = range;
-    logsState.earliest = range === 'All' ? '' : `-${range}`;
-    logsState.latest = '';
-    logsSetQuery(logsLastQuery());
-    renderLogsRange();
     refreshLogsSources();
+    renderLogsBack();
+    // A tile opened in LOGS before the tab was ever shown has put its query
+    // and its window in the state: they stay, and only the range a zoom goes
+    // back to comes from the store (a window of its own has no button)
+    if (logsOpenPending) {
+        logsOpenPending = false;
+        if (!logsRangeLabel(logsState.earliest, logsState.latest)) logsBase = range;
+    } else {
+        logsBase = range;
+        logsState.earliest = range === 'All' ? '' : `-${range}`;
+        logsState.latest = '';
+        if (logsTakePending()) return;
+        logsSetQuery(logsLastQuery());
+    }
+    renderLogsRange();
     runLogsSearch({ silent: true });
 }
 
-// The tab is opened: the first time it is set up, later it searches again
+// The tab is opened: the first time it is set up, later it searches again (or runs the search a jump brought)
 function logsTabShown() {
+    // The dialog belongs to the result that was on screen: a trip through
+    // another tab leaves it behind
+    closeLogsSave();
     if (!logsReady) {
         initLogs();
         return;
     }
+    logsOpenPending = false;           // the tab is set up: nothing of it to keep
     refreshLogsSources();
+    renderLogsBack();
+    if (logsTakePending()) return;
     runLogsSearch({ silent: true });
 }
 
@@ -13806,6 +16057,2639 @@ function networkTabShown() {
     networkRefreshReports();
 }
 
+// --- A jump in from another tab (openLogsTab) and the way back ---
+// The search a jump brought, run as one of the analyst's own (it goes to the
+// recent ones) over its own range; the result of the search before it is
+// gone at once, so a query the server refuses shows its error over nothing
+// rather than over the old events. False when no jump is waiting.
+function logsTakePending() {
+    const p = logsPending;
+    if (!p) return false;
+    logsPending = null;
+    if (p.earliest !== null) {
+        logsState.earliest = p.earliest;
+        logsState.latest = p.latest;
+        logsRangeNote = p.note || '';
+    }
+    logsSetQuery(p.query);
+    logsClearResult();
+    renderLogsRange();
+    renderLogsBack();
+    runLogsSearch();
+    return true;
+}
+
+function logsClearResult() {
+    logsState.result = null;
+    logsState.openIds = new Set();
+    logsLastSig = '';
+    logsDrawn = null;
+    for (const id of ['logs-summary', 'logs-results', 'logs-histogram', 'logs-legend', 'logs-field-list', 'logs-fields-count']) {
+        const host = document.getElementById(id);
+        if (host) host.innerHTML = '';
+    }
+}
+
+// The way back as the caller of openLogsTab gives it: 'firewall', or {tab: 'firewall', filter} with the filter
+// openFirewallTab takes ({select, image, pid, ip, port, text}); null for none or a tab there is no way back to
+function logsBackOf(back) {
+    const b = typeof back === 'string' ? { tab: back } : back;
+    if (!b || typeof b !== 'object' || b.tab !== 'firewall') return null;
+    const filter = b.filter && typeof b.filter === 'object' ? b.filter : {};
+    const image = String(filter.image ?? '').split(/[\\/]/).pop();
+    const ip = String(filter.ip ?? '');
+    const label = image && ip ? `${image} → ${ip}` : image || ip;
+    return { tab: 'firewall', label: label.length > 80 ? `${label.slice(0, 79)}…` : label, filter };
+}
+
+// ← FIREWALL over the search line: back to the tab with what was selected there; × takes the chip away
+function logsBackChipHtml() {
+    if (!logsBack) return '';
+    const what = logsBack.label ? ` with ${logsBack.label} selected` : '';
+    return '<span class="logs-back" role="group" aria-label="The way back">'
+        + `<button type="button" class="alerts-filter-chip logs-back-go" data-logs-back title="${escapeHtml(`Back to the FIREWALL tab${what}`)}" onclick="logsGoBack()">`
+        + '<span class="alerts-filter-chip-kind">← FIREWALL</span>'
+        + (logsBack.label ? ` <span class="alerts-filter-chip-value">${escapeHtml(logsBack.label)}</span>` : '') + '</button>'
+        + '<button type="button" class="alerts-filter-chip logs-back-x" data-logs-back-x title="Remove the way back" aria-label="Remove the way back" onclick="logsDropBack()">'
+        + '<span class="alerts-filter-chip-x" aria-hidden="true">&times;</span></button></span>';
+}
+
+function renderLogsBack() {
+    const host = document.getElementById('logs-back');
+    if (!host) return;
+    host.innerHTML = logsBackChipHtml();
+    host.hidden = !logsBack;
+}
+
+function logsGoBack() {
+    if (!logsBack) return false;
+    return openFirewallTab(logsBack.filter);
+}
+
+function logsDropBack() {
+    logsBack = null;
+    renderLogsBack();
+    document.getElementById('logs-query')?.focus?.();
+}
+
+// =============================================
+// FIREWALL (the chamber's connections: who talks to whom, and the switches that cut it)
+// =============================================
+// The head holds LIVE, ASK (what TDC does when a process in the chamber
+// fetches a file; the setting lives on the server), ISOLATED and the range;
+// under it the bands that say what is not enforced (a firewall profile off,
+// ASK off, rules that could not be read, ISOLATED with what it leaves open).
+// On the left the process tree: a process a row, unfolded its endpoints, TDC's
+// own processes and local addresses in groups of their own. In the middle MAP
+// | LIST | ASN, the hunting hints of the selection and the secured samples;
+// the summary below that, or as a third column on a wide window.
+// Everything a flow carries comes from the VM, most of it from the sample:
+// every text goes through escapeHtml, every class part is a known token, a
+// value in a query goes through logsQuote, and a URL or a host name is only
+// ever shown defanged (fwDefang), never as a link.
+const FW_RANGES = ['15m', '1h', '4h', '24h', '7d', 'All'];
+const FW_DEFAULT_RANGE = '1h';
+const FW_RANGE_KEY = 'tdc.firewall.range';
+const FW_VIEW_KEY = 'tdc.firewall.view';
+const FW_VIEWS = ['map', 'list', 'asn', 'decisions'];
+const FW_LIVE_MS = 5000;
+// Every this many LIVE ticks also the summary, the captures and the rules: they are no poll paths of the access
+// log, and the rules cost a PowerShell call on the VM. ISOLATED's state is asked every tick: it says whether a
+// way out of ISOLATED stands open, which must not wait 30 s, and it is a cheap poll (the server caches the profiles)
+const FW_SLOW_EVERY = 6;
+// The flows asked for (the most severe first), the destinations drawn on the map, the rows of LIST and the
+// endpoints of a process shown before "Show all"
+const FW_MAX = 5000;
+const FW_MAP_MAX = 300;
+const FW_LIST_MAX = 1000;
+const FW_EP_PAGE = 50;
+// Schemes fwDefang always takes as schemes, even before digits ("javascript:1/alert(1)" is no host and port)
+const FW_SCHEMES = ['http', 'https', 'ftp', 'ftps', 'sftp', 'file', 'smb', 'javascript', 'vbscript', 'jscript', 'data', 'blob',
+    'about', 'mailto', 'tel', 'ws', 'wss', 'ldap', 'ms-msdt', 'search-ms', 'ms-officecmd', 'ms-word', 'ms-excel', 'mhtml'];
+// How long the filter waits for the typing to pause
+const FW_FILTER_MS = 200;
+const FW_ASK_MODES = [
+    { mode: 'detonation', label: 'Detonation', text: 'A download from the detonation is blocked at once, then asked about; everything else is only tagged.' },
+    { mode: 'all', label: 'All', text: 'Every download seen is blocked and asked about, except those of TDC itself outside a detonation.' },
+    { mode: 'off', label: 'Off', text: 'Nothing is blocked and nothing fetched by TDC: connections are only tagged and logged.' },
+];
+// The tags of webui/firewall.py (TAGS) and their tones: the most severe tag of a row or an arc is its colour
+const FW_TONES = {
+    ioc: 'critical', beacon: 'critical', sigma: 'high', detonated: 'high', 'direct-ip': 'high', download: 'high',
+    'tdc-anomaly': 'high', lolbin: 'medium', dga: 'medium', 'risky-tld': 'medium', 'dead-drop': 'medium',
+    'rare-port': 'medium', newborn: 'low', dropped: 'info',
+};
+const FW_TAG_INFO = {
+    ioc: 'The address or the name is on an IOC list (ioc/ips.txt, ioc/domains.txt).',
+    beacon: 'The connections come in a rhythm: beaconing.',
+    sigma: 'A Rustinel or Fibratus alert names this address and port.',
+    detonated: 'The process or one of its ancestors is a submission.',
+    'direct-ip': 'No DNS answer explains this address: a hard-coded target.',
+    download: 'A URL to an executable file was seen for this connection.',
+    'tdc-anomaly': 'One of TDC\'s own processes talks to an endpoint it has no business with.',
+    lolbin: 'A living-off-the-land binary talks to the network.',
+    dga: 'The name looks generated: high entropy or many digits.',
+    'risky-tld': 'The name is under a top-level domain that malware favours.',
+    'dead-drop': 'A known dead-drop service: paste sites, chat, raw file hosts.',
+    'rare-port': 'An unusual port, or one of the classics of malware (4444, 31337 and the like).',
+    newborn: 'The process was less than a minute old when it connected.',
+    dropped: 'The Windows Firewall dropped packets to this endpoint, of whichever process.',
+};
+const FW_GROUP_INFO = {
+    tdc: 'TDC\'s own processes: tagged like any other, never blocked or asked about from here. A tdc-anomaly tag is an endpoint TDC has no business with.',
+    local: 'Private, loopback, link-local and multicast addresses: they are not on the map.',
+};
+const FW_SELF_NOTE = 'One of TDC\'s own processes: it is not blocked from here, because that could cut TDC itself off.';
+const FW_BYTES_NOTE = 'Sysmon has no byte counts; the tab counts connections and firewall records.';
+// What a press of CUT THE NETWORK does: the title of the button while nothing is cut, and the help says the same
+const FW_ISOLATE_TEXT = 'One press, no question: one outbound Block rule for every program shuts every way out of the chamber in a few '
+    + 'seconds, because a Block rule beats every Allow rule. Then, in the background, Windows\' own outbound Allow rules are switched off '
+    + 'and the default outbound action set to Block, and the rule goes; a rule a group policy sets cannot be switched off from here, and '
+    + 'there the rule stays. Cut off: the sample\'s connections and Windows\' alike, TDC\'s tool updates and the cloud lookups of the EDR '
+    + 'under test. While the cut stands TDC cannot secure a sample. Still reachable: loopback and this web UI from the host. '
+    + 'The way back: this button again, which asks before it leaves, or scripts/tdc-unisolate.ps1 on the VM if the web UI is gone.';
+const FW_CUT_WAIT = 'TDC writes one outbound Block rule through PowerShell and reads it back before it says anything; that takes a few '
+    + 'seconds. The cut runs on the server: closing or reloading this page does not stop it.';
+const FW_ISOLATE_WAIT = 'TDC switches Windows\' own outbound Allow rules and the default outbound action through PowerShell, then reads '
+    + 'the firewall back before it says anything. Every PowerShell call takes seconds on a small VM, so this can take up to about a '
+    + 'minute; the button stays busy until the firewall has answered. The switch runs on the server: closing or reloading this page does not stop it.';
+// Ready LOGS queries for the selection (needs: the part of the selection a hint takes, '' for none)
+const FW_HINTS = [
+    { label: 'Who else talks to this endpoint', needs: 'ip', query: s => `dst_ip=${logsQuote(s.ip)} | top image` },
+    { label: 'The rhythm of this process', needs: 'image', query: s => `source=netflow image=${logsQuote(s.image)} | timechart span=1m count by dst_ip` },
+    { label: 'What the firewall dropped', needs: '', query: () => 'source=firewall action=DROP | stats count by dst_ip, dst_port' },
+    { label: 'Names that never resolved: DGA suspects', needs: '', query: () => 'source=dns result="-" | top query' },
+    { label: 'Download cradles in clear text', needs: '', query: () => 'source=powershell "http" | head 50' },
+];
+const FW_DECIDED = { allow: 'ALLOWED', block: 'BLOCKED', block_fetch: 'BLOCKED + FETCHED' };
+// A search in LOGS about connections covers their lifetime and this much either side: the DNS answer before the
+// first one, a firewall drop or a script block just after the last
+const FW_LOGS_PAD_MS = 5 * 60000;
+// The decision toasts: /pending is asked every FW_PENDING_MS on every tab (not while the browser tab is hidden),
+// at most FW_TOASTS_VISIBLE toasts stand, the rest is a "+ n more". The countdown is redrawn every FW_CLOCK_MS.
+// A result stays FW_RECEIPT_MS once nothing more is to come, and waits for a fetch at most FW_FETCH_WAIT_MS.
+const FW_PENDING_MS = 3000;
+const FW_TOASTS_VISIBLE = 3;
+const FW_CLOCK_MS = 1000;
+const FW_RECEIPT_MS = 10000;
+const FW_FETCH_WAIT_MS = 120000;
+// How long a /pending or /decide request may hang before the toasts give up on it
+const FW_REQUEST_MS = 15000;
+// The id of the standing summary of what was decided while nobody watched (no decision id starts with @)
+const FW_AWAY_ID = '@away';
+// The unattended results not closed yet, so that a reload brings them back
+const FW_STANDING_KEY = 'tdc.firewall.standing';
+// The server start whose firewall state was toasted
+const FW_STARTUP_KEY = 'tdc.firewall.startup';
+// The server_time of the last /pending answer this browser showed: what resolved after it, nobody here saw
+const FW_SEEN_KEY = 'tdc.firewall.seen';
+const FW_DECIDE_ACTIONS = [
+    { action: 'block_fetch', label: 'CUT + FETCH', title: 'Keep it cut, and let TDC fetch the file itself, from the chamber, so the sample is secured and never runs.' },
+    { action: 'block', label: 'CUT ONLY', title: 'Keep it cut. Nothing is fetched.' },
+    { action: 'allow', label: 'ALLOW', title: 'Lift the block: the process can reach the address again, and fetch and run its download.' },
+];
+const FW_TAKEN = { allow: 'ALLOWED', block: 'CUT', block_fetch: 'CUT + FETCHED', dropped: 'DROPPED' };
+// What the routes said last; isolate, summary, captures and rules come with the slower round
+let fwState = { loaded: false, error: null, flows: [], count: 0, truncated: false, rulesError: null, isolated: false, askMode: 'detonation', pending: [], history: [], summary: null, summaryError: null, isolate: null, isolateError: null, captures: null, capturesError: null, rules: null, rulesListError: null, live: true };
+let fwSeq = 0;                         // a response older than the last request is dropped
+let fwSlowSeq = 0;                     // the same for the slower round
+let fwIsoSeq = 0;                      // and for ISOLATED's state, asked every tick
+let fwIsoBusy = false;                 // an ISOLATED request still out (it may read the profiles): no second one
+let fwIsoSwitching = '';              // 'on' or 'off' while a switch of ISOLATED is on its way: the button waits for it
+let fwReady = false;
+let fwTimer = null;
+let fwTicks = 0;
+let fwRange = FW_DEFAULT_RANGE;
+let fwView = 'map';
+let fwSelected = '';                   // 'p:<image|pid>', 'f:<flow key>' or 'a:<address>'
+let fwFilter = '';
+let fwOpen = new Map();                // a group, or 'p:<process key>' -> open, as the analyst left it
+let fwMore = new Set();                // process keys whose endpoints are all shown
+let fwWorld = null;                    // world.json, once it is loaded
+let fwWorldAsked = false;
+let fwLastSig = '';
+let fwLastBands = '';
+let fwLastCut = '';                    // the cut button and its note as last drawn (renderFirewallCut)
+let fwLastCutNote = '';
+let fwFilterTimer = null;
+let fwWant = null;                     // what openFirewallTab asked to select ({select, image, pid, ip, port, text}), until the connections are in
+let fwWantMissed = '';                 // what it asked for and is not among the connections, said where the selection would be
+let fwDecisions = new Map();           // decision id -> its toast: {item, phase open|deciding|due|done, arrived, dueAt, ...}
+let fwDecisionSeq = 0;                 // the order the decisions came in
+let fwDecisionOrder = '';              // the ids the stack shows, in order, and the count behind them
+let fwDecisionMore = null;             // the "+ n more" element
+let fwDecisionTimer = null;            // the countdown, only while a toast stands
+let fwPendingTimer = null;
+let fwPendingBusy = false;             // a /pending request still out: no second one
+let fwStartupSeen = '';               // the server start this page has toasted
+let fwPendingReq = 0;                  // /pending requests sent (the tab's too), counted
+let fwPendingApplied = 0;              // the number of the newest one applied: an answer to an older one is dropped
+let fwPendingAsk = 'detonation';       // ask_mode as /pending said it: with off, the server takes no default
+let fwPendingError = null;             // the last poll failed: the toasts say they may be stale
+let fwPendingFirst = true;             // the next answer is the first since the page loaded or came back: it summarises
+let fwPendingData = null;               // the last /pending answer applied: the DECISIONS view lists it
+let fwLastDecisionsHtml = '';
+let fwPendingSkew = null;               // the VM's clock minus this computer's (ms), from server_time
+let fwStandingLoaded = false;           // the saved results came back (fwRestoreStanding)
+let fwStandingJson = '';
+let fwSeenMs = null;                   // FW_SEEN_KEY as this page knows it, should the storage be blocked
+
+// --- Text of the VM ---
+function fwOwn(table, key) {
+    return Object.prototype.hasOwnProperty.call(table, String(key)) ? table[String(key)] : undefined;
+}
+
+function fwText(value) {
+    return _worldText(value);
+}
+
+function fwShort(value, max) {
+    return _chartEllipsis(_worldText(value), max);
+}
+
+function fwNumber(n) {
+    const value = Number(n);
+    return Number.isFinite(value) ? value.toLocaleString('en-US') : '0';
+}
+
+function fwBase(image) {
+    const s = String(image ?? '');
+    return s.split(/[\\/]/).pop() || s;
+}
+
+// A URL or a host name as text nobody follows by accident: http(s) becomes
+// hxxp(s), the dots of the host part [.], and any other scheme scheme[:]
+// (javascript:, data:, ftp:, mailto:, whose opaque rest loses its dots too).
+// A host is found after //, \\ or right after the scheme; "localhost:8080"
+// and "host.example:8080" are a host and a port, not a scheme. Bidi controls go.
+function fwDefang(text) {
+    const s = _worldText(text);
+    if (!s) return '';
+    const m = /^([a-z][a-z0-9+.-]*):/i.exec(s);
+    // A known scheme is always one (javascript:1/alert(1)); an unknown word followed by digits is a host and a port
+    const known = m && FW_SCHEMES.includes(m[1].toLowerCase());
+    const scheme = m && (known || (!m[1].includes('.') && !/^\d+(?:[/?#\\]|$)/.test(s.slice(m[0].length)))) ? m[1] : '';
+    let head = '', rest = s;
+    if (scheme) {
+        rest = s.slice(scheme.length + 1);
+        const web = /^https?$/i.test(scheme);
+        head = web ? `${scheme.replace(/t/g, 'x').replace(/T/g, 'X')}:` : `${scheme}[:]`;
+        if (!web && !/^[/\\]{2}/.test(rest)) return head + rest.replace(/\./g, '[.]');
+    }
+    const lead = /^[/\\]*/.exec(rest)[0];
+    const after = rest.slice(lead.length);
+    const cut = after.search(/[/\\?#]/);
+    const host = cut < 0 ? after : after.slice(0, cut);
+    return head + lead + host.replace(/\./g, '[.]') + (cut < 0 ? '' : after.slice(cut));
+}
+
+// --- Tones ---
+function fwTone(tone) {
+    return ALERT_SEVERITIES.includes(tone) ? tone : 'info';
+}
+
+function fwToneRank(tone) {
+    const i = ALERT_SEVERITIES.indexOf(tone);
+    return i < 0 ? ALERT_SEVERITIES.length - 1 : i;
+}
+
+// The tone of the most severe of the tags ('info' for none, or none it knows)
+function fwToneOf(tags) {
+    let best = ALERT_SEVERITIES.length - 1;
+    for (const tag of tags || []) best = Math.min(best, fwToneRank(fwOwn(FW_TONES, tag)));
+    return ALERT_SEVERITIES[best];
+}
+
+// The tags of a flow and of its endpoint (dropped belongs to the endpoint)
+function fwFlowTags(flow) {
+    return [...new Set([...(flow.tags || []), ...(flow.endpoint_tags || [])].map(String))];
+}
+
+function fwTagChips(tags, max) {
+    const list = [...new Set((tags || []).map(String))]
+        .sort((a, b) => fwToneRank(fwOwn(FW_TONES, a)) - fwToneRank(fwOwn(FW_TONES, b)));
+    const chip = tag => `<span class="fw-tag fw-tone-${fwTone(fwOwn(FW_TONES, tag))}" title="${escapeHtml(fwOwn(FW_TAG_INFO, tag) || 'A tag this tab does not know.')}">${escapeHtml(fwShort(tag, 24))}</span>`;
+    const rest = list.slice(max);
+    return list.slice(0, max).map(chip).join('')
+        + (rest.length ? `<span class="fw-tag fw-tag-more" title="${escapeHtml(rest.map(t => fwShort(t, 40)).join(', '))}">+${rest.length}</span>` : '');
+}
+
+// --- Keys and the selection ---
+function fwFlowKey(f) {
+    return [f.image, f.pid, f.protocol, f.src_ip, f.dst_ip, f.dst_port].join('|');
+}
+
+function fwProcKey(f) {
+    return `${f.image}|${f.pid}`;
+}
+
+// ':443/TCP' of a flow (the part of its address after the IP)
+function fwPortProto(f) {
+    const port = f.dst_port === null || f.dst_port === undefined ? '' : `:${f.dst_port}`;
+    return `${port}${f.protocol ? `/${String(f.protocol).toUpperCase()}` : ''}`;
+}
+
+function fwAddr(f) {
+    const ip = String(f.dst_ip ?? '');
+    const bracket = ip.includes(':') && f.dst_port !== null && f.dst_port !== undefined;
+    return `${bracket ? `[${ip}]` : ip}${fwPortProto(f)}`;
+}
+
+function fwIsOpen(id, dflt) {
+    return fwOpen.has(id) ? fwOpen.get(id) : dflt;
+}
+
+// The flows the filter lets through: process, address, host name, AS and country
+function fwVisible(flows) {
+    const needle = fwFilter.trim().toLowerCase();
+    if (!needle) return flows;
+    return flows.filter(f => [f.image, f.dst_ip, f.dst_hostname, f.geo && f.geo.as_org, f.geo && f.geo.country, f.geo && f.geo.cc]
+        .some(v => v !== null && v !== undefined && String(v).toLowerCase().includes(needle)));
+}
+
+// What fwSelected (or another id) stands for: {id, kind, image, pid, ip, flows}, or null
+function fwSelection(other) {
+    const id = other === undefined ? fwSelected : String(other);
+    const flows = fwState.flows || [];
+    let list = [];
+    if (id.startsWith('p:')) list = flows.filter(f => fwProcKey(f) === id.slice(2));
+    else if (id.startsWith('f:')) list = flows.filter(f => fwFlowKey(f) === id.slice(2)).slice(0, 1);
+    else if (id.startsWith('a:')) list = flows.filter(f => f.dst_ip === id.slice(2));
+    if (!list.length) return null;
+    const kind = id[0] === 'p' ? 'process' : id[0] === 'f' ? 'flow' : 'address';
+    const images = new Set(list.map(f => f.image));
+    return { id, kind, flows: list, image: images.size === 1 ? list[0].image : '', pid: kind === 'address' ? null : list[0].pid,
+        ip: kind === 'process' ? '' : list[0].dst_ip };
+}
+
+// A process, an endpoint or a point of the map is chosen: its rows unfold, the hints are about it
+function fwSelect(id) {
+    fwWantMissed = '';
+    const next = String(id ?? '');
+    fwSelected = next === WORLD_CHAMBER_ID ? '' : next;
+    const sel = fwSelection();
+    if (sel && sel.kind !== 'process') {
+        for (const f of sel.flows) {
+            fwOpen.set(`p:${fwProcKey(f)}`, true);
+            fwOpen.set(f.self ? 'tdc' : f.geo && f.geo.scope === 'local' ? 'local' : 'main', true);
+        }
+    }
+    renderFirewallTree(fwState.flows);
+    renderFirewallView();
+    renderFirewallHints(sel);
+}
+
+// --- Rules and the switches ---
+function fwEnforceOff() {
+    const off = fwState.isolate && Array.isArray(fwState.isolate.profiles_off) ? fwState.isolate.profiles_off : [];
+    return off.length ? `Windows Firewall is off for ${off.map(p => fwText(p)).join(', ')}: a rule would be accepted and do nothing, so nothing can be enforced.` : '';
+}
+
+function fwIsolatedOn() {
+    return !!fwState.isolated;
+}
+
+// The stage of ISOLATED as GET /isolate said it: open, cut, isolated or cut_policy. The marker (fwIsolatedOn), not
+// the stage, says whether TDC is isolating: start-up can leave stage open beside a marker while the cut rule holds
+function fwStage(iso = fwState.isolate) {
+    return iso && typeof iso.stage === 'string' && iso.stage ? iso.stage : 'open';
+}
+
+// What the cut button and the ISOLATED switch both show and what a press of either does: the one state of the two.
+// One rule decides the press: not confirmed closed, it cuts (again, without a question: cut() repairs a tampered
+// rule, and a cut only closes); confirmed closed, it leaves (asks first). With a firewall profile off nothing is
+// enforced and nothing can be cut, so nothing is confirmed and the button is disabled, full stop: a reflexive press
+// must not become "open the network again". Leaving is then in the off band, beside TURN THE FIREWALL ON.
+function fwCutState(iso = fwState.isolate) {
+    const s = iso || {};
+    const off = fwEnforceOff(), stage = fwStage(iso), on = fwIsolatedOn();
+    // A rule does nothing on a profile that is off, and with the profiles unread whether it works is not known
+    const enforced = Array.isArray(s.profiles_off) && !s.profiles_off.length;
+    const still = Array.isArray(s.allowed_out) ? s.allowed_out : null;
+    // A finished fetch's way out that would not close is let out as much as an Allow rule is; a cut closes both
+    const holes = Array.isArray(s.fetch_paths_open) ? s.fetch_paths_open.length : 0;
+    const cutStage = stage === 'cut' || stage === 'cut_policy';
+    let key;
+    if (!on) key = 'open';
+    else if (off) key = cutStage ? 'cutoff' : 'isooff';
+    else if (cutStage && (s.verified !== true || !enforced)) key = 'cutunconfirmed';
+    else if (stage === 'cut') key = s.converging ? 'securing' : 'unsecured';
+    else if (stage === 'cut_policy') key = 'nofetch';
+    else if (stage === 'isolated') key = (still && still.length) || holes ? 'reopened' : s.verified === true && still && enforced ? 'isolated' : 'unconfirmed';
+    else key = 'unconfirmed';
+    const closed = ['securing', 'unsecured', 'isolated', 'nofetch'].includes(key);
+    const action = off ? 'none' : !on || !closed ? 'cut' : 'leave';
+    const held = 'Cut by one outbound Block rule, read back.';
+    const offText = 'Windows Firewall is off for a profile, so nothing is enforced: no rule works there, the cut rule neither.';
+    const [label, now] = {
+        open: ['CUT THE NETWORK', 'TDC is not isolating the chamber.'],
+        securing: ['CUT · SECURING…', `${held} Windows' own Allow rules are being switched off in the background.`],
+        unsecured: ['CUT · NOT SECURED', `${held} The securing behind it did not get through; the band says what.`],
+        isolated: ['ISOLATED', 'Isolated: Block on every profile and no outbound Allow rule but TDC\'s own enabled, read back.'],
+        reopened: ['ISOLATED · OPEN', `Isolated, but ${holes && !(still && still.length) ? 'a finished fetch left a way out open' : 'an outbound Allow rule is enabled again'} and lets traffic out.`],
+        nofetch: ['CUT · NO FETCH', `${held} It stays: something a group policy allows cannot be switched off from here.`],
+        unconfirmed: ['ISOLATED · NOT CONFIRMED', 'ISOLATED is on, but that nothing gets out was not confirmed.'],
+        cutunconfirmed: ['CUT · NOT CONFIRMED', 'Whether the cut holds is not confirmed: its rule was not read back as standing (or, read again, no longer stands), or the firewall profiles could not be read.'],
+        cutoff: ['CUT · FIREWALL OFF', offText],
+        isooff: ['ISOLATED · FIREWALL OFF', offText],
+    }[key];
+    const disabled = !!off;
+    const press = disabled ? `${off}${on ? ' The way out of ISOLATED is in the band: LEAVE ISOLATED, or TURN THE FIREWALL ON.' : ''}`
+        : key === 'open' ? FW_ISOLATE_TEXT
+            : action === 'cut' ? 'One press cuts again, without a question: a Block rule beats every Allow rule.'
+                : `A press leaves it${key === 'securing' ? ' and stops the background work' : ''} (asks first).`;
+    return { key, label, on, action, disabled, note: disabled ? (on ? now : off) : now, title: key === 'open' ? press : `${now} ${press}` };
+}
+
+// Whether TDC's own fetch can get out, as the server knows it: true, false, or null for not known (never either)
+function fwCanFetchText(iso = fwState.isolate) {
+    const can = iso ? iso.can_fetch : null;
+    return can === true ? 'TDC can secure a sample now.' : can === false ? 'TDC cannot secure a sample now: no fetch gets through.'
+        : 'Whether TDC can secure a sample now is not known yet.';
+}
+
+// The panic button under SUMMARY, built like UPDATE ALL; while a switch is on its way it says so and waits
+function fwCutButtonHtml(iso = fwState.isolate) {
+    const st = fwCutState(iso);
+    const busy = fwIsoSwitching === 'on' ? 'CUTTING…' : fwIsoSwitching === 'off' ? 'LEAVING…' : '';
+    const title = busy ? (fwIsoSwitching === 'on' ? FW_CUT_WAIT : FW_ISOLATE_WAIT) : st.title;
+    return `<button type="button" id="firewall-cut" class="btn-skull fw-cut fw-cut-${st.key}" data-fw-cut aria-pressed="${st.on}"`
+        + ` aria-busy="${!!busy}"${busy || st.disabled ? ' disabled' : ''} title="${escapeHtml(title)}">`
+        + `<span class="btn-skull-art">${skullButtonSvg('-cut')}</span><span class="btn-skull-label">${escapeHtml(busy || st.label)}</span></button>`;
+}
+
+function fwRuleById(id) {
+    return (fwState.rules || []).find(r => r && r.rule_id === id) || null;
+}
+
+function fwRuleProto(rule) {
+    return rule ? (rule.protocol ? String(rule.protocol).toUpperCase() : 'ANY') : '?';
+}
+
+// The block of a whole program: a TDC rule with this image and no address
+function fwProcessRule(image) {
+    const img = String(image ?? '').toLowerCase();
+    return (fwState.rules || []).find(r => r && r.kind === 'block' && r.blocking !== false && !r.ip && r.image
+        && String(r.image).toLowerCase() === img) || null;
+}
+
+// Why a switch cannot say ALLOW or DENY: the rules are unreadable, failed to load, or not loaded yet; '' when known
+function fwRulesUnknown() {
+    if (fwState.rulesError) return `The TDC rules could not be read, so whether this is blocked is unknown: ${fwShort(fwState.rulesError, 300)}`;
+    if (fwState.rulesListError) return `The list of TDC rules could not be loaded, so whether this is blocked is unknown: ${fwShort(fwState.rulesListError, 300)}`;
+    if (fwState.rules === null) return 'The TDC rules are still being read; until then whether this is blocked is unknown.';
+    return '';
+}
+
+function fwUnknownSwitch(reason) {
+    return `<span class="fw-switch is-unknown" title="${escapeHtml(reason || fwRulesUnknown())}">?</span>`;
+}
+
+// Whether the rule that blocks a flow is for another protocol than the flow's own (ruling 4)
+function fwProtoMismatch(flow, rule) {
+    return !!(rule && rule.protocol && flow.protocol && String(rule.protocol).toLowerCase() !== String(flow.protocol).toLowerCase());
+}
+
+function fwEndpointSwitch(flow) {
+    if (fwState.rulesError) return fwUnknownSwitch();
+    const off = fwEnforceOff();
+    if (flow.state === 'blocked' && !flow.rule_id) {
+        // The server says blocked and names no rule: never fall back to ALLOW
+        return `<span class="fw-switch is-deny is-unknown-rule" title="Blocked, by a rule the server did not name: which rule, and for which protocol, is unknown.">DENY<span class="fw-proto">?</span></span>`;
+    }
+    if (flow.state === 'blocked') {
+        const rule = fwRuleById(flow.rule_id);
+        const proto = fwRuleProto(rule);
+        const mismatch = fwProtoMismatch(flow, rule);
+        const what = !rule ? (fwState.rulesListError ? 'a rule whose protocol is unknown, because no list of rules could be read'
+            : fwState.rules === null ? 'a rule whose protocol is still being read' : 'a rule not in the list read') : rule.protocol ? `a rule for ${proto} only` : 'a rule for every protocol';
+        const title = `Blocked by ${fwText(flow.rule_id)}, ${what}`
+            + (mismatch ? `; this connection is ${String(flow.protocol).toUpperCase()}, so it may still get through` : '')
+            + '. Click to remove the rule.';
+        return `<button type="button" class="fw-switch is-deny${mismatch ? ' is-mismatch' : ''}" data-fw-unblock="${escapeHtml(flow.rule_id)}" aria-pressed="true" title="${escapeHtml(off || title)}"${off ? ' disabled' : ''}>DENY<span class="fw-proto">${escapeHtml(proto)}</span></button>`;
+    }
+    const reason = off || (flow.self ? FW_SELF_NOTE : '');
+    const pending = flow.state === 'pending';
+    const title = pending ? 'A decision about this endpoint is open. Click to block this program to this address now.'
+        : 'Allowed. Click to block this program to this address, on every port.';
+    return `<button type="button" class="fw-switch ${pending ? 'is-pending' : 'is-allow'}" data-fw-block="endpoint" data-fw-key="${escapeHtml(fwFlowKey(flow))}" aria-pressed="false" title="${escapeHtml(reason || title)}"${reason ? ' disabled' : ''}>${pending ? 'PENDING' : 'ALLOW'}</button>`;
+}
+
+function fwProcessSwitch(proc) {
+    // A process-wide block is only known from the rule list: without it, never ALLOW
+    if (fwRulesUnknown()) return fwUnknownSwitch();
+    const off = fwEnforceOff();
+    const rule = fwProcessRule(proc.image);
+    if (rule) {
+        const title = `Every outbound connection of this program is blocked by ${fwText(rule.rule_id)} (${fwRuleProto(rule)}). Click to remove the rule.`;
+        return `<button type="button" class="fw-switch is-deny" data-fw-unblock="${escapeHtml(rule.rule_id)}" aria-pressed="true" title="${escapeHtml(off || title)}"${off ? ' disabled' : ''}>DENY<span class="fw-proto">${escapeHtml(fwRuleProto(rule))}</span></button>`;
+    }
+    const reason = off || (proc.self ? FW_SELF_NOTE : '');
+    return `<button type="button" class="fw-switch is-allow" data-fw-block="process" data-fw-key="${escapeHtml(proc.key)}" aria-pressed="false" title="${escapeHtml(reason || 'Click to block every outbound connection of this program.')}"${reason ? ' disabled' : ''}>ALLOW</button>`;
+}
+
+// --- The tree ---
+// The flows as groups (the sample's, TDC's own, local addresses), each a list of processes, the most severe first
+function fwGroups(flows) {
+    const groups = [{ id: 'main', title: 'PROCESSES', procs: new Map() }, { id: 'tdc', title: 'TDC', procs: new Map() },
+        { id: 'local', title: 'LOCAL', procs: new Map() }];
+    for (const f of flows) {
+        const group = f.self ? groups[1] : f.geo && f.geo.scope === 'local' ? groups[2] : groups[0];
+        const key = fwProcKey(f);
+        let proc = group.procs.get(key);
+        if (!proc) {
+            proc = { key, image: f.image, pid: f.pid, self: !!f.self, flows: [], count: 0, tags: new Set(), rank: ALERT_SEVERITIES.length - 1, times: [] };
+            group.procs.set(key, proc);
+        }
+        proc.flows.push(f);
+        proc.count += Number(f.count) || 0;
+        (f.tags || []).forEach(t => proc.tags.add(String(t)));
+        proc.rank = Math.min(proc.rank, fwToneRank(fwToneOf(fwFlowTags(f))));
+        if (proc.times.length < 2000) proc.times.push(...(f.times || []).slice(-200));
+    }
+    const flowRank = f => fwToneRank(fwToneOf(fwFlowTags(f)));
+    return groups.map(g => {
+        const procs = [...g.procs.values()];
+        procs.forEach(p => {
+            p.tone = ALERT_SEVERITIES[p.rank];
+            p.flows.sort((a, b) => flowRank(a) - flowRank(b) || (Number(b.count) || 0) - (Number(a.count) || 0));
+        });
+        procs.sort((a, b) => a.rank - b.rank || b.count - a.count || fwBase(a.image).localeCompare(fwBase(b.image)));
+        return { id: g.id, title: g.title, procs };
+    });
+}
+
+// Connections over the range, 16 bars of a small SVG
+function fwSparkSvg(times) {
+    const list = (times || []).map(Number).filter(Number.isFinite);
+    if (!list.length) return '<span class="fw-spark" aria-hidden="true"></span>';
+    const span = fwRangeMs(fwRange) / 1000;
+    const to = span ? Date.now() / 1000 : list.reduce((m, t) => Math.max(m, t), -Infinity);
+    let from = span ? to - span : list.reduce((m, t) => Math.min(m, t), Infinity);
+    if (!(to > from)) from = to - 1;
+    const bins = 16, counts = new Array(bins).fill(0);
+    for (const t of list) {
+        const i = Math.floor((t - from) / (to - from) * bins);
+        if (i >= 0) counts[Math.min(i, bins - 1)]++;
+    }
+    const top = Math.max(...counts) || 1;
+    const rects = counts.map((n, i) => {
+        if (!n) return '';
+        const h = Math.max(1.5, 12 * n / top);
+        return `<rect x="${i * 3}" y="${_chartCoord(12 - h)}" width="2" height="${_chartCoord(h)}"/>`;
+    }).join('');
+    return `<svg class="fw-spark" viewBox="0 0 48 12" width="48" height="12" aria-hidden="true"><path class="fw-spark-base" d="M0 11.5H48"/>${rects}</svg>`;
+}
+
+// The URLs seen for an endpoint: of its open and decided downloads, and of the samples secured from it
+function fwUrlsFor(flow) {
+    const out = [], seen = new Set();
+    const add = (url, status) => {
+        const u = String(url ?? '');
+        if (!u || seen.has(u) || out.length >= 5) return;
+        seen.add(u);
+        out.push({ url: u, status });
+    };
+    const mine = item => item && item.finding && item.finding.pid === flow.pid && item.finding.dst_ip === flow.dst_ip
+        && item.finding.dst_port === flow.dst_port;
+    (fwState.pending || []).filter(mine).forEach(item => add(item.finding.url, 'BLOCKED, ASKING'));
+    (fwState.history || []).filter(mine).forEach(item => add(item.finding.url, fwOwn(FW_DECIDED, item.action) || 'DECIDED'));
+    const ids = new Set((flow.capture_ids || []).map(String));
+    (fwState.captures || []).filter(c => c && ids.has(String(c.id))).forEach(c => add(c.url, 'SECURED'));
+    return out;
+}
+
+function fwUrlsHtml(flow) {
+    return fwUrlsFor(flow).map(({ url, status }) => {
+        const text = fwDefang(url);
+        return `<div class="fw-ep-url"><span class="fw-url-state">${escapeHtml(status)}</span><code class="fw-url" title="${escapeHtml(fwShort(text, 2000))}">${escapeHtml(fwShort(text, 120))}</code></div>`;
+    }).join('');
+}
+
+function fwEndpointHtml(flow) {
+    const id = `f:${fwFlowKey(flow)}`;
+    const tags = fwFlowTags(flow);
+    const host = flow.dst_hostname ? fwDefang(flow.dst_hostname) : '';
+    const geo = flow.geo || {};
+    const title = [host && fwShort(host, 500), fwAddr(flow), geo.country && fwShort(geo.country, 80),
+        geo.as_org && `AS${geo.asn ?? '?'} ${fwShort(geo.as_org, 120)}`, `${fwNumber(flow.count)} connections`].filter(Boolean).join(' · ');
+    const fwlog = Number(flow.fw_records) > 0
+        ? `<span class="fw-fwrec" title="${escapeHtml(`FW (endpoint): ${fwNumber(flow.fw_records)} records in the Windows Firewall log for this endpoint, of whichever process: ${fwNumber(flow.fw_allowed)} allowed, ${fwNumber(flow.fw_dropped)} dropped`)}">FW ${fwNumber(flow.fw_records)}</span>` : '';
+    // A point of the map selects an address: every row of that address is marked
+    const marked = fwSelected === id || fwSelected === `a:${flow.dst_ip}`;
+    return `<div class="fw-ep fw-tone-${fwToneOf(tags)}${marked ? ' is-selected' : ''}" role="listitem">`
+        + `<div class="fw-ep-row"><button type="button" class="fw-ep-main" data-fw-id="${escapeHtml(id)}" title="${escapeHtml(title)}">`
+        + `<span class="fw-ep-host">${escapeHtml(host ? fwShort(host, 80) : fwShort(flow.dst_ip, 46))}</span>`
+        + (geo.cc ? `<span class="fw-cc">${escapeHtml(fwShort(geo.cc, 3))}</span>` : '') + '</button>'
+        + `<span class="fw-num" title="Connections">${fwNumber(flow.count)}</span>${fwEndpointSwitch(flow)}</div>`
+        + `<div class="fw-ep-sub"><span class="fw-ep-addr">${escapeHtml(host ? fwShort(fwAddr(flow), 60) : fwShort(fwPortProto(flow), 20))}</span>`
+        + `${fwlog}<span class="fw-ep-tags">${fwTagChips(tags.filter(t => t !== 'detonated'), 3)}</span></div>`
+        + fwUrlsHtml(flow)
+        + (fwSelected === id ? `<div class="fw-row-actions">${fwLogsButton()}</div>` : '') + '</div>';
+}
+
+function fwProcHtml(proc) {
+    const id = `p:${proc.key}`;
+    const open = fwIsOpen(id, fwFilter.trim() ? true : !proc.self && proc.rank <= 1);
+    const detonated = proc.tags.has('detonated');
+    const name = fwShort(fwBase(proc.image), 60);
+    const shown = fwMore.has(proc.key) ? proc.flows : proc.flows.slice(0, FW_EP_PAGE);
+    const more = proc.flows.length > shown.length
+        ? `<button type="button" class="btn btn-xs fw-more" data-fw-more="${escapeHtml(proc.key)}">Show all ${fwNumber(proc.flows.length)} endpoints</button>` : '';
+    return `<div class="fw-proc fw-tone-${proc.tone}${detonated ? ' is-detonated' : ''}${fwSelected === id ? ' is-selected' : ''}">`
+        + `<div class="fw-proc-row"><button type="button" class="fw-caret-btn" data-fw-toggle="${escapeHtml(id)}" aria-expanded="${open}" aria-label="${escapeHtml(`${open ? 'Fold' : 'Unfold'} the endpoints of ${name}`)}"><span class="fw-caret" aria-hidden="true"></span></button>`
+        + `<button type="button" class="fw-name" data-fw-id="${escapeHtml(id)}" title="${escapeHtml(`${fwShort(proc.image, 500)} · PID ${proc.pid ?? '?'}`)}"><span class="fw-name-text">${escapeHtml(name)}</span><span class="fw-pid">${escapeHtml(String(proc.pid ?? ''))}</span></button>`
+        + fwSparkSvg(proc.times)
+        + `<span class="fw-num" title="${escapeHtml(`${fwNumber(proc.count)} connections to ${fwNumber(proc.flows.length)} endpoints`)}">${fwNumber(proc.count)}</span>`
+        + fwProcessSwitch(proc) + '</div>'
+        + (fwSelected === id ? `<div class="fw-row-actions">${fwLogsButton()}${fwKillButton(proc)}</div>` : '')
+        + (proc.tags.size ? `<div class="fw-proc-tags">${detonated ? '<span class="fw-det" title="The process or one of its ancestors is a submission">DETONATED</span>' : ''}`
+            + `${fwTagChips([...proc.tags].filter(t => t !== 'detonated'), 3)}</div>` : '')
+        + (open ? `<div class="fw-eps" role="list">${shown.map(fwEndpointHtml).join('')}${more}</div>` : '')
+        + '</div>';
+}
+
+// in LOGS ▸: the perspective switch for the selection, one click away wherever the selection is shown
+function fwLogsButton() {
+    return '<button type="button" class="btn btn-xs fw-logs" data-fw-logs title="Search the logs for the selection in the LOGS tab">in LOGS ▸</button>';
+}
+
+// KILL: taskkill /F for a selected process (asks first); never for TDC's own
+function fwKillButton(proc) {
+    const title = proc.self ? 'One of TDC\'s own processes: it is not killed from here.'
+        : `End ${fwShort(fwBase(proc.image), 60)} (PID ${proc.pid ?? '?'}) at once with taskkill /F (asks first).`;
+    return `<button type="button" class="btn btn-xs fw-kill" data-fw-kill="${escapeHtml(proc.key)}" title="${escapeHtml(title)}"${proc.self ? ' disabled' : ''}>KILL</button>`;
+}
+
+// The LOGS search for the selection: a process by its image, an endpoint by its address, both for one flow
+// A process and a connection are one run of the image, as their window is: with its PID when it is known
+// (Windows gives a PID to the next process, so the image alone would match every run)
+function fwLogsQuery(sel) {
+    if (!sel) return '';
+    const pid = Number.isInteger(Number(sel.pid)) && sel.pid !== null && sel.pid !== '' ? ` pid=${logsQuote(String(sel.pid))}` : '';
+    if (sel.kind === 'process') return `image=${logsQuote(sel.image)}${pid}`;
+    if (sel.kind === 'flow') return `image=${logsQuote(sel.image)}${pid} dst_ip=${logsQuote(sel.ip)}`;
+    return `dst_ip=${logsQuote(sel.ip)}`;
+}
+
+function fwOpenLogs() {
+    const sel = fwSelection();
+    const query = fwLogsQuery(sel);
+    if (!query) return false;
+    const range = fwLogsRange(sel.flows);
+    return openLogsTab(query, range.earliest, range.latest, fwBackTo(sel), range.note);
+}
+
+// The LOGS range of these connections: from the first to the last, FW_LOGS_PAD_MS either side, with `note`, what
+// LOGS says about it. A last packet less than the margin ago may be from a connection still running: the range
+// runs to now then (the VM's clock, as far as /pending told it), and grows with every search. A time that cannot
+// be read gives the tab's range, and the note says so.
+function fwLogsRange(flows) {
+    let first = Infinity, last = -Infinity;
+    for (const f of flows || []) {
+        const from = Date.parse(f && f.first_seen), to = Date.parse(f && f.last_seen);
+        if (!Number.isFinite(from) || !Number.isFinite(to)) return fwRangeFallback('A time of these connections could not be read');
+        first = Math.min(first, from);
+        last = Math.max(last, to);
+    }
+    if (!(last >= first)) return fwRangeFallback('These connections have no times');
+    const end = last + FW_LOGS_PAD_MS;
+    if (end >= Date.now() + (fwPendingSkew || 0)) {
+        return { earliest: fwIso(first - FW_LOGS_PAD_MS), latest: '',
+            note: 'To now: the last packet is recent, so the connection may still be running and this search grows with it.' };
+    }
+    return { earliest: fwIso(first - FW_LOGS_PAD_MS), latest: fwIso(end), note: '' };
+}
+
+// The tab's range in place of one that could not be worked out, and why
+function fwRangeFallback(why) {
+    if (fwRange === 'All') {
+        return { earliest: '', latest: '', note: `${why}: the FIREWALL range (everything kept) is used instead. `
+            + 'It is not theirs: it holds other events too, and LOGS may no longer keep the oldest of theirs.' };
+    }
+    // A range that ends now and starts fwRange ago is not theirs: it holds other events, and misses whatever of
+    // theirs came before it (an old download, the start of a connection that was already open)
+    return { earliest: fwEarliest(), latest: '', note: `${why}: the FIREWALL range (the last ${fwRange}) is used instead. `
+        + 'It is not theirs: it can hold more than they do, and it misses whatever of them came before it, such as an old download or the start of a connection that was already open.' };
+}
+
+function fwIso(ms) {
+    return new Date(ms).toISOString().replace(/\.\d+Z$/, 'Z');
+}
+
+// The way back from LOGS to this selection: its id, its parts should the id not come back (a process that
+// restarted), and the tree's filter as it is now
+function fwBackTo(sel) {
+    const filter = { select: sel.id, text: fwFilter };
+    if (sel.image) filter.image = sel.image;
+    if (sel.ip) filter.ip = sel.ip;
+    if (sel.kind !== 'address' && sel.pid !== null && sel.pid !== undefined) filter.pid = sel.pid;
+    if (sel.kind === 'flow') filter.port = sel.flows[0].dst_port;
+    return { tab: 'firewall', filter };
+}
+
+async function fwKill(proc) {
+    const p = proc || {};
+    const pid = Number(p.pid);
+    if (p.self || !Number.isInteger(pid)) return false;
+    const name = fwShort(fwBase(p.image), 60);
+    const ok = await tdcConfirm({ title: `Kill ${name} (PID ${pid})?`, danger: true, confirmLabel: 'KILL',
+        message: `taskkill /F ends ${name} at once, without letting it clean up. Its telemetry stops there: no more connections, `
+            + 'files or child processes of it to watch, and whatever it was about to fetch stays unknown. TDC refuses if the '
+            + `process holding PID ${pid} now started after the last connection seen under that PID, because then Windows has given the PID to `
+            + 'another process; the check is only as fine as Sysmon\'s timestamps, a millisecond.' });
+    if (!ok) return false;
+    const r = await fwPost('/api/firewall/kill', { pid });
+    if (!r.ok) {
+        showToast('error', `Not killed: ${name} (PID ${pid})`, r.error);
+        return false;
+    }
+    showToast('success', `Killed: ${name} (PID ${pid})`, 'taskkill /F ended it.');
+    await refreshFirewall();
+    return true;
+}
+
+// TURN THE FIREWALL ON, from the red band: the analyst's call, since it changes what the malware sees
+async function fwEnableFirewall() {
+    const ok = await tdcConfirm({ title: 'Turn the Windows Firewall on?', confirmLabel: 'TURN IT ON',
+        message: 'This switches the Windows Firewall on for the Domain, Private and Public profiles. It changes what the malware '
+            + 'sees: a sample that looks for a firewall, or whose traffic the profiles\' own rules now filter, may behave '
+            + 'differently from here on. TDC never does this by itself; it is your call. Blocks and ISOLATED take effect only once it is on.' });
+    if (!ok) return false;
+    const r = await fwPost('/api/firewall/enable', {});
+    if (r.data && r.data.state && typeof r.data.state === 'object') fwSetIsolateState(r.data.state);
+    if (!r.ok) {
+        showToast('error', 'The firewall is not on', r.error);
+    } else {
+        showToast('success', 'The Windows Firewall is on', 'Every profile reads back as on; blocks and ISOLATED take effect now.');
+    }
+    renderFirewallHead();
+    renderFirewallBands();
+    await refreshFirewall();
+    return r.ok;
+}
+
+function fwGroupHtml(group) {
+    if (group.id === 'main') {
+        return `<div class="fw-group fw-group-main" data-fw-open="true">${group.procs.map(fwProcHtml).join('')}</div>`;
+    }
+    const open = fwIsOpen(group.id, false);
+    const rank = group.procs.reduce((m, p) => Math.min(m, p.rank), ALERT_SEVERITIES.length - 1);
+    const tags = [...new Set(group.procs.flatMap(p => p.flows.flatMap(fwFlowTags)))];
+    const worst = tags.filter(t => fwToneRank(fwOwn(FW_TONES, t)) === rank && rank < ALERT_SEVERITIES.length - 1);
+    return `<div class="fw-group fw-group-${group.id}" data-fw-open="${open}">`
+        + `<button type="button" class="fw-group-head" data-fw-group="${group.id}" aria-expanded="${open}" title="${escapeHtml(FW_GROUP_INFO[group.id])}">`
+        + `<span class="fw-caret" aria-hidden="true"></span><span class="fw-group-name">${group.title}</span>`
+        + `<span class="fw-num">${fwNumber(group.procs.length)}</span>${fwTagChips(worst, 2)}</button>`
+        + (open ? group.procs.map(fwProcHtml).join('') : '') + '</div>';
+}
+
+function fwEmptyText(flows) {
+    if (fwState.error && !fwState.flows.length) return `The connections could not be loaded: ${fwShort(fwState.error, 300)}`;
+    if (!fwState.loaded) return 'Loading connections…';
+    if ((flows || []).length) {
+        const what = `“${fwShort(fwFilter.trim(), 120)}”`;
+        return fwRange === 'All' ? `No connection kept matches ${what}. Clear the filter for all of them.`
+            : `No connection in the last ${fwRange} matches ${what}. A wider range shows older connections; clear the filter for all of them.`;
+    }
+    return 'No connections in this range. Sysmon network events appear here as they come in; a wider range shows older ones.';
+}
+
+function renderFirewallTree(flows) {
+    const host = document.getElementById('firewall-tree');
+    if (!host) return;
+    const list = fwVisible(flows || []);
+    host.innerHTML = list.length ? fwGroups(list).filter(g => g.procs.length).map(fwGroupHtml).join('')
+        : `<div class="fw-empty">${escapeHtml(fwEmptyText(flows))}</div>`;
+}
+
+// --- MAP | LIST | ASN ---
+function renderFirewallView() {
+    if (fwView === 'list') renderFirewallList(fwState.flows);
+    else if (fwView === 'asn') renderFirewallAsn(fwState.flows);
+    else if (fwView === 'decisions') renderFirewallDecisions();
+    else renderFirewallMap(fwState.flows);
+}
+
+function renderFirewallViews() {
+    const host = document.getElementById('firewall-views');
+    if (host) host.innerHTML = FW_VIEWS.map(v => `<button type="button" class="chart-range-btn" data-fw-view="${v}" aria-pressed="${v === fwView}">${v.toUpperCase()}</button>`).join('');
+}
+
+function fwMapTitle(p) {
+    const images = [...new Set(p.flows.map(f => fwBase(f.image)))];
+    const ports = [...new Set(p.flows.map(f => `${f.dst_port ?? '?'}/${String(f.protocol || '').toUpperCase()}`))];
+    const geo = p.geo || {};
+    const tags = [...new Set(p.flows.flatMap(fwFlowTags))];
+    return [p.host ? `${fwShort(fwDefang(p.host), 200)} (${p.ip})` : p.ip,
+        `${images.slice(0, 3).map(i => fwShort(i, 60)).join(', ')}${images.length > 3 ? ` and ${images.length - 3} more` : ''} · ${ports.slice(0, 4).join(' ')}`,
+        [geo.as_org && `AS${geo.asn ?? '?'} ${fwShort(geo.as_org, 120)}`, geo.country && fwShort(geo.country, 80)].filter(Boolean).join(' · '),
+        tags.length ? tags.map(t => fwShort(t, 24)).join(', ') : 'no tags', `${fwNumber(p.count)} connections`].filter(Boolean).join('\n');
+}
+
+// MAP: an arc from the chamber to every public destination (by address), as wide as its connections and
+// coloured by its most severe tag; a local address is never drawn
+function renderFirewallMap(flows) {
+    const host = document.getElementById('firewall-view');
+    if (!host) return;
+    const visible = fwVisible(flows || []);
+    const byIp = new Map();
+    let local = 0;
+    for (const f of visible) {
+        if (!f.geo || f.geo.scope !== 'public') {
+            if (f.geo && f.geo.scope === 'local') local++;
+            continue;
+        }
+        let p = byIp.get(f.dst_ip);
+        if (!p) {
+            p = { ip: String(f.dst_ip ?? ''), flows: [], count: 0, rank: ALERT_SEVERITIES.length - 1, pending: false, geo: f.geo, host: '' };
+            byIp.set(f.dst_ip, p);
+        }
+        p.flows.push(f);
+        p.count += Number(f.count) || 0;
+        p.rank = Math.min(p.rank, fwToneRank(fwToneOf(fwFlowTags(f))));
+        if (f.state === 'pending') p.pending = true;
+        if (!p.host && f.dst_hostname) p.host = f.dst_hostname;
+    }
+    const all = [...byIp.values()];
+    const placed = all.filter(p => project(p.geo.lon, p.geo.lat));
+    placed.sort((a, b) => a.rank - b.rank || b.count - a.count);
+    const drawn = placed.slice(0, FW_MAP_MAX);
+    const points = drawn.map(p => ({ id: `a:${p.ip}`, lon: p.geo.lon, lat: p.geo.lat, tone: ALERT_SEVERITIES[p.rank],
+        r: 2.5 + Math.min(3.5, Math.log10(1 + p.count)), label: p.host ? fwDefang(p.host) : p.ip, title: fwMapTitle(p) }));
+    const arcs = drawn.map(p => ({ from: WORLD_CHAMBER_ID, to: `a:${p.ip}`, tone: ALERT_SEVERITIES[p.rank], weight: p.count,
+        pending: p.pending, title: fwMapTitle(p) }));
+    const notes = [];
+    if (fwState.summary && fwState.summary.geo_available === false) {
+        notes.push('No geo data, so no destination can be placed: run make geoip on the host and deploy again.');
+    }
+    if (placed.length > drawn.length) notes.push(`The ${fwNumber(drawn.length)} most severe of ${fwNumber(placed.length)} destinations are drawn; LIST has them all.`);
+    if (all.length > placed.length) notes.push(`${fwNumber(all.length - placed.length)} public destinations without a known position are in LIST.`);
+    if (local) notes.push(`${fwNumber(local)} connections to local addresses are in the tree, not on the map.`);
+    if (fwState.loaded && !all.length && !visible.length) notes.push(fwEmptyText(flows));
+    // The perspective switch sits on the selected point itself
+    const sel = fwSelection();
+    const at = sel && sel.ip ? drawn.find(p => p.ip === sel.ip) : null;
+    const xy = at ? project(at.geo.lon, at.geo.lat) : null;
+    const pin = xy ? `<span class="fw-map-pin${xy[0] > WORLD_BOX.w * 0.75 ? ' is-left' : ''}" style="left:${_chartCoord(100 * xy[0] / WORLD_BOX.w)}%;top:${_chartCoord(100 * xy[1] / (WORLD_BOX.h + WORLD_DOCK))}%">${fwLogsButton()}</span>` : '';
+    host.innerHTML = `<div class="fw-map-wrap chart-clickable">${worldMapSvg(points, arcs, { world: fwWorld })}${pin}</div>`
+        + (notes.length ? `<div class="fw-map-notes">${notes.map(n => `<span>${escapeHtml(n)}</span>`).join('')}</div>` : '');
+}
+
+// [text, title, kind] of LIST's State column
+function fwStateCell(flow) {
+    if (fwState.rulesError) return ['?', 'The TDC rules could not be read', 'unknown'];
+    if (flow.state === 'blocked') {
+        if (!flow.rule_id) return ['DENY ?', 'Blocked, by a rule the server did not name', 'deny'];
+        const rule = fwRuleById(flow.rule_id);
+        if (fwProtoMismatch(flow, rule)) {
+            return [`DENY ${fwRuleProto(rule)} ≠ ${String(flow.protocol).toUpperCase()}`, `Blocked by ${fwText(flow.rule_id)}, a rule for `
+                + `${fwRuleProto(rule)} only; this connection is ${String(flow.protocol).toUpperCase()}, so it may still get through`, 'deny is-mismatch'];
+        }
+        return [`DENY ${fwRuleProto(rule)}`, `Blocked by ${fwText(flow.rule_id)}`, 'deny'];
+    }
+    return flow.state === 'pending' ? ['PENDING', 'A decision is open', 'pending'] : ['ALLOW', 'Allowed', 'allow'];
+}
+
+// LIST: the same flows as a sortable table; the firewall log's numbers are the endpoint's
+function renderFirewallList(flows) {
+    const host = document.getElementById('firewall-view');
+    if (!host) return;
+    const list = fwVisible(flows || []);
+    if (!list.length) {
+        host.innerHTML = `<div class="fw-empty">${escapeHtml(fwEmptyText(flows))}</div>`;
+        return;
+    }
+    const rows = list.slice(0, FW_LIST_MAX).map(f => {
+        const id = `f:${fwFlowKey(f)}`, geo = f.geo || {}, tags = fwFlowTags(f), tone = fwToneOf(tags);
+        const host = f.dst_hostname ? fwDefang(f.dst_hostname) : '';
+        const [state, stateTitle, stateKind] = fwStateCell(f);
+        const fwlog = Number(f.fw_records) > 0 ? `${fwNumber(f.fw_allowed)} / ${fwNumber(f.fw_dropped)}` : '';
+        return `<tr class="fw-list-row fw-tone-${tone}${fwSelected === id ? ' is-selected' : ''}" data-fw-id="${escapeHtml(id)}">`
+            + `<td class="fw-cell-proc" title="${escapeHtml(fwShort(f.image, 500))}" data-sort-value="${escapeHtml(fwShort(fwBase(f.image), 200))}">${escapeHtml(fwShort(fwBase(f.image), 60))}</td>`
+            + `<td class="logs-cell-num" data-sort-value="${Number(f.pid) || 0}">${escapeHtml(String(f.pid ?? ''))}</td>`
+            + `<td title="${escapeHtml(fwShort(host, 500))}">${escapeHtml(fwShort(host, 40))}</td>`
+            + `<td>${escapeHtml(fwShort(f.dst_ip, 46))}</td>`
+            + `<td class="logs-cell-num" data-sort-value="${Number(f.dst_port) || 0}">${escapeHtml(String(f.dst_port ?? ''))}</td>`
+            + `<td>${escapeHtml(String(f.protocol || '').toUpperCase().slice(0, 8))}</td>`
+            + `<td title="${escapeHtml(fwShort(geo.country, 80))}">${escapeHtml(fwShort(geo.cc, 3))}</td>`
+            + `<td title="${escapeHtml(fwShort(geo.as_org, 200))}">${escapeHtml(fwShort(geo.as_org, 30))}</td>`
+            + `<td class="fw-cell-tags" data-sort-value="${fwToneRank(tone)}">${fwTagChips(tags, 3)}</td>`
+            + `<td class="logs-cell-num" data-sort-value="${Number(f.count) || 0}">${fwNumber(f.count)}</td>`
+            + `<td class="logs-cell-num" data-sort-value="${Number(f.fw_records) || 0}" title="Allowed / dropped records of the Windows Firewall log for this endpoint, of whichever process">${fwlog}</td>`
+            + `<td class="fw-cell-state ${stateKind.split(' ').map(k => k.startsWith('is-') ? k : `fw-state-${k}`).join(' ')}" title="${escapeHtml(stateTitle)}">${escapeHtml(state)}</td>`
+            + `<td class="logs-cell-time" data-sort-value="${escapeHtml(sortTimeValue(f.last_seen))}">${escapeHtml(formatAlertTime(f.last_seen))}</td></tr>`;
+    }).join('');
+    const head = ['Process', 'PID', 'Destination', 'Address', 'Port', 'Proto', 'CC', 'AS', 'Tags', 'Conn.', 'FW (endpoint)', 'State', 'Last seen']
+        .map(c => `<th>${c}</th>`).join('');
+    const cut = list.length > FW_LIST_MAX ? `<div class="fw-map-notes"><span>The first ${fwNumber(FW_LIST_MAX)} of ${fwNumber(list.length)} are listed.</span></div>` : '';
+    host.innerHTML = `<div class="logs-table-wrap fw-table-wrap"><table class="logs-table fw-table" data-sortable data-sort-id="firewall-list"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>${cut}`;
+}
+
+// ASN: the public destinations by the organisation that owns them, so that five "different" addresses of
+// one hoster stand in one row
+function renderFirewallAsn(flows) {
+    const host = document.getElementById('firewall-view');
+    if (!host) return;
+    const groups = new Map();
+    for (const f of fwVisible(flows || [])) {
+        if (!f.geo || f.geo.scope !== 'public') continue;
+        const geo = f.geo;
+        const key = geo.asn !== null && geo.asn !== undefined ? `AS${geo.asn}` : geo.as_org ? `org:${geo.as_org}` : '?';
+        let g = groups.get(key);
+        if (!g) {
+            g = { asn: geo.asn, org: geo.as_org || '', ips: new Map(), images: new Set(), countries: new Set(), count: 0, rank: ALERT_SEVERITIES.length - 1 };
+            groups.set(key, g);
+        }
+        const rank = fwToneRank(fwToneOf(fwFlowTags(f)));
+        g.ips.set(f.dst_ip, Math.min(g.ips.has(f.dst_ip) ? g.ips.get(f.dst_ip) : rank, rank));
+        g.images.add(f.image);
+        if (geo.cc) g.countries.add(String(geo.cc));
+        g.count += Number(f.count) || 0;
+        g.rank = Math.min(g.rank, rank);
+    }
+    const list = [...groups.values()].sort((a, b) => a.rank - b.rank || b.ips.size - a.ips.size || b.count - a.count);
+    if (!list.length) {
+        host.innerHTML = `<div class="fw-empty">${escapeHtml(fwState.loaded && !(flows || []).length ? fwEmptyText(flows) : 'No public destinations.')}</div>`;
+        return;
+    }
+    const rows = list.map(g => {
+        const tone = ALERT_SEVERITIES[g.rank];
+        const ips = [...g.ips.entries()].sort((a, b) => a[1] - b[1]);
+        const chips = ips.slice(0, 8).map(([ip, rank]) => `<button type="button" class="fw-ip fw-tone-${ALERT_SEVERITIES[rank]}" data-fw-id="${escapeHtml(`a:${ip}`)}">${escapeHtml(fwShort(ip, 46))}</button>`).join('')
+            + (ips.length > 8 ? `<span class="fw-tag fw-tag-more">+${ips.length - 8}</span>` : '');
+        const countries = [...g.countries];
+        return `<tr class="fw-list-row fw-tone-${tone}">`
+            + `<td class="fw-cell-org" title="${escapeHtml(fwShort(g.org, 300))}">${escapeHtml(g.org ? fwShort(g.org, 40) : 'Unknown AS')}</td>`
+            + `<td data-sort-value="${Number(g.asn) || 0}">${g.asn !== null && g.asn !== undefined ? escapeHtml(`AS${fwShort(g.asn, 12)}`) : ''}</td>`
+            + `<td title="${escapeHtml(countries.map(c => fwShort(c, 3)).join(', '))}">${escapeHtml(countries.slice(0, 4).map(c => fwShort(c, 3)).join(' '))}${countries.length > 4 ? ' …' : ''}</td>`
+            + `<td class="logs-cell-num" data-sort-value="${g.ips.size}">${fwNumber(g.ips.size)}</td>`
+            + `<td class="fw-cell-ips">${chips}</td>`
+            + `<td class="logs-cell-num" data-sort-value="${g.images.size}">${fwNumber(g.images.size)}</td>`
+            + `<td class="logs-cell-num" data-sort-value="${g.count}">${fwNumber(g.count)}</td>`
+            + `<td data-sort-value="${g.rank}"><span class="fw-tag fw-tone-${tone}">${tone.toUpperCase()}</span></td></tr>`;
+    }).join('');
+    const head = ['AS organisation', 'ASN', 'Countries', 'Addresses', '', 'Processes', 'Conn.', 'Tone'].map(c => `<th>${c}</th>`).join('');
+    host.innerHTML = `<div class="logs-table-wrap fw-table-wrap"><table class="logs-table fw-table" data-sortable data-sort-id="firewall-asn"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+
+// --- Summary, hints, captures ---
+function renderFirewallSummary(summary) {
+    const host = document.getElementById('firewall-summary');
+    if (!host) return;
+    if (!summary) {
+        host.innerHTML = `<div class="fw-empty">${escapeHtml(fwState.summaryError ? `The summary could not be loaded: ${fwShort(fwState.summaryError, 300)}` : 'Loading the summary…')}</div>`;
+        return;
+    }
+    const s = summary;
+    const tile = (label, value, sub, tone, title) => `<div class="fw-tile${tone ? ` fw-tone-${tone}` : ''}"${title ? ` title="${escapeHtml(title)}"` : ''}><span class="fw-tile-label">${label}</span>`
+        + `<span class="fw-tile-value">${value === null ? '?' : fwNumber(value)}</span>${sub ? `<span class="fw-tile-sub">${sub}</span>` : ''}</div>`;
+    // Without the rules, how many connections are blocked is not known: "0" would say none are
+    const rulesUnread = fwState.rulesError || s.rules_error;
+    const tiles = tile('CONNECTIONS', s.connections, `${fwNumber(s.events)} single connections`, '')
+        + (rulesUnread ? tile('BLOCKED', null, 'rules unreadable', '', `The TDC rules could not be read, so which connections are blocked is unknown: ${fwShort(rulesUnread, 300)}`)
+            : tile('BLOCKED', s.blocked, '', Number(s.blocked) > 0 ? 'high' : ''))
+        + tile('OPEN DECISIONS', s.open_decisions, '', Number(s.open_decisions) > 0 ? 'critical' : '')
+        + tile('SAMPLES', s.captures_total, 'secured', '');
+    const top = (title, items, label) => {
+        const list = Array.isArray(items) ? items : [];
+        const max = list.reduce((m, i) => Math.max(m, Number(i && i.count) || 0), 1);
+        const rows = list.map(item => {
+            const [text, full, id] = label(item || {});
+            const share = Math.max(2, Math.min(100, Math.round(100 * (Number(item && item.count) || 0) / max)));
+            const inner = `<span class="fw-top-label">${escapeHtml(text)}</span><span class="fw-num">${fwNumber(item && item.count)}</span>`;
+            return `<li class="fw-top-row" style="--share:${share}%" title="${escapeHtml(full)}">`
+                + (id ? `<button type="button" class="fw-top-btn" data-fw-id="${escapeHtml(id)}">${inner}</button>` : inner) + '</li>';
+        }).join('');
+        return `<div class="fw-top"><h4 class="fw-top-title">${title}</h4><ul class="fw-top-list">${rows || '<li class="fw-top-none">None.</li>'}</ul></div>`;
+    };
+    const stale = fwState.summaryError ? `<div class="fw-stale">${escapeHtml(`Not updated: ${fwShort(fwState.summaryError, 300)}`)}</div>` : '';
+    host.innerHTML = `<div class="chart-card fw-sum-card"><div class="chart-card-head"><h3 class="chart-card-title" data-info="What the range holds: connections (bundled per process and endpoint), blocks, open decisions and secured samples, with the busiest processes, endpoints and countries.">SUMMARY</h3></div>`
+        + `${stale}<div class="fw-tiles">${tiles}</div>`
+        + top('TOP PROCESSES', s.top_processes, i => [fwShort(fwBase(i.image), 40), fwShort(i.image, 500), ''])
+        + top('TOP ENDPOINTS', s.top_endpoints, i => {
+            const name = i.dst_hostname ? fwDefang(i.dst_hostname) : String(i.dst_ip ?? '');
+            const port = i.dst_port === null || i.dst_port === undefined ? '' : `:${i.dst_port}`;
+            return [`${fwShort(name, 40)}${port}`, `${fwShort(name, 500)} (${fwShort(i.dst_ip, 46)}${port})`, i.dst_ip ? `a:${i.dst_ip}` : ''];
+        })
+        + top('TOP COUNTRIES', s.top_countries, i => [`${fwShort(i.cc, 3)} ${fwShort(i.country, 40)}`.trim(), fwShort(i.country, 80), ''])
+        + `<p class="fw-sum-note">${escapeHtml(fwShort(s.bytes_note || FW_BYTES_NOTE, 300))} The bars count connections; exact traffic needs the proxy of Part B.</p></div>`;
+}
+
+function fwSelectionHtml(sel) {
+    const f = sel.flows[0];
+    const name = sel.image ? fwShort(fwBase(sel.image), 60) : `${fwNumber(new Set(sel.flows.map(x => x.image)).size)} processes`;
+    const host = f.dst_hostname ? fwDefang(f.dst_hostname) : '';
+    const geo = f.geo || {};
+    let what;
+    if (sel.kind === 'process') what = `${name} · PID ${sel.pid ?? '?'} · ${fwNumber(sel.flows.length)} endpoints`;
+    else what = `${sel.kind === 'flow' ? `${name} → ` : ''}${host ? `${fwShort(host, 80)} ` : ''}${sel.kind === 'flow' ? fwAddr(f) : fwShort(sel.ip, 46)}`
+        + `${sel.kind === 'address' ? ` · ${name}` : ''}${geo.as_org ? ` · ${fwShort(geo.as_org, 40)}` : ''}${geo.cc ? ` · ${fwShort(geo.cc, 3)}` : ''}`;
+    let actions = fwLogsButton();
+    if (sel.ip) {
+        const off = fwEnforceOff();
+        actions += `<button type="button" class="btn btn-xs fw-copy" data-fw-copy="${escapeHtml(host || String(sel.ip))}" title="Copy ${escapeHtml(host ? 'the defanged name' : 'the address')}">COPY</button>`
+            + `<button type="button" class="btn btn-xs fw-block-all" data-fw-block="endpoint_all" data-fw-ip="${escapeHtml(sel.ip)}" title="${escapeHtml(off || 'Block this address for every program, TDC\'s own fetcher included (asks first).')}"${off ? ' disabled' : ''}>BLOCK FOR EVERY PROGRAM</button>`;
+    }
+    return `<span class="fw-sel-what" title="${escapeHtml(what)}">${escapeHtml(what)}</span><span class="fw-sel-actions">${actions}</span>`;
+}
+
+// HUNT FURTHER: ready queries for the LOGS tab about the selection, and those always worth a look
+function renderFirewallHints(sel) {
+    const host = document.getElementById('firewall-hints');
+    if (!host) return;
+    const items = FW_HINTS.map((hint, i) => ({ hint, i })).filter(({ hint }) => !hint.needs || (sel && sel[hint.needs]))
+        .map(({ hint, i }) => `<li><button type="button" class="fw-hint" data-fw-hint="${i}" title="Run this search in LOGS">`
+            + `<span class="fw-hint-label">${escapeHtml(hint.label)}</span><code class="fw-hint-query">${escapeHtml(hint.query(sel || {}))}</code></button></li>`).join('');
+    host.innerHTML = '<div class="chart-card-head"><h3 class="chart-card-title" data-info="Ready searches for the LOGS tab about the selected process or endpoint, and a few that are always worth a look. A click runs one there.">HUNT FURTHER</h3></div>'
+        + `<div class="fw-sel">${sel ? fwSelectionHtml(sel) : fwWantMissed ? `<span class="fw-sel-none fw-sel-missed" role="status">${escapeHtml(fwWantMissed)}</span>`
+            : '<span class="fw-sel-none">Select a process, an endpoint or a point of the map for the searches about it.</span>'}</div>`
+        + `<ul class="fw-hint-list">${items}</ul>`;
+}
+
+// SECURED SAMPLES: what TDC fetched itself, to open by its path; nothing here runs a file
+function renderFirewallCaptures(captures) {
+    const host = document.getElementById('firewall-captures');
+    if (!host) return;
+    const known = Array.isArray(captures);
+    const list = known ? captures : [];
+    const rows = list.slice(0, 50).map(c => {
+        const url = fwDefang(c.url);
+        const sha = String(c.sha256 ?? '');
+        const dis = c.path ? '' : ' disabled';
+        const id = escapeHtml(String(c.id ?? ''));
+        const button = (kind, label, title) => `<button type="button" class="btn btn-xs" data-fw-open="${kind}" data-fw-capture="${id}" title="${title}"${dis}>${label}</button>`;
+        return '<li class="fw-cap">'
+            + `<span class="fw-cap-time">${escapeHtml(formatAlertTime(c.fetched_at))}</span>`
+            + `<code class="fw-url" title="${escapeHtml(fwShort(url, 2000))}">${escapeHtml(fwShort(url, 120))}</code>`
+            + `<span class="fw-cap-meta"><span class="fw-cap-magic">${escapeHtml(fwShort(c.magic || '?', 8))}</span>`
+            + `<span>${escapeHtml(formatSize(Number(c.size) || 0))}</span>`
+            + `<span class="fw-cap-sha" title="${escapeHtml(`SHA-256 ${fwShort(sha, 64)}`)}">${escapeHtml(fwShort(sha, 13))}</span>`
+            + (c.image ? `<span class="fw-cap-proc" title="${escapeHtml(fwShort(c.image, 500))}">${escapeHtml(fwShort(fwBase(c.image), 40))}</span>` : '') + '</span>'
+            + `<span class="fw-cap-actions">${button('rizin', 'RIZIN', 'Open the file in the RIZIN tab')}${button('hex', 'HEX', 'Open the file in the Hex editor')}`
+            + `${button('threatscan', 'THREATSCAN', 'Put the path into ThreatScan')}</span></li>`;
+    }).join('');
+    host.innerHTML = '<div class="chart-card-head"><h3 class="chart-card-title" data-info="The files TDC fetched itself for a download it blocked, kept by their SHA-256 and never run. Open one in Rizin, the Hex editor or ThreatScan.">SECURED SAMPLES</h3>'
+        + `<span class="fw-num">${known ? fwNumber(list.length) : '?'}</span></div>`
+        + (fwState.capturesError ? `<div class="fw-stale">${escapeHtml(`${known ? 'Not updated' : 'The secured samples could not be loaded'}: ${fwShort(fwState.capturesError, 300)}`)}</div>` : '')
+        + (rows ? `<ul class="fw-cap-list">${rows}</ul>` : known ? '<div class="fw-empty">None yet.</div>'
+            : fwState.capturesError ? '' : '<div class="fw-empty">Loading the secured samples…</div>');
+}
+
+function fwOpenCapture(kind, id) {
+    const cap = (fwState.captures || []).find(c => c && String(c.id) === String(id));
+    const path = cap && cap.path ? String(cap.path) : '';
+    if (!path) return false;
+    if (kind === 'rizin') openInRizin(path);
+    else if (kind === 'hex') hexOpenFile(path);
+    else if (kind === 'threatscan') {
+        threatscanResetDrop();
+        const input = document.getElementById('threatscan-filepath');
+        if (input) input.value = path;
+        switchTab('threatscan');
+    } else return false;
+    return true;
+}
+
+function fwOpenHint(index) {
+    const hint = FW_HINTS[index];
+    if (!hint) return false;
+    const sel = fwSelection();
+    if (hint.needs && !(sel && sel[hint.needs])) return false;
+    // A hint about the endpoint or the process covers all of its connections, whichever was selected; the others the range
+    const image = String(sel && sel.image || '').toLowerCase();
+    const flows = hint.needs === 'ip' ? fwState.flows.filter(f => f.dst_ip === sel.ip)
+        : hint.needs === 'image' ? fwState.flows.filter(f => String(f.image ?? '').toLowerCase() === image) : null;
+    const range = flows ? fwLogsRange(flows) : { earliest: fwEarliest(), latest: '', note: '' };
+    return openLogsTab(hint.query(sel || {}), range.earliest, range.latest, sel ? fwBackTo(sel) : { tab: 'firewall', filter: { text: fwFilter } }, range.note);
+}
+
+function fwCopy(text) {
+    const value = String(text ?? '');
+    if (typeof navigator === 'undefined' || !navigator.clipboard) return false;
+    navigator.clipboard.writeText(value).then(() => showToast('info', 'Copied', fwShort(value, 200)), () => showToast('error', 'Not copied', 'The browser refused the clipboard.'));
+    return true;
+}
+
+// The perspective switch into this tab (from the way back in LOGS, from GRAPH's network nodes, from TRACING;
+// openLogsTab, beside openAlertsTab, is the one out of it): the tab opens with the tree filtered and the endpoint
+// or the process selected. filter: {ip, port, image, pid}, and from LOGS' way back also `select`, the id that was
+// selected, and `text`, the tree's filter then. The selection is found again once the connections are in: on
+// the first opening there are none yet, and those on screen may be old.
+function openFirewallTab(filter) {
+    const f = filter && typeof filter === 'object' ? filter : {};
+    const want = { select: typeof f.select === 'string' ? f.select : '', image: String(f.image ?? ''), ip: String(f.ip ?? ''),
+        pid: f.pid ?? null, port: f.port ?? null };
+    want.text = typeof f.text === 'string' ? f.text : want.ip || want.image;
+    fwWant = want;
+    fwFilter = want.text;
+    const search = document.getElementById('firewall-search');
+    if (search) search.value = fwFilter;
+    if (fwState.loaded) fwApplyWant(false);
+    switchTab('firewall');
+    return true;
+}
+
+// What fwWant stands for among the connections: the exact id when it is still there, else an endpoint by its
+// address, a process by its image (the newest run, should its PID be gone), one connection by both; '' for none
+function fwWantedId(want, flows) {
+    const list = flows || [];
+    if (want.select && fwSelection(want.select)) return want.select;
+    const image = want.image.toLowerCase(), port = want.port === null || want.port === '' ? null : String(want.port);
+    const pid = want.pid === null || want.pid === '' ? null : String(want.pid);
+    const match = (usePid, usePort) => list.filter(f => (!image || String(f.image ?? '').toLowerCase() === image)
+        && (!want.ip || f.dst_ip === want.ip) && (!usePid || pid === null || String(f.pid) === pid)
+        && (!usePort || port === null || String(f.dst_port) === port));
+    if (!image) return want.ip && match(false, false).length ? `a:${want.ip}` : '';
+    const found = [match(true, true), match(false, true), match(false, false)].find(m => m.length) || [];
+    if (!found.length) return '';
+    const newest = found.reduce((a, b) => (String(b.last_seen ?? '') > String(a.last_seen ?? '') ? b : a));
+    return want.ip ? `f:${fwFlowKey(newest)}` : `p:${fwProcKey(newest)}`;
+}
+
+// Selects what openFirewallTab asked for, with the connections on screen; `final` once they are the new ones
+function fwApplyWant(final) {
+    const want = fwWant;
+    if (!want) return false;
+    if (final) fwWant = null;
+    const id = fwWantedId(want, fwState.flows);
+    fwSelect(id);
+    // Only the fresh list can say the selection is gone: the one on screen may be old, and its load may still fail
+    if (final && !id && (want.select || want.image || want.ip)) {
+        fwWantMissed = fwMissedText(want);
+        renderFirewallHints(null);
+    }
+    return true;
+}
+
+// What was asked for and is gone: by its parts, the select id's when the parts are missing
+function fwMissedText(want) {
+    let image = want.image, ip = want.ip, pid = want.pid;
+    const id = want.select || '';
+    if (!image && !ip) {
+        if (id.startsWith('a:')) ip = id.slice(2);
+        else if (id.startsWith('p:')) [image, pid] = [id.slice(2, id.lastIndexOf('|')), id.slice(id.lastIndexOf('|') + 1)];
+    }
+    const proc = image ? `${fwShort(fwBase(image), 60)}${pid !== null && pid !== undefined && pid !== '' ? ` (PID ${pid})` : ''}` : '';
+    const what = proc && ip ? `${proc} → ${fwShort(ip, 46)}` : proc || fwShort(ip, 46) || 'The selection';
+    // A cut list cannot say it has no connections, only that none is among those shown
+    if (fwState.truncated) {
+        return `${what} is not among the ${fwNumber(fwState.flows.length)} most severe connections shown, so nothing is selected. It may have connections that were left out; a shorter range shows fewer and may bring them in.`;
+    }
+    const range = fwRange === 'All' ? 'among the connections kept' : `in the last ${fwRange}`;
+    return `${what} has no connections ${range} any more, so nothing is selected.${fwRange === 'All' ? '' : ' A wider range shows older ones.'}`;
+}
+
+// --- The head and the bands ---
+function fwRangeMs(label) {
+    const m = /^(\d+)([mhd])$/.exec(label || '');
+    return m ? Number(m[1]) * { m: 60000, h: 3600000, d: 86400000 }[m[2]] : 0;
+}
+
+function fwSince() {
+    const ms = fwRangeMs(fwRange);
+    return ms ? new Date(Date.now() - ms).toISOString().replace(/\.\d+Z$/, 'Z') : '';
+}
+
+function fwEarliest() {
+    return fwRange === 'All' ? '' : `-${fwRange}`;
+}
+
+function renderFirewallRange() {
+    const host = document.getElementById('firewall-range');
+    if (host) {
+        host.innerHTML = `<span class="chart-range" role="group" aria-label="Time range">${FW_RANGES.map(name => `<button type="button" class="chart-range-btn" data-fw-range="${name}" aria-pressed="${name === fwRange}">${name.toUpperCase()}</button>`).join('')}</span>`;
+    }
+}
+
+function renderFirewallHead() {
+    const live = document.getElementById('firewall-live');
+    if (live) live.setAttribute('aria-pressed', String(!!fwState.live));
+    const ask = document.getElementById('firewall-ask-btn');
+    const mode = FW_ASK_MODES.find(m => m.mode === fwState.askMode) || FW_ASK_MODES[0];
+    if (ask) {
+        ask.textContent = `ASK: ${mode.label} ▾`;
+        ask.title = `${mode.text} Click to change it; the setting is kept on the server.`;
+        ask.classList.toggle('is-off', mode.mode === 'off');
+    }
+    const iso = document.getElementById('firewall-isolated');
+    if (iso) {
+        // The same state as the cut button (fwCutState), and the same press: only its text is shorter while off
+        const st = fwCutState(), on = st.on;
+        iso.setAttribute('aria-pressed', String(on));
+        iso.classList.toggle('is-on', on);
+        iso.setAttribute('aria-busy', String(!!fwIsoSwitching));
+        iso.textContent = fwIsoSwitching === 'on' ? 'CUTTING…' : fwIsoSwitching === 'off' ? 'LEAVING…' : on ? st.label : 'ISOLATED';
+        iso.disabled = !!fwIsoSwitching || st.disabled;
+        iso.title = fwIsoSwitching === 'on' ? FW_CUT_WAIT : fwIsoSwitching ? FW_ISOLATE_WAIT : st.title;
+    }
+    renderFirewallCut();
+    const count = document.getElementById('firewall-count');
+    if (count) {
+        const n = Number(fwState.count) || 0;
+        count.textContent = fwState.loaded ? `${fwNumber(n)} ${n === 1 ? 'connection' : 'connections'}${fwState.truncated ? `, the ${fwNumber(fwState.flows.length)} most severe shown` : ''}` : '';
+    }
+    renderFirewallRange();
+    renderFirewallViews();
+}
+
+// The cut button and its note; drawn again only when they change (the state comes every tick, and the focus may be on it)
+function renderFirewallCut() {
+    const slot = document.getElementById('firewall-cut-slot');
+    if (!slot) return;
+    const html = fwCutButtonHtml();
+    if (html !== fwLastCut || slot.innerHTML === '') {
+        const focused = !!document.activeElement && document.activeElement.id === 'firewall-cut';
+        fwLastCut = html;
+        slot.innerHTML = html;
+        const button = focused ? document.getElementById('firewall-cut') : null;
+        if (button && typeof button.focus === 'function') button.focus();
+    }
+    const note = document.getElementById('firewall-cut-note');
+    const text = `<span class="fw-cut-now">${escapeHtml(fwCutState().note)}</span><span class="fw-cut-fetch">${escapeHtml(fwCanFetchText())}</span>`;
+    // It is a live region: written only when it says something new, so nothing is read out twice
+    if (note && (text !== fwLastCutNote || note.innerHTML === '')) {
+        fwLastCutNote = text;
+        note.innerHTML = text;
+    }
+}
+
+// What is not enforced, or not known, is said above everything else
+function renderFirewallBands() {
+    const host = document.getElementById('firewall-bands');
+    if (!host) return;
+    const iso = fwState.isolate || {};
+    const bands = [];
+    const off = Array.isArray(iso.profiles_off) ? iso.profiles_off : [];
+    // Leaving, one press away in a band wherever the big button does not leave (it cuts again, or the firewall is off)
+    const leave = ' <button type="button" class="btn btn-xs fw-cut-leave" data-fw-leave title="Open the network again: what ISOLATED switched off is '
+        + 'switched on again and the cut rule removed (asks first).">LEAVE ISOLATED</button>';
+    if (off.length) {
+        bands.push(['off', `<strong>Windows Firewall is off — no enforcement possible.</strong> Switched off: ${escapeHtml(off.map(p => fwShort(p, 40)).join(', '))}. `
+            + 'A rule or ISOLATED would be accepted and do nothing, so the switches are disabled. TDC does not turn it on by itself, '
+            + 'because it changes what the sample sees. '
+            + (fwIsolatedOn() ? 'ISOLATED stays recorded, with its way back, but holds nothing while a profile is off. ' : '')
+            + '<button type="button" class="btn btn-xs fw-enable" id="firewall-enable" data-fw-enable title="Switch every Windows Firewall profile on (asks first)">TURN THE FIREWALL ON</button>'
+            + (fwIsolatedOn() ? leave : '')]);
+    }
+    if (fwState.isolateError) {
+        bands.push(['warn', `The firewall's state could not be read (${escapeHtml(fwShort(fwState.isolateError, 300))}): whether it is on, whether ISOLATED holds `
+            + 'and whether a way out stands open are unknown.']);
+    } else if (!fwState.isolate && fwState.loaded) {
+        bands.push(['warn', 'The firewall\'s state is still being read: whether it is on and whether ISOLATED holds are not known yet.']);
+    }
+    if (iso.profiles_error) bands.push(['warn', `The Windows Firewall profiles could not be read: ${escapeHtml(fwShort(iso.profiles_error, 300))}. Whether a rule takes effect is unknown.`]);
+    const cutState = fwCutState();
+    // With a profile off nothing is in force: no band about what stands or was read back, the off band says it all
+    if (fwIsolatedOn() && fwState.isolate && !off.length) {
+        const stage = fwStage();
+        const since = iso.isolated_since ? ` since ${escapeHtml(formatAlertTime(iso.isolated_since))}` : '';
+        const still = Array.isArray(iso.allowed_out) ? iso.allowed_out : null;
+        const names = list => list.slice(0, 8).map(r => `${escapeHtml(fwShort(r && (r.display || r.name), 80))} (${escapeHtml(fwShort(r && r.source, 20))})`).join(', ')
+            + (list.length > 8 ? ` and ${list.length - 8} more` : '');
+        if (stage === 'cut' || stage === 'cut_policy') {
+            const note = iso.converge_note ? escapeHtml(fwShort(iso.converge_note, 600).replace(/[.\s]+$/, '')) : '';
+            let text = iso.verified === true
+                ? `<strong>CUT${since}.</strong> One outbound Block rule for every program stands and was read back; a Block rule beats every Allow rule, and loopback stays open. `
+                : `<strong>CUT${since}, not confirmed.</strong> ${Array.isArray(iso.profiles_off)
+                    ? 'The catch-all Block rule was not read back as standing, or no longer stands when read again, so whether outbound is shut is not known. '
+                    : 'The firewall profiles could not be read, so whether the catch-all Block rule is in force, and outbound shut, is not known. '}`;
+            text += '<strong>TDC cannot secure a sample in this state</strong>: no fetch gets through a catch-all Block rule. ';
+            if (stage === 'cut_policy') {
+                // Only a rule read back as standing "stays": after a restart this stage can be reached with none there
+                const why = still && still.length
+                    ? `something that lets traffic out cannot be switched off from here (a rule a group policy sets): ${names(still)}`
+                    : still ? 'when this stage was reached, something still let traffic out or the list of Allow rules could not be read (it reads empty now)'
+                        : 'which of Windows\' own outbound Allow rules are still enabled is not known';
+                // Say what is known: verified stops at the profiles before the rule is looked at
+                const unknown = !Array.isArray(iso.profiles_off)
+                    ? 'but the firewall profiles could not be read, so whether it is in force is not known'
+                    : iso.profiles_off.length ? 'but a firewall profile is off, so it is not in force there'
+                        : 'but it was not read back as standing, or no longer stands when read again, so it may not be there';
+                text += iso.verified === true
+                    ? `The rule stays, because ${why}. Leaving the cut is the way to secure samples again.`
+                    : `This stage keeps the rule, because ${why}; ${unknown}.`;
+            } else if (iso.converging) {
+                text += 'In the background Windows\' own outbound Allow rules are being switched off and the default set to Block; then the rule goes.';
+            } else {
+                text += `The securing behind the cut did not get through${note ? `: ${note}` : ', and said nothing about why'}. Nothing more happens by itself until the cut is left.`;
+            }
+            if (stage === 'cut_policy' && note) text += ` ${note}.`;
+            bands.push([iso.verified === true ? 'isolated' : 'hole', text]);
+        } else if (stage === 'isolated') {
+            const n = Number(iso.fetches_in_flight) || 0;
+            bands.push(['isolated', `<strong>ISOLATED${since}.</strong> `
+                + `${escapeHtml(fwShort(iso.residual || 'Outbound is Block; Windows\' own outbound Allow rules are switched off.', 600))} `
+                + (n ? `<strong>${n} ${n === 1 ? 'fetch' : 'fetches'} running</strong>: one address each is open while it runs. ` : '')
+                + 'The way back: ISOLATED again, or scripts/tdc-unisolate.ps1 on the VM.']);
+            if (iso.allowed_out_error || (!still && 'allowed_out' in iso)) {
+                bands.push(['hole', `<strong>Whether ISOLATED is closed is not known.</strong> Which outbound Allow rules are still enabled could not be read`
+                    + `${iso.allowed_out_error ? ` (${escapeHtml(fwShort(iso.allowed_out_error, 300))})` : ''}, and each of them would still let traffic out.`]);
+            } else if (still && still.length) {
+                bands.push(['hole', `<strong>Still let out despite ISOLATED: ${still.length} outbound Allow ${still.length === 1 ? 'rule' : 'rules'}.</strong> `
+                    + `${names(still)}. The default action does not stop what a rule allows; `
+                    + `a rule a group policy sets cannot be switched off from here, but a cut closes it: a Block rule beats every Allow rule.`]);
+            } else if (still && iso.verified === true) {
+                bands.push(['isolated', 'Read back: no outbound Allow rule but TDC\'s own is enabled.']);
+            } else if (still) {
+                bands.push(['hole', '<strong>ISOLATED is not confirmed.</strong> No outbound Allow rule but TDC\'s own is enabled, but Block was not '
+                    + `read back in force on every profile, so whether outbound is shut is not known.`]);
+            }
+        } else {
+            bands.push(['hole', `<strong>ISOLATED is on${since}, but nothing in force was read back.</strong> TDC's marker stands in stage `
+                + `${escapeHtml(fwShort(stage, 20))} (start-up may have found a firewall profile off), so whether outbound is shut is not known, `
+                + `and TDC cannot secure a sample while a cut rule may stand.`]);
+        }
+    }
+    for (const hole of Array.isArray(iso.fetch_paths_open) ? iso.fetch_paths_open : []) {
+        bands.push(['hole', `<strong>A way out stands open.</strong> The rule ${escapeHtml(fwShort(hole && hole.rule_id, 80))} of a finished fetch would not go and still lets TDC's fetcher reach one address`
+            + `${hole && hole.problem ? `: ${escapeHtml(fwShort(hole.problem, 300).replace(/[.\s]+$/, ''))}` : ''}. TDC keeps trying to remove it; scripts/tdc-unisolate.ps1 removes it by hand.`]);
+    }
+    // Not confirmed closed: the remedy and the other action, once, whatever above said why
+    if (fwIsolatedOn() && cutState.action === 'cut') {
+        bands.push(['hole', `<strong>${escapeHtml(cutState.label)}: not confirmed closed.</strong> One press cuts again, without a question: `
+            + 'a Block rule beats every Allow rule. '
+            + `<button type="button" class="btn btn-xs fw-cut-again" data-fw-cut title="${escapeHtml(cutState.title)}">CUT AGAIN</button>${leave}`]);
+    }
+    if (iso.startup && iso.startup.announce && iso.startup.note) bands.push(['warn', `At start-up: ${escapeHtml(fwShort(iso.startup.note, 400))}`]);
+    if (iso.settings_error) bands.push(['warn', `The firewall settings could not be read: ${escapeHtml(fwShort(iso.settings_error, 300))}`]);
+    if (fwState.askMode === 'off') bands.push(['ask', '<strong>ASK is off</strong>: TDC blocks nothing and fetches nothing by itself; connections are only tagged and logged.']);
+    if (fwState.rulesError) bands.push(['warn', `The TDC rules could not be read (${escapeHtml(fwShort(fwState.rulesError, 300))}): which connections are blocked is unknown, so the switches show ?.`]);
+    else if (fwState.rulesListError) bands.push(['warn', `The list of TDC rules could not be loaded (${escapeHtml(fwShort(fwState.rulesListError, 300))}): whether a whole program is blocked is unknown, so its switch shows ?.`]);
+    if (fwState.error) bands.push(['warn', `The connections could not be loaded: ${escapeHtml(fwShort(fwState.error, 300))}`]);
+    // Drawn again only when they change: ISOLATED's state comes every tick, and the focus may be on a band's button
+    const html = bands.map(([kind, text]) => `<div class="fw-band fw-band-${kind}">${text}</div>`).join('');
+    if (html !== fwLastBands || host.innerHTML === '') {
+        fwLastBands = html;
+        host.innerHTML = html;
+    }
+    host.hidden = !bands.length;
+}
+
+function fwAskMenuHtml() {
+    return FW_ASK_MODES.map(m => `<button type="button" class="fw-ask-item" role="menuitemradio" aria-checked="${m.mode === fwState.askMode}" data-fw-ask="${m.mode}">`
+        + `<span class="fw-ask-label">${escapeHtml(m.label)}</span><span class="fw-ask-text">${escapeHtml(m.text)}</span></button>`).join('');
+}
+
+function fwToggleAskMenu(force) {
+    const menu = document.getElementById('firewall-ask-menu'), button = document.getElementById('firewall-ask-btn');
+    if (!menu) return;
+    const open = typeof force === 'boolean' ? force : menu.hidden;
+    if (open) menu.innerHTML = fwAskMenuHtml();
+    menu.hidden = !open;
+    if (button) button.setAttribute('aria-expanded', String(open));
+}
+
+function fwCloseAskMenu() {
+    fwToggleAskMenu(false);
+}
+
+// --- Asking the server ---
+// `timeoutMs` (optional) gives up on a request that hangs: the decision toasts must not wait on one for good
+async function fwFetch(url, init, timeoutMs) {
+    if (!timeoutMs || typeof AbortController !== 'function') return fetch(url, init);
+    const abort = new AbortController();
+    const timer = setTimeout(() => abort.abort(), timeoutMs);
+    try {
+        return await fetch(url, Object.assign({}, init, { signal: abort.signal }));
+    } catch (e) {
+        if (abort.signal.aborted) throw new Error(`TDC did not answer within ${Math.round(timeoutMs / 1000)} s`);
+        throw e;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+async function fwGet(url, timeoutMs) {
+    try {
+        const resp = await fwFetch(url, undefined, timeoutMs);
+        const data = await resp.json().catch(() => ({}));
+        return resp.ok ? { ok: true, status: resp.status, data: data || {} }
+            : { ok: false, status: resp.status, data, error: data && data.error ? String(data.error) : `HTTP ${resp.status}` };
+    } catch (e) {
+        return { ok: false, status: 0, data: null, error: String(e && e.message ? e.message : e) };
+    }
+}
+
+async function fwPost(url, body, timeoutMs) {
+    try {
+        const resp = await fwFetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) }, timeoutMs);
+        const data = await resp.json().catch(() => ({}));
+        return resp.ok ? { ok: true, status: resp.status, data: data || {} }
+            : { ok: false, status: resp.status, data, error: data && data.error ? String(data.error) : `HTTP ${resp.status}` };
+    } catch (e) {
+        return { ok: false, status: 0, data: null, error: `The request failed: ${e && e.message ? e.message : e}` };
+    }
+}
+
+function fwSignature() {
+    const s = fwState;
+    return JSON.stringify([s.loaded, s.error, s.rulesError, s.rulesListError, s.summaryError, s.capturesError, s.flows.map(f => [fwFlowKey(f), f.count, f.state, f.rule_id, f.tags, f.endpoint_tags, f.fw_records, f.last_seen]),
+        (s.pending || []).map(i => [i && i.id, i && i.action]), (s.history || []).map(i => [i && i.id, i && i.action]), s.summary,
+        s.captures === null ? null : s.captures.map(c => c && c.id), s.rules, s.isolate && s.isolate.profiles_off]);
+}
+
+// Everything drawn again, unless nothing it shows has changed (LIVE would otherwise take the hover away every 5 s)
+function fwRender() {
+    renderFirewallHead();
+    renderFirewallBands();
+    const sig = fwSignature();
+    if (sig === fwLastSig) return;
+    fwLastSig = sig;
+    renderFirewallTree(fwState.flows);
+    renderFirewallView();
+    renderFirewallHints(fwSelection());
+    renderFirewallSummary(fwState.summary);
+    renderFirewallCaptures(fwState.captures);
+}
+
+// The connections and the open decisions (the poll paths); a response older than the last request is dropped
+async function fwLoadFlows() {
+    const seq = ++fwSeq;
+    const params = new URLSearchParams({ max: String(FW_MAX) });
+    const since = fwSince();
+    if (since) params.set('since', since);
+    const sent = ++fwPendingReq;
+    const [conn, pending] = await Promise.all([fwGet(`/api/firewall/connections?${params.toString()}`), fwGet('/api/firewall/pending')]);
+    if (seq !== fwSeq) return false;
+    if (conn.ok) {
+        const d = conn.data;
+        fwState.flows = Array.isArray(d.connections) ? d.connections : [];
+        fwState.count = Number.isFinite(Number(d.count)) ? Number(d.count) : fwState.flows.length;
+        fwState.truncated = !!d.truncated;
+        fwState.rulesError = d.rules_error ? String(d.rules_error) : null;
+        if (typeof d.isolated === 'boolean') fwState.isolated = d.isolated;
+        if (typeof d.ask_mode === 'string') fwState.askMode = d.ask_mode;
+        fwState.error = null;
+    } else {
+        fwState.error = conn.error;
+    }
+    fwState.loaded = true;
+    if (pending.ok) {
+        fwState.pending = Array.isArray(pending.data.pending) ? pending.data.pending : [];
+        fwState.history = Array.isArray(pending.data.history) ? pending.data.history : [];
+        fwApplyPending(pending.data, sent);
+    }
+    fwRender();
+    if (conn.ok) fwApplyWant(true);
+    return true;
+}
+
+// ISOLATED's state as an enforcement route answered it: newer than any GET of the state (or of the connections,
+// which carry `isolated`) still on its way, so those are dropped when they come
+function fwSetIsolateState(state) {
+    fwIsoSeq += 1;
+    fwSeq += 1;
+    fwState.isolate = state;
+    fwState.isolateError = null;
+    if (typeof state.isolated === 'boolean') fwState.isolated = state.isolated;
+}
+
+// ISOLATED's state: whether the firewall is off, ISOLATED, its residual and any way out left open. Every tick,
+// but never two at once (a request may be the one that reads the profiles again)
+async function fwLoadIsolate() {
+    if (fwIsoBusy) return false;
+    fwIsoBusy = true;
+    const seq = ++fwIsoSeq;
+    let isolate;
+    try {
+        isolate = await fwGet('/api/firewall/isolate');
+    } finally {
+        fwIsoBusy = false;
+    }
+    if (seq !== fwIsoSeq) return false;
+    if (isolate.ok) {
+        fwState.isolate = isolate.data;
+        fwState.isolateError = null;
+        if (typeof isolate.data.isolated === 'boolean') fwState.isolated = isolate.data.isolated;
+        if (typeof isolate.data.ask_mode === 'string') fwState.askMode = isolate.data.ask_mode;
+    } else {
+        fwState.isolateError = isolate.error;
+    }
+    fwRender();
+    return true;
+}
+
+// The summary of the same window, the captures and the rules; a route that fails says so where its data is
+async function fwLoadSlow() {
+    const seq = ++fwSlowSeq;
+    const since = fwSince();
+    const [summary, captures, rules] = await Promise.all([
+        fwGet(`/api/firewall/summary${since ? `?since=${encodeURIComponent(since)}` : ''}`),
+        fwGet('/api/firewall/captures'), fwGet('/api/firewall/rules')]);
+    if (seq !== fwSlowSeq) return false;
+    if (summary.ok) {
+        fwState.summary = summary.data;
+        fwState.summaryError = null;
+    } else {
+        fwState.summaryError = summary.error;
+    }
+    if (captures.ok) {
+        fwState.captures = Array.isArray(captures.data.captures) ? captures.data.captures : [];
+        fwState.capturesError = null;
+    } else {
+        fwState.capturesError = captures.error;
+    }
+    if (rules.ok) {
+        fwState.rules = Array.isArray(rules.data.rules) ? rules.data.rules : [];
+        fwState.rulesListError = null;
+    } else {
+        fwState.rulesListError = rules.error;
+    }
+    fwRender();
+    return true;
+}
+
+// opts.slow false: the poll paths and ISOLATED's state (a LIVE tick); otherwise everything
+async function refreshFirewall(opts) {
+    const jobs = [fwLoadFlows(), fwLoadIsolate()];
+    if (!(opts && opts.slow === false)) jobs.push(fwLoadSlow());
+    await Promise.all(jobs);
+}
+
+async function fwLoadWorld() {
+    if (fwWorld || fwWorldAsked) return;
+    fwWorldAsked = true;
+    const r = await fwGet('/static/data/world.json');
+    if (r.ok && Array.isArray(r.data.shapes)) {
+        fwWorld = r.data;
+        if (fwView === 'map') renderFirewallMap(fwState.flows);
+    } else {
+        fwWorldAsked = false;
+    }
+}
+
+// --- What the switches do ---
+async function fwBlock(scope, flow) {
+    const f = flow || {};
+    const off = fwEnforceOff();
+    if (off) {
+        showToast('error', 'Nothing blocked', off);
+        return false;
+    }
+    const image = String(f.image ?? ''), ip = String(f.dst_ip ?? '');
+    let body, what;
+    if (scope === 'endpoint' && image && ip) {
+        body = { scope, image, ip };
+        what = `${fwShort(fwBase(image), 40)} → ${fwShort(ip, 46)}`;
+    } else if (scope === 'process' && image) {
+        body = { scope, image };
+        what = `${fwShort(fwBase(image), 40)}, everywhere`;
+    } else if (scope === 'endpoint_all' && ip) {
+        const ok = await tdcConfirm({ title: `Block ${fwShort(ip, 46)} for every program?`, danger: true, confirmLabel: 'BLOCK FOR ALL',
+            message: `Every program in the chamber loses ${fwShort(ip, 46)}, TDC's own fetcher included: while this rule stands, TDC cannot `
+                + 'secure a sample from this address, and BLOCK + FETCH is refused there. The DENY switch of any row it blocks removes it again.' });
+        if (!ok) return false;
+        body = { scope, ip };
+        what = `${fwShort(ip, 46)} for every program`;
+    } else {
+        return false;
+    }
+    const r = await fwPost('/api/firewall/block', body);
+    if (!r.ok) {
+        showToast('error', `Not blocked: ${what}`, r.error);
+        await refreshFirewall();
+        return false;
+    }
+    showToast('success', `Blocked: ${what}`, `Rule ${fwShort(r.data.rule_id, 40)} stands and was read back. A running connection should starve; it gets no reset.`);
+    await refreshFirewall();
+    return true;
+}
+
+async function fwUnblock(ruleId) {
+    const id = String(ruleId ?? '');
+    if (!id) return false;
+    const r = await fwPost('/api/firewall/unblock', { rule_id: id });
+    if (!r.ok) {
+        showToast('error', `Not unblocked: ${fwShort(id, 40)}`, r.error);
+        await refreshFirewall();
+        return false;
+    }
+    const n = Array.isArray(r.data.removed) ? r.data.removed.length : 1;
+    showToast('success', `Unblocked: ${fwShort(id, 40)}`, n > 1 ? `${n} rules of this endpoint were removed, one per protocol.` : 'The rule was removed.');
+    await refreshFirewall();
+    return true;
+}
+
+// The one place that switches, for the cut button and the ISOLATED switch alike: a press does what fwCutState says.
+// Cutting asks nothing (it only closes, and leaving works in seconds from any stage); leaving asks first. `want`
+// 'leave' is the band's LEAVE ISOLATED, the other action of a state whose press cuts again.
+async function fwToggleIsolated(want) {
+    if (fwIsoSwitching) return false;
+    const st = fwCutState();
+    if (want === 'leave' && !st.on) return false;          // nothing to leave: never taken for a cut
+    if (want !== 'leave' && st.action === 'none') {        // the firewall off: no cut, and no leaving by reflex
+        showToast('error', st.on ? 'Nothing changed' : 'The network is not cut', fwEnforceOff());
+        return false;
+    }
+    const cut = want !== 'leave' && st.action === 'cut';
+    if (cut) {
+        const off = fwEnforceOff();
+        if (off) {
+            showToast('error', 'The network is not cut', off);
+            return false;
+        }
+    } else {
+        const before = fwState.isolate && fwState.isolate.outbound_before ? fwShort(fwState.isolate.outbound_before, 20) : 'Allow';
+        const ok = await tdcConfirm({ title: 'Open the network again?', confirmLabel: 'LEAVE',
+            message: `Leaving ${st.label}: ${st.key === 'securing' ? 'the securing in the background stops at its next step, ' : ''}`
+                + `outbound connections go back to the default action that stood before (${before}), the outbound Allow rules of Windows' own `
+                + 'that ISOLATED switched off are switched on again and the cut rule is removed. A sample still running can reach the network again.' });
+        if (!ok) return false;
+    }
+    // Each step is a PowerShell call on the VM: say that it is working, and keep a second click out
+    fwIsoSwitching = cut ? 'on' : 'off';
+    renderFirewallHead();
+    showToast('info', cut ? 'Cutting the network…' : 'Leaving ISOLATED…', cut ? FW_CUT_WAIT : FW_ISOLATE_WAIT);
+    let r;
+    try {
+        r = await fwPost('/api/firewall/isolate', { on: cut });
+    } finally {
+        fwIsoSwitching = '';
+    }
+    if (!r.ok) {
+        showToast('error', cut ? (st.on ? 'Not cut again' : 'The network is not cut') : 'ISOLATED is still on', r.error);
+        await refreshFirewall();
+        return false;
+    }
+    if (r.data.state && typeof r.data.state === 'object') {
+        fwSetIsolateState(r.data.state);
+    } else {
+        fwIsoSeq += 1;
+        fwSeq += 1;
+        fwState.isolated = cut;
+    }
+    const d = r.data || {};
+    const shut = d.outbound_after && typeof d.outbound_after === 'object'
+        ? Object.keys(d.outbound_after).filter(p => d.outbound_after[p] === 'Block') : [];
+    let detail, tone, title;
+    if (!cut) {
+        // The server's own words first: it knows whether the egress stays shut and what would not switch on again
+        detail = d.note ? String(d.note)
+            : shut.length ? `Outbound stays Block on ${shut.join(', ')}.` : 'Outbound is back to the default action that stood before; Windows\' own rules ISOLATED switched off are on again.';
+        tone = d.note || shut.length ? 'warning' : 'info';
+        title = 'ISOLATED is off';
+    } else {
+        // Only the read-back of the rule says the egress is shut; the securing behind it is the band's
+        detail = d.verified === true ? `${d.note ? `${d.note} ` : ''}One outbound Block rule for every program stands and was read back; `
+            + 'loopback stays open. Windows\' own Allow rules are switched off in the background, and TDC cannot secure a sample while the cut stands.'
+            : d.note ? String(d.note) : 'The cut rule was not read back, so whether outbound is shut is not known: see the band.';
+        tone = d.verified === true ? 'warning' : 'error';
+        title = d.verified === true ? 'The network is cut' : 'The cut is not confirmed';
+    }
+    showToast(tone, title, fwShort(detail, 600));
+    renderFirewallHead();
+    renderFirewallBands();
+    await refreshFirewall();
+    return true;
+}
+
+async function fwSetAsk(mode) {
+    fwCloseAskMenu();
+    if (!FW_ASK_MODES.some(m => m.mode === mode)) return false;
+    const r = await fwPost('/api/firewall/ask', { mode });
+    if (!r.ok) {
+        showToast('error', 'ASK not changed', r.error);
+        return false;
+    }
+    fwState.askMode = typeof r.data.ask_mode === 'string' ? r.data.ask_mode : mode;
+    renderFirewallHead();
+    renderFirewallBands();
+    return true;
+}
+
+function fwSetRange(label) {
+    if (!FW_RANGES.includes(label)) return false;
+    fwRange = label;
+    try {
+        localStorage.setItem(FW_RANGE_KEY, label);
+    } catch (e) {
+        // storage blocked
+    }
+    renderFirewallRange();
+    refreshFirewall();
+    return true;
+}
+
+function fwSetView(name) {
+    if (!FW_VIEWS.includes(name)) return false;
+    fwView = name;
+    try {
+        localStorage.setItem(FW_VIEW_KEY, name);
+    } catch (e) {
+        // storage blocked
+    }
+    renderFirewallViews();
+    renderFirewallView();
+    return true;
+}
+
+// The flow a switch stands for: by its flow key, or for a process by its process key
+function fwFlowByKey(key, scope) {
+    const k = String(key ?? '');
+    return (fwState.flows || []).find(f => (scope === 'process' ? fwProcKey(f) : fwFlowKey(f)) === k) || null;
+}
+
+// The one click handler of the tab: every control carries a data-fw-* attribute
+function onFirewallClick(event) {
+    const target = event && event.target && typeof event.target.closest === 'function' ? event.target : null;
+    if (!target) return;
+    fwWant = null;
+    const hit = selector => {
+        const el = target.closest(selector);
+        return el && !el.disabled ? el : null;
+    };
+    let el;
+    if (hit('[data-fw-ask-menu]')) fwToggleAskMenu();
+    else if ((el = hit('[data-fw-ask]'))) fwSetAsk(el.getAttribute('data-fw-ask'));
+    else if ((el = hit('[data-fw-range]'))) fwSetRange(el.getAttribute('data-fw-range'));
+    else if ((el = hit('[data-fw-view]'))) fwSetView(el.getAttribute('data-fw-view'));
+    else if (hit('[data-fw-live]')) fwToggleLive();
+    else if (hit('[data-fw-isolated], [data-fw-cut]')) fwToggleIsolated();
+    else if (hit('[data-fw-leave]')) fwToggleIsolated('leave');
+    else if ((el = hit('[data-fw-decide]'))) {
+        const row = target.closest('[data-fw-decision]');
+        if (row) fwDecide(row.getAttribute('data-fw-decision'), el.getAttribute('data-fw-decide'));
+    } else if (hit('[data-fw-decisions-clear]')) fwDismissResults();
+    else if ((el = hit('[data-fw-group]'))) {
+        const id = el.getAttribute('data-fw-group');
+        fwOpen.set(id, !fwIsOpen(id, false));
+        renderFirewallTree(fwState.flows);
+    } else if ((el = hit('[data-fw-toggle]'))) {
+        const id = el.getAttribute('data-fw-toggle');
+        fwOpen.set(id, el.getAttribute('aria-expanded') !== 'true');
+        renderFirewallTree(fwState.flows);
+    } else if ((el = hit('[data-fw-more]'))) {
+        fwMore.add(el.getAttribute('data-fw-more'));
+        renderFirewallTree(fwState.flows);
+    } else if ((el = hit('[data-fw-unblock]'))) fwUnblock(el.getAttribute('data-fw-unblock'));
+    else if ((el = hit('[data-fw-block]'))) {
+        const scope = el.getAttribute('data-fw-block');
+        const flow = scope === 'endpoint_all' ? { dst_ip: el.getAttribute('data-fw-ip') } : fwFlowByKey(el.getAttribute('data-fw-key'), scope);
+        if (flow) fwBlock(scope, flow);
+    } else if ((el = hit('button[data-fw-open]'))) fwOpenCapture(el.getAttribute('data-fw-open'), el.getAttribute('data-fw-capture'));
+    else if ((el = hit('[data-fw-hint]'))) fwOpenHint(Number(el.getAttribute('data-fw-hint')));
+    else if (hit('[data-fw-logs]')) fwOpenLogs();
+    else if (hit('[data-fw-enable]')) fwEnableFirewall();
+    else if ((el = hit('[data-fw-kill]'))) {
+        const flow = fwFlowByKey(el.getAttribute('data-fw-kill'), 'process');
+        if (flow) fwKill(flow);
+    }
+    else if ((el = hit('[data-fw-copy]'))) fwCopy(el.getAttribute('data-fw-copy'));
+    else if ((el = hit('[data-fw-id]'))) fwSelect(el.getAttribute('data-fw-id'));
+}
+
+// Escape closes the ASK menu and gives the focus back to its button
+function onFirewallKeydown(event) {
+    const menu = document.getElementById('firewall-ask-menu');
+    if (!event || event.key !== 'Escape' || !menu || menu.hidden) return false;
+    fwCloseAskMenu();
+    const button = document.getElementById('firewall-ask-btn');
+    if (button && typeof button.focus === 'function') button.focus();
+    return true;
+}
+
+// The filter, applied once the typing pauses: the tree and the view hold up to 5000 flows
+function fwFilterSoon(text) {
+    if (fwFilterTimer) clearTimeout(fwFilterTimer);
+    fwWant = null;
+    fwFilterTimer = setTimeout(() => {
+        fwFilterTimer = null;
+        fwFilter = String(text ?? '');
+        renderFirewallTree(fwState.flows);
+        renderFirewallView();
+    }, FW_FILTER_MS);
+}
+
+// --- Live ---
+function fwToggleLive() {
+    fwState.live = !fwState.live;
+    renderFirewallHead();
+    if (fwState.live) {
+        if (!fwTimer) fwTimer = setInterval(fwLiveTick, FW_LIVE_MS);
+        fwLiveTick();
+    } else if (fwTimer) {
+        clearInterval(fwTimer);
+        fwTimer = null;
+    }
+}
+
+// Every 5 s while LIVE is on: the poll paths again, everything every FW_SLOW_EVERY ticks; only while the tab
+// is on screen and the browser tab is not hidden
+function fwLiveTick() {
+    if (!fwState.live || document.hidden || state.activeTab !== 'firewall') return false;
+    fwTicks += 1;
+    refreshFirewall({ slow: fwTicks % FW_SLOW_EVERY === 0 });
+    return true;
+}
+
+// --- The tab ---
+// Set up once, when the tab is first opened: the range and the view come back, LIVE starts, the map loads
+function initFirewall() {
+    if (fwReady) return;
+    const tab = document.getElementById('tab-firewall');
+    if (!tab) return;
+    fwReady = true;
+    tab.addEventListener('click', onFirewallClick);
+    const search = document.getElementById('firewall-search');
+    if (search) search.addEventListener('input', () => fwFilterSoon(search.value));
+    document.addEventListener('click', event => {
+        const wrap = event.target && typeof event.target.closest === 'function' ? event.target.closest('.fw-ask-wrap') : null;
+        if (!wrap) fwCloseAskMenu();
+    });
+    document.addEventListener('keydown', onFirewallKeydown);
+    try {
+        const range = localStorage.getItem(FW_RANGE_KEY), view = localStorage.getItem(FW_VIEW_KEY);
+        if (FW_RANGES.includes(range)) fwRange = range;
+        if (FW_VIEWS.includes(view)) fwView = view;
+    } catch (e) {
+        // storage blocked
+    }
+    if (fwState.live && !fwTimer) fwTimer = setInterval(fwLiveTick, FW_LIVE_MS);
+    fwRender();
+    fwLoadWorld();
+    refreshFirewall();
+}
+
+// The tab is opened: the first time it is set up, later everything is asked for again
+function firewallTabShown() {
+    if (!fwReady) {
+        initFirewall();
+        return;
+    }
+    fwLoadWorld();
+    refreshFirewall();
+}
+
+// --- The decision toasts ---
+// A download from the chamber is blocked at once and then asked about (spec, the download case). The deadline
+// is the server's: when it runs out, the server keeps the block and fetches the file itself, whether a browser is
+// open or not. So the countdown only shows what is going to happen anyway; nothing here is the way the default
+// is taken, and a closed page changes no outcome. Every tab asks /pending (fwPendingPoll), and the FIREWALL
+// tab's own answers come in too. A toast says what the server says happened, never what was clicked. A result
+// nobody here answered (taken by the deadline, dropped, gone from the lists) stays until it is closed: that the
+// page was on screen says nothing about whether anybody looked at it.
+
+function fwClock(seconds) {
+    const s = Math.max(0, Math.ceil(Number(seconds) || 0));
+    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+}
+
+function fwEpochMs(iso) {
+    const t = typeof iso === 'string' ? Date.parse(iso) : NaN;
+    return Number.isFinite(t) ? t : null;
+}
+
+// With ASK off the server takes no default at the deadline (the sweep does nothing then)
+function fwDecisionDue(entry, now) {
+    return fwPendingAsk !== 'off' && now >= entry.dueAt;
+}
+
+// A decision of an answer into fwDecisions: a new one comes in at the end. One that is decided keeps that,
+// whatever an older look of the server says. One whose click is still on its way shows the server's decision
+// at once, and the answer to the click says later whose it was
+function fwTrackDecision(item, now) {
+    if (!item || typeof item !== 'object' || typeof item.id !== 'string' || !item.id || item.id === FW_AWAY_ID) return null;
+    const open = item.action === null || item.action === undefined;
+    let entry = fwDecisions.get(item.id);
+    if (!entry) {
+        entry = { kind: 'decision', item, arrived: ++fwDecisionSeq, phase: open ? 'open' : 'done', dueAt: now, doneAt: open ? null : now,
+            until: null, note: '', noFetch: false, mine: false, won: true, clicked: null, posting: false, tried: null, waitedOut: false,
+            gone: null, lost: false, el: null, sig: '', clock: null, fresh: true };
+        fwDecisions.set(item.id, entry);
+    }
+    if (entry.phase === 'done') {
+        if (!open && !entry.gone) {
+            entry.item = item;                  // a later look at it: the fetch that followed
+            entry.lost = false;
+        }
+        return entry;
+    }
+    entry.item = item;
+    if (!open) {
+        entry.phase = 'done';
+        entry.doneAt = now;
+        return entry;
+    }
+    entry.dueAt = now + Math.max(0, Number(item.remaining) || 0) * 1000;
+    if (entry.phase !== 'deciding') entry.phase = fwDecisionDue(entry, now) ? 'due' : 'open';
+    return entry;
+}
+
+// A result that somebody answered may go once it has been read; one nobody answered stays until it is closed.
+// A click that failed is no answer: what the deadline then took, nobody saw
+function fwDecisionAttended(entry) {
+    if (entry.kind !== 'decision' || entry.posting || entry.lost) return false;
+    const result = entry.item && entry.item.result && typeof entry.item.result === 'object' ? entry.item.result : {};
+    return entry.mine || !!entry.gone || result.by === 'analyst';
+}
+
+// An attended result goes FW_RECEIPT_MS after nothing more is to come: a fetch is waited for, up to
+// FW_FETCH_WAIT_MS, then it says where the sample will show. True when that changed what it says
+function fwDecisionSettle(entry, now) {
+    if (entry.kind !== 'decision' || entry.phase !== 'done' || entry.until !== null) return false;
+    const item = entry.item || {};
+    const waiting = !entry.gone && !entry.lost && item.action === 'block_fetch' && !(item.result && item.result.fetch);
+    if (waiting && now - entry.doneAt < FW_FETCH_WAIT_MS) return false;
+    const changed = waiting && !entry.waitedOut;
+    entry.waitedOut = waiting;
+    if (fwDecisionAttended(entry)) entry.until = now + FW_RECEIPT_MS;
+    return changed;
+}
+
+// What resolved while nobody here could see it: by the deadline or dropped, after FW_SEEN_KEY
+function fwSeenMark() {
+    let stored = null;
+    try {
+        stored = fwEpochMs(localStorage.getItem(FW_SEEN_KEY));
+    } catch (e) {
+        // storage blocked
+    }
+    return stored === null ? fwSeenMs : stored;
+}
+
+function fwSetSeen(ms, iso) {
+    fwSeenMs = ms;
+    try {
+        localStorage.setItem(FW_SEEN_KEY, String(iso));
+    } catch (e) {
+        // storage blocked
+    }
+}
+
+function fwAbsenceText(items, sinceUnknown) {
+    const count = (n, one, many) => `${n} ${n === 1 ? one : many}`;
+    const fetch = i => (i.result && typeof i.result.fetch === 'object' && i.result.fetch) || null;
+    const secured = items.filter(i => fetch(i) && fetch(i).capture_id).length;
+    const failed = items.filter(i => fetch(i) && fetch(i).error).length;
+    const running = items.filter(i => i.action === 'block_fetch' && !fetch(i)).length;
+    const cut = items.filter(i => i.action === 'block').length;
+    const dropped = items.filter(i => i.action === 'dropped').length;
+    const decided = items.length - dropped;
+    const title = secured ? `${count(secured, 'sample', 'samples')} secured while you were away`
+        : `${count(items.length, 'decision', 'decisions')} taken while you were away`;
+    const parts = [];
+    if (decided) parts.push(`${count(decided, 'decision', 'decisions')} nobody answered, so TDC took its default`);
+    if (secured) parts.push(`${count(secured, 'sample', 'samples')} secured`);
+    if (failed) parts.push(`${count(failed, 'fetch', 'fetches')} failed`);
+    if (running) parts.push(`${count(running, 'fetch', 'fetches')} still running`);
+    if (cut) parts.push(`${cut} cut without a fetch: TDC could not secure the file (the cut, or a block for every program on the address, stood)`);
+    if (dropped) parts.push(`${count(dropped, 'decision', 'decisions')} dropped, too many were open (still blocked)`);
+    return { title, detail: `${parts.join('; ')}${sinceUnknown ? ' (in the last 24 h)' : ''}. DECISIONS in the FIREWALL tab lists every one, the samples are under SECURED SAMPLES.` };
+}
+
+// The results nobody closed, kept across a reload (FW_STANDING_KEY): the ids of the unattended result toasts and
+// of the summary's items. Written only once the first answer has brought them back, so a page that has not heard
+// from TDC yet cannot wipe them
+function fwSaveStanding() {
+    if (!fwStandingLoaded) return;
+    const results = [], away = fwDecisions.get(FW_AWAY_ID);
+    fwDecisions.forEach(entry => {
+        if (entry.kind === 'decision' && entry.phase === 'done' && !entry.lost && !fwDecisionAttended(entry)) results.push(entry.item.id);
+    });
+    const json = JSON.stringify({ results, away: away ? [...away.items.keys()] : [] });
+    if (json === fwStandingJson) return;
+    fwStandingJson = json;
+    try {
+        localStorage.setItem(FW_STANDING_KEY, json);
+    } catch (e) {
+        // storage blocked
+    }
+}
+
+function fwRestoreStanding(decided, now) {
+    fwStandingLoaded = true;
+    let saved = null;
+    try {
+        saved = JSON.parse(localStorage.getItem(FW_STANDING_KEY) || 'null');
+    } catch (e) {
+        saved = null;
+    }
+    if (!saved || typeof saved !== 'object') return;
+    const ids = list => (Array.isArray(list) ? list : []).filter(id => typeof id === 'string' && decided.has(id) && !fwDecisions.has(id));
+    ids(saved.results).forEach(id => fwTrackDecision(decided.get(id), now));
+    const away = ids(saved.away).map(id => decided.get(id));
+    if (away.length) fwAddAway(away, false, now);
+}
+
+// The standing summary of what was decided while nobody watched: one toast in the stack, with no throttle and
+// no timer, that takes in what comes on the next return as long as it is not closed
+function fwAddAway(items, sinceUnknown, now) {
+    let entry = fwDecisions.get(FW_AWAY_ID);
+    if (!entry) {
+        entry = { kind: 'summary', item: { id: FW_AWAY_ID }, items: new Map(), sinceUnknown: false, arrived: ++fwDecisionSeq, phase: 'done',
+            doneAt: now, until: null, note: '', el: null, sig: '', clock: null, fresh: true };
+        fwDecisions.set(FW_AWAY_ID, entry);
+    }
+    items.forEach(i => entry.items.set(i.id, i));
+    entry.sinceUnknown = entry.sinceUnknown || sinceUnknown;
+    return entry;
+}
+
+// An answer of GET /api/firewall/pending (from fwPendingPoll or the tab). `sent` is the request's number
+// (++fwPendingReq when it went out): an answer to a request older than one applied, or than an answer of
+// /decide, is dropped. Requests are counted here, not by server_time, since the VM's clock may be set back.
+// An answer without a list of open decisions is no answer: it says nothing about the decisions shown
+function fwApplyPending(data, sent) {
+    if (!data || typeof data !== 'object' || !Array.isArray(data.pending)) {
+        fwPendingError = 'TDC answered without a list of open decisions';
+        fwRenderDecisions();
+        return false;
+    }
+    if (typeof sent === 'number') {
+        if (sent <= fwPendingApplied) return false;
+        fwPendingApplied = sent;
+    }
+    const t = fwEpochMs(data.server_time);
+    fwPendingError = null;
+    fwPendingSkew = t === null ? null : t - Date.now();
+    if (typeof data.ask_mode === 'string') fwPendingAsk = data.ask_mode;
+    const now = Date.now();
+    const listed = new Set();
+    for (const item of data.pending) {
+        if (!item || (item.action !== null && item.action !== undefined)) continue;
+        const entry = fwTrackDecision(item, now);
+        if (!entry) continue;
+        listed.add(item.id);
+        // The address-wide block a 409 met is gone, says an answer asked after it: the fetch is offered again
+        if (entry.noFetch && item.can_fetch === true && typeof sent === 'number' && sent > (entry.noFetchReq || 0)) entry.noFetch = false;
+    }
+    const historyKnown = Array.isArray(data.history);
+    const history = (historyKnown ? data.history : [])
+        .filter(i => i && typeof i === 'object' && typeof i.id === 'string' && i.id && i.action !== null && i.action !== undefined);
+    fwPendingData = { pending: data.pending.filter(i => i && typeof i === 'object' && typeof i.id === 'string'), history };
+    const decided = new Map(history.map(i => [i.id, i]));
+    let away = fwDecisions.get(FW_AWAY_ID);
+    if (away) [...away.items.keys()].forEach(id => { if (decided.has(id)) away.items.set(id, decided.get(id)); });
+    for (const [id, entry] of fwDecisions) {
+        if (entry.kind !== 'decision' || listed.has(id)) continue;
+        if (decided.has(id)) {
+            fwTrackDecision(decided.get(id), now);
+        } else if (historyKnown && (entry.phase === 'open' || entry.phase === 'due')) {
+            // In neither list: decided and already out of the history, or gone with the server's file
+            entry.phase = 'done';
+            entry.lost = true;
+            entry.doneAt = now;
+        }
+    }
+    if (!fwStandingLoaded) fwRestoreStanding(decided, now);
+    const mark = fwSeenMark();
+    away = fwDecisions.get(FW_AWAY_ID);
+    const unseen = history.filter(i => !fwDecisions.has(i.id) && !(away && away.items.has(i.id))
+        && (i.action === 'dropped' || (i.result && i.result.by === 'deadline'))
+        && (mark === null || (fwEpochMs(i.resolved_at) ?? 0) > mark));
+    if (fwPendingFirst) {
+        if (unseen.length) fwAddAway(unseen, mark === null, now);
+    } else {
+        unseen.forEach(i => fwTrackDecision(i, now));
+    }
+    fwPendingFirst = false;
+    if (t !== null) fwSetSeen(t, data.server_time);
+    fwDecisions.forEach(entry => fwDecisionSettle(entry, now));
+    fwRenderDecisions();
+    fwDecisionClockOn();
+    return true;
+}
+
+// Whether TDC could fetch an open decision's file: the server says it (can_fetch, false while the cut stands or a
+// block for every program stands on the address), and a refused CUT + FETCH (409) says it too. null: the server could not tell
+function fwDecisionCanFetch(entry) {
+    if (entry.noFetch || (entry.item && entry.item.can_fetch === false)) return false;
+    return entry.item && entry.item.can_fetch === null ? null : true;
+}
+
+// Why TDC cannot fetch, as far as the state says: 'cut' (its can_fetch is false for any address: the cut stands, and
+// no Allow exception gets through a catch-all Block rule), 'address' (the state says a fetch could go, so a block for
+// every program on this address is what cuts it), or 'either' (the state is not known: neither is claimed)
+function fwNoFetchWhy(iso = fwState.isolate) {
+    return iso && iso.can_fetch === false ? 'cut' : iso && iso.can_fetch === true ? 'address' : 'either';
+}
+
+const FW_NO_FETCH_TEXT = {
+    cut: ['the cut stands, and a Block rule for every program beats every Allow rule, so no exception lets TDC\'s fetch out',
+        'This keeps it cut. To secure a sample, leave ISOLATED first (the big button, or LEAVE ISOLATED in the band).'],
+    address: ['a block for every program stands on this address',
+        'This keeps it cut. Remove that block in the FIREWALL tab to let TDC fetch.'],
+    either: ['either the cut stands or a block for every program stands on this address',
+        'This keeps it cut. To let TDC fetch, leave the cut and remove any block for every program on this address.'],
+};
+
+// The answers a decision offers: without a fetch, the primary one says it only cuts, and why
+function fwDecisionChoices(entry) {
+    if (fwDecisionCanFetch(entry) !== false) return FW_DECIDE_ACTIONS;
+    const allow = FW_DECIDE_ACTIONS.find(c => c.action === 'allow');
+    const [why, what] = FW_NO_FETCH_TEXT[fwNoFetchWhy()];
+    return [{ action: 'block', label: 'CUT — NO FETCH', primary: true,
+        title: `TDC cannot fetch this file: ${why}. It cuts TDC's own fetch as well. ${what}` }, allow];
+}
+
+// What a toast says: {tone, title, lines (markup, every value escaped), actions, clock, close, away}
+function fwDecisionView(entry) {
+    if (entry.kind === 'summary') {
+        const text = fwAbsenceText([...entry.items.values()], entry.sinceUnknown);
+        return { tone: 'away', title: text.title, lines: [escapeHtml(text.detail)], actions: false, clock: false, close: true, away: true };
+    }
+    const item = entry.item || {};
+    const result = item.result && typeof item.result === 'object' ? item.result : {};
+    const block = result.block && typeof result.block === 'object' ? result.block : null;
+    if (entry.phase === 'done') return fwDecisionOutcome(entry, item, result, block);
+    const lines = [];
+    let tone = 'ask', title = 'Download blocked: allow it?';
+    if (!block) {
+        tone = 'warn';
+        title = 'Download seen: the block is being set';
+    } else if (!block.verified) {
+        tone = 'warn';
+        title = 'Download seen: the block is NOT confirmed';
+        lines.push(`The rule could not be confirmed (${escapeHtml(fwShort(block.problem || block.error || 'it was not read back', 300))}): the process may still get through.`);
+    }
+    const confirmed = !!(block && block.verified);
+    const canFetch = fwDecisionCanFetch(entry);
+    const keep = confirmed ? 'TDC keeps it cut' : 'TDC blocks it';
+    const what = canFetch === false ? `${keep}; it cannot fetch the file: ${FW_NO_FETCH_TEXT[fwNoFetchWhy()][0]}`
+        : `${keep} and fetches the file itself${canFetch === null ? ' (unless a block for every program stands on this address: TDC could not read its rules)' : ''}`;
+    if (entry.phase === 'due') {
+        tone = 'due';
+        lines.push(`<strong>Time is up:</strong> ${what}, now.`);
+    } else if (fwPendingAsk === 'off') {
+        lines.push(`<strong>ASK is off:</strong> TDC takes no default${confirmed ? '; it stays cut until you answer' : ''}.`);
+    } else {
+        lines.push(`When the clock runs out, ${what}, with this page open or not.`);
+    }
+    if (entry.note) lines.push(`<span class="decision-note">${escapeHtml(fwShort(entry.note, 500))}</span>`);
+    if (fwPendingError) {
+        lines.push(`<span class="decision-note">No update from TDC (${escapeHtml(fwShort(fwPendingError, 200))}); the server keeps its deadline all the same.</span>`);
+    }
+    return { tone, title, lines, actions: true, clock: fwPendingAsk !== 'off', close: false };
+}
+
+function fwDecisionOutcome(entry, item, result, block) {
+    if (entry.gone) return { tone: 'fail', title: 'Decision gone', lines: [escapeHtml(fwShort(entry.gone, 300))], close: true };
+    if (entry.lost) {
+        return { tone: 'fail', title: 'No longer listed', close: true,
+            lines: ['TDC lists this decision neither as open nor among the decided ones any more: what became of it is in LOGS.'] };
+    }
+    const action = String(item.action ?? '');
+    const lines = [];
+    let tone = 'done';
+    if (action === 'allow') {
+        if (result.unblocked) {
+            lines.push('The block is lifted: the process can reach the address again.');
+        } else {
+            tone = 'fail';
+            lines.push(`<strong>Still blocked:</strong> ${escapeHtml(fwShort(result.reason || result.error || 'the block was not lifted', 300))}.`);
+        }
+    } else if (action === 'block' || action === 'block_fetch') {
+        if (block && block.verified) {
+            lines.push(action === 'block' ? 'The block stands; nothing was fetched.' : 'The block stands.');
+        } else {
+            tone = 'fail';
+            lines.push(`<strong>The block is not confirmed:</strong> ${escapeHtml(fwShort((block && (block.problem || block.error)) || 'no rule was read back', 300))}.`);
+        }
+        if (action === 'block' && result.note) lines.push(`<strong>No sample secured.</strong> ${escapeHtml(fwShort(result.note, 400))}`);
+        if (action === 'block_fetch') {
+            const fetch = result.fetch && typeof result.fetch === 'object' ? result.fetch : null;
+            if (!fetch) {
+                lines.push(entry.waitedOut ? 'Still fetching: the sample shows under SECURED SAMPLES once it is in.' : 'TDC is fetching the file…');
+            } else if (fetch.error) {
+                tone = 'fail';
+                lines.push(`<strong>The fetch failed:</strong> ${escapeHtml(fwShort(fetch.error, 300))}`);
+            } else {
+                lines.push(`<strong>Secured:</strong> ${escapeHtml(fwShort(fetch.magic || '?', 12))} · ${escapeHtml(formatSize(Number(fetch.size) || 0))}`
+                    + ` · SHA-256 ${escapeHtml(String(fetch.sha256 ?? '').slice(0, 12))}…, under SECURED SAMPLES. It is never run.`);
+            }
+        }
+    } else if (action === 'dropped') {
+        lines.push(`${escapeHtml(fwShort(result.reason || 'Dropped', 200))}: `
+            + (block && block.verified ? 'the block stands, and nothing was fetched.'
+                : 'nothing was fetched; dropping lifts no block, but whether one stands was never confirmed.'));
+    }
+    if (entry.posting) {
+        lines.push('Your click is still on its way to TDC; this is what TDC has decided.');
+    } else if (entry.mine && !entry.won) {
+        lines.push(result.by === 'deadline' ? 'The deadline came first: this is the default TDC took before your click.'
+            : 'Already answered before your click: this is the decision that stands.');
+    } else if (result.by === 'deadline') {
+        lines.push('Taken by the deadline: nobody answered in time.');
+    } else if (result.by === 'analyst' && !entry.mine) {
+        lines.push(entry.tried && entry.tried === action ? 'Probably your click: its answer did not arrive, and this is the decision it asked for.'
+            : 'Answered elsewhere: in another browser tab or window.');
+    }
+    if (entry.note) lines.push(`<span class="decision-note">${escapeHtml(fwShort(entry.note, 500))}</span>`);
+    return { tone, title: fwOwn(FW_TAKEN, action) || `DECIDED: ${fwShort(action, 40)}`, lines, actions: false, clock: false, close: true };
+}
+
+// The answer buttons of a decision, for its toast and its row in DECISIONS
+function fwDecisionButtons(entry) {
+    const disabled = entry && entry.phase === 'open' ? '' : ' disabled';
+    return fwDecisionChoices(entry || {}).map(choice => {
+        const label = entry && entry.phase === 'deciding' && entry.clicked === choice.action ? `${choice.label}…` : choice.label;
+        const kind = choice.primary || choice.action === 'block_fetch' ? ' is-primary' : choice.action === 'allow' ? ' is-allow' : '';
+        return `<button type="button" class="btn btn-xs decision-btn${kind}" data-fw-decide="${escapeHtml(choice.action)}" `
+            + `title="${escapeHtml(choice.title)}"${disabled}>${escapeHtml(label)}</button>`;
+    }).join('');
+}
+
+function fwDecisionWhere(f) {
+    const ip = fwShort(f.dst_ip, 46), port = f.dst_port === null || f.dst_port === undefined ? '' : fwShort(f.dst_port, 6);
+    return ip ? `${ip.includes(':') ? `[${ip}]` : ip}${port ? `:${port}` : ''}` : '';
+}
+
+// The markup of a toast; `clock` is the countdown's text ('' for the signature that says whether to draw it again)
+function fwDecisionHtml(entry, clock) {
+    const view = fwDecisionView(entry);
+    const close = view.close ? '<button type="button" class="toast-close" data-fw-decide-close aria-label="Close" title="Close">&times;</button>' : '';
+    if (view.away) {
+        return `<div class="decision-head"><span class="toast-title">${escapeHtml(view.title)}</span>${close}</div>`
+            + view.lines.map(line => `<div class="decision-line">${line}</div>`).join('')
+            + '<div class="decision-actions"><button type="button" class="btn btn-xs decision-btn" data-fw-decide-more title="Open DECISIONS in the FIREWALL tab: every decision of the last 24 h">DECISIONS ▸</button></div>';
+    }
+    const f = entry.item && entry.item.finding && typeof entry.item.finding === 'object' ? entry.item.finding : {};
+    const url = fwDefang(f.url);
+    const where = fwDecisionWhere(f);
+    const who = `${fwShort(fwBase(f.image), 60) || 'A process'}${f.pid !== null && f.pid !== undefined ? ` (PID ${fwShort(f.pid, 12)})` : ''}${where ? ` → ${where}` : ''}`;
+    const via = [f.source && `seen in ${fwShort(f.source, 40)}`, f.requested_by === 'bits' && 'requested through BITS'].filter(Boolean).join(', ');
+    return `<div class="decision-head"><span class="toast-title">${escapeHtml(view.title)}</span>`
+        + (view.clock ? `<span class="decision-clock" data-fw-clock title="What TDC does then, kept by the server: closing this page changes nothing">${escapeHtml(clock)}</span>` : '')
+        + close + '</div>'
+        + `<div class="decision-who" title="${escapeHtml(fwShort(f.image, 500))}">${escapeHtml(who)}</div>`
+        + (url ? `<div class="decision-url-row"><code class="fw-url decision-url" title="${escapeHtml(fwShort(url, 2000))}">${escapeHtml(fwShort(url, 160))}</code>`
+            + `<button type="button" class="btn btn-xs fw-copy" data-fw-copy="${escapeHtml(fwShort(url, 2000))}" title="Copy the defanged URL">COPY</button></div>` : '')
+        + (via ? `<div class="decision-via">${escapeHtml(via)}</div>` : '')
+        + view.lines.map(line => `<div class="decision-line">${line}</div>`).join('')
+        + `<div class="decision-actions">${view.actions ? fwDecisionButtons(entry) : ''}<button type="button" class="btn btn-xs fw-logs" data-fw-decide-logs title="Search the logs for this process and address in the LOGS tab">in LOGS ▸</button></div>`;
+}
+
+function fwDecisionElement(entry, now) {
+    const view = fwDecisionView(entry);
+    const el = document.createElement('div');
+    el.className = `toast toast-decision is-${cssToken(view.tone)}${entry.fresh ? ' is-new' : ''}`;
+    el.setAttribute('role', 'group');
+    el.setAttribute('aria-label', view.title);
+    el.setAttribute('data-fw-decision', String(entry.item.id));
+    el.innerHTML = fwDecisionHtml(entry, fwClock((entry.dueAt - now) / 1000));
+    entry.clock = typeof el.querySelector === 'function' ? el.querySelector('[data-fw-clock]') : null;
+    entry.fresh = false;
+    return el;
+}
+
+// The stack: open decisions first, in the order they came, then the summary, then the results;
+// FW_TOASTS_VISIBLE of them, and a "+ n more" that opens DECISIONS. A toast is drawn again only when what it
+// says changes (the countdown is its text alone), so a button is not replaced under the pointer
+function fwRenderDecisions() {
+    fwSyncDecisionsView();
+    fwSaveStanding();
+    const host = document.getElementById('decision-toasts');
+    if (!host) return;
+    const now = Date.now();
+    const rank = entry => (entry.phase !== 'done' ? 0 : entry.kind === 'summary' ? 1 : 2);
+    const list = [...fwDecisions.values()].sort((a, b) => rank(a) - rank(b) || a.arrived - b.arrived);
+    const shown = list.slice(0, FW_TOASTS_VISIBLE), behind = list.length - shown.length;
+    list.slice(FW_TOASTS_VISIBLE).forEach(entry => {
+        entry.el = null;
+        entry.clock = null;
+    });
+    const swaps = [];
+    for (const entry of shown) {
+        const sig = fwDecisionHtml(entry, '');
+        if (entry.el && entry.sig === sig) continue;
+        const old = entry.el;
+        entry.sig = sig;
+        entry.el = fwDecisionElement(entry, now);
+        if (old) swaps.push([old, entry.el]);
+    }
+    if (behind > 0) {
+        if (!fwDecisionMore) {
+            fwDecisionMore = document.createElement('button');
+            fwDecisionMore.setAttribute('type', 'button');
+            fwDecisionMore.className = 'decision-more';
+            fwDecisionMore.setAttribute('data-fw-decide-more', '');
+        }
+        const open = list.slice(FW_TOASTS_VISIBLE).filter(entry => entry.phase !== 'done').length;
+        fwDecisionMore.innerHTML = escapeHtml(`+ ${behind} more`);
+        fwDecisionMore.setAttribute('title', `${open} more open ${open === 1 ? 'decision' : 'decisions'} and ${behind - open} more `
+            + `${behind - open === 1 ? 'result' : 'results'}: each moves up when one above is answered or closed. Click to open DECISIONS in the FIREWALL tab.`);
+    }
+    const order = shown.map(entry => entry.item.id).join('\n') + (behind > 0 ? '\n+' : '');
+    if (order === fwDecisionOrder) {
+        swaps.forEach(([old, el]) => { if (old.parentNode === host) old.replaceWith(el); });
+    } else {
+        host.replaceChildren(...shown.map(entry => entry.el), ...(behind > 0 ? [fwDecisionMore] : []));
+        fwDecisionOrder = order;
+    }
+}
+
+// Every second while a toast stands: the countdowns, a deadline that ran out, results that have been read
+function fwDecisionTick() {
+    if (!fwDecisions.size) {
+        fwDecisionClockOff();
+        return false;
+    }
+    if (document.hidden) return false;
+    const now = Date.now();
+    let redraw = false;
+    for (const [id, entry] of fwDecisions) {
+        if (entry.phase === 'open' && fwDecisionDue(entry, now)) {
+            entry.phase = 'due';
+            redraw = true;
+        } else if (entry.phase === 'open' || entry.phase === 'deciding') {
+            if (entry.clock) entry.clock.textContent = fwClock((entry.dueAt - now) / 1000);
+        } else if (entry.phase === 'done') {
+            if (fwDecisionSettle(entry, now)) redraw = true;
+            if (entry.until !== null && now >= entry.until) {
+                fwDecisions.delete(id);
+                redraw = true;
+            }
+        }
+    }
+    if (redraw) fwRenderDecisions();
+    if (!fwDecisions.size) fwDecisionClockOff();
+    return true;
+}
+
+function fwDecisionClockOn() {
+    if (!fwDecisionTimer && fwDecisions.size) fwDecisionTimer = setInterval(fwDecisionTick, FW_CLOCK_MS);
+}
+
+function fwDecisionClockOff() {
+    if (fwDecisionTimer) clearInterval(fwDecisionTimer);
+    fwDecisionTimer = null;
+}
+
+// The answer of a toast or a row of DECISIONS. The buttons are disabled at once, and a decision whose answer is
+// out takes no second one. A click whose answer never came is remembered (tried): if the server then shows that
+// very action by an analyst, it was most likely this click
+async function fwDecide(id, action) {
+    const entry = fwDecisions.get(String(id ?? ''));
+    if (!entry || entry.kind !== 'decision' || entry.phase !== 'open' || !fwDecisionChoices(entry).some(c => c.action === action)) return false;
+    entry.phase = 'deciding';
+    entry.clicked = action;
+    entry.posting = true;
+    entry.note = '';
+    fwRenderDecisions();
+    const r = await fwPost('/api/firewall/decide', { id: entry.item.id, action }, FW_REQUEST_MS);
+    const now = Date.now();
+    entry.posting = false;
+    const item = r.ok && r.data && r.data.item && typeof r.data.item === 'object' ? r.data.item : null;
+    if (item && item.action !== null && item.action !== undefined) {
+        if (entry.phase !== 'done') entry.doneAt = now;
+        entry.item = item;
+        entry.phase = 'done';
+        entry.mine = true;
+        entry.won = r.data.won !== false;
+        // An answer of /pending to a request sent before this answer may show it open again
+        fwPendingApplied = fwPendingReq;
+    } else if (r.status === 404 && entry.phase !== 'done') {
+        entry.phase = 'done';
+        entry.doneAt = now;
+        entry.gone = r.error || 'TDC no longer knows this decision.';
+    } else if (entry.phase === 'done') {
+        // A poll showed it decided meanwhile, and the answer to the click did not arrive
+        entry.tried = action;
+        entry.note = `The answer to your click did not arrive (${r.error || 'no answer'}).`;
+    } else {
+        entry.phase = fwDecisionDue(entry, now) ? 'due' : 'open';
+        if (r.status === 409) {
+            if (action === 'block_fetch') {
+                entry.noFetch = true;
+                entry.noFetchReq = fwPendingReq;    // only a /pending asked after this refusal may lift it
+            }
+            entry.note = `Refused: ${r.error || 'HTTP 409'} The decision is still open.`;
+        } else {
+            entry.tried = action;
+            entry.note = `${r.error || 'No answer'}. Whether it was taken shows with the next update.`;
+        }
+    }
+    fwDecisionSettle(entry, now);
+    fwRenderDecisions();
+    fwDecisionClockOn();
+    if (fwReady && state.activeTab === 'firewall') refreshFirewall({ slow: false });
+    return r.ok;
+}
+
+function fwDismissDecision(id) {
+    const entry = fwDecisions.get(String(id ?? ''));
+    if (!entry || entry.phase !== 'done') return false;
+    fwDecisions.delete(entry.item.id);
+    fwRenderDecisions();
+    return true;
+}
+
+// CLOSE THE RESULTS of DECISIONS: every result toast and the summary go, the open decisions stay
+function fwDismissResults() {
+    let n = 0;
+    for (const [id, entry] of fwDecisions) {
+        if (entry.phase === 'done') {
+            fwDecisions.delete(id);
+            n++;
+        }
+    }
+    fwRenderDecisions();
+    return n;
+}
+
+function fwDecisionLogs(id) {
+    const entry = fwDecisions.get(String(id ?? ''));
+    const f = (entry && entry.item && entry.item.finding) || {};
+    const ip = String(f.dst_ip ?? ''), image = String(f.image ?? '');
+    if (!ip) return false;
+    // From the download on: what came of it (the drop, a retry, a fetch) is after it
+    const at = Date.parse((f.observed_at || entry.item.created_at) ?? '');
+    const range = Number.isFinite(at) ? { earliest: fwIso(at - FW_LOGS_PAD_MS), latest: '', note: '' }
+        : fwRangeFallback('The time of the download is not known');
+    const back = { select: `a:${ip}`, ip, text: ip };
+    if (image) back.image = image;
+    if (f.dst_port !== null && f.dst_port !== undefined) back.port = f.dst_port;
+    return openLogsTab(fwLogsQuery(image ? { kind: 'flow', image, ip } : { kind: 'address', ip }), range.earliest, range.latest, { tab: 'firewall', filter: back }, range.note);
+}
+
+// "+ n more" and DECISIONS ▸: the FIREWALL tab with its DECISIONS view
+function fwOpenDecisions() {
+    switchTab('firewall');
+    fwSetView('decisions');
+    return true;
+}
+
+// The one click handler of the stack (it lives outside the tab: onFirewallClick does not see it)
+function onFirewallDecisionClick(event) {
+    const target = event && event.target && typeof event.target.closest === 'function' ? event.target : null;
+    if (!target) return;
+    const hit = selector => {
+        const el = target.closest(selector);
+        return el && !el.disabled ? el : null;
+    };
+    const toast = target.closest('[data-fw-decision]');
+    const id = toast ? toast.getAttribute('data-fw-decision') : null;
+    let el;
+    if (hit('[data-fw-decide-more]')) fwOpenDecisions();
+    else if (hit('[data-fw-decide-close]')) fwDismissDecision(id);
+    else if (hit('[data-fw-decide-logs]')) fwDecisionLogs(id);
+    else if ((el = hit('[data-fw-decide]'))) fwDecide(id, el.getAttribute('data-fw-decide'));
+    else if ((el = hit('[data-fw-copy]'))) fwCopy(el.getAttribute('data-fw-copy'));
+}
+
+// Every FW_PENDING_MS on every tab, the FIREWALL tab included, but not while the browser tab is hidden, and
+// never two at once. The tab's LIVE poll asks /pending too, but waits on /connections and drops an answer a later
+// tick overtook: on a busy chamber that may be every answer, so the toasts do not rely on it
+async function fwPendingPoll() {
+    if (document.hidden || fwPendingBusy) return false;
+    fwPendingBusy = true;
+    const sent = ++fwPendingReq;
+    let r;
+    try {
+        r = await fwGet('/api/firewall/pending', FW_REQUEST_MS);
+    } finally {
+        fwPendingBusy = false;
+    }
+    if (r.ok) {
+        fwApplyPending(r.data, sent);
+        fwAnnounceStartup(r.data);
+    } else {
+        fwPendingError = r.error;
+        fwRenderDecisions();
+    }
+    return true;
+}
+
+// What the firewall was like when the server started (a restart into ISOLATED, an egress shut by someone else):
+// a toast on whatever tab is open, once per server start (FW_STARTUP_KEY), and in the FIREWALL band besides
+function fwAnnounceStartup(data) {
+    const s = data && data.startup && typeof data.startup === 'object' ? data.startup : null;
+    if (!s || !s.announce || !s.note || typeof s.id !== 'string' || !s.id || fwStartupSeen === s.id) return false;
+    fwStartupSeen = s.id;
+    try {
+        if (localStorage.getItem(FW_STARTUP_KEY) === s.id) return false;
+        localStorage.setItem(FW_STARTUP_KEY, s.id);
+    } catch (e) { /* storage blocked: once per page then */ }
+    showToast(data.isolated ? 'error' : 'warning', data.isolated ? 'ISOLATED is on since the web UI started' : 'The firewall at start-up',
+        fwShort(String(s.note), 600));
+    return true;
+}
+
+// From page load: the poll, and on coming back to a hidden page an answer at once, with its summary
+function fwInitDecisions() {
+    if (fwPendingTimer) return;
+    const host = document.getElementById('decision-toasts');
+    if (host) host.addEventListener('click', onFirewallDecisionClick);
+    fwPendingTimer = setInterval(fwPendingPoll, FW_PENDING_MS);
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) return;
+        fwPendingFirst = true;
+        fwDecisionTick();
+        fwPendingPoll();
+    });
+    fwPendingPoll();
+}
+
+// --- DECISIONS: who decided what, when ---
+// The fourth view: the open decisions (with their answers), then the decisions of the last 24 h, newest first,
+// each with its time, the process, the defanged URL, the endpoint, what was taken and by whom, the block and
+// the fetch with its capture. Drawn from the last /pending answer; drawn again only when it changes, so a
+// button is not replaced under the pointer (the open rows show the time of their default, not a countdown)
+function fwDecisionBlockCell(item) {
+    const result = item.result && typeof item.result === 'object' ? item.result : {};
+    const block = result.block && typeof result.block === 'object' ? result.block : null;
+    if (item.action === 'allow') {
+        return result.unblocked ? ['lifted', '', ''] : ['still blocked', fwShort(result.reason || result.error || '', 300), 'is-fail'];
+    }
+    if (!block && item.action === 'dropped') return ['not recorded', 'Dropping a decision lifts no block, but no block was recorded for it, so whether one stands is not known', 'is-fail'];
+    if (!block) return ['not set yet', '', 'is-fail'];
+    return block.verified ? ['confirmed', fwShort(block.rule_id || '', 80), ''] : ['NOT confirmed', fwShort(block.problem || block.error || '', 300), 'is-fail'];
+}
+
+function fwDecisionFetchCell(item) {
+    const result = item.result && typeof item.result === 'object' ? item.result : {};
+    const fetch = result.fetch && typeof result.fetch === 'object' ? result.fetch : null;
+    if (item.action === 'block' && result.note) {
+        return `<span class="fw-dec-fail" title="${escapeHtml(fwShort(result.note, 500))}">could not fetch</span>`;
+    }
+    if (item.action !== 'block_fetch') return '<span class="fw-dec-none">—</span>';
+    if (!fetch) return '<span class="fw-dec-wait">fetching…</span>';
+    if (fetch.error) return `<span class="fw-dec-fail" title="${escapeHtml(fwShort(fetch.error, 500))}">failed: ${escapeHtml(fwShort(fetch.error, 80))}</span>`;
+    const cap = (fwState.captures || []).find(c => c && fetch.capture_id !== undefined && String(c.id) === String(fetch.capture_id));
+    const open = cap && cap.path ? ['rizin', 'hex'].map(kind => `<button type="button" class="btn btn-xs" data-fw-open="${kind}" data-fw-capture="${escapeHtml(String(cap.id))}" title="Open the secured file in ${kind === 'rizin' ? 'Rizin' : 'the Hex editor'} (it is never run)">${kind.toUpperCase()}</button>`).join('')
+        : '<span class="fw-dec-none" title="The capture is listed under SECURED SAMPLES once the tab has read them">SECURED SAMPLES</span>';
+    return `<span class="fw-dec-cap" title="SHA-256 ${escapeHtml(fwShort(fetch.sha256, 64))}">${escapeHtml(fwShort(fetch.magic || '?', 12))} · ${escapeHtml(formatSize(Number(fetch.size) || 0))} · ${escapeHtml(String(fetch.sha256 ?? '').slice(0, 12))}…</span>${open}`;
+}
+
+function fwDecisionRow(item, open) {
+    const f = item.finding && typeof item.finding === 'object' ? item.finding : {};
+    const entry = fwDecisions.get(item.id);
+    const result = item.result && typeof item.result === 'object' ? item.result : {};
+    const url = fwDefang(f.url);
+    const [block, blockTitle, blockKind] = fwDecisionBlockCell(item);
+    let decision, by, kind = '';
+    if (open) {
+        const phase = entry ? entry.phase : 'open';
+        decision = phase === 'deciding' ? 'ANSWERING…' : phase === 'due' ? 'OPEN, time is up'
+            : fwPendingAsk === 'off' ? 'OPEN, no default (ASK off)'
+                : `OPEN, default at ${escapeHtml(formatAlertTime(item.deadline).slice(11) || '?')} (VM clock)`;
+        by = '';
+        kind = ' is-open';
+    } else {
+        decision = escapeHtml(fwOwn(FW_TAKEN, item.action) || `DECIDED: ${fwShort(item.action, 40)}`);
+        by = result.by === 'deadline' ? 'the deadline' : result.by === 'analyst' ? 'an analyst' : item.action === 'dropped' ? 'TDC (too many open)' : '';
+    }
+    const when = open ? item.created_at : item.resolved_at;
+    return `<tr class="fw-dec-row${kind}" data-fw-decision="${escapeHtml(item.id)}">`
+        + `<td class="logs-cell-time" data-sort-value="${escapeHtml(sortTimeValue(when))}">${escapeHtml(formatAlertTime(when))}</td>`
+        + `<td class="fw-cell-proc" title="${escapeHtml(fwShort(f.image, 500))}">${escapeHtml(fwShort(fwBase(f.image), 40))}${f.pid !== null && f.pid !== undefined ? ` <span class="fw-pid">${escapeHtml(fwShort(f.pid, 12))}</span>` : ''}</td>`
+        + `<td class="fw-dec-url"><code class="fw-url" title="${escapeHtml(fwShort(url, 2000))}">${escapeHtml(fwShort(url, 70))}</code></td>`
+        + `<td>${escapeHtml(fwDecisionWhere(f))}</td>`
+        + `<td class="fw-dec-what${kind}">${decision}</td>`
+        + `<td>${escapeHtml(by)}</td>`
+        + `<td class="fw-dec-block ${blockKind}" title="${escapeHtml(blockTitle)}">${escapeHtml(block)}</td>`
+        + `<td class="fw-dec-fetch">${fwDecisionFetchCell(item)}</td>`
+        + `<td class="fw-dec-actions">${open ? fwDecisionButtons(entry || { phase: 'unknown', item }) : ''}</td></tr>`;
+}
+
+// How far the VM's clock is from this computer's, in words, when it is a minute or more (the times of DECISIONS
+// are the VM's; a sample may have set its clock on purpose)
+function fwSkewText(ms) {
+    if (ms === null || !Number.isFinite(ms) || Math.abs(ms) < 60000) return '';
+    const a = Math.abs(ms) / 60000;
+    const [n, unit] = a < 120 ? [Math.round(a), 'minutes'] : a < 2880 ? [Math.round(a / 60), 'hours'] : [Math.round(a / 1440), 'days'];
+    return `The VM's clock is ${fwNumber(n)} ${unit} ${ms > 0 ? 'ahead of' : 'behind'} this computer's: the times here are the VM's, the countdowns of the toasts are not affected.`;
+}
+
+function fwDecisionsViewHtml() {
+    const data = fwPendingData || { pending: fwState.pending || [], history: fwState.history || [] };
+    const valid = i => i && typeof i === 'object' && typeof i.id === 'string' && i.id;
+    const open = (data.pending || []).filter(valid), done = (data.history || []).filter(valid);
+    if (!fwPendingData && fwPendingError) {
+        return `<div class="fw-empty">The decisions could not be loaded: ${escapeHtml(fwShort(fwPendingError, 300))}. Whether any is open is unknown.</div>`;
+    }
+    const notes = [];
+    if (fwPendingError) notes.push(`Not up to date: ${escapeHtml(fwShort(fwPendingError, 300))}. This is the last list TDC gave.`);
+    if (open.some(i => i.can_fetch === null)) notes.push('TDC could not read its rules: whether it can fetch a file is unknown.');
+    const skew = fwSkewText(fwPendingSkew);
+    if (skew) notes.push(escapeHtml(skew));
+    const noteHtml = notes.map(n => `<div class="fw-stale">${n}</div>`).join('');
+    if (!open.length && !done.length) {
+        return `${noteHtml}<div class="fw-empty">No decisions in the last 24 h: TDC asks when a process of the detonation fetches a file (see ASK).</div>`;
+    }
+    const results = [...fwDecisions.values()].filter(e => e.phase === 'done').length;
+    const head = ['Time (VM clock)', 'Process', 'URL', 'Endpoint', 'Decision', 'By', 'Block', 'Fetch', ''].map(c => `<th>${c}</th>`).join('');
+    return `<div class="fw-dec-head"><span>${fwNumber(open.length)} open, ${fwNumber(done.length)} decided in the last 24 h</span>`
+        + (results ? `<button type="button" class="btn btn-xs" data-fw-decisions-clear title="Close every result toast and the summary; the open decisions stay">CLOSE ${fwNumber(results)} RESULT ${results === 1 ? 'TOAST' : 'TOASTS'}</button>` : '')
+        + `</div>${noteHtml}`
+        + `<div class="logs-table-wrap fw-table-wrap"><table class="logs-table fw-table fw-dec-table" data-sortable data-sort-id="firewall-decisions"><thead><tr>${head}</tr></thead>`
+        + `<tbody>${open.map(i => fwDecisionRow(i, true)).join('')}${done.map(i => fwDecisionRow(i, false)).join('')}</tbody></table></div>`;
+}
+
+function renderFirewallDecisions() {
+    const host = document.getElementById('firewall-view');
+    if (!host) return;
+    fwLastDecisionsHtml = fwDecisionsViewHtml();
+    host.innerHTML = fwLastDecisionsHtml;
+}
+
+// DECISIONS on screen follows every answer of /pending and every click, but only when what it shows changed
+function fwSyncDecisionsView() {
+    if (!fwReady || fwView !== 'decisions') return;
+    if (fwDecisionsViewHtml() !== fwLastDecisionsHtml) renderFirewallDecisions();
+}
+
 // --- LitterBox Integration ---
 let _lbData = null;
 let _lbHealth = null;
@@ -14431,8 +19315,9 @@ function activityCounter(label, value) {
 
 // --- Keyboard shortcuts ---
 // Esc closes one layer per press, the top-most first: the (i) popover (the
-// focus goes back to its button), help, a drop-down of the top bar and the
-// drawer (the focus goes back to their button), the detail view.
+// focus goes back to its button), the save dialog of the LOGS tab, help, a
+// drop-down of the top bar and the drawer (the focus goes back to their
+// button), the detail view.
 function handleGlobalKeydown(e) {
     if (e.key === 'Escape') {
         const infoPopover = document.getElementById('info-popover');
@@ -14440,11 +19325,26 @@ function handleGlobalKeydown(e) {
             closeInfoPopover()?.focus();
             return;
         }
+        const logsSaveModal = document.getElementById('logs-save');
+        if (logsSaveModal && !logsSaveModal.classList.contains('hidden')) {
+            closeLogsSave();
+            return;
+        }
         const helpModal = document.getElementById('help-modal');
         if (helpModal && !helpModal.classList.contains('hidden')) {
             closeHelp();
             return;
         }
+        // An open ⋯ menu, which a click elsewhere closes too: the one beside
+        // the search box of the LOGS tab, and the ones of a tile and of a page
+        // on the Dashboard tab. The focus goes back to the button that opened it.
+        const logsMenu = document.getElementById('logs-menu');
+        if (logsMenu && !logsMenu.hidden) {
+            closeLogsMenu();
+            document.getElementById('logs-menu-btn')?.focus();
+            return;
+        }
+        if (closeDashboardMenus()) return;
         // An open drop-down closes and gives the focus back to its button.
         const menuButton = Object.keys(TOPBAR_MENUS).find(isTopbarMenuOpen);
         if (menuButton) {
@@ -14499,6 +19399,60 @@ document.addEventListener('DOMContentLoaded', () => {
         tab.addEventListener('click', () => showHelpSection(tab.dataset.help));
     });
 });
+
+// --- The offline wiki in the help ---
+// webui/static/wiki.html is built on the host by `make docs` and is not in the
+// repository, so it may not be here at all - and on the VM, which has no
+// network, it is the only documentation there is. The help carries both lines
+// and this shows the one that is true.
+
+// "2026-03-04 05:06 UTC" as the wiki's own footer writes it, with the age in
+// days after it: a wiki is built once while the guide moves on, so a reader has
+// to see that he is holding an old file. The stamp is cut out of the ISO text
+// and never parsed into a local time - 05:06 UTC must not read 06:06 in Berlin.
+function wikiBuiltLabel(stamp, now) {
+    const m = /^(\d{4}-\d\d-\d\d)T(\d\d:\d\d):\d\dZ$/.exec(stamp || '');
+    if (!m) return '';
+    const label = m[1] + ' ' + m[2] + ' UTC';
+    const days = Math.floor((now - Date.parse(stamp)) / 86400000);
+    if (!isFinite(days) || days < 1) return label;
+    return label + ' \u00b7 ' + days + (days === 1 ? ' day old' : ' days old');
+}
+
+// Shows the link with the file's date, or the line that says how to build the
+// file. Without a date there is no sentence about one: the whole clause is one
+// element, so a stamp this cannot read leaves no dangling words behind.
+function renderWikiState(data) {
+    const box = document.getElementById('help-wiki');
+    const link = document.getElementById('help-wiki-link');
+    const missing = document.getElementById('help-wiki-missing');
+    const date = document.getElementById('help-wiki-date');
+    const built = document.getElementById('help-wiki-built');
+    if (!box || !link || !missing || !date || !built) return;
+    const present = !!(data && data.present);
+    const label = present ? wikiBuiltLabel(data.built, Date.now()) : '';
+    built.textContent = label;
+    date.hidden = !label;
+    link.hidden = !present;
+    missing.hidden = present;
+    box.hidden = false;
+}
+
+async function initHelpWiki() {
+    try {
+        const resp = await fetch('/api/wiki');
+        if (!resp.ok) return;
+        const data = await resp.json();
+        // Only an answer in the route's shape decides anything. An empty object
+        // or an error body from something in front of Flask would otherwise
+        // read as "no wiki" and tell a reader to build a file he may have.
+        if (!data || typeof data.present !== 'boolean') return;
+        renderWikiState(data);
+    } catch (e) {
+        // No answer: the entry stays hidden rather than linking a file that may
+        // not be there or telling someone to build one he already has.
+    }
+}
 
 // =============================================
 // FILE MAP (BytePlot / Entropy / Structure)
@@ -15521,6 +20475,91 @@ function renderProcessDumpBlock(pd) {
     });
     html += `</tbody></table>`;
     return html + _detRawButton('View Process Dump raw', pd);
+}
+
+// Whether a detonation has anything for its Memory tab. The syscall stage counts on its own, a stage that skipped
+// itself too: its reason belongs where the analyst looks for the memory results.
+function detHasMemoryResults(data) {
+    const d = data && typeof data === 'object' ? data : {};
+    return Boolean(d.hunt_sleeping_beacons || d.beaconeye || d.aether || d.process_dump || d.exit_capture_result
+        || d.syscalls
+        || (d.network_beaconing && (d.network_beaconing.evidence_findings || []).length));
+}
+
+// The syscall stage of a detonation (app.py _run_syscall_stage): the ntdll stubs of the process measured against
+// the baseline, and the stubs the process and the sample file carry. A stage that skipped itself says why; a
+// partial one says what it did not read. Names, owners and notes come from the process: all of it is escaped.
+function renderSyscallStageBlock(sc) {
+    let html = '<div class="det-sub-title" data-info="The ntdll syscall stubs of the process measured against the NTSleuth baseline of this build and view, and the stubs the process memory and the sample file carry. Diverged and unreadable stubs are not scored.">Syscalls &mdash; ntdll stubs against the baseline</div>';
+    if (!sc || typeof sc !== 'object') return '';
+    if (sc.skipped || sc.error) {
+        return html + `<div class="det-sub-value det-warn">Skipped: ${escapeHtml(String(sc.skipped || sc.error))}</div>`
+            + '<div class="det-sub-value muted">Nothing was measured, which is not evidence of being clean.</div>';
+    }
+    const counts = sc.counts && typeof sc.counts === 'object' ? sc.counts : {};
+    const num = v => (Number.isFinite(Number(v)) ? Number(v) : 0);
+    const chip = (label, value, cls) =>
+        `<span class="mem-chip ${cls || ''}"><span class="mem-chip-val">${escapeHtml(String(value))}</span>${escapeHtml(label)}</span>`;
+    const where = [sc.pid !== undefined && `PID ${sc.pid}`, sc.build && `build ${sc.build}`, sc.view && `view ${sc.view}`].filter(Boolean);
+    if (where.length) html += `<div class="det-sub-value muted">${escapeHtml(where.join(' · '))}</div>`;
+    html += '<div class="mem-chips">';
+    html += chip('intact', num(counts.intact));
+    if (num(counts.hooked)) html += chip('hooked (file-backed module)', num(counts.hooked), 'sev-medium');
+    if (num(counts.patched)) html += chip('patched', num(counts.patched), 'sev-high');
+    if (num(sc.renumbered)) html += chip('renumbered', num(sc.renumbered), 'sev-high');
+    if (num(counts.diverged)) html += chip('diverged, not scored', num(counts.diverged), 'sev-medium');
+    if (num(counts.unreadable)) html += chip('unreadable', num(counts.unreadable), 'sev-medium');
+    html += '</div>';
+    if (sc.partial) {
+        html += `<div class="det-sub-value det-warn">Partial: ${escapeHtml(String(sc.note || 'not every stub could be measured'))}. `
+            + 'What was not read is not evidence of being clean.</div>';
+    } else if (sc.note) {
+        html += `<div class="det-sub-value muted">${escapeHtml(String(sc.note))}</div>`;
+    }
+    const stubs = sc.stubs && typeof sc.stubs === 'object' ? sc.stubs : {};
+    const search = (label, part) => {
+        if (!part || typeof part !== 'object') return '';
+        const hits = Array.isArray(part.hits) ? part.hits.length : 0;
+        let text = `${label}: ${hits} stub${hits === 1 ? '' : 's'} of its own`;
+        if (part.skipped) text += ` · not searched: ${part.skipped}`;
+        if (part.error) text += ` · failed: ${part.error}`;
+        else if (part.partial) text += ` · partial: ${part.note || 'not all of it could be read'}`;
+        if (hits && part.doors_complete === false && part.doors_note) text += ` · no proof: ${part.doors_note}`;
+        return `<div class="det-sub-value ${hits || part.partial || part.error ? 'det-warn' : 'muted'}">${escapeHtml(text)}</div>`;
+    };
+    html += search('Process memory', stubs.process) + search('Sample file', stubs.file);
+
+    const devs = (Array.isArray(sc.deviations) ? sc.deviations : []).filter(d => d && typeof d === 'object');
+    if (devs.length) {
+        const rank = d => (Object.prototype.hasOwnProperty.call(SYSCALL_SEVERITY_RANK, d.state) ? SYSCALL_SEVERITY_RANK[d.state] : 2);
+        html += '<div class="mem-section-label">Deviations</div>';
+        html += '<table class="mem-dump-table" data-sortable data-sort-id="det-syscall-deviations"><thead><tr>'
+            + '<th>syscall</th><th>state</th><th>jump target</th><th>pattern</th><th>note</th></tr></thead><tbody>';
+        devs.slice().sort((a, b) => rank(a) - rank(b)).slice(0, 50).forEach(d => {
+            const state = String(d.state ?? '');
+            const cls = state === 'patched' ? 'sev-high' : state === 'unreadable' ? '' : 'sev-medium';
+            const notes = [];
+            const relay = Array.isArray(d.relay) ? d.relay.filter(h => h && typeof h === 'object') : [];
+            if (relay.length) {
+                notes.push('via relay ' + relay.map(h => `${syscallHex(h.address)} (${h.owner || 'unresolved'}${h.pattern ? ', ' + h.pattern : ''})`).join(' → '));
+            }
+            if (d.number_matches === false) notes.push(`loads number ${syscallHex(d.live_number)} of another syscall, the baseline has ${syscallHex(d.number)}`);
+            if (state === 'hooked' && d.allowlisted === true) notes.push('on the hook allowlist, not scored');
+            html += '<tr>'
+                + `<td>${escapeHtml(String(d.name ?? ''))}</td>`
+                + `<td><span class="mem-chip ${cls}">${escapeHtml(state)}</span></td>`
+                + `<td>${state === 'unreadable' ? '' : syscallOwnerHtml(d.target_owner)}</td>`
+                + `<td>${escapeHtml(String(d.pattern || ''))}</td>`
+                + `<td>${escapeHtml(notes.join('; '))}</td></tr>`;
+        });
+        html += '</tbody></table>';
+    }
+    // the measurement went into the scan history: the map can show it, as the past measurement it is
+    if (typeof sc.history_id === 'string' && sc.history_id) {
+        html += `<button class="btn btn-sm" onclick="switchTab('syscalls');syscallSetView('map');syscallOpenMeasurement(${jsArg(sc.history_id)})" `
+            + 'title="Draw this measurement on the map of the SYSCALLS tab, as the past measurement it is: nothing is measured again">Show on the syscall map</button>';
+    }
+    return html + _detRawButton('View Syscalls raw', sc);
 }
 
 // --- On-demand scans from the process views ---
@@ -16856,6 +21895,37 @@ const RIZIN_C_WORDS = new Set([
     'uchar', 'ushort', 'uint', 'ulong', 'longlong', 'ulonglong', 'code', 'undefined', 'undefined1', 'undefined2',
     'undefined4', 'undefined8', 'wchar_t', 'size_t',
 ]);
+// The emulation's run line (the strip above the work area): the runs it offers (the server also knows until,
+// which needs an address: the right-click menu's, not a button; there is no step back, rizin's aesb restores no
+// memory), the words for a run that did what it was asked and for each reason the server gives for a stop,
+// and how many changed registers the strip shows (the EMULATION pane has them all)
+const RIZIN_EMU = {
+    kinds: ['cont', 'step', 'over', 'skip', 'to_call'],
+    labels: { cont: 'CONT', step: 'STEP', over: 'OVER', skip: 'SKIP', to_call: 'TO CALL' },
+    done: {
+        cont: 'Ran until it stopped', step: 'Stepped one instruction', over: 'Stepped over the instruction',
+        skip: 'Skipped the instruction', to_call: 'Ran to the next call and stopped before it', until: 'Ran to the address',
+    },
+    stops: {
+        breakpoint: 'Stopped at a breakpoint',
+        timeout: 'Stopped by esil.timeout: the run took too long',
+        invalid: 'Stopped: rizin cannot decode the instruction here',
+        trap: 'Stopped: an invalid memory access, or the PC is in memory that cannot be executed',
+    },
+    regs: 6,
+};
+// The EMULATION pane of the dock: the rows each group of patches shows (the rest is counted, not hidden), and the
+// one sentence of the session's note that cannot wait: rizin_sessions._WAITING_NOTE, which the server appends last
+// to a note that may be long, so the pane puts it first (a test holds the two to the same words)
+const RIZIN_EMU_PANE = {
+    rows: 100,
+    urgent: 'A patch, a breakpoint or the timeline of the emulation is waiting to be saved; the project is written when the analysis has finished.',
+};
+// The patches of the right-click menu: the kinds that act on one instruction (rizin_emulation.PATCH_KINDS), the
+// most bytes the field takes (rizin_emulation.MAX_PATCH_BYTES: a patch is one write, one command line, and rizin's
+// stdin reader keeps 4094 characters of a line and cuts what is longer, without a word) and the arch whose bytes
+// the kinds are (the server refuses all others: 0x90 is a nop on x86 and nowhere else)
+const RIZIN_PATCH = { kinds: ['nop', 'flip', 'always', 'nocall'], maxBytes: 2000, arch: 'x86' };
 // The views that follow the current place. load(force) brings a view to it:
 // it asks rizin when what the view shows is of another place, and always with
 // force (a finished analysis step may have changed it). The requests go out
@@ -16867,6 +21937,17 @@ const RIZIN_C_WORDS = new Set([
 const RIZIN_VIEWS = {
     disasm: force => rizinLoadDisasm(force),
     graph: force => rizinLoadGraph(force),
+    // The emulation's state: asked for only when forced (a run's answer is the state; see rizinLoadEmulation)
+    emulation: force => rizinLoadEmulation(force),
+    // The EMULATION pane's lists (patches and breakpoints; the pane draws the state from the entry above, it never asks
+    // for it): asked for while the pane is shown, wanted again after a run or a finished analysis step. The entry is
+    // also what keeps a promise: a list that found rizin busy says "the patches and breakpoints follow", and only a view
+    // registered here is asked for again (rizinRetryViews, rizinReloadViews); without it that sentence would stay for good
+    emuPane: force => rizinLoadEmuPane(force),
+    // The marks of the gutter and of the patched lines (rizinState.marks): asked for once for each file, and again
+    // when forced; a click in the gutter or a patch of the menu brings the answer's list itself
+    // (not while the EMULATION pane is on screen: it reads the same two routes, and what it reads is the marks' too)
+    marks: force => (rizinDockOnScreen('emulation') ? Promise.resolve(true) : rizinLoadMarks(force)),
     hex: force => rizinLoadHex(force),
     strings: force => rizinLoadList('strings', force),
     imports: force => rizinLoadList('imports', force),
@@ -16969,6 +22050,30 @@ const rizinState = {
     // Decompiles that ended a session (rizin stopped during pdgj), {path, func}: kept over Reopen and other
     // files (rizinReset leaves it), so DECOMPILER does not run them again on its own (rizinDecompileSlow)
     decompileSlow: [],
+    // The emulation: null outside it, else the server's state (running, pc, registers [{name, value}] in rizin's
+    // order, changed [names], stack [{addr, value, hint}], stopped, arch, bits; every word of it, the PC, the
+    // registers' values and the stack's addresses and values, a "0x…" string) with what only the tab knows: ran
+    // (the run that answered), summary (what a skipped call applied) and assist (the offer for the call at the
+    // PC, or null). The run strip and the EMULATION pane draw from this one state; neither asks the route again
+    emu: null,
+    emuWait: '',        // what waits for its answer: start, stop, or the kind of run; one at a time
+    emuNote: '',        // why the last run did not happen (shown in the strip, until the next one)
+    emuSeq: 0,          // the newest action on the state: a late answer of an older one is dropped
+    emuShown: {},       // what the strip's parts show (markup by id), so that only a change writes
+    // The EMULATION pane's lists: the session they are of (at), patches [{addr, size, before, after, mine}] and
+    // breakpoints [{addr, enabled}] as the routes answer them (integers: they are bounded by the file's layout),
+    // why they could not be read (problem), wanted again when the pane is shown (stale), the newest request (seq),
+    // the words of the last action ({kind, text}), the export's answer (exported) and what waits (busy). waiting is what
+    // /patches lists as held back ([{addr, after, reason}]) and restore the offer of the restore button ({actions, reason,
+    // digests, refused}); both come in the answer that brings patches, and null (not read) means no button
+    emuPane: { at: '', patches: null, waiting: null, restore: null, breakpoints: null, problem: '', stale: false, seq: 0, notice: null, exported: null, busy: '' },
+    emuPaneShown: '',   // the markup the pane shows, so that only a change writes
+    // What DISASSEMBLY marks: the breakpoints (their addresses) and the ranges patched by hand ([addr, size]), integers
+    // as the routes answer them (bounded by the file's layout), null until the file's lists are known; seq: the
+    // newest request for both; busy: a click in the gutter waits for its answer
+    // stamp: how many times each list was set, so that a read that was asked for before a newer list took its place
+    // does not put the older one back (rizinLoadMarks)
+    marks: { breakpoints: null, patched: null, seq: 0, busy: false, stamp: { patches: 0, breakpoints: 0 } },
 };
 
 // This browser tab's ID: random and kept in sessionStorage, so a reload of the
@@ -17067,6 +22172,8 @@ function rizinSetUi(state, extra) {
     if (state === 'moved' || state === 'ended') {
         rizinStopPoll();
         rizinState.retry.clear();
+        // The session is gone, and its emulation with it: the strip goes
+        if (rizinState.emu || rizinState.emuWait) rizinEmuLeave();
     }
     rizinRenderState();
     // Without a session DISASSEMBLY says how rizin gets installed
@@ -17168,13 +22275,19 @@ function rizinFunctionsHtml(funcs, options) {
     return html;
 }
 
-// The lines of DISASSEMBLY: address, the mnemonic in the colour of its kind,
-// operands and comment. Each line carries its address in data-addr; the one
-// that holds current (an address) is marked.
+// The lines of DISASSEMBLY: a gutter (a ● where a breakpoint is set, one click sets or removes it) and a cell for
+// the mark of a patch by hand (≠: these bytes were written here by hand; what a run wrote is not marked), then the address, the mnemonic in the colour of its
+// kind, operands and comment. Each line carries its address in data-addr; the one that holds current (an address)
+// is marked, and the one that holds pc (the emulation's) with a mark of its own. breakpoints: the addresses of the
+// ones set, patched: [address, size] of each patch by hand (integers, as the routes answer them); a line that
+// starts at a breakpoint is .bp, one that overlaps a patch .patched. The three marks (the breakpoint's ● in
+// the gutter, the PC's ▶ and dashed edge, the current line's solid bar) are never one thing: a line may carry all.
 function rizinDisasmHtml(ops, options) {
-    const { current = null } = options || {};
-    const at = rizinNum(rizinHex(current));
-    let marked = false;
+    const { current = null, pc = null, breakpoints = [], patched = [] } = options || {};
+    const at = rizinNum(rizinHex(current)), pcAt = rizinNum(rizinHex(pc));
+    const stops = new Set(Array.isArray(breakpoints) ? breakpoints : []);
+    const edits = Array.isArray(patched) ? patched.filter(p => Array.isArray(p) && Number.isSafeInteger(p[0]) && Number.isSafeInteger(p[1])) : [];
+    let marked = false, pcMarked = false;
     let html = '';
     for (const op of Array.isArray(ops) ? ops : []) {
         const addr = rizinHex(op && op.offset);
@@ -17182,9 +22295,17 @@ function rizinDisasmHtml(ops, options) {
         const size = Number.isInteger(op.size) && op.size > 0 ? op.size : 1;
         const here = !marked && at >= op.offset && at < op.offset + size;
         marked = marked || here;
+        const there = !pcMarked && pcAt >= op.offset && pcAt < op.offset + size;
+        pcMarked = pcMarked || there;
+        const stop = stops.has(op.offset);
+        const edited = edits.some(([from, length]) => op.offset < from + length && from < op.offset + size);
         const [, mnemonic, operands] = /^(\S*)\s*([\s\S]*)$/.exec(String(op.text ?? ''));
         const kind = rizinOpClass(op.type);
-        html += `<div class="rizin-op${here ? ' current' : ''}" data-addr="${addr}"><span class="rz-addr">${addr}</span> `
+        html += `<div class="rizin-op${here ? ' current' : ''}${there ? ' pc' : ''}${stop ? ' bp' : ''}${edited ? ' patched' : ''}" data-addr="${addr}">`
+            + `<span class="rizin-gutter${stop ? ' on' : ''}" data-rizin-gutter="${addr}" title="${stop ? 'Breakpoint set: click to remove it' : 'Click to set a breakpoint here'}"`
+            + `${stop ? ' aria-label="breakpoint"' : ''}>${stop ? '●' : ''}</span>`
+            + `<span class="rz-pm${edited ? ' on' : ''}"${edited ? ' title="Patched by hand: these bytes were written here"' : ''}>${edited ? '≠' : ''}</span>`
+            + `<span class="rz-addr">${addr}</span> `
             + `<span class="rz-mnem${kind ? ' ' + kind : ''}">${escapeHtml(mnemonic)}</span>`
             + (operands ? ' ' + rizinOperandsHtml(operands, rizinHex(op.jump)) : '')
             + (op.comment ? '  ' + rizinCommentHtml(op.comment) : '') + '</div>';
@@ -17246,7 +22367,14 @@ function rizinReset(described) {
         graphDrag: null, graphDragged: false, xrefs: null, xrefsPending: null, xrefsShown: '', placeName: null,
         decompiler: null, decompilerAsk: null, decompilerPending: null, decompilerShown: '', decompilerAt: '',
         decompilerClick: null, hex: null, hexAsk: null, hexPending: null, hexShown: '', backTo: null,
+        emu: null, emuWait: '', emuNote: '', emuShown: {}, emuPaneShown: '',
     });
+    rizinState.emuSeq++;            // an answer of the old session's emulation is dropped
+    Object.assign(rizinState.emuPane, { at: '', patches: null, waiting: null, restore: null, breakpoints: null, problem: '', stale: false,
+                                        notice: null, exported: null, busy: '' });
+    rizinState.emuPane.seq++;       // a late list of the old session is dropped
+    Object.assign(rizinState.marks, { breakpoints: null, patched: null, busy: false });
+    rizinState.marks.seq++;         // so is a late list of the marks
     for (const list of Object.values(rizinState.lists)) {
         if (list.timer !== null) clearTimeout(list.timer);
         Object.assign(list, { offset: 0, total: 0, items: null, truncated: false, at: '', stale: false, problem: '', shown: '', shownAt: '', timer: null });
@@ -17643,7 +22771,10 @@ async function rizinSeek(addr, source = '') {
     // A newer jump draws the views itself. The place drawn is where rizin is now: this jump's, or (if it did
     // not happen) that of a jump it replaced whose answer moved rizin
     if (ticket === rizinState.seekSeq) {
-        if (source !== 'history' && rizinState.seek) rizinPushHistory(rizinState.seek);
+        // ◀ ▶ walk the places the user went to: the views following a run of the emulation ('emulation') are
+        // no navigation of theirs (the PC is where they are; GO TO PC is a jump and does push), and a push
+        // would evict their places from the list and cut off what ▶ holds
+        if (source !== 'history' && source !== 'emulation' && rizinState.seek) rizinPushHistory(rizinState.seek);
         await rizinRefreshViews();
     }
     return !!seek;
@@ -17659,9 +22790,12 @@ function rizinPushHistory(addr) {
 }
 
 // ◀ ▶: the next place in the history at once (so that another click goes on
-// from there); a step that did not happen (rizin busy) is taken back.
+// from there); a step that did not happen (rizin busy) is taken back. At a place that is no entry of the
+// history (the views followed the emulation's PC there) ◀ goes to the entry the user left, not past it.
 async function rizinHistoryStep(delta) {
-    const from = rizinState.historyAt, at = from + delta;
+    const from = rizinState.historyAt;
+    const off = !!rizinState.seek && rizinState.history[from] !== rizinState.seek;
+    const at = off && delta < 0 ? from : from + delta;
     if (!rizinState.session || at < 0 || at >= rizinState.history.length) return false;
     rizinState.historyAt = at;
     rizinRenderLocation();
@@ -17785,6 +22919,9 @@ function rizinRenderState() {
     // A state or its buttons need the room: the file's details give way (style.css .rizin-crowded)
     const bar = document.getElementById('rizin-toolbar');
     if (bar) bar.classList.toggle('rizin-crowded', !!text || !!again || (!!full && !full.hidden));
+    // The one place the run strip and START follow the session's state (opening, moved, ended, not installed)
+    // from: everything that changes them renders this
+    rizinRenderRunStrip();
 }
 
 // SEEK shows where the views are: the name of the function at its start, else
@@ -17813,7 +22950,8 @@ function rizinRenderLocation() {
     if (input) input.title = seek ? `${seek}${rizinState.func ? ' in ' + rizinState.func : ''}` : '';
     const back = document.getElementById('rizin-back');
     const forward = document.getElementById('rizin-forward');
-    if (back) back.disabled = !seek || rizinState.historyAt <= 0;
+    const off = !!seek && rizinState.history[rizinState.historyAt] !== seek;
+    if (back) back.disabled = !seek || (off ? rizinState.historyAt < 0 : rizinState.historyAt <= 0);
     if (forward) forward.disabled = !seek || rizinState.historyAt >= rizinState.history.length - 1;
     rizinRenderPrompt();
 }
@@ -17897,10 +23035,13 @@ function rizinRenderDisasm(problem) {
         return;
     }
     if (title) title.textContent = page.function || rizinState.seek;
-    const at = JSON.stringify([rizinState.session, rizinState.seek]);
+    const pc = rizinEmuPc();
+    const at = JSON.stringify([rizinState.session, rizinState.seek, pc]);
     // The lines as JSON, once for each list of them (a page that loads on gets a new one)
     if (page.linesOf !== page.ops) Object.assign(page, { lines: JSON.stringify(page.ops), linesOf: page.ops });
-    const shown = JSON.stringify([rizinState.session, page.function, page.more, !!page.capped]) + page.lines;
+    // The marks of the gutter and of the patched lines are part of what is shown: another list draws the lines again
+    const marks = rizinState.marks;
+    const shown = JSON.stringify([rizinState.session, page.function, page.more, !!page.capped, marks.breakpoints, marks.patched]) + page.lines;
     const jumped = rizinState.disasmJump !== rizinState.jumpSeq;
     // Without a size (another code view chosen, GRAPH below 1400 px, the RIZIN tab in the background) the
     // place cannot be scrolled into sight: rizinCodeShown does it once DISASSEMBLY is in sight again
@@ -17908,9 +23049,13 @@ function rizinRenderDisasm(problem) {
     if (shown === rizinState.disasmShown) {
         if (at !== rizinState.disasmAt) {
             rizinState.disasmAt = at;
-            const seek = rizinNum(rizinState.seek);
-            const op = page.ops.find(o => seek >= o.offset && seek < o.offset + (Number.isInteger(o.size) && o.size > 0 ? o.size : 1));
+            const holder = place => {
+                const n = rizinNum(place);
+                return page.ops.find(o => n >= o.offset && n < o.offset + (Number.isInteger(o.size) && o.size > 0 ? o.size : 1));
+            };
+            const op = holder(rizinState.seek), pcOp = pc ? holder(pc) : null;
             rizinMoveMark(pane, '.rizin-op', op ? [rizinHex(op.offset)].filter(Boolean) : []);
+            rizinMovePc(pane, '.rizin-op', pcOp ? [rizinHex(pcOp.offset)].filter(Boolean) : []);
         } else if (jumped) {
             rizinReveal(pane, pane.querySelector('.rizin-op.current'));
         }
@@ -17920,7 +23065,7 @@ function rizinRenderDisasm(problem) {
     rizinState.disasmShown = shown;
     rizinState.disasmAt = at;
     const end = `The linear disassembly stops here, after ${RIZIN_MORE.linear} instructions: enter a later address in SEEK to read on.`;
-    pane.innerHTML = (page.ops.length ? rizinDisasmHtml(page.ops, { current: rizinState.seek })
+    pane.innerHTML = (page.ops.length ? rizinDisasmHtml(page.ops, { current: rizinState.seek, pc, breakpoints: marks.breakpoints || [], patched: marks.patched || [] })
         : '<div class="rizin-empty">No instructions at this address.</div>')
         + (page.more ? `<div class="rizin-more" title="The instructions go on below">${escapeHtml(rizinMoreText(page))}</div>`
             : page.capped ? `<div class="rizin-disasm-end">${escapeHtml(end)}</div>` : '');
@@ -17937,8 +23082,9 @@ function rizinOnFunctionClick(event) {
 }
 
 // A click on an instruction moves there, on a jump or call target jumps to it;
-// not when the click ends a selection of text. A click on the line under the
-// last one asks for the next page at once.
+// not when the click ends a selection of text. A click in the gutter, left of the
+// address, sets or removes the breakpoint there and moves nowhere. A click on the
+// line under the last one asks for the next page at once.
 function rizinOnDisasmClick(event) {
     const more = event.target && event.target.closest ? event.target.closest('.rizin-more') : null;
     if (more) {
@@ -17947,6 +23093,11 @@ function rizinOnDisasmClick(event) {
         return;
     }
     if (typeof window.getSelection === 'function' && String(window.getSelection())) return;
+    const gutter = event.target && event.target.closest ? event.target.closest('[data-rizin-gutter]') : null;
+    if (gutter) {
+        rizinToggleBreakpoint(gutter.getAttribute('data-rizin-gutter'));
+        return;
+    }
     const el = event.target && event.target.closest ? event.target.closest('[data-addr]') : null;
     if (el) rizinSeek(el.getAttribute('data-addr'), el.classList.contains('rz-target') ? 'target' : 'disasm');
 }
@@ -18014,25 +23165,44 @@ function rizinMoveMark(container, selector, addrs) {
     rizinReveal(container, container.querySelector(`${selector}.current`));
 }
 
+// The mark of the emulation's PC (.pc) of a list drawn already moves to its rows (selector) of the addresses
+// addrs (data-addr); unlike rizinMoveMark it scrolls nothing: the PC is where the user is not always looking
+function rizinMovePc(container, selector, addrs) {
+    for (const el of container.querySelectorAll(`${selector}.pc`)) {
+        if (!addrs.includes(el.getAttribute('data-addr'))) el.classList.remove('pc');
+    }
+    for (const addr of addrs) container.querySelector(`${selector}[data-addr="${addr}"]`)?.classList.add('pc');
+}
+
 // What a scrolled list shows at its top: the first row in sight (its
-// data-addr) and how far it is from the top, to put it back there when the
-// list is drawn again. At the top the list stays at the top.
+// data-addr, and its place among the rows) and how far it is from the top, to
+// put it back there when the list is drawn again. At the top the list stays at
+// the top.
 function rizinScrollAnchor(container) {
     const top = container.scrollTop;
-    if (!Number.isFinite(top) || top <= 0) return { top: 0, addr: null, delta: 0 };
-    for (const row of Array.from(container.children)) {
-        const addr = row.getAttribute('data-addr');
+    if (!Number.isFinite(top) || top <= 0) return { top: 0, addr: null, delta: 0, index: 0 };
+    const rows = Array.from(container.children);
+    for (let index = 0; index < rows.length; index++) {
+        const row = rows[index], addr = row.getAttribute('data-addr');
         if (addr && Number.isFinite(row.offsetTop) && row.offsetTop + row.offsetHeight > top) {
-            return { top, addr, delta: row.offsetTop - top };
+            return { top, addr, delta: row.offsetTop - top, index };
         }
     }
-    return { top, addr: null, delta: 0 };
+    return { top, addr: null, delta: 0, index: 0 };
 }
 
 // The list drawn again: the same row at the same height, else the same scroll
-// position (rows that came in above the ones in sight push the list on)
+// position (rows that came in above the ones in sight push the list on). Of
+// several rows with the address (lines of C that share an instruction) the one
+// nearest the place the row had, or the list would creep up with each redraw.
 function rizinRestoreScroll(container, anchor) {
-    const row = anchor.addr ? Array.from(container.children).find(r => r.getAttribute('data-addr') === anchor.addr) : null;
+    const rows = Array.from(container.children);
+    let row = null, gap = Infinity;
+    if (anchor.addr) {
+        rows.forEach((r, i) => {
+            if (r.getAttribute('data-addr') === anchor.addr && Math.abs(i - (anchor.index || 0)) < gap) [row, gap] = [r, Math.abs(i - (anchor.index || 0))];
+        });
+    }
     const top = row && Number.isFinite(row.offsetTop) ? row.offsetTop - anchor.delta : anchor.top;
     container.scrollTop = Math.max(0, top);
 }
@@ -18505,17 +23675,18 @@ function rizinGraphBoxAt(layout, nodes, at) {
 
 // The graph as SVG: the edges in the colour of their kind (a class each),
 // then the blocks, each a group with its address in data-addr and a title;
-// the block of current (an address) is marked. overview: no instructions
+// the block of current (an address) is marked, and the block of pc (the emulation's) with a mark of its own. overview: no instructions
 // and no arrow heads; section {x, y, w, h}: only the blocks that reach into
 // it have their text. Every text of the file is escaped.
 function rizinGraphSvg(layout, graph, options) {
-    const { current = null, overview = false, section = null } = options || {};
+    const { current = null, pc = null, overview = false, section = null } = options || {};
     if (!layout || !Array.isArray(layout.boxes) || !layout.boxes.length) return '';
     const g = RIZIN_GRAPH;
     const nodes = graph && Array.isArray(graph.nodes) ? graph.nodes : [];
     const byOffset = new Map();
     for (const node of nodes) if (node && Number.isFinite(node.offset) && !byOffset.has(node.offset)) byOffset.set(node.offset, node);
     const here = rizinGraphBoxAt(layout, nodes, rizinNum(rizinHex(current)));
+    const there = rizinGraphBoxAt(layout, nodes, rizinNum(rizinHex(pc)));
     const c = v => String(Math.round(v * 10) / 10);
     const cut = line => {
         const text = String(line ?? '');
@@ -18538,7 +23709,7 @@ function rizinGraphSvg(layout, graph, options) {
         const lines = node && Array.isArray(node.lines) ? node.lines : [];
         const addr = rizinHex(box.offset);
         const count = `${addr} · ${lines.length} instruction${lines.length === 1 ? '' : 's'}`;
-        svg += `<g class="rizin-block${box === here ? ' current' : ''}" data-addr="${addr}"><title>${escapeHtml(count)}</title>`
+        svg += `<g class="rizin-block${box === here ? ' current' : ''}${box === there ? ' pc' : ''}" data-addr="${addr}"><title>${escapeHtml(count)}</title>`
             + `<rect class="rizin-block-box" x="${c(box.x)}" y="${c(box.y)}" width="${c(box.w)}" height="${c(box.h)}" rx="3"></rect>`;
         const reaches = !section || (box.x < section.x + section.w && box.x + box.w > section.x
             && box.y < section.y + section.h && box.y + box.h > section.y);
@@ -18726,6 +23897,8 @@ function rizinRenderGraph(problem) {
     if (title) title.textContent = graph.function ? `GRAPH · ${graph.function}` : 'GRAPH';
     const layout = graph.layout;
     const box = rizinGraphBoxAt(layout, graph.nodes, rizinNum(rizinState.seek));
+    const pc = rizinEmuPc();
+    const pcBox = pc ? rizinGraphBoxAt(layout, graph.nodes, rizinNum(pc)) : null;
     // The view is the function's, by its entry: a rename keeps it
     const place = JSON.stringify([graph.session, graph.entry ?? layout.boxes[0].offset]);
     if (place !== rizinState.graphPlace) {
@@ -18759,10 +23932,10 @@ function rizinRenderGraph(problem) {
     }
     const shown = JSON.stringify([graph.session, graph.gen, mode, section]);
     if (shown !== rizinState.graphShown) {
-        pane.innerHTML = rizinGraphSvg(layout, graph, { current: rizinState.seek, overview: mode === 'overview', section });
+        pane.innerHTML = rizinGraphSvg(layout, graph, { current: rizinState.seek, pc, overview: mode === 'overview', section });
         rizinState.graphShown = shown;
     } else {
-        rizinGraphMark(pane, box);
+        rizinGraphMark(pane, box, pcBox);
     }
     rizinState.graphMode = mode;
     rizinState.graphSection = section;
@@ -18777,13 +23950,17 @@ function rizinRenderGraph(problem) {
     }
 }
 
-// The mark on the block of the current address, without drawing the graph again
-function rizinGraphMark(pane, box) {
-    const addr = box ? rizinHex(box.offset) : null;
+// The marks on the block of the current address and of the emulation's PC, without drawing the graph again
+function rizinGraphMark(pane, box, pcBox) {
+    const addr = box ? rizinHex(box.offset) : null, pcAddr = pcBox ? rizinHex(pcBox.offset) : null;
     pane.querySelectorAll('.rizin-block.current').forEach(el => {
         if (el.getAttribute('data-addr') !== addr) el.classList.remove('current');
     });
     if (addr) pane.querySelector(`.rizin-block[data-addr="${addr}"]`)?.classList.add('current');
+    pane.querySelectorAll('.rizin-block.pc').forEach(el => {
+        if (el.getAttribute('data-addr') !== pcAddr) el.classList.remove('pc');
+    });
+    if (pcAddr) pane.querySelector(`.rizin-block[data-addr="${pcAddr}"]`)?.classList.add('pc');
 }
 
 // The view's zoom and place on the SVG (a CSS transform); lines and edges
@@ -19450,11 +24627,11 @@ function rizinFunctionRenamed(addr, name) {
     return true;
 }
 
-// After a rename or a comment (the menu, or a console command that changed something): every view
-// again, also at the same place
-async function rizinAnnotated() {
+// After a rename, a comment or a patch (the menu, or a console command that changed something): every view
+// (but skip) again, also at the same place
+async function rizinAnnotated(skip) {
     rizinRenderToolbar();
-    await rizinReloadViews();
+    await rizinReloadViews(skip);
 }
 
 // --- XREFS, STRINGS and IMPORTS: the dock's lists ---
@@ -19719,6 +24896,7 @@ function rizinDockShown(name) {
         return rizinLoadXrefs(pending === true);
     }
     if (name === 'strings' || name === 'imports') return rizinLoadList(name, false);
+    if (name === 'emulation') return rizinLoadEmuPane(false);
     return Promise.resolve(true);
 }
 
@@ -19728,7 +24906,10 @@ function rizinDockOnScreen(name) {
 
 function rizinRenderDockNote() {
     const note = document.getElementById('rizin-dock-note');
-    if (note) note.textContent = { console: 'follows the views', imports: 'a click shows its references' }[rizinState.views.dock] || 'a click jumps there';
+    if (note) {
+        note.textContent = { console: 'follows the views', imports: 'a click shows its references',
+                             emulation: 'type in a register to set it · a click jumps there' }[rizinState.views.dock] || 'a click jumps there';
+    }
 }
 
 // ▾ folds the dock to its head, ▴ brings it back with the pane it showed
@@ -19812,11 +24993,15 @@ function rizinOnDockGripKey(event) {
     rizinSetDockHeight((rizinState.layout.dock ?? (Number(dock && dock.getBoundingClientRect().height) || 0)) + step);
 }
 
-// --- Rename and Comment: the right-click menu ---
+// --- The right-click menu: Rename, Comment, the patches and Run to here ---
 // A right-click on a function, a line of the disassembly or a block of the
 // graph opens it for that address; Rename names the function there (afn on
 // the server), Comment sets or, empty, removes the comment there. Both are
-// kept in the file's project, and every view is drawn again.
+// kept in the file's project, and every view is drawn again. On a line of the
+// disassembly it also holds what acts on that one instruction (DISASSEMBLY has
+// no selection): NOP out, Flip the jump, Always jump, Kill the call, Bytes… (as
+// many bytes as the field takes, over as many instructions as they cover) and,
+// while the emulation runs, Run to here.
 
 // source: functions, disasm or graph; elsewhere the browser's own menu shows
 function rizinOnContextMenu(event, source) {
@@ -19836,13 +25021,42 @@ function rizinOnContextMenu(event, source) {
     }
     const page = rizinState.disasm;
     const op = page && page.session === rizinState.session ? page.ops.find(o => o && rizinHex(o.offset) === addr) : null;
-    // The comment there, if the page shown has the address; else null: Comment… reads it first
-    rizinOpenMenu({ addr, source, name: name || null, comment: op ? (typeof op.comment === 'string' ? op.comment : '') : null },
+    // The comment there, if the page shown has the address; else null: Comment… reads it first. The type is what the
+    // patch entries are chosen from (rizin's op type, '' where the page does not have the address)
+    rizinOpenMenu({ addr, source, name: name || null, comment: op ? (typeof op.comment === 'string' ? op.comment : '') : null,
+                    type: op && typeof op.type === 'string' ? op.type : '' },
                   Number(event.clientX) || 0, Number(event.clientY) || 0);
 }
 
+// What the menu offers for info (see rizinOpenMenu): the patch entries only on a line of the disassembly, each
+// of the four only where its kind applies to the instruction's type (the ones that do not are hidden, as there is
+// nothing to say about them), and all four off, with the reason, where the file is not x86: the server refuses them
+// there, and Bytes… stays; Run to here only while the emulation runs, and off while a run is in flight.
+function rizinMenuEntries(info) {
+    const disasm = info.source === 'disasm';
+    const file = rizinState.file, arch = file && file.arch ? String(file.arch) : '';
+    const x86 = arch === RIZIN_PATCH.arch;
+    const kinds = disasm ? rizinPatchKinds(info.type) : [];
+    const reason = `The patch buttons write x86 bytes, and this file is ${arch || 'of an arch rizin did not name'}: use Bytes… to write the bytes by hand.`;
+    const entry = (name, hidden, off, why) => {
+        const el = document.getElementById(`rizin-menu-${name}`);
+        if (!el) return;
+        el.hidden = hidden;
+        el.disabled = !hidden && off;
+        if (!hidden && off) el.title = why;
+        else el.removeAttribute('title');
+    };
+    const sep = document.getElementById('rizin-menu-sep');
+    if (sep) sep.hidden = !disasm;
+    for (const kind of RIZIN_PATCH.kinds) entry(kind, !kinds.includes(kind), !x86, reason);
+    entry('bytes', !disasm, false, '');
+    const running = !!rizinState.emu && rizinState.emu.running === true;
+    entry('until', !(disasm && running), !!rizinState.emuWait, 'A run is in flight; it cannot be interrupted, and the next one waits for it.');
+    return !x86 && kinds.length ? reason : '';
+}
+
 // The menu at x, y (inside the window) for info (addr, source, name of the function, comment there or
-// null when it is not known here)
+// null when it is not known here, type: rizin's op type of the instruction there, for a line of the disassembly)
 function rizinOpenMenu(info, x, y) {
     const menu = document.getElementById('rizin-menu');
     if (!menu) return;
@@ -19857,9 +25071,13 @@ function rizinOpenMenu(info, x, y) {
     }
     const items = document.getElementById('rizin-menu-items'), form = document.getElementById('rizin-menu-form');
     const note = document.getElementById('rizin-menu-note');
+    const why = rizinMenuEntries(info);
     if (items) items.hidden = false;
     if (form) form.hidden = true;
-    if (note) note.textContent = '';
+    if (note) {
+        note.className = 'rizin-menu-note' + (why ? ' rizin-menu-hint' : '');
+        note.textContent = why;
+    }
     menu.hidden = false;
     rizinPlaceMenu();
     (rename && !rename.disabled ? rename : document.getElementById('rizin-menu-comment'))?.focus();
@@ -19906,12 +25124,13 @@ function rizinMenuNote(text, waiting) {
     rizinPlaceMenu();
 }
 
-// Rename…, Comment…, Save and Cancel in the menu
+// The menu's entries, Save and Cancel: Rename…, Comment… and Bytes… open the field, the four patches and Run to here act
 function rizinOnMenuClick(event) {
     const button = event.target && event.target.closest ? event.target.closest('[data-action]') : null;
     if (!button || button.disabled) return;
     const action = button.getAttribute('data-action');
-    if (action === 'rename' || action === 'comment') rizinMenuForm(action);
+    if (action === 'rename' || action === 'comment' || action === 'bytes') rizinMenuForm(action);
+    else if (RIZIN_PATCH.kinds.includes(action) || action === 'until') rizinMenuAct(action);
     else if (action === 'save') rizinMenuSubmit();
     else if (action === 'cancel') rizinCloseMenu(true);
 }
@@ -19926,7 +25145,7 @@ function rizinOnMenuKey(event) {
         event.preventDefault();
         rizinMenuSubmit();
     } else if ((event.key === 'ArrowDown' || event.key === 'ArrowUp') && document.getElementById('rizin-menu-items')?.hidden === false) {
-        const items = [...document.querySelectorAll('#rizin-menu .rizin-menu-item')].filter(b => !b.disabled);
+        const items = [...document.querySelectorAll('#rizin-menu .rizin-menu-item')].filter(b => !b.disabled && !b.hidden);
         if (!items.length) return;
         event.preventDefault();
         const at = items.indexOf(document.activeElement);
@@ -19934,8 +25153,9 @@ function rizinOnMenuKey(event) {
     }
 }
 
-// The menu's field for the new name (filled with the old one) or the comment (with the one there, read
-// from rizin first when the page shown does not have it); the menu stays inside the window
+// The menu's field for the new name (filled with the old one), the comment (with the one there, read
+// from rizin first when the page shown does not have it) or the bytes to write (empty, and it says how many
+// it takes); the menu stays inside the window
 function rizinMenuForm(action) {
     const menu = rizinState.menu;
     const input = document.getElementById('rizin-menu-input');
@@ -19944,10 +25164,15 @@ function rizinMenuForm(action) {
     document.getElementById('rizin-menu-items').hidden = true;
     document.getElementById('rizin-menu-form').hidden = false;
     document.getElementById('rizin-menu-label').textContent = action === 'rename' ? `New name for ${menu.name}`
+        : action === 'bytes' ? `Bytes to write at ${menu.addr}: hex digits, an even number, at most ${RIZIN_PATCH.maxBytes} bytes (${2 * RIZIN_PATCH.maxBytes} digits)`
         : `Comment at ${menu.addr} (empty removes it)`;
     document.getElementById('rizin-menu-note').textContent = '';
-    input.value = action === 'rename' ? menu.name || '' : menu.comment || '';
-    input.setAttribute('maxlength', action === 'rename' ? '128' : '500');
+    input.value = action === 'rename' ? menu.name || '' : action === 'bytes' ? '' : menu.comment || '';
+    // The bytes field has no maxlength: a value that is too long is said so, in words, not cut off by the field
+    if (action === 'bytes') input.removeAttribute('maxlength');
+    else input.setAttribute('maxlength', action === 'rename' ? '128' : '500');
+    if (action === 'bytes') input.setAttribute('placeholder', '90 90 eb 05');
+    else input.removeAttribute('placeholder');
     rizinMenuWaits(false);
     rizinPlaceMenu();
     if (action === 'comment' && menu.comment === null) {
@@ -19986,9 +25211,10 @@ async function rizinMenuReadComment(menu) {
     return !!r.ok;
 }
 
-// Save: the name or the comment goes to rizin; the menu closes and every view is drawn again, or it
+// Save: the name, the comment or the bytes go to rizin; the menu closes and every view is drawn again, or it
 // stays and says why (a name rizin does not take; renames and comments wait for the analysis; an empty
-// comment where the one there could not be read, which it would remove unseen)
+// comment where the one there could not be read, which it would remove unseen; bytes that are odd in number, too
+// many or no hex, which are said before anything goes out)
 async function rizinMenuSubmit() {
     const menu = rizinState.menu;
     const input = document.getElementById('rizin-menu-input');
@@ -20001,14 +25227,44 @@ async function rizinMenuSubmit() {
         rizinMenuNote('Not saved: the comment here could not be read, and an empty field would remove it.');
         return false;
     }
+    if (menu.action === 'bytes') {
+        const parsed = rizinPatchHex(input.value);
+        if (!parsed.bytes) {
+            rizinMenuNote(parsed.error);
+            return false;
+        }
+    }
     const sid = rizinState.session;
     menu.saving = true;
     rizinMenuNote('Saving…', true);
-    const r = menu.action === 'rename' ? await rizinRename(menu.addr, input.value.trim()) : await rizinComment(menu.addr, input.value);
+    const r = menu.action === 'rename' ? await rizinRename(menu.addr, input.value.trim())
+        : menu.action === 'bytes' ? await rizinPatchBytes(menu.addr, input.value) : await rizinComment(menu.addr, input.value);
+    return rizinMenuFinish(menu, sid, r);
+}
+
+// NOP out, Flip the jump, Always jump, Kill the call (the kind is the entry's data-action) patch the one instruction
+// at the menu's address and close the menu; Run to here closes it and starts the run. A patch that the server
+// refuses (no such jump there, no instruction decoded) says why in the menu, which stays.
+async function rizinMenuAct(action) {
+    const menu = rizinState.menu, sid = rizinState.session;
+    if (!menu || menu.saving || !sid) return false;
+    if (action === 'until') {
+        rizinCloseMenu();
+        return rizinRunToHere(menu.addr);
+    }
+    menu.saving = true;
+    rizinMenuNote('Patching…', true);
+    return rizinMenuFinish(menu, sid, await rizinPatchOp(menu.addr, action));
+}
+
+// The end of a menu action r (an answer of rizinApi): done, the menu closes and every view is drawn again (not the
+// marks: the answer of a patch brought its list, and a rename or a comment changes none); else the menu stays and
+// says why
+async function rizinMenuFinish(menu, sid, r) {
     if (sid !== rizinState.session) return false;
     if (r.ok) {
         if (rizinState.menu === menu) rizinCloseMenu();
-        await rizinAnnotated();
+        await rizinAnnotated(['marks']);
         return true;
     }
     if (rizinState.menu !== menu) return false;
@@ -20108,6 +25364,23 @@ function rizinDecompilerMark(lines, current, prefer) {
     return best;
 }
 
+// What a click in the gutter of each line of C acts on (null for a line without an address): the lowest
+// address of the line that carries a breakpoint, else its lowest address, and whether one sits there. The
+// lowest because a breakpoint on a line of C stops before the line, and its offset is only the first of
+// rizin's annotations (pdgo's address), which can be past the call the line is about; one that is set
+// already wins, so that a second click removes it instead of setting another. An instruction may belong to
+// several lines (unlike rizinDecompilerMark, which picks the one line that is "here"): each carries the
+// mark, and a click on any of them removes the same breakpoint.
+function rizinDecompilerStops(lines, breakpoints) {
+    const set = new Set(Array.isArray(breakpoints) ? breakpoints : []);
+    return (Array.isArray(lines) ? lines : []).map(line => {
+        const offsets = rizinLineOffsets(line).sort((a, b) => a - b);
+        if (!offsets.length) return null;
+        const at = offsets.find(o => set.has(o));
+        return { addr: rizinHex(at ?? offsets[0]), set: at !== undefined };
+    });
+}
+
 // A line of rz-ghidra's C as markup: keywords and types, the names of the functions it calls (rizin's names
 // have dots: sym.imp.KERNEL32.dll_Sleep), strings and comments in their colours, everything else as text.
 // Linear: every try at a quote or a comment matches (one that nothing closes takes the rest of the line),
@@ -20135,19 +25408,30 @@ function rizinCHtml(text) {
 
 // The lines of DECOMPILER: rz-ghidra's C, each with its index in data-line; a line with an address (its
 // offset, as pdgo shows it) carries it in data-addr and all its addresses on hover. current (an address)
-// marks its line (rizinDecompilerMark), line is the line clicked.
+// marks its line (rizinDecompilerMark), line is the line clicked. Before the text of each line stands the
+// gutter, as in DISASSEMBLY: a cell with data-rizin-gutter (the address a click acts on, which its hover
+// text names) where the line has an address, and where it has none (the signature, a brace) an empty cell
+// of the same width, so that the C of every line starts on the same column. breakpoints are the addresses
+// of the list the marks hold (numbers): a line shows one when any of its addresses carries one.
 function rizinDecompilerHtml(lines, options) {
-    const { current = null, line = null } = options || {};
+    const { current = null, line = null, breakpoints = [] } = options || {};
     const list = Array.isArray(lines) ? lines : [];
     const mark = rizinDecompilerMark(list, current, line);
+    const stops = rizinDecompilerStops(list, breakpoints);
     let html = '';
     list.forEach((item, i) => {
         const text = item && item.text !== null && item.text !== undefined ? String(item.text) : '';
         const addr = rizinHex(item && item.offset);
         const all = rizinLineOffsets(item).sort((a, b) => a - b).map(rizinHex).filter(Boolean);
+        const stop = stops[i] && stops[i].addr ? stops[i] : null;
+        const gutter = stop
+            ? `<span class="rizin-dec-gutter${stop.set ? ' on' : ''}" data-rizin-gutter="${escapeHtml(stop.addr)}" title="${escapeHtml(stop.set
+                ? `Breakpoint at ${stop.addr}: click to remove it` : `Click to set a breakpoint before this line, at ${stop.addr}`)}"`
+                + `${stop.set ? ' aria-label="breakpoint"' : ''}>${stop.set ? '●' : ''}</span>`
+            : '<span class="rizin-dec-pad"></span>';
         html += `<div class="rizin-dec-line${i === mark ? ' current' : ''}${addr ? ' rizin-dec-jump' : ''}" data-line="${i}"`
             + (addr ? ` data-addr="${addr}" title="${escapeHtml(all.join(' '))}"` : '')
-            + `>${text ? rizinCHtml(text) : ' '}</div>`;
+            + `>${gutter}${text ? rizinCHtml(text) : ' '}</div>`;
     });
     return html;
 }
@@ -20260,7 +25544,8 @@ async function rizinLoadDecompiler(force) {
 // DECOMPILER: the C when it holds the current place, else why not (problem: busy or an error; else it is
 // on its way). The same C at another place in it only moves the mark (a selection stays); a jump brings
 // the marked line into sight, and C drawn again for the same function keeps the lines in sight where they
-// are.
+// are. The same holds when the list of breakpoints changed (rizinSetLists): the gutter's marks are drawn
+// with the lines.
 function rizinRenderDecompiler(problem) {
     const pane = document.getElementById('rizin-decompiler');
     if (!pane) return;
@@ -20290,11 +25575,14 @@ function rizinRenderDecompiler(problem) {
     const prefer = rizinState.jumpFrom === 'decompiler' && click && click.addr === seek ? click.line : null;
     const jumped = rizinState.decompilerJump !== rizinState.jumpSeq;
     rizinState.decompilerJump = rizinState.jumpSeq;
-    const shown = JSON.stringify([sid, dec.gen]);
+    // The breakpoints are part of what is shown, as in DISASSEMBLY: another list draws the lines again (a toggle
+    // changes neither the C nor its generation), and the anchor below keeps the lines in sight where they are
+    const breakpoints = rizinState.marks.breakpoints || [];
+    const shown = JSON.stringify([sid, dec.gen, breakpoints]);
     if (shown !== rizinState.decompilerShown) {
         const place = JSON.stringify([sid, dec.function]);
         const anchor = place === rizinState.decompilerAt && !jumped ? rizinScrollAnchor(pane) : null;
-        pane.innerHTML = rizinDecompilerHtml(dec.lines, { current: seek, line: prefer });
+        pane.innerHTML = rizinDecompilerHtml(dec.lines, { current: seek, line: prefer, breakpoints });
         rizinState.decompilerShown = shown;
         if (anchor) {
             rizinRestoreScroll(pane, anchor);
@@ -20313,7 +25601,8 @@ function rizinRenderDecompiler(problem) {
     if (jumped) rizinReveal(pane, pane.querySelector('.rizin-dec-line.current'));
 }
 
-// A click on a line of C with an address jumps there (not when it ends a selection of text); Reopen opens
+// A click on a line of C with an address jumps there (not when it ends a selection of text), a click in the
+// gutter before it sets or removes the breakpoint at the address of its cell and moves nowhere; Reopen opens
 // the file again, Decompile again asks for the function whose decompile ended a session
 function rizinOnDecompilerClick(event) {
     const el = event.target && event.target.closest ? event.target : null;
@@ -20321,6 +25610,8 @@ function rizinOnDecompilerClick(event) {
     if (el.closest('[data-action="reopen"]')) return rizinReopen();
     if (el.closest('[data-action="decompile-again"]')) return rizinDecompileAgain();
     if (typeof window.getSelection === 'function' && String(window.getSelection())) return false;
+    const gutter = el.closest('[data-rizin-gutter]');
+    if (gutter) return rizinToggleBreakpoint(gutter.getAttribute('data-rizin-gutter'));
     const line = el.closest('[data-addr]');
     const addr = line ? rizinHex(line.getAttribute('data-addr')) : null;
     if (!addr) return false;
@@ -20566,6 +25857,1302 @@ function rizinOnPageHide() {
     return sent;
 }
 
+// --- The emulation: the run strip ---
+// START (the toolbar) enters the emulation; the strip between the toolbar and the work area shows while it
+// runs: the runs, the PC, the registers the last step or edit changed, why it stood, and the offer for a call at the PC.
+// The state (rizinState.emu) is the server's answer to the last start, run or skip: a run is one request, the
+// views follow the PC through rizinSeek, and nothing asks for the state again unless a view is forced (an
+// analysis step ended, a busy answer is retried). STOP leaves the emulation; it aborts nothing (rizin cannot
+// interrupt a command: a run ends by itself at esil.timeout). Addresses are "0x…" strings; rizin's register
+// names, the API behind a call and its summary come out of the file and are only ever set as text.
+
+// A word of the state as it is shown: the server sends every machine word as an exact "0x…" string (a JSON
+// number would reach the browser as a double, which cannot hold a 64-bit register), so this only normalises it;
+// a value that is no word shows as "?", never as an empty cell
+function rizinEmuHex(value) {
+    return rizinHex(value) || '?';
+}
+
+// The emulation's PC as "0x…", or null outside the emulation
+function rizinEmuPc() {
+    const emu = rizinState.emu;
+    return emu && emu.running ? rizinHex(emu.pc) : null;
+}
+
+// Why the emulation stands, in words, never none: a run in flight (it cannot be interrupted), why the last one
+// did not happen, else the reason of the last stop (a run that did what was asked says which run it was).
+// {kind, text}: kind names the class of the line.
+function rizinEmuWhy(emu, options) {
+    const { wait = '', note = '' } = options || {};
+    if (wait) {
+        const label = RIZIN_EMU.labels[wait] || wait.toUpperCase();
+        return { kind: 'wait', text: wait === 'start' ? 'Starting the emulation…' : wait === 'stop' ? 'Leaving the emulation…'
+            : wait === 'register' ? 'Setting a register…'
+            : wait === 'restore' ? 'Replaying the saved timeline: it runs the file\'s code again, and each run ends by itself (esil.timeout).'
+            : `Running ${label}: a run ends by itself (esil.timeout) and cannot be interrupted.` };
+    }
+    if (note) return { kind: 'note', text: note };
+    const stopped = emu && typeof emu.stopped === 'string' ? emu.stopped : '';
+    const summary = emu && typeof emu.summary === 'string' && emu.summary ? ` · ${emu.summary}` : '';
+    if (stopped === 'step') return { kind: 'step', text: (RIZIN_EMU.done[emu.ran] || 'Stopped after the step asked for') + summary };
+    if (RIZIN_EMU.stops[stopped]) return { kind: stopped, text: RIZIN_EMU.stops[stopped] + summary };
+    if (stopped) return { kind: 'stopped', text: `Stopped: ${stopped}${summary}` };
+    return { kind: 'ready', text: `Ready at ${rizinHex(emu && emu.pc) || 'the PC'}: no run has stopped here yet` };
+}
+
+// The offer for a call at the PC (rizinEmuAssist): the sentence of what SKIP will do, and the field for the
+// value that goes into the return register, with the offered one in it. Where the assistant is off, its reason
+// and no field: SKIP is the plain skip then.
+function rizinRunAssistHtml(assist) {
+    if (!assist || typeof assist !== 'object') return '';
+    if (!assist.supported) {
+        const reason = assist.reason || 'no answer is offered for this call';
+        return `<span class="rizin-run-assist-text" title="${escapeHtml(reason)}">; ${escapeHtml(reason)}</span>`;
+    }
+    const text = assist.summary || `skip ${assist.api || 'the call'}`;
+    const value = typeof assist.value === 'string' ? rizinHex(assist.value) || '' : '';
+    const reg = assist.ret_reg || 'value';
+    return `<span class="rizin-run-assist-text" title="${escapeHtml(text)}">; ${escapeHtml(text)}</span>`
+        + `<label class="rizin-run-assist-label" for="rizin-run-assist-value">${escapeHtml(reg)} =</label>`
+        + `<input type="text" id="rizin-run-assist-value" class="filter-input rizin-run-value" value="${escapeHtml(value)}" `
+        + `placeholder="${value ? '' : 'keep'}" aria-label="The value SKIP puts into ${escapeHtml(reg)}" autocomplete="off" spellcheck="false">`;
+}
+
+// The strip's parts from the state: {pc, regs, assist} as markup and {why} as {kind, text}. The registers are
+// those in emu.changed, in rizin's order (all of them are in the state for the EMULATION pane), marked with a
+// delta and a bar, so that the colour does not carry it alone; at most RIZIN_EMU.regs, then "+n more".
+function rizinRunStripHtml(emu, options) {
+    const pc = emu && emu.running ? rizinHex(emu.pc) : null;
+    const changed = new Set(emu && Array.isArray(emu.changed) ? emu.changed.map(String) : []);
+    const all = (emu && Array.isArray(emu.registers) ? emu.registers : []).filter(reg => reg && changed.has(String(reg.name)));
+    const shown = all.slice(0, RIZIN_EMU.regs);
+    const regs = shown.map(reg => `<span class="rizin-run-reg" title="${escapeHtml(reg.name)} changed by the last step or edit">`
+        + `<span class="rizin-run-delta" aria-hidden="true">Δ</span><span class="rizin-run-reg-name">${escapeHtml(reg.name)}</span> `
+        + `<span class="rizin-run-reg-value">${escapeHtml(rizinEmuHex(reg.value))}</span></span>`).join(' ');
+    const rest = all.slice(shown.length);
+    return {
+        pc: pc ? `<span class="rizin-run-pc-label">▶ PC</span> <span class="rizin-run-pc-value">${escapeHtml(pc)}</span>`
+            : '<span class="rizin-run-pc-label">▶ PC</span> <span class="rizin-run-pc-value">unknown</span>',
+        regs: (regs || '<span class="rizin-run-none">no register changed</span>')
+            + (rest.length ? ` <span class="rizin-run-more" title="${escapeHtml(rest.map(reg => reg.name).join(' '))}">+${rest.length} more</span>` : ''),
+        why: rizinEmuWhy(emu, options),
+        assist: rizinRunAssistHtml(emu && emu.assist),
+    };
+}
+
+// The strip, and START: the strip is there while the emulation runs; only a part that changed is written
+// (the offered value being edited stays while the rest moves). A run in flight puts the runs and STOP off.
+function rizinRenderRunStrip() {
+    rizinRenderEmuPane();       // the pane draws from the same state
+    const emu = rizinState.session ? rizinState.emu : null;
+    const running = !!emu && emu.running === true;
+    const start = document.getElementById('rizin-emu-start');
+    if (start) {
+        start.disabled = !rizinState.session || running || !!rizinState.emuWait || rizinState.opening
+            || ['moved', 'ended', 'not-installed'].includes(rizinState.ui.state);
+    }
+    const strip = document.getElementById('rizin-run');
+    if (!strip) return;
+    if (!running) {
+        if (!strip.hidden) strip.hidden = true;
+        rizinState.emuShown = {};
+        return;
+    }
+    if (strip.hidden) strip.hidden = false;
+    const wait = rizinState.emuWait, parts = rizinRunStripHtml(emu, { wait, note: rizinState.emuNote });
+    const shown = rizinState.emuShown;
+    for (const [id, html] of [['rizin-run-pc', parts.pc], ['rizin-run-regs', parts.regs], ['rizin-run-assist', parts.assist]]) {
+        const el = document.getElementById(id);
+        if (!el) continue;
+        if (shown[id] !== html) {
+            el.innerHTML = html;
+            shown[id] = html;
+        }
+        if (id === 'rizin-run-assist') el.hidden = !html;
+    }
+    const why = document.getElementById('rizin-run-why');
+    const key = JSON.stringify(parts.why);
+    if (why && shown['rizin-run-why'] !== key) {
+        why.textContent = parts.why.text;
+        why.title = parts.why.text;
+        why.className = `rizin-run-why rizin-run-why-${cssToken(parts.why.kind)}`;
+        shown['rizin-run-why'] = key;
+    }
+    const pc = rizinEmuPc();
+    for (const button of strip.querySelectorAll('button')) {
+        button.disabled = !!wait || (button.getAttribute('data-rizin-act') === 'gotopc' && !pc);
+    }
+    const stop = document.getElementById('rizin-run-stop');
+    if (stop) stop.title = wait ? 'A run in flight ends by itself; STOP is there again once it has' : 'Leave the emulation';
+}
+
+// The marks of the PC in DISASSEMBLY and GRAPH drawn again (the PC moved, or the emulation ended): only where
+// the view holds its place now, so that a message of the view (busy, loading) stays
+function rizinRenderPcMarks() {
+    if (rizinPageHolds(rizinState.disasm)) rizinRenderDisasm();
+    if (rizinGraphHolds(rizinState.graph)) rizinRenderGraph();
+}
+
+// Out of the emulation: the state, what waits and its note go, the strip and the marks of the PC with them
+function rizinEmuLeave() {
+    Object.assign(rizinState, { emu: null, emuWait: '', emuNote: '', emuShown: {} });
+    rizinState.emuSeq++;
+    rizinRenderRunStrip();
+    rizinRenderPcMarks();
+}
+
+// Whether the instruction at pc is a call, from the page DISASSEMBLY shows; true where the page does not
+// hold it (the offer is then asked for, and the server says whether there is a call)
+function rizinEmuAtCall(pc) {
+    const page = rizinState.disasm, at = rizinNum(pc);
+    const op = page && page.session === rizinState.session && Array.isArray(page.ops)
+        ? page.ops.find(o => o && o.offset === at) : null;
+    return op ? String(op.type || '').includes('call') : true;
+}
+
+// The offer for the call at the PC (GET call changes nothing, so it may be asked after every run): kept in
+// emu.assist for the strip. Not asked at an instruction that is no call, nor again at the PC it has been asked
+// at. A busy answer is retried with the other views; any other answer leaves no offer (SKIP is the plain skip).
+async function rizinEmuAssist() {
+    const sid = rizinState.session, emu = rizinState.emu, pc = rizinEmuPc();
+    if (!sid || !emu || !pc) return false;
+    if (!rizinEmuAtCall(pc)) return true;
+    if (emu.assist && emu.assist.addr === pc) return true;
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/call?addr=${encodeURIComponent(pc)}`);
+    if (sid !== rizinState.session || rizinState.emu !== emu || rizinEmuPc() !== pc) return false;
+    if (!r.ok) {
+        if (r.state === 'busy') rizinViewBusy('emulation', true);
+        emu.assist = null;
+        rizinRenderRunStrip();
+        return false;
+    }
+    const d = r.data;
+    emu.assist = {
+        addr: pc, supported: d.supported === true, reason: typeof d.reason === 'string' ? d.reason : '',
+        api: typeof d.api === 'string' ? d.api : '', ret_reg: typeof d.ret_reg === 'string' ? d.ret_reg : '',
+        value: typeof d.value === 'string' ? rizinHex(d.value) : null, stack_fix: Number.isInteger(d.stack_fix) ? d.stack_fix : 0,
+        summary: typeof d.summary === 'string' ? d.summary : '',
+    };
+    rizinRenderRunStrip();
+    return true;
+}
+
+// The emulation's state for the views registered in RIZIN_VIEWS: nothing outside the emulation, nothing unless
+// forced (the state of the last run is current, and a step must not cost another request), and forced (an
+// analysis step ended, the console changed something, a busy answer is retried) it is read again. Reading
+// gives no reason for a stop, so the one of the run stays while the PC does. A busy answer waits for the poll,
+// a refusal that the emulation is not started (rizin restarted) leaves the mode, and a 404 ends it with the session.
+async function rizinLoadEmulation(force) {
+    const sid = rizinState.session, emu = rizinState.emu;
+    if (!sid || !emu || !emu.running) {
+        rizinRenderRunStrip();
+        return true;
+    }
+    if (force && !rizinState.emuWait) {
+        const seq = ++rizinState.emuSeq;
+        const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/emulation`);
+        if (sid !== rizinState.session || seq !== rizinState.emuSeq || rizinState.emu !== emu) return false;
+        if (!r.ok) {
+            if (r.state === 'busy') {
+                rizinViewBusy('emulation', true);
+            } else if (r.state === 'refused' && /not started/.test(r.error)) {
+                rizinEmuLeave();
+                rizinState.note = r.error;
+                rizinRenderState();
+            } else {
+                rizinState.emuNote = `The emulation's state could not be read: ${r.error}`;
+            }
+            rizinRenderRunStrip();
+            return false;
+        }
+        rizinState.retry.delete('emulation');
+        if (r.data.running !== true) {
+            rizinEmuLeave();
+            return true;
+        }
+        const same = rizinHex(emu.pc) === rizinHex(r.data.pc);
+        const kept = same ? { stopped: emu.stopped, ran: emu.ran, summary: emu.summary, assist: emu.assist } : { ran: '', assist: null };
+        rizinState.emu = { ...kept, ...r.data, stopped: r.data.stopped || kept.stopped || null };
+        rizinState.emuNote = '';
+        rizinRenderRunStrip();
+        rizinRenderPcMarks();
+        await rizinEmuAssist();
+        return true;
+    }
+    rizinRenderRunStrip();
+    return true;
+}
+
+// One request that changes the state (a run, or a skip of a call): the answer is the new state, the views
+// follow its PC, and the offer for the call there is asked for. One at a time (rizin answers one request at a
+// time, a run blocks up to its timeout); a refusal or a busy answer leaves the state, with its reason in the
+// strip; the end of the session and a rizin that lost the emulation leave the mode.
+async function rizinEmuPost(wait, path, body, ran) {
+    const sid = rizinState.session, emu = rizinState.emu;
+    if (!sid || !emu || !emu.running || rizinState.emuWait) return false;
+    const seq = ++rizinState.emuSeq;
+    rizinState.emuWait = wait;
+    rizinState.emuNote = '';
+    rizinRenderRunStrip();
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/${path}`, { method: 'POST', body });
+    // The session ended (rizinSetUi left the mode) or another one took the tab: nothing of it is left to change
+    if (sid !== rizinState.session || seq !== rizinState.emuSeq) return false;
+    rizinState.emuWait = '';
+    if (!r.ok || r.data.running !== true) {
+        if (r.state === 'refused' && /not started/.test(r.error)) {
+            rizinEmuLeave();
+            rizinState.note = r.error;
+            rizinRenderState();
+            return false;
+        }
+        rizinState.emuNote = r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); nothing ran. Try again once it is free.`
+            : r.ok ? 'the server answered without a state' : r.error;
+        rizinRenderRunStrip();
+        if (r.state === 'busy') rizinPollSoon();        // the toolbar's busy goes once rizin is free
+        return false;
+    }
+    rizinState.emu = { ...r.data, ran, assist: null };
+    rizinRenderRunStrip();
+    const pc = rizinEmuPc();
+    // The jump draws every view, with the PC's marks (also where it found rizin busy); no PC: its marks go
+    if (pc) await rizinSeek(pc, 'emulation');
+    else rizinRenderPcMarks();
+    await rizinEmuAssist();
+    // What a run wrote is in the pane's patches (a run cannot change the breakpoints, and the registers and the stack are
+    // in the answer: not asked for)
+    await rizinLoadEmuPane(true, 'patches');
+    return true;
+}
+
+// START: the emulation at the current address (rizin sets io.cache and the guards, and maps its stack). Its
+// refusal shows in the toolbar's state, where the strip is not yet.
+async function rizinEmuStart() {
+    const sid = rizinState.session;
+    if (!sid || rizinState.emuWait || rizinState.opening || (rizinState.emu && rizinState.emu.running)) return false;
+    const seq = ++rizinState.emuSeq;
+    rizinState.emuWait = 'start';
+    rizinState.note = '';
+    rizinRenderState();
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/emulation/start`,
+                             { method: 'POST', body: rizinState.seek ? { addr: rizinState.seek } : {} });
+    if (sid !== rizinState.session || seq !== rizinState.emuSeq) return false;
+    rizinState.emuWait = '';
+    if (!r.ok || r.data.running !== true) {
+        if (r.state === 'refused' || r.state === 'error' || r.ok) rizinState.note = r.ok ? 'the server answered without a state' : r.error;
+        rizinRenderState();
+        if (r.state === 'busy') rizinPollSoon();
+        return false;
+    }
+    rizinState.emu = { ...r.data, ran: '', assist: null };
+    rizinState.emuNote = '';
+    rizinRenderRunStrip();
+    const pc = rizinEmuPc();
+    if (pc && pc !== rizinState.seek) await rizinSeek(pc, 'emulation');
+    rizinRenderPcMarks();
+    await rizinEmuAssist();
+    await rizinLoadEmuPane(true, 'patches');       // a running emulation changes what the restore button may do
+    return true;
+}
+
+// STOP: leaves the emulation mode (the patches stay). It is no abort: while a run is in flight nothing goes out.
+async function rizinEmuStop() {
+    const sid = rizinState.session;
+    if (!sid || !rizinState.emu || rizinState.emuWait) return false;
+    const seq = ++rizinState.emuSeq;
+    rizinState.emuWait = 'stop';
+    rizinState.emuNote = '';
+    rizinRenderRunStrip();
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/emulation/stop`, { method: 'POST' });
+    if (sid !== rizinState.session || seq !== rizinState.emuSeq) return false;
+    rizinState.emuWait = '';
+    if (!r.ok) {
+        rizinState.emuNote = r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); the emulation was not left. Try again once it is free.`
+            : r.error;
+        rizinRenderRunStrip();
+        if (r.state === 'busy') rizinPollSoon();
+        return false;
+    }
+    rizinEmuLeave();
+    await rizinLoadEmuPane(true, 'patches');       // and so does leaving it
+    return true;
+}
+
+// A run: one of the strip's kinds, or until with the address that the right-click menu gives. Anything else
+// (there is no step back) goes nowhere.
+function rizinEmuRun(kind, addr) {
+    const body = { kind: String(kind) };
+    if (kind === 'until') {
+        const at = rizinHex(addr);
+        if (!at) return Promise.resolve(false);
+        body.addr = at;
+    } else if (!RIZIN_EMU.kinds.includes(kind)) {
+        return Promise.resolve(false);
+    }
+    return rizinEmuPost(body.kind, 'emulation/run', body, body.kind);
+}
+
+// SKIP at a call the assistant answers for: the call is skipped with the value in the field (the offered one
+// unless it was edited; none leaves the return register as it is) and the stack correction the offer named.
+// Anywhere else, and where the assistant is off, it is the plain skip.
+function rizinEmuSkipCall() {
+    const emu = rizinState.emu, pc = rizinEmuPc();
+    if (!rizinState.session || !emu || !emu.running || rizinState.emuWait || !pc) return Promise.resolve(false);
+    const assist = emu.assist;
+    if (!assist || assist.addr !== pc || !assist.supported) return rizinEmuRun('skip');
+    const field = document.getElementById('rizin-run-assist-value');
+    const typed = field ? String(field.value).trim() : '';
+    const value = typed ? rizinHex(typed) : null;
+    if (typed && !value) {
+        rizinState.emuNote = `"${typed}" is no number: the value is decimal or 0x…`;
+        rizinRenderRunStrip();
+        return Promise.resolve(false);
+    }
+    return rizinEmuPost('skip', 'call', { addr: pc, value, stack_fix: assist.stack_fix }, 'skip');
+}
+
+// GO TO PC: every view at the PC, after the user went elsewhere. A jump of the user's, so it enters the history
+// (the views following a run do not)
+function rizinEmuGoToPc() {
+    const pc = rizinEmuPc();
+    return pc && !rizinState.emuWait ? rizinSeek(pc, 'pc') : Promise.resolve(false);
+}
+
+// One click handler for the strip: a run (SKIP goes through the call assistant), GO TO PC or STOP. It does not
+// look at the button being off: every action refuses by itself while a run waits (a browser sends no click of an
+// off button anyway), so there is one rule, in the actions
+function rizinOnRunClick(event) {
+    const button = event.target && event.target.closest ? event.target.closest('button') : null;
+    if (!button) return false;
+    const kind = button.getAttribute('data-rizin-run'), action = button.getAttribute('data-rizin-act');
+    if (kind === 'skip') return rizinEmuSkipCall();
+    if (kind) return rizinEmuRun(kind);
+    if (action === 'gotopc') return rizinEmuGoToPc();
+    if (action === 'stop') return rizinEmuStop();
+    return false;
+}
+
+// --- The emulation: the EMULATION pane ---
+// The dock's pane for the full state: every register (each field takes a new value), the stack from the stack
+// pointer, the breakpoints, and the patches in the two groups that decide what survives the session. The registers,
+// the stack and the PC come from rizinState.emu, the state that the run strip draws from too (the pane never asks the
+// route for it); the pane fetches only /patches and /breakpoints, itself, while it is shown and after what changes them.
+// Every machine word is the server's exact "0x…" string, set as text and sent back as typed (rizinHex), never parsed
+// into a number; the rows of /patches and /breakpoints carry integers, which the file's layout bounds. The names of
+// registers, functions, hints and the notes come out of the file: only ever set as text.
+
+// The address of a row of /patches or /breakpoints as "0x…": one that a double cannot hold exactly is no address
+// here, rather than a wrong one
+function rizinEmuRowAddr(value) {
+    return Number.isSafeInteger(value) && value >= 0 ? rizinHex(value) : null;
+}
+
+// The name of the function of the file that holds a row's address; '' where none does or the list is not loaded
+function rizinEmuFunctionAt(functions, addr) {
+    if (!Array.isArray(functions) || !Number.isSafeInteger(addr)) return '';
+    const fn = functions.find(f => f && Number.isSafeInteger(f.offset) && addr >= f.offset
+        && addr < f.offset + (Number.isSafeInteger(f.size) && f.size > 0 ? f.size : 1));
+    return fn && typeof fn.name === 'string' ? fn.name : '';
+}
+
+// The bytes of a patch as hex, cut after 16 of them
+function rizinEmuBytes(hex) {
+    const text = String(hex ?? '');
+    return text.length > 32 ? `${text.slice(0, 32)}…` : text;
+}
+
+// The session's note as the pane shows it: the sentence that cannot wait (RIZIN_EMU_PANE.urgent: the server appends
+// it last) first, then the rest; [{urgent, text}]
+function rizinEmuNotes(note) {
+    const text = typeof note === 'string' ? note.trim() : '';
+    if (!text) return [];
+    const at = text.indexOf(RIZIN_EMU_PANE.urgent);
+    if (at < 0) return [{ urgent: false, text }];
+    const rest = `${text.slice(0, at)} ${text.slice(at + RIZIN_EMU_PANE.urgent.length)}`.replace(/\s+/g, ' ').trim();
+    return [{ urgent: true, text: RIZIN_EMU_PANE.urgent }, ...(rest ? [{ urgent: false, text: rest }] : [])];
+}
+
+// A section that has nothing to show says why, in words (never a blank)
+function rizinEmuEmpty(text) {
+    return `<div class="rizin-empty rizin-emu-empty">${escapeHtml(text)}</div>`;
+}
+
+// What the hand-made patches are, as one string: an export is of these, and is out of date once they differ
+function rizinEmuHandSignature(patches) {
+    return (Array.isArray(patches) ? patches : []).filter(row => row && row.mine === true).map(row => `${row.addr}:${row.after}`).join(',');
+}
+
+// Every register of the state in an editable field, in rizin's order. A register the last step or edit changed has a
+// sign (Δ), a bar and a heavier name, and says so to assistive technology: the colour does not carry it alone.
+function rizinEmuRegistersHtml(emu) {
+    if (!emu || emu.running !== true) return rizinEmuEmpty('No emulation is running: EMULATE in the toolbar begins one at the current address.');
+    const regs = (Array.isArray(emu.registers) ? emu.registers : []).filter(reg => reg && typeof reg === 'object' && reg.name !== undefined && reg.name !== null);
+    if (!regs.length) return rizinEmuEmpty('rizin listed no registers.');
+    const changed = new Set(Array.isArray(emu.changed) ? emu.changed.map(String) : []);
+    return '<div class="rizin-emu-regs">' + regs.map(reg => {
+        const name = escapeHtml(String(reg.name)), mark = changed.has(String(reg.name));
+        return `<label class="rizin-emu-reg${mark ? ' changed' : ''}" title="${name}${mark ? ' changed by the last step or edit' : ''}">`
+            + `<span class="rizin-emu-delta" aria-hidden="true">${mark ? 'Δ' : ''}</span><span class="rizin-emu-reg-name">${name}</span>`
+            + `<input type="text" class="filter-input rizin-emu-reg-input" data-rizin-reg="${name}" value="${escapeHtml(rizinEmuHex(reg.value))}" `
+            + `aria-label="${name}${mark ? ' (changed by the last step or edit)' : ''}" autocomplete="off" spellcheck="false"></label>`;
+    }).join('') + '</div>';
+}
+
+// The stack words from the stack pointer: slot address, value, and where the value points when it is a function or
+// a flag (the hint). A click on the row goes to the slot, on a value that has a hint to the function. An empty stack of
+// a running emulation says why: the server answers [] both where the stack pointer has left the mapped stack and where
+// the map is gone, and the state cannot tell the two apart.
+function rizinEmuStackHtml(emu) {
+    if (!emu || emu.running !== true) return rizinEmuEmpty('No emulation is running, so there is no stack to show.');
+    const stack = (Array.isArray(emu.stack) ? emu.stack : []).filter(row => row && typeof row === 'object');
+    if (!stack.length) {
+        return rizinEmuEmpty('No stack words to show: the stack pointer is outside the stack the emulation mapped, or that map is gone. '
+            + 'Restarting the emulation (STOP, then EMULATE) maps it again.');
+    }
+    return stack.map(row => {
+        const addr = rizinHex(row.addr), value = rizinHex(row.value);
+        const hint = typeof row.hint === 'string' ? row.hint : '';
+        const title = `${addr || '?'} holds ${rizinEmuHex(row.value)}${hint ? ` · ${hint}` : ''}`;
+        return `<div class="rizin-row rizin-emu-row rizin-emu-stack${addr ? '' : ' rizin-row-none'}"${addr ? ` data-addr="${addr}"` : ''} title="${escapeHtml(title)}">`
+            + `<span class="rz-addr">${escapeHtml(addr || '?')}</span>`
+            + `<span class="rizin-emu-value"${hint && value ? ` data-addr="${value}"` : ''}>${escapeHtml(rizinEmuHex(row.value))}</span>`
+            + `<span class="rizin-emu-hint">${escapeHtml(hint)}</span></div>`;
+    }).join('');
+}
+
+// The breakpoints: address, the function it is in, and ✕ to remove it. There is no on/off: rizin 0.9.1 stops a run at
+// a breakpoint that is listed as disabled all the same, and a row says so rather than looking switched off.
+function rizinEmuBreakpointsHtml(breakpoints, functions) {
+    const rows = (Array.isArray(breakpoints) ? breakpoints : []).filter(bp => bp && typeof bp === 'object');
+    if (!rows.length) return rizinEmuEmpty('No breakpoints set.');
+    return rows.map(bp => {
+        const addr = rizinEmuRowAddr(bp.addr), fn = rizinEmuFunctionAt(functions, bp.addr), off = bp.enabled === false;
+        const title = `${addr || 'an address that cannot be shown exactly'}${fn ? ` · ${fn}` : ''}`
+            + `${off ? ' · rizin lists it as disabled, but a run stops there all the same' : ''}`;
+        return `<div class="rizin-row rizin-emu-row rizin-emu-bp${addr ? '' : ' rizin-row-none'}"${addr ? ` data-addr="${addr}"` : ''} title="${escapeHtml(title)}">`
+            + `<span class="rz-addr">${escapeHtml(addr || '?')}</span><span class="rizin-emu-fn">${escapeHtml(fn || '—')}</span>`
+            + `<span class="rizin-emu-hint">${off ? 'off, still stops a run' : ''}</span>`
+            + (addr ? `<button type="button" class="rizin-tool rizin-emu-del" data-rizin-act="unbreak" title="Remove this breakpoint" `
+                + `aria-label="Remove the breakpoint at ${addr}">✕</button>` : '<span></span>')
+            + '</div>';
+    }).join('');
+}
+
+// The head of PATCHES: the one button that belongs to neither group. rizin has one write cache for what was set by hand
+// and for what a run wrote, so this clears all of it (wc-*): it is not "take back mine", and it is disabled only for an
+// empty cache, which its title says.
+function rizinEmuPatchesHeadHtml(patches, busy) {
+    const count = Array.isArray(patches) ? patches.filter(row => row && typeof row === 'object').length : 0;
+    const title = count ? "Clear everything in rizin's write cache: the patches set by hand and every write a run made. rizin has one cache for both."
+        : "rizin's write cache is empty: nothing to clear";
+    return `<div class="rizin-emu-head rizin-emu-head-row"><span>PATCHES</span><span class="rizin-emu-actions">`
+        + `<button type="button" class="rizin-tool" data-rizin-act="unpatch-all"${count && !busy ? '' : ' disabled'} title="${escapeHtml(title)}">`
+        + `Clear rizin's whole cache</button></span></div>`;
+}
+
+// The patches in three groups, apart on the page: what was set by hand (kept with the project, exported, taken back one
+// by one), what waits (kept with the project, but not in the cache: rizinEmuWaitingHtml, only where something waits)
+// and what a run wrote (it ends with the session: the group says so before it hurts, and carries Re-analyse).
+// rizin has one write cache for the first and the last: the button that clears all of it is in the head of PATCHES,
+// outside the groups.
+function rizinEmuPatchesHtml(patches, functions, options) {
+    const { exported = null, busy = '', waiting = null } = options || {};
+    const rows = (Array.isArray(patches) ? patches : []).filter(row => row && typeof row === 'object');
+    const hand = rows.filter(row => row.mine === true), run = rows.filter(row => row.mine !== true);
+    const off = on => (on ? ' disabled' : '');
+    const line = (patch, own) => {
+        const addr = rizinEmuRowAddr(patch.addr), fn = rizinEmuFunctionAt(functions, patch.addr);
+        const size = Number.isSafeInteger(patch.size) ? patch.size : 0;
+        const before = rizinEmuBytes(patch.before), after = rizinEmuBytes(patch.after);
+        const over = own && patch.over_run === true;
+        const title = `${addr || 'an address that cannot be shown exactly'} · ${size} byte${size === 1 ? '' : 's'}${fn ? ` · ${fn}` : ''} · ${before} → ${after}`
+            + (over ? ' · written over bytes a run wrote: the bytes on the left are the run\'s, which need not be the file\'s, and the export\'s note says what the file holds there' : '');
+        return `<div class="rizin-row rizin-emu-row rizin-emu-patch${addr ? '' : ' rizin-row-none'}"${addr ? ` data-addr="${addr}"` : ''} title="${escapeHtml(title)}">`
+            + `<span class="rz-addr">${escapeHtml(addr || '?')}</span><span class="rizin-emu-fn">${escapeHtml(fn || '—')}</span>`
+            + `<span class="rizin-emu-bytes">${size} B · ${over ? '<span class="rizin-emu-over-mark">⚠</span>' : ''}${escapeHtml(before)} → ${escapeHtml(after)}</span>`
+            + (own && addr ? `<button type="button" class="rizin-tool rizin-emu-del" data-rizin-act="unpatch" title="Take this patch back" `
+                + `aria-label="Take back the patch at ${addr}">✕</button>` : '<span></span>')
+            + '</div>';
+    };
+    const list = (group, own, none) => {
+        if (!group.length) return rizinEmuEmpty(none);
+        const more = group.length - RIZIN_EMU_PANE.rows;
+        return group.slice(0, RIZIN_EMU_PANE.rows).map(patch => line(patch, own)).join('')
+            + (more > 0 ? rizinEmuEmpty(`+${more} more writes, not shown here`) : '');
+    };
+    let result = '';
+    if (exported) {
+        const skipped = (Array.isArray(exported.skipped) ? exported.skipped : []).map(addr => rizinEmuRowAddr(addr) || '?');
+        const current = exported.sig === rizinEmuHandSignature(hand);
+        result = `<div class="rizin-emu-export" role="status"><b>${escapeHtml(exported.name)}</b> · ${escapeHtml(exported.patched)} bytes patched`
+            + (skipped.length ? `<div class="rizin-emu-note rizin-emu-note-error">Not placed in the file (no file offset there), so not in the copy: ${escapeHtml(skipped.join(', '))}</div>`
+                : '<div>Every patch was placed in the file.</div>')
+            + (current ? '' : '<div class="rizin-emu-note rizin-emu-note-error">The patches changed since this copy was made: export again.</div>')
+            + `<div><button type="button" class="rizin-tool" data-rizin-act="detonate"${current && !busy ? '' : ' disabled'} `
+            + `title="Choose this copy in the Submit tab; nothing is submitted until Detonate is pressed there">To the Submit tab`
+            + `${skipped.length ? ` (${skipped.length} patch${skipped.length === 1 ? '' : 'es'} not in it)` : ''}</button></div>`
+            + `<pre>${escapeHtml(exported.note)}</pre></div>`;
+    }
+    const written = run.reduce((sum, patch) => sum + (Number.isSafeInteger(patch.size) ? patch.size : 0), 0);
+    // A patch set over bytes a run wrote: rizin's "before" for such a row is the run's byte, which need not be the file's, so the
+    // row alone would read as if the file held it. The glyph marks the row, this line says what follows from it.
+    const over = hand.filter(patch => patch.over_run === true).length;
+    const overLine = over ? `<div class="rizin-emu-warn" role="note">${over === 1 ? 'One of these was' : `${over} of these were`}`
+        + ' set over bytes a run wrote: in the file those bytes may be different, and the export writes the file\'s own'
+        + ' bytes around the patch — so the copy has it inside bytes that may still be encrypted. The note names them.</div>' : '';
+    return `<div class="rizin-emu-group rizin-emu-hand" data-rizin-group="hand"><div class="rizin-emu-subhead">`
+        + `<span class="rizin-emu-group-title">SET BY HAND · ${hand.length}</span><span class="rizin-emu-fate">kept with the project</span>`
+        + `<span class="rizin-emu-actions"><button type="button" class="rizin-tool" data-rizin-act="export"${off(!hand.length || busy)} `
+        + `title="Write a copy of the file with these patches in it, and a note beside it">Export</button>`
+        + `</span></div>${overLine}${result}${list(hand, true, 'Nothing set by hand.')}</div>`
+        + rizinEmuWaitingHtml(waiting, functions, { busy })
+        + `<div class="rizin-emu-group rizin-emu-run" data-rizin-group="run"><div class="rizin-emu-subhead">`
+        + `<span class="rizin-emu-group-title">WRITTEN BY THE RUN · ${run.length}${run.length ? ` · ${written} B` : ''}</span>`
+        + `<span class="rizin-emu-fate">these end with the session</span>`
+        + `<span class="rizin-emu-actions"><button type="button" class="rizin-tool" data-rizin-act="reanalyze"${off(!run.length || busy)} `
+        + `title="Analyse the range the run wrote again, so FUNCTIONS and STRINGS see it. What it finds ends with the session too.">Re-analyse</button></span></div>`
+        + `<div class="rizin-emu-warn" role="note">These bytes end with the session: they are not saved with the project and not in an export.</div>`
+        + `${list(run, false, 'Nothing written by a run.')}</div>`;
+}
+
+// What waits: the patches the project holds that were set over bytes a run wrote and are not in the cache (the open ran
+// before any run, so they would have gone into the file's own, still encrypted bytes, and the next decryption would run
+// over them). A group of its own with the reason of each row and two ways out: ✕ takes it out of the project, Apply now
+// writes it -- drawn only where the server says `apply_now: true` for the entry (it asked run_covers over the rows of
+// the same answer; the pane keeps no copy of that rule), and the server decides again when it is pressed. Nothing waits:
+// no group. Every text here is the server's or the file's: escaped.
+function rizinEmuWaitingHtml(waiting, functions, options) {
+    const { busy = '' } = options || {};
+    const entries = (Array.isArray(waiting) ? waiting : []).filter(entry => entry && typeof entry === 'object');
+    if (!entries.length) return '';
+    const off = on => (on ? ' disabled' : '');
+    const line = entry => {
+        const addr = rizinEmuRowAddr(entry.addr), fn = rizinEmuFunctionAt(functions, entry.addr);
+        const bytes = typeof entry.after === 'string' ? entry.after : '';
+        const size = Math.floor(bytes.length / 2), why = typeof entry.reason === 'string' ? entry.reason : '';
+        const title = `${addr || 'an address that cannot be shown exactly'} · ${size} byte${size === 1 ? '' : 's'}${fn ? ` · ${fn}` : ''} · waiting: ${why}`;
+        const apply = !!addr && entry.apply_now === true;
+        return `<div class="rizin-row rizin-emu-row rizin-emu-wait${addr ? '' : ' rizin-row-none'}"${addr ? ` data-addr="${addr}"` : ''} title="${escapeHtml(title)}">`
+            + `<span class="rz-addr">${escapeHtml(addr || '?')}</span><span class="rizin-emu-fn">${escapeHtml(fn || '—')}</span>`
+            + `<span class="rizin-emu-bytes">${size} B · ${escapeHtml(rizinEmuBytes(bytes))}</span>`
+            + (apply ? `<button type="button" class="rizin-tool" data-rizin-act="apply-waiting"${off(busy)} title="The server says a run's bytes lie under this patch again: write it into the cache now. `
+                + `It checks once more." aria-label="Apply the waiting patch at ${addr} now">Apply now</button>` : '<span></span>')
+            + (addr ? `<button type="button" class="rizin-tool rizin-emu-del" data-rizin-act="drop-waiting"${off(busy)} title="Remove this patch from the project: it will not come back when the file is opened again" `
+                + `aria-label="Remove the waiting patch at ${addr} from the project">✕</button>`
+                // nothing else reaches a waiting patch (it is in no cache): a row that cannot be named exactly says it has no exit
+                : `<button type="button" class="rizin-tool rizin-emu-del" data-rizin-act="drop-waiting" disabled title="This address cannot be sent exactly, so this patch cannot be removed from here" `
+                + `aria-label="The waiting patch at an address that cannot be shown exactly cannot be removed from here">✕</button>`)
+            + `<span class="rizin-emu-note rizin-emu-wait-why">${escapeHtml(why)}</span></div>`;
+    };
+    const more = entries.length - RIZIN_EMU_PANE.rows;
+    return `<div class="rizin-emu-group rizin-emu-waiting" data-rizin-group="waiting"><div class="rizin-emu-subhead">`
+        + `<span class="rizin-emu-group-title">WAITING · ${entries.length}</span><span class="rizin-emu-fate">not applied · kept with the project</span></div>`
+        + `<div class="rizin-emu-warn" role="note">These are not in rizin's cache: written into the file's own bytes, which are still encrypted, the next decryption `
+        + `would run over them. Apply now is there once a run's bytes lie under a patch; ✕ removes one from the project.</div>`
+        + entries.slice(0, RIZIN_EMU_PANE.rows).map(line).join('')
+        + (more > 0 ? rizinEmuEmpty(`+${more} more waiting, not shown here`) : '') + '</div>';
+}
+
+// The offer of the restore button as /patches (and the routes that carry the same block) answer it: {refused, reason,
+// actions, digests} where `refused` says whether the button may run (null) or why not (a sentence); null where the
+// answer is none -- no block, no `refused`, or one that is neither null nor text: a button that cannot tell is off.
+// reason (why the timeline is not kept) is the notice's and is never read for the button.
+function rizinEmuOffer(restore) {
+    if (!restore || typeof restore !== 'object' || Array.isArray(restore)) return null;
+    if (restore.refused !== null && typeof restore.refused !== 'string') return null;
+    const count = n => (Number.isSafeInteger(n) && n >= 0 ? n : null);
+    return { refused: restore.refused, reason: typeof restore.reason === 'string' && restore.reason.trim() ? restore.reason.trim() : null,
+             actions: count(restore.actions), digests: count(restore.digests) };
+}
+
+// The restore button, and the notice of why the timeline is not kept. The button is on where the offer's `refused` is
+// null and no action of the pane is out, and off with the sentence of the refusal as its title everywhere else; the
+// reason is shown whenever there is one, whatever the button says. Both texts are the server's: escaped.
+function rizinEmuRestoreHtml(restore, options) {
+    const { busy = '', wait = '', sessionNote = '' } = options || {};
+    const offer = rizinEmuOffer(restore), plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+    let title = 'The offer of the restore comes with the patches and was not in the answer: it is read again with the next one.';
+    let disabled = true;
+    if (offer && offer.refused !== null) {
+        title = offer.refused || 'The server refused the restore without saying why.';
+    } else if (offer && (busy || wait)) {
+        title = 'An action of the pane is out: the restore is there again once it has ended.';
+    } else if (offer) {
+        disabled = false;
+        title = 'Replay the saved timeline of the emulation'
+            + `${offer.actions === null ? '' : ` (${plural(offer.actions, 'action')})`} and check the bytes it leaves against the SHA-256 the project holds`
+            + `${offer.digests === null ? '' : ` (${plural(offer.digests, 'range')})`}. This runs the file's code in the emulator again.`;
+    }
+    // The status band says the same (the session's note, which the server makes while it is true): not twice in one pane. Where the
+    // button is on while the timeline is not kept, the project holds an earlier timeline and the button replays that one.
+    const said = offer && offer.reason ? `The way to this state is not kept in the project: ${offer.reason.replace(/[.\s]+$/, '')}.` : '';
+    const note = said && !String(sessionNote || '').includes(said)
+        ? `<div class="rizin-emu-note rizin-emu-warn rizin-emu-restore-note" role="note">${escapeHtml(said)}${offer.refused === null ? ' The project still holds an earlier timeline, which the restore button replays.' : ''}</div>` : '';
+    return `<div class="rizin-emu-restore"><button type="button" class="rizin-tool" data-rizin-act="restore"${disabled ? ' disabled' : ''} `
+        + `title="${escapeHtml(title)}">Restore the run</button></div>${note}`;
+}
+
+// What a POST restore that was answered says, as {kind, text} for the pane's notice: restored (the timeline replayed and
+// the SHA-256 held: how many actions and ranges where the answer's block says, which waiting patches were written, how
+// many still wait), or not (the reason the server gave, and that the waiting ones wait still), or neither where the
+// answer does not say. Nothing is counted from a block the answer does not have.
+function rizinEmuRestoreWords(data) {
+    const d = data && typeof data === 'object' ? data : {};
+    const list = d.patches && typeof d.patches === 'object' ? d.patches : null;
+    const waiting = list && Array.isArray(list.waiting) ? list.waiting.length : 0;
+    const offer = list ? rizinEmuOffer(list.restore) : null;
+    const count = (n, word, many = `${word}s`) => `${n} ${n === 1 ? word : many}`;
+    if (d.restored === true) {
+        const applied = (Array.isArray(d.applied) ? d.applied : []).map(addr => rizinEmuRowAddr(addr) || '?');
+        // how many actions ran is the answer's own count: the block's `actions` is the timeline the session holds afterwards, which
+        // is longer by the patches that were written after the proof
+        const replayed = Number.isSafeInteger(d.replayed) && d.replayed >= 0 ? d.replayed : null;
+        let text = `Session restored: the saved timeline was replayed${replayed !== null ? ` (${count(replayed, 'action')})` : ''}`
+            + ` and the bytes it left match the SHA-256 the project holds${offer && offer.digests !== null ? ` for ${count(offer.digests, 'range')}` : ''}.`;
+        if (applied.length) text += ` ${count(applied.length, 'patch', 'patches')} that waited ${applied.length === 1 ? 'was' : 'were'} written: ${applied.join(', ')}.`;
+        if (waiting) text += ` ${waiting} still ${waiting === 1 ? 'waits' : 'wait'}: no run's bytes lie under ${waiting === 1 ? 'it' : 'them'}.`;
+        return { kind: 'ok', text };
+    }
+    if (d.restored === false) {
+        const why = typeof d.reason === 'string' && d.reason.trim() ? d.reason.trim().replace(/[.\s]+$/, '') : 'the replay did not hold';
+        return { kind: 'error', text: `Not restored: ${why}.${waiting ? ' The patches that wait still wait.' : ''}` };
+    }
+    return { kind: 'error', text: 'The server answered without saying whether the run was restored.' };
+}
+
+// The pane: registers and stack on the left, breakpoints and patches on the right, each column scrolling in itself.
+// patches and breakpoints are null while they load (problem says why they could not be read instead).
+function rizinEmuPaneHtml(emu, patches, breakpoints, options) {
+    const { functions = null, note = '', notice = null, exported = null, problem = '', busy = '', wait = '', waiting = null, restore = null } = options || {};
+    const regs = emu && emu.running === true && Array.isArray(emu.registers) ? emu.registers.filter(reg => reg && reg.name !== undefined) : [];
+    const changed = new Set(emu && Array.isArray(emu.changed) ? emu.changed.map(String) : []);
+    const marked = regs.filter(reg => changed.has(String(reg.name))).length;
+    const sp = ['rsp', 'esp', 'sp'].find(name => regs.some(reg => String(reg.name) === name));
+    const head = (title, extra) => `<div class="rizin-emu-head">${title}${extra ? ` <b>${escapeHtml(extra)}</b>` : ''}</div>`;
+    const section = (name, title, body) => `<div class="rizin-emu-section" data-rizin-section="${name}">${title}${body}</div>`;
+    const ready = Array.isArray(patches) && Array.isArray(breakpoints) && !problem;
+    const notes = rizinEmuNotes(note).map(n => `<div class="rizin-emu-note rizin-emu-session-note${n.urgent ? ' rizin-emu-urgent' : ''}">${escapeHtml(n.text)}</div>`).join('');
+    const said = notice ? `<div class="rizin-emu-note rizin-emu-notice rizin-emu-note-${cssToken(notice.kind)}" role="status">${escapeHtml(notice.text)}</div>` : '';
+    return '<div class="rizin-emu-col">'
+        + section('registers', head('REGISTERS', regs.length ? `${regs.length}${marked ? ` · Δ ${marked} changed` : ''}` : ''), rizinEmuRegistersHtml(emu))
+        + section('stack', head('STACK', sp ? `from ${sp}` : ''), rizinEmuStackHtml(emu))
+        + '</div><div class="rizin-emu-col">'
+        + (ready ? rizinEmuRestoreHtml(restore, { busy, wait, sessionNote: note }) : '') + said + notes
+        + (ready
+            ? section('breakpoints', head('BREAKPOINTS', String(breakpoints.length)), rizinEmuBreakpointsHtml(breakpoints, functions))
+                + section('patches', rizinEmuPatchesHeadHtml(patches, busy), rizinEmuPatchesHtml(patches, functions, { exported, busy, waiting }))
+            : rizinEmuEmpty(problem || 'Loading…'))
+        + '</div>';
+}
+
+// The pane, drawn from the state and the lists when the dock shows it: only a change writes, a register being typed
+// into keeps its text and its focus, and each column keeps its scroll position
+function rizinRenderEmuPane() {
+    const el = document.getElementById('rizin-emulation');
+    if (!el || !rizinDockOnScreen('emulation')) return;
+    const sid = rizinState.session, ui = rizinState.emuPane;
+    const ready = !!sid && ui.at === sid && !ui.problem;
+    const html = !sid ? '<div class="rizin-empty">No file open.</div>'
+        : rizinEmuPaneHtml(rizinState.emu, ready ? ui.patches : null, ready ? ui.breakpoints : null, {
+            functions: rizinState.functions, note: rizinState.analysis ? rizinState.analysis.note : '', notice: ui.notice,
+            exported: ui.exported, problem: ui.problem, busy: ui.busy, wait: rizinState.emuWait, waiting: ready ? ui.waiting : null,
+            restore: ready ? ui.restore : null });
+    if (html === rizinState.emuPaneShown) return;
+    const active = document.activeElement;
+    const field = active && el.contains(active) && active.getAttribute ? active.getAttribute('data-rizin-reg') : null;
+    const typing = field === null ? null : { name: field, value: active.value, dirty: active.value !== active.getAttribute('value') };
+    const tops = Array.from(el.querySelectorAll('.rizin-emu-col'), col => col.scrollTop);
+    el.innerHTML = html;
+    rizinState.emuPaneShown = html;
+    Array.from(el.querySelectorAll('.rizin-emu-col')).forEach((col, i) => { if (tops[i]) col.scrollTop = tops[i]; });
+    const again = typing && Array.from(el.querySelectorAll('[data-rizin-reg]')).find(input => input.getAttribute('data-rizin-reg') === typing.name);
+    if (again) {
+        if (typing.dirty) again.value = typing.value;
+        again.focus();
+    }
+}
+
+// The lists of the pane (patches and breakpoints), only while the pane is shown, else when it is shown (stale); a
+// forced load is after a run, a patch or a take-back, a busy answer is retried by the poll like the other views. A late
+// answer (another one asked for since, or another file) is dropped. what 'patches' asks for the patches alone, where the
+// breakpoints held cannot have changed (a run); anything not loaded yet or stale is asked for whole.
+async function rizinLoadEmuPane(force, what) {
+    const sid = rizinState.session, pane = rizinState.emuPane;
+    if (!rizinDockOnScreen('emulation')) {
+        if (force) pane.stale = true;
+        return true;
+    }
+    if (!sid || (!force && !pane.stale && pane.at === sid)) {
+        rizinRenderEmuPane();
+        return true;
+    }
+    const seq = ++pane.seq, base = `/api/rizin/${encodeURIComponent(sid)}`;
+    const only = what === 'patches' && pane.at === sid && !pane.stale && !pane.problem && Array.isArray(pane.breakpoints);
+    // Not asked for: the breakpoints held stay as they are when the patches land (read then, not now: a ✕ that removed one
+    // while the patches were on their way is newer than anything this request could say)
+    const [patches, breakpoints] = await Promise.all([rizinApi(`${base}/patches`), only ? null : rizinApi(`${base}/breakpoints`)]);
+    if (sid !== rizinState.session || seq !== pane.seq) return false;
+    const failed = !patches.ok ? patches : breakpoints && !breakpoints.ok ? breakpoints : null;
+    if (failed) {
+        if (failed.state === 'busy') rizinViewBusy('emuPane', force);
+        pane.problem = failed.state === 'busy' ? `rizin is busy (${failed.data.step || 'rizin'}); the patches and breakpoints follow.`
+            : `The patches and breakpoints could not be loaded: ${failed.error}`;
+        rizinRenderEmuPane();
+        return false;
+    }
+    rizinState.retry.delete('emuPane');
+    // What waits and the offer of the restore button come in the answer of the patches: one read, one state
+    const list = patches.data && typeof patches.data === 'object' ? patches.data : {};
+    Object.assign(pane, { at: sid, patches: Array.isArray(list.patches) ? list.patches : [], waiting: Array.isArray(list.waiting) ? list.waiting : [],
+                          restore: list.restore ?? null, problem: '', stale: false });
+    if (breakpoints) pane.breakpoints = Array.isArray(breakpoints.data) ? breakpoints.data : [];
+    // The marks of DISASSEMBLY take what the pane read (the patches it holds are the same rows)
+    rizinSetLists({ patches: pane.patches, waiting: pane.waiting, restore: pane.restore, breakpoints: breakpoints ? pane.breakpoints : undefined });
+    rizinRenderEmuPane();
+    return true;
+}
+
+// What the last action of the pane did, in words (no text: nothing to say); kind: ok, wait or error
+function rizinEmuPaneSay(text, kind = 'ok') {
+    rizinState.emuPane.notice = text ? { kind, text } : null;
+    rizinRenderEmuPane();
+}
+
+// One delegated click handler: the buttons of the groups and ✕, else a row jumps to its data-addr (not where the click
+// ended a selection). A register field has no data-addr: a click in it only places the caret.
+function rizinOnEmuPaneClick(event) {
+    const target = event.target && event.target.closest ? event.target : null;
+    if (!target) return false;
+    const button = target.closest('button');
+    if (button) {
+        const act = button.getAttribute('data-rizin-act');
+        const row = button.closest('[data-addr]');
+        const addr = row ? row.getAttribute('data-addr') : null;
+        if (act === 'export') return rizinExportPatched();
+        if (act === 'detonate') {
+            const copy = rizinState.emuPane.exported;
+            return copy ? rizinDetonatePatched(copy.path, copy.name) : false;
+        }
+        if (act === 'restore') return rizinRestoreRun();
+        if (act === 'apply-waiting') return rizinApplyWaiting(addr);
+        if (act === 'drop-waiting') return rizinDropWaiting(addr);
+        if (act === 'unpatch-all') return rizinUnpatch();
+        if (act === 'unpatch') return rizinUnpatch(addr);
+        if (act === 'unbreak') return rizinUnbreak(addr);
+        if (act === 'reanalyze') return rizinReanalyze();
+        return false;
+    }
+    if (typeof window.getSelection === 'function' && String(window.getSelection())) return false;
+    const el = target.closest('[data-addr]');
+    const addr = el ? rizinHex(el.getAttribute('data-addr')) : null;
+    return addr ? rizinSeek(addr, 'emupane') : false;
+}
+
+// A register field changed (Enter, or leaving it): the register is set to what was typed
+function rizinOnEmuPaneChange(event) {
+    const input = event.target && event.target.closest ? event.target.closest('[data-rizin-reg]') : null;
+    return input ? rizinSetRegister(input.getAttribute('data-rizin-reg'), input.value) : false;
+}
+
+// A register set by hand: what was typed goes through rizinHex (exact for a 64-bit word: decimal takes BigInt) and
+// out as the string; the state is then read again (rizinLoadEmulation fills rizinState.emu), and the views follow a
+// PC that moved. Said where the user is looking (the pane) when it did not work.
+async function rizinSetRegister(name, value) {
+    const sid = rizinState.session, emu = rizinState.emu;
+    if (!sid || !emu || emu.running !== true || typeof name !== 'string' || !name) return false;
+    if (rizinState.emuWait) {
+        rizinEmuPaneSay(`${name} was not set: the emulation waits for another request.`, 'error');
+        return false;
+    }
+    const typed = String(value ?? '').trim(), word = rizinHex(typed);
+    if (!word) {
+        rizinEmuPaneSay(`"${typed}" is no number: ${name} takes a decimal or 0x… value.`, 'error');
+        return false;
+    }
+    const seq = ++rizinState.emuSeq;
+    rizinState.emuWait = 'register';
+    rizinState.emuPane.notice = null;
+    rizinRenderRunStrip();
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/emulation/register`, { method: 'POST', body: { name, value: word } });
+    if (sid !== rizinState.session || seq !== rizinState.emuSeq) return false;
+    rizinState.emuWait = '';
+    if (!r.ok) {
+        if (r.state === 'refused' && /not started/.test(r.error)) {
+            rizinEmuLeave();
+            rizinState.note = r.error;
+            rizinRenderState();
+            return false;
+        }
+        rizinEmuPaneSay(r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); ${name} was not set. Try again once it is free.`
+            : `${name} was not set: ${r.error}`, 'error');
+        if (r.state === 'busy') rizinPollSoon();
+        rizinRenderRunStrip();
+        return false;
+    }
+    const before = rizinEmuPc();
+    await rizinLoadEmulation(true);
+    const pc = rizinEmuPc();
+    if (pc && pc !== before) await rizinSeek(pc, 'emulation');
+    await rizinLoadEmuPane(true, 'patches');       // a register set by hand spoils the timeline: the notice says so now
+    return true;
+}
+
+// Take a patch back (addr, a "0x…" string: every write that overlaps it) or, called without one, clear every write in
+// the cache. rizin has one cache: the run's bytes go with the hand-made patches, so the user is always asked first. A bad
+// address takes nothing back. The answer is the new list; what the views show (bytes, the stack's words, functions)
+// is asked for again.
+async function rizinUnpatch(addr) {
+    const sid = rizinState.session, pane = rizinState.emuPane;
+    const all = addr === undefined, at = all ? null : rizinHex(addr);
+    if (!sid || pane.busy || (!all && !at)) return false;
+    if (all) {
+        const rows = (Array.isArray(pane.patches) ? pane.patches : []).filter(row => row && typeof row === 'object');
+        const hand = rows.filter(row => row.mine === true).length, run = rows.length - hand;
+        if (!rows.length) {
+            rizinEmuPaneSay("rizin's write cache is empty: there is nothing to clear.", 'error');
+            return false;
+        }
+        const plural = n => `${n} write${n === 1 ? '' : 's'}`;
+        if (typeof confirm !== 'function' || !confirm(`Clear rizin's whole cache? That drops ${plural(hand)} set by hand and ${plural(run)} the run made: `
+            + 'rizin has one cache, and what a run wrote is back only by running it again.')) return false;
+    }
+    pane.busy = 'unpatch';
+    rizinRenderEmuPane();
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/patch`, { method: 'DELETE', body: all ? {} : { addr: at } });
+    if (sid !== rizinState.session) return false;
+    pane.busy = '';
+    if (!r.ok) {
+        rizinEmuPaneSay(r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); nothing was taken back. Try again once it is free.`
+            : `Not taken back: ${r.error}`, 'error');
+        if (r.state === 'busy') rizinPollSoon();
+        return false;
+    }
+    Object.assign(pane, { at: sid, patches: Array.isArray(r.data.patches) ? r.data.patches : pane.patches, problem: '', stale: false });
+    rizinSetLists({ patches: r.data.patches });     // the answer has no offer: the pane reads the lists again (rizinSetLists)
+    // wc- <addr> <addr+1> removes every write that overlaps the address, so a patch set over bytes a run wrote takes
+    // the run's whole row with it -- up to a copied or decrypted stage. The server names those rows; saying only
+    // "took the patch back" would leave the pane claiming less than happened.
+    const gone = (Array.isArray(r.data.run_removed) ? r.data.run_removed : []).filter(row => row && typeof row === 'object');
+    const bytes = gone.reduce((sum, row) => sum + (Number.isSafeInteger(row.size) ? row.size : 0), 0);
+    // Only for one patch: clearing the whole cache asked first and said how many of the run's writes go with it.
+    const also = all || !gone.length ? '' : ` ${gone.length} write${gone.length === 1 ? '' : 's'} the run made went with it`
+        + ` (${bytes} byte${bytes === 1 ? '' : 's'}, from ${gone.map(row => rizinEmuRowAddr(row.addr) || '?').slice(0, 4).join(', ')}${gone.length > 4 ? ', …' : ''}):`
+        + ' rizin removes a write whole, and those bytes are back only by running again.';
+    rizinEmuPaneSay((all ? "Cleared rizin's whole cache." : `Took the patch at ${at} back.`) + also, also ? 'error' : 'ok');
+    await rizinReloadViews(['emuPane', 'marks']);       // the answer carried the list; the pane and the marks took it
+    return true;
+}
+
+// Remove the breakpoint at addr (a "0x…" string); the answer is the new list. There is no off switch: rizin 0.9.1 stops
+// at a disabled breakpoint all the same.
+async function rizinUnbreak(addr) {
+    const sid = rizinState.session, pane = rizinState.emuPane, at = rizinHex(addr);
+    if (!sid || !at || pane.busy) return false;
+    pane.busy = 'unbreak';
+    rizinRenderEmuPane();
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/breakpoints`, { method: 'DELETE', body: { addr: at } });
+    if (sid !== rizinState.session) return false;
+    pane.busy = '';
+    if (!r.ok) {
+        rizinEmuPaneSay(r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); the breakpoint stays. Try again once it is free.`
+            : `The breakpoint was not removed: ${r.error}`, 'error');
+        if (r.state === 'busy') rizinPollSoon();
+        return false;
+    }
+    Object.assign(pane, { at: sid, breakpoints: Array.isArray(r.data.breakpoints) ? r.data.breakpoints : pane.breakpoints, problem: '' });
+    rizinSetLists({ breakpoints: r.data.breakpoints });
+    rizinEmuPaneSay(`Removed the breakpoint at ${at}.`);
+    return true;
+}
+
+// Re-analyse: the range the run wrote is analysed again (the server knows it), so that FUNCTIONS and STRINGS see what
+// the run decrypted; then FUNCTIONS and the lists of the dock are asked for again. What it finds ends with the session.
+async function rizinReanalyze() {
+    const sid = rizinState.session, pane = rizinState.emuPane;
+    if (!sid || pane.busy) return false;
+    pane.busy = 'reanalyze';
+    rizinEmuPaneSay('Analysing the range the run wrote…', 'wait');
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/reanalyze`, { method: 'POST', body: {} });
+    if (sid !== rizinState.session) return false;
+    pane.busy = '';
+    if (!r.ok) {
+        rizinEmuPaneSay(r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); nothing was analysed. Try again once it is free.`
+            : `Not re-analysed: ${r.error}`, 'error');
+        if (r.state === 'busy') rizinPollSoon();
+        return false;
+    }
+    const count = (n, word) => `${Number.isSafeInteger(n) ? n : '?'} ${word}${n === 1 ? '' : 's'}`;
+    rizinEmuPaneSay(`Analysed ${rizinEmuRowAddr(r.data.start) || '?'}–${rizinEmuRowAddr(r.data.end) || '?'}: `
+        + `${count(r.data.functions, 'function')}, ${count(r.data.strings, 'string')}. They end with the session, like the bytes.`);
+    await rizinReloadViews(['emulation', 'emuPane']);
+    return true;
+}
+
+// Take what a route answered with the patches ({patches, waiting, restore}: GET /patches, the waiting variants of POST
+// and DELETE patch, and POST restore's `patches`) into the pane and DISASSEMBLY's marks, as the newest answer there is
+// (rizinSetLists drops the request of the pane that is still out). Without the rows -- null, as POST restore answers
+// where rizin would not list the cache -- there is nothing to take: the pane's offer is dropped and its lists are stale,
+// for whoever draws the views next (a jump asks for a stale pane) or, failing that, the caller, which reads them.
+function rizinEmuTakeLists(answer) {
+    const pane = rizinState.emuPane;
+    if (answer && typeof answer === 'object' && Array.isArray(answer.patches)) {
+        // The offer and what waits are taken together or not at all: an answer that has the rows and not both of them is
+        // one that cannot say what the pane shows beside them, and rizinSetLists reads the lists again for it
+        const whole = Array.isArray(answer.waiting) && answer.restore && typeof answer.restore === 'object';
+        return rizinSetLists({ patches: answer.patches, ...(whole ? { waiting: answer.waiting, restore: answer.restore } : {}) });
+    }
+    pane.restore = null;
+    pane.stale = true;
+    rizinRenderEmuPane();
+    return false;
+}
+
+// Apply now: the server writes the patches that wait at addr ("0x…") into the cache -- it decides whether a run's bytes
+// lie under it, and says why not in a sentence that is shown as it is. The press is sent whatever the row looked like:
+// the pane draws the button, the server answers it. The answer is the lists.
+async function rizinApplyWaiting(addr) {
+    const sid = rizinState.session, pane = rizinState.emuPane, at = rizinHex(addr);
+    if (!sid || !at || pane.busy) return false;
+    pane.busy = 'apply-waiting';
+    rizinEmuPaneSay(`Writing the waiting patch at ${at}…`, 'wait');
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/patch`, { method: 'POST', body: { addr: at, waiting: true } });
+    if (sid !== rizinState.session) return false;
+    pane.busy = '';
+    if (!r.ok) {
+        rizinEmuPaneSay(r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); the patch at ${at} was not written. Try again once it is free.`
+            : `Not applied: ${r.error}`, 'error');
+        if (r.state === 'busy') rizinPollSoon();
+        else if (r.state === 'refused') await rizinLoadEmuPane(true, 'patches');       // what was drawn is out of date
+        return false;
+    }
+    rizinEmuTakeLists(r.data);
+    rizinEmuPaneSay(`Applied the waiting patch at ${at}: it is in rizin's cache now, over the bytes the run wrote.`);
+    await rizinReloadViews(['emuPane', 'marks']);     // the bytes under it changed; the answer carried the lists
+    if (pane.stale) await rizinLoadEmuPane(true, 'patches');
+    return true;
+}
+
+// ✕ on a waiting patch: it goes out of the list and the project (the other way out of waiting; nothing in the cache is
+// touched). The request says `waiting`, so that it is never the take-back of a write at that address.
+async function rizinDropWaiting(addr) {
+    const sid = rizinState.session, pane = rizinState.emuPane, at = rizinHex(addr);
+    if (!sid || !at || pane.busy) return false;
+    pane.busy = 'drop-waiting';
+    rizinEmuPaneSay(`Removing the waiting patch at ${at}…`, 'wait');
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/patch`, { method: 'DELETE', body: { addr: at, waiting: true } });
+    if (sid !== rizinState.session) return false;
+    pane.busy = '';
+    if (!r.ok) {
+        rizinEmuPaneSay(r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); the patch at ${at} stays. Try again once it is free.`
+            : `Not removed: ${r.error}`, 'error');
+        if (r.state === 'busy') rizinPollSoon();
+        else if (r.state === 'refused') await rizinLoadEmuPane(true, 'patches');
+        return false;
+    }
+    rizinEmuTakeLists(r.data);
+    rizinEmuPaneSay(`Removed the waiting patch at ${at} from the project: it does not come back when the file is opened again.`);
+    if (pane.stale) await rizinLoadEmuPane(true, 'patches');
+    return true;
+}
+
+// Restore the run: the project's timeline is replayed (one request that holds rizin like a run, and a run in flight
+// holds the pane's other actions off until it is answered) and the server proves the bytes it left. The notice says
+// what happened (rizinEmuRestoreWords); the answer's lists are the pane's; the emulation the replay left running is the
+// answer's state, and the views follow its PC. Nothing is decided here: a refusal is the server's sentence.
+async function rizinRestoreRun() {
+    const sid = rizinState.session, pane = rizinState.emuPane;
+    if (!sid || pane.busy || rizinState.emuWait) return false;
+    const seq = ++rizinState.emuSeq;
+    pane.busy = 'restore';
+    rizinState.emuWait = 'restore';
+    rizinState.emuNote = '';
+    rizinEmuPaneSay('Replaying the saved timeline…', 'wait');
+    rizinRenderRunStrip();
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/restore`, { method: 'POST' });
+    if (sid !== rizinState.session) return false;
+    pane.busy = '';
+    if (seq !== rizinState.emuSeq) {                 // the emulation was left under the request: the session is gone
+        rizinEmuPaneSay('');
+        return false;
+    }
+    rizinState.emuWait = '';
+    if (!r.ok) {
+        rizinEmuPaneSay(r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); nothing was restored. Try again once it is free.`
+            : `Not restored: ${r.error}`, 'error');
+        rizinRenderRunStrip();
+        if (r.state === 'busy') rizinPollSoon();
+        else if (r.state === 'refused' || r.state === 'error') await rizinLoadEmuPane(true, 'patches');       // the offer that allowed it was out of date, or what broke left the pane's state unknown
+        return false;
+    }
+    const d = r.data, words = rizinEmuRestoreWords(d);
+    const state = d.state && typeof d.state === 'object' && d.state.running === true ? d.state : null;
+    if (d.restored === true) {
+        rizinState.emu = { ...(state || { running: true, pc: null, registers: [], changed: [], stack: [], stopped: null }), ran: '', assist: null };
+    }
+    rizinEmuTakeLists(d.patches);
+    rizinEmuPaneSay(words.text, words.kind);
+    rizinRenderRunStrip();
+    if (d.restored === true) {
+        if (!state) await rizinLoadEmulation(true);
+        const pc = rizinEmuPc();
+        if (pc) await rizinSeek(pc, 'emulation');       // every view at the PC, over the bytes the replay left
+        else rizinRenderPcMarks();
+        await rizinEmuAssist();
+    }
+    if (pane.stale) await rizinLoadEmuPane(true, 'patches');       // no lists in the answer, and no jump has read them
+    return d.restored === true;
+}
+
+// Export: the patched copy of the file with the patches set by hand (what a run wrote is not in it), built by the server;
+// its answer is shown in the hand-made group: the bytes patched, the addresses that have no place in the file (they are
+// not in the copy), and the note written beside it. Returns the answer kept in rizinState.emuPane.exported ({name, path,
+// sha256, patched, skipped [addresses], note, sig}), false where nothing was exported. The copy is handed on from there.
+async function rizinExportPatched() {
+    const sid = rizinState.session, pane = rizinState.emuPane;
+    if (!sid || pane.busy) return false;
+    const hand = (Array.isArray(pane.patches) ? pane.patches : []).filter(row => row && row.mine === true);
+    if (!hand.length) {
+        rizinEmuPaneSay('Nothing set by hand to export: only patches set by hand go into the copy, what a run wrote does not.', 'error');
+        return false;
+    }
+    pane.busy = 'export';
+    rizinEmuPaneSay('Building the patched copy…', 'wait');
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/export`, { method: 'POST' });
+    if (sid !== rizinState.session) return false;
+    pane.busy = '';
+    if (!r.ok) {
+        rizinEmuPaneSay(r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); nothing was exported. Try again once it is free.`
+            : `Not exported: ${r.error}`, 'error');
+        if (r.state === 'busy') rizinPollSoon();
+        return false;
+    }
+    const d = r.data;
+    pane.exported = { name: String(d.name ?? ''), path: String(d.path ?? ''), sha256: String(d.sha256 ?? ''),
+                      patched: Number.isSafeInteger(d.patched) ? d.patched : 0, skipped: Array.isArray(d.skipped) ? d.skipped : [],
+                      note: String(d.note ?? ''), sig: rizinEmuHandSignature(hand) };
+    rizinEmuPaneSay('');
+    return pane.exported;
+}
+
+// The hand-off to the Submit tab: the copy at path (the server wrote it in the uploads folder) is fetched through
+// /api/file/download, wrapped in a File that carries the patched name, put into #file-input through a DataTransfer and
+// shown by handleFileSelect, and the Submit tab opens. NOTHING is submitted: the target and the press of Detonate are
+// the Submit tab's, and no route is asked to run a file by its path. Where patches had no place in the file the Submit
+// tab says so too, where the user is about to press Detonate. Returns true once the copy waits there, false (and says
+// why in the pane) when it does not: then the Submit tab is left as it was.
+async function rizinDetonatePatched(path, name) {
+    const sid = rizinState.session, pane = rizinState.emuPane;
+    if (!sid || pane.busy || typeof path !== 'string' || !path || typeof name !== 'string' || !name) return false;
+    const copy = pane.exported && pane.exported.path === path ? pane.exported : null;
+    const skipped = copy ? copy.skipped.map(addr => rizinEmuRowAddr(addr) || '?') : [];
+    const patched = copy ? copy.patched : 0;
+    pane.busy = 'detonate';
+    rizinEmuPaneSay('Fetching the patched copy…', 'wait');
+    let blob = null, why = '';
+    try {
+        const resp = await fetch(`/api/file/download?path=${encodeURIComponent(path)}`);
+        if (!resp.ok) why = `the web UI answered HTTP ${resp.status}`;
+        else blob = await resp.blob();
+    } catch (e) {
+        why = `the web UI did not answer (${e.message})`;
+    }
+    if (sid !== rizinState.session) return false;
+    pane.busy = '';
+    if (!why && !(blob && blob.size > 0)) why = 'the copy came back empty';
+    if (!why) {
+        try {
+            const input = document.getElementById('file-input'), chosen = input.files;
+            const transfer = new DataTransfer();
+            transfer.items.add(new File([blob], name, { type: blob.type || 'application/octet-stream' }));
+            input.files = transfer.files;
+            if (!input.files || input.files.length !== 1 || input.files[0].name !== name) {
+                why = 'the Submit tab did not take the file';
+                input.files = chosen;           // what was chosen there before stays chosen
+            } else {
+                handleFileSelect(input.files[0]);
+                const result = document.getElementById('submit-result');
+                result.className = `submit-result visible${skipped.length ? ' warning' : ''}`;
+                result.textContent = `Patched copy from the RIZIN tab: ${patched} byte${patched === 1 ? '' : 's'} patched. `
+                    + (skipped.length ? `Not in the copy (no place in the file): ${skipped.join(', ')}. ` : '') + 'Nothing has been submitted yet.';
+                switchTab('submit');
+            }
+        } catch (e) {
+            why = `the Submit tab did not take the file (${e.message})`;
+        }
+    }
+    if (why) {
+        rizinEmuPaneSay(`The copy was not handed to the Submit tab: ${why}.`, 'error');
+        return false;
+    }
+    rizinEmuPaneSay(`${name} waits in the Submit tab: nothing has been submitted yet.`);
+    return true;
+}
+
+// --- Breakpoints and patches in DISASSEMBLY (and the gutter of DECOMPILER) ---
+// The gutter (a click sets or removes a breakpoint, in DISASSEMBLY and in DECOMPILER) and the patch entries of the right-click menu (rizinMenuAct) act
+// on one address; what DISASSEMBLY marks (rizinState.marks) is the list each route answers: asked for once for each
+// file, again when forced, and taken from the answer of every change. A breakpoint is set or removed: rizin 0.9.1's
+// dbd does not stop a breakpoint from stopping a run, so there is no switch. Addresses go out as "0x…" strings; the
+// rows of /patches and /breakpoints carry integers, which the file's layout bounds (a row a double cannot hold exactly
+// marks nothing, rather than a wrong line).
+
+// The lists the tab has learned (an answer of /patches, /breakpoints, POST patch or breakpoints): DISASSEMBLY's marks
+// and, where the EMULATION pane holds the list already, its rows (a request of the pane that is still out is older
+// than this answer, so it is dropped). Either list may be missing: the other one stays.
+// The offer of the restore button and what waits come with the patches of the routes that answer them (/patches, the
+// waiting variants of patch, restore): lists with a `restore` key carry them, and the newest answer wins them with the
+// rows. An answer that changes the patches or the breakpoints and carries no offer (a plain patch, a take-back, a
+// breakpoint) leaves the pane's offer out of date: it is dropped, so that no button says what is no longer so, and the
+// pane reads the lists again.
+function rizinSetLists(lists) {
+    const sid = rizinState.session, marks = rizinState.marks, pane = rizinState.emuPane;
+    if (!sid || !lists) return false;
+    const safe = n => Number.isSafeInteger(n) && n >= 0;
+    const offered = 'restore' in lists;
+    let outdated = false;
+    if (Array.isArray(lists.breakpoints)) {
+        marks.stamp.breakpoints++;
+        marks.breakpoints = lists.breakpoints.filter(bp => bp && safe(bp.addr)).map(bp => bp.addr);
+        if (pane.at === sid && Array.isArray(pane.breakpoints)) {
+            Object.assign(pane, { breakpoints: lists.breakpoints, seq: pane.seq + 1 });
+            outdated = outdated || !offered;
+        }
+    }
+    if (Array.isArray(lists.patches)) {
+        marks.stamp.patches++;
+        marks.patched = lists.patches.filter(p => p && p.mine === true && safe(p.addr) && Number.isSafeInteger(p.size) && p.size > 0)
+            .map(p => [p.addr, p.size]);
+        if (pane.at === sid && Array.isArray(pane.patches)) {
+            Object.assign(pane, { patches: lists.patches, seq: pane.seq + 1 });
+            if (offered) Object.assign(pane, { waiting: Array.isArray(lists.waiting) ? lists.waiting : pane.waiting, restore: lists.restore ?? null });
+            else outdated = true;
+        }
+    }
+    if (outdated) pane.restore = null;
+    rizinRenderEmuPane();
+    if (rizinPageHolds(rizinState.disasm)) rizinRenderDisasm();
+    // The C in sight shows the breakpoints too (decompilerAt is empty while the pane says something instead of
+    // lines, which a list must not overwrite); hidden, it takes them once it is shown again
+    if (rizinState.decompilerAt && rizinCodeOnScreen('decompiler')) rizinRenderDecompiler();
+    if (outdated) rizinLoadEmuPane(true, 'patches');
+    return true;
+}
+
+// Both lists, for the marks: once for each file (unforced asks only while they are not known), and again when
+// forced (an analysis step ended, the console changed something). A busy answer is asked for again once rizin is
+// free; any other failure leaves the marks as they were (a click in the gutter then says why it cannot decide).
+async function rizinLoadMarks(force) {
+    const sid = rizinState.session, marks = rizinState.marks;
+    if (!sid || (!force && marks.breakpoints !== null && marks.patched !== null)) return true;
+    const seq = ++marks.seq, base = `/api/rizin/${encodeURIComponent(sid)}`, stamp = { ...marks.stamp };
+    const [patches, breakpoints] = await Promise.all([rizinApi(`${base}/patches`), rizinApi(`${base}/breakpoints`)]);
+    if (sid !== rizinState.session || seq !== marks.seq) return false;
+    const failed = !patches.ok ? patches : !breakpoints.ok ? breakpoints : null;
+    if (failed) {
+        if (failed.state === 'busy') rizinViewBusy('marks', force);
+        return false;
+    }
+    rizinState.retry.delete('marks');
+    // A list that something newer set while these were on their way (an answer to a click, to a patch) stays
+    const fresh = stamp.patches === marks.stamp.patches, list = patches.data && typeof patches.data === 'object' ? patches.data : {};
+    return rizinSetLists({ patches: fresh ? (Array.isArray(list.patches) ? list.patches : []) : undefined,
+                           ...(fresh ? { waiting: list.waiting, restore: list.restore } : {}),
+                           breakpoints: stamp.breakpoints === marks.stamp.breakpoints ? (Array.isArray(breakpoints.data) ? breakpoints.data : []) : undefined });
+}
+
+// A click in the gutter at addr ("0x…"): the breakpoint there is removed, or set where there is none. What is set is
+// known from the list the marks hold (asked for first if it is not known yet); one request at a time. The answer is
+// the new list. A refusal says why in the toolbar, as a jump that did not happen does.
+async function rizinToggleBreakpoint(addr) {
+    const sid = rizinState.session, at = rizinHex(addr), marks = rizinState.marks;
+    if (!sid || !at || marks.busy) return false;
+    marks.busy = true;
+    // One request at a time: while it is out a click in the gutter of any line is not taken, and the pointer says so
+    // in both views that have a gutter
+    const panes = ['rizin-disasm', 'rizin-decompiler'].map(id => document.getElementById(id)).filter(Boolean);
+    panes.forEach(pane => pane.classList.add('rizin-gutter-busy'));
+    try {
+        if (marks.breakpoints === null && !(await rizinLoadMarks(true))) {
+            if (sid === rizinState.session && rizinState.ui.state !== 'busy') {
+                rizinState.note = 'The breakpoints could not be read, so a click in the gutter cannot tell whether one is set.';
+                rizinRenderState();
+            }
+            return false;
+        }
+        if (sid !== rizinState.session) return false;
+        const set = marks.breakpoints.includes(rizinNum(at));
+        const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/breakpoints`, { method: set ? 'DELETE' : 'POST', body: { addr: at } });
+        if (sid !== rizinState.session) return false;
+        if (!r.ok) {
+            if (r.state === 'busy') rizinPollSoon();
+            else if (r.state === 'refused' || r.state === 'error') {
+                rizinState.note = `The breakpoint at ${at} was not ${set ? 'removed' : 'set'}: ${r.error}`;
+                rizinRenderState();
+            }
+            return false;
+        }
+        rizinSetLists({ breakpoints: r.data.breakpoints });
+        return true;
+    } finally {
+        if (sid === rizinState.session) marks.busy = false;
+        if (!marks.busy) panes.forEach(pane => pane.classList.remove('rizin-gutter-busy'));
+    }
+}
+
+// The bytes of a patch by hand as the server takes them, from what was typed: the hex digits, an even number of
+// them, at most RIZIN_PATCH.maxBytes bytes. White space is dropped (90 90 eb 05 is fine); nothing else is (no 0x).
+// {bytes} or {error}: the field says why, rather than the server refusing a value that was long or odd.
+function rizinPatchHex(text) {
+    const typed = String(text ?? '').replace(/\s+/g, '');
+    if (!typed) return { error: 'Type the bytes to write: hex digits, like 90 90 eb 05.' };
+    if (!/^[0-9a-fA-F]+$/.test(typed)) return { error: 'Only the hex digits 0-9 and a-f: no 0x, no other characters.' };
+    if (typed.length > 2 * RIZIN_PATCH.maxBytes) {
+        return { error: `That is ${Math.ceil(typed.length / 2)} bytes: a patch is at most ${RIZIN_PATCH.maxBytes} bytes (${2 * RIZIN_PATCH.maxBytes} hex digits).` };
+    }
+    if (typed.length % 2) return { error: `${typed.length} hex digits is an odd number: bytes are two digits each, so type one more or one fewer.` };
+    return { bytes: typed.toLowerCase() };
+}
+
+// The kinds of patch that apply to an instruction of rizin's op type: NOP out to any, Flip the jump and Always jump
+// to a conditional jump (cjmp), Kill the call to any call: rizin_emulation.is_call is "ends with call", which takes
+// ircall (call qword [import], 64 bit) and ucall (call dword [slot], 32 bit), the import calls an analyst knocks out
+function rizinPatchKinds(type) {
+    const t = typeof type === 'string' ? type : '';
+    return RIZIN_PATCH.kinds.filter(kind => kind === 'nop' || (t === 'cjmp' && (kind === 'flip' || kind === 'always'))
+        || (kind === 'nocall' && t.endsWith('call')));
+}
+
+// POST patch at addr with the body ({kind} or {bytes}); the answer is the list of what rizin's write cache holds,
+// which DISASSEMBLY and the pane take at once. Returns the answer of rizinApi, as rizinRename does.
+async function rizinPatchPost(addr, body) {
+    const sid = rizinState.session, at = rizinHex(addr);
+    if (!sid) return { ok: false, status: 0, data: {}, error: 'no file is open', state: 'error' };
+    if (!at) return { ok: false, status: 0, data: {}, error: `${String(addr)} is no address`, state: 'refused' };
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/patch`, { method: 'POST', body: { addr: at, ...body } });
+    if (r.ok && sid === rizinState.session) rizinSetLists({ patches: r.data.patches });
+    return r;
+}
+
+// NOP out, Flip the jump, Always jump or Kill the call (kind: one of RIZIN_PATCH.kinds) for the instruction at addr:
+// the server computes the bytes from what rizin decoded there and writes them into the cache. It needs no emulation.
+function rizinPatchOp(addr, kind) {
+    if (!RIZIN_PATCH.kinds.includes(kind)) {
+        return Promise.resolve({ ok: false, status: 0, data: {}, error: `${String(kind)} is no kind of patch`, state: 'refused' });
+    }
+    return rizinPatchPost(addr, { kind });
+}
+
+// Bytes… : hex bytes written at addr (as rizinPatchHex takes them), over as many instructions as they cover
+function rizinPatchBytes(addr, text) {
+    const parsed = rizinPatchHex(text);
+    if (!parsed.bytes) return Promise.resolve({ ok: false, status: 0, data: {}, error: parsed.error, state: 'refused' });
+    return rizinPatchPost(addr, { bytes: parsed.bytes });
+}
+
+// Run to here: the emulation runs to the address (aesu), and stops at a breakpoint on the way
+function rizinRunToHere(addr) {
+    return rizinEmuRun('until', addr);
+}
+
 // Wired once at start-up: Upload, a file dropped on the tab, OPEN ▾ closing
 // on Esc and on a click beside it, the graph's drag and wheel, the line
 // between the halves, the halves for the window's width, the dock's ═, the
@@ -20749,4 +27336,3867 @@ async function rizinCheckInstalled() {
         rizinSetUi('not-installed', { path: typeof r.data.path === 'string' ? r.data.path : null });
     }
     return !!r.data.installed;
+}
+
+// =============================================
+// SYSCALLS
+// =============================================
+// The map of every syscall of ntdll.dll and win32u.dll: one cell per syscall in
+// the order of its number, a band per module (/api/syscalls/...). Without a scan
+// the cells show the baseline and the map is the catalog; after a scan each
+// cell carries the state the stub was measured in. Names, owners and notes
+// come from the baseline and from the target process, so they are escaped or
+// set as text. The map is drawn on canvas, colours through themeColor(); the
+// cells keep their place whatever the filter says, which only dims them.
+const SYSCALL_STATES = ['intact', 'hooked', 'patched', 'diverged', 'unreadable'];
+const SYSCALL_STATE_COLORS = {
+    intact: '--syscall-intact', hooked: '--syscall-hooked', patched: '--syscall-patched',
+    diverged: '--syscall-diverged', unreadable: '--syscall-unreadable',
+};
+const SYSCALL_STATE_HELP = {
+    intact: 'The stub is as the baseline has it.',
+    hooked: 'hooked (file-backed module): the jump ends in a loaded module other than ntdll that a file backs. An EDR does that, ' +
+            'but so does a DLL the sample loaded, or a legitimate DLL it overwrote in place (module stomping), which this scan cannot tell apart.',
+    patched: 'The jump ends in memory no hooking product explains: private memory, a section no file backs or a mapped view of a file, ' +
+             'after any relay was followed, or a core Windows module such as kernelbase.dll (a code cave), or ntdll itself reached through such a relay.',
+    diverged: 'The bytes differ, but the jump is not into a foreign module and not into private memory, or its target cannot be resolved. Not guessed at.',
+    unreadable: 'No stub could be read.',
+};
+const SYSCALL_MODULES = ['ntdll.dll', 'win32u.dll'];
+const SYSCALL_WIN32U_TITLE = 'win32u stubs exist only in GUI processes, so a scan leaves them out unless asked for';
+// Where a syscall is documented, and where the modules are that Rizin opens
+const SYSCALL_DOC_URL = 'https://ntdoc.m417z.com/';
+// WinGraph, a dependency graph of the System32 binaries: only its root is linked, it has no address for one module
+const SYSCALL_WINGRAPH_URL = 'https://wingraph.m0n1x90.dev/';
+const SYSCALL_SYSTEM_DIR = 'C:\\Windows\\System32\\';
+// Below this width the map and the detail panel share the room as two panes
+const SYSCALL_NARROW = '(max-width: 1399px)';
+const SYSCALL_PANE_NAMES = ['map', 'detail'];
+// The deviations list begins with the loudest; a state this tab does not know ranks as diverged
+const SYSCALL_SEVERITY_RANK = { patched: 0, hooked: 1, diverged: 2, unreadable: 3 };
+// The map in px: a cell and the gap between cells, the room around the grid for the ring of the outer
+// cells, the ring a patched or diverged cell gets and its alpha; the alpha of the baseline tone (no scan)
+// and of a cell the filter does not match
+// `reach`: how far a ring of a cell reaches beyond it; what a repaint of one cell clears and draws again
+const SYSCALL_MAP = { cell: 10, gap: 2, pad: 3, halo: 2, haloAlpha: 0.35, baseline: 0.75, dim: 0.18, reach: 3 };
+// The catalog under the map lists this many rows of the filtered baseline; /baseline pages hold at most SYSCALL_PAGE
+const SYSCALL_ROWS_MAX = 300;
+const SYSCALL_PAGE = 500;
+const SYSCALL_POLL_MS = 4000;
+
+// The syscalls grouped by module, the modules in SYSCALL_MODULES order and the others after them, each band by number
+function syscallBands(items) {
+    const byModule = new Map();
+    for (const item of items) {
+        const key = String(item.module || '').toLowerCase();
+        if (!byModule.has(key)) byModule.set(key, []);
+        byModule.get(key).push(item);
+    }
+    const known = SYSCALL_MODULES.filter(m => byModule.has(m));
+    const others = [...byModule.keys()].filter(m => !SYSCALL_MODULES.includes(m)).sort();
+    return [...known, ...others].map(module => ({
+        module, items: byModule.get(module).slice().sort((a, b) => a.number - b.number),
+    }));
+}
+
+// Where the cells of a band of `count` go in a canvas `width` px wide: rows from the left, a whole number of columns
+function syscallBandLayout(count, width) {
+    const { cell, gap, pad } = SYSCALL_MAP;
+    const pitch = cell + gap;
+    const cols = Math.max(1, Math.floor((width - 2 * pad + gap) / pitch));
+    const rows = count > 0 ? Math.ceil(count / cols) : 0;
+    return { cols, rows, cell, pitch, pad, count, width, height: rows > 0 ? rows * pitch - gap + 2 * pad : 0 };
+}
+
+function syscallCellOrigin(layout, index) {
+    return { x: layout.pad + (index % layout.cols) * layout.pitch,
+             y: layout.pad + Math.floor(index / layout.cols) * layout.pitch };
+}
+
+// The index of the cell at a point of the canvas; -1 in a gap, outside the grid and past the last cell
+function syscallCellAt(layout, x, y) {
+    const dx = x - layout.pad, dy = y - layout.pad;
+    if (dx < 0 || dy < 0) return -1;
+    const col = Math.floor(dx / layout.pitch), row = Math.floor(dy / layout.pitch);
+    if (col >= layout.cols || dx - col * layout.pitch >= layout.cell || dy - row * layout.pitch >= layout.cell) return -1;
+    const index = row * layout.cols + col;
+    return index < layout.count ? index : -1;
+}
+
+// How a cell is drawn. Without a measurement (state null or undefined) it is the baseline tone: the colour of an
+// intact stub, held back, so a map that was never scanned draws no eye. A measured intact stub is that colour in
+// full; every deviation is a colour of its own, and patched, diverged and unreadable get a ring in the gap around
+// the cell (a stub that reads as zeros is tampering, not absence).
+// A state the server does not send counts as diverged, never as quiet. `dimmed`: the filter does not match.
+function syscallCellLook(state, dimmed) {
+    let look;
+    if (state === null || state === undefined) {
+        look = { state: 'intact', alpha: SYSCALL_MAP.baseline, halo: 0, hollow: false, loud: false };
+    } else {
+        const known = Object.prototype.hasOwnProperty.call(SYSCALL_STATE_COLORS, state) ? state : 'diverged';
+        look = {
+            state: known, alpha: 1, loud: known !== 'intact',
+            halo: known === 'patched' || known === 'diverged' || known === 'unreadable' ? SYSCALL_MAP.halo : 0,
+            hollow: known === 'unreadable',
+        };
+    }
+    if (dimmed) look = { ...look, alpha: SYSCALL_MAP.dim, halo: 0, loud: false };
+    look.color = SYSCALL_STATE_COLORS[look.state];
+    return look;
+}
+
+// The colour of a state from the theme; a state the server does not send reads as diverged
+function syscallStateColor(state, alpha) {
+    const known = Object.prototype.hasOwnProperty.call(SYSCALL_STATE_COLORS, state) ? state : 'diverged';
+    return themeColor(SYSCALL_STATE_COLORS[known], alpha);
+}
+
+// One band onto its canvas context (in CSS px). model: states (Map name → state, or null without a scan), match
+// (Set of the names the filter matches, or null for all), selected and hover (names). The quiet cells first and
+// the deviations after them, so no neighbour paints over a ring.
+// `only`: the indexes of the cells that changed (a hover moved). Then nothing but their surroundings is drawn
+// again: a cell's rings reach SYSCALL_MAP.reach px beyond it, so the square of that reach round the cell is
+// cleared and drawn again (clipped to it) from the cell and the eight round it, which are all that touch it.
+function syscallDrawBand(ctx, layout, cells, model, only) {
+    const { states, match, selected, hover } = model;
+    const size = layout.cell;
+    const lookOf = i => syscallCellLook(states ? states.get(cells[i].name) : null,
+                                        match !== null && match !== undefined && !match.has(cells[i].name));
+    const paint = indexes => {
+        const looks = indexes.map(lookOf);
+        for (const pass of [false, true]) {
+            for (let k = 0; k < indexes.length; k++) {
+                const look = looks[k];
+                if (look.loud !== pass) continue;
+                const { x, y } = syscallCellOrigin(layout, indexes[k]);
+                ctx.globalAlpha = look.alpha;
+                if (look.halo) {
+                    ctx.fillStyle = syscallStateColor(look.state, SYSCALL_MAP.haloAlpha);
+                    ctx.fillRect(x - look.halo, y - look.halo, size + 2 * look.halo, size + 2 * look.halo);
+                }
+                if (look.hollow) {
+                    ctx.strokeStyle = syscallStateColor(look.state);
+                    ctx.lineWidth = 1;
+                    ctx.strokeRect(x + 0.5, y + 0.5, size - 1, size - 1);
+                } else {
+                    ctx.fillStyle = syscallStateColor(look.state);
+                    ctx.fillRect(x, y, size, size);
+                }
+            }
+        }
+        ctx.globalAlpha = 1;
+        for (const [name, color, width] of [[selected, '--text-primary', 2], [hover, '--text-secondary', 1]]) {
+            const index = name ? cells.findIndex(cell => cell.name === name) : -1;
+            if (index < 0 || (only !== undefined && !indexes.includes(index))) continue;
+            const { x, y } = syscallCellOrigin(layout, index);
+            ctx.strokeStyle = themeColor(color);
+            ctx.lineWidth = width;
+            ctx.strokeRect(x - 1.5, y - 1.5, size + 3, size + 3);
+        }
+    };
+    if (only === undefined) {
+        ctx.clearRect(0, 0, layout.width, layout.height);
+        paint(cells.map((_, i) => i));
+        return;
+    }
+    const reach = SYSCALL_MAP.reach, side = size + 2 * reach;
+    for (const index of new Set(only)) {
+        if (!(index >= 0 && index < cells.length)) continue;
+        const { x, y } = syscallCellOrigin(layout, index);
+        const near = [], col = index % layout.cols, row = Math.floor(index / layout.cols);
+        for (let r = row - 1; r <= row + 1; r++) {
+            for (let c = col - 1; c <= col + 1; c++) {
+                const i = r * layout.cols + c;
+                if (r >= 0 && c >= 0 && c < layout.cols && i < cells.length) near.push(i);
+            }
+        }
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(x - reach, y - reach, side, side);
+        ctx.clip();
+        ctx.clearRect(x - reach, y - reach, side, side);
+        paint(near);
+        ctx.restore();
+    }
+}
+
+// A syscall number as 0x3A
+function syscallHex(number) {
+    const n = Number(number);
+    return Number.isFinite(n) ? '0x' + Math.trunc(n).toString(16).toUpperCase().padStart(2, '0') : '?';
+}
+
+// The legend under the toolbar: each state with its count, `–` before a scan. `unscanned`: syscalls of the baseline
+// the measurement did not cover (win32u is left out unless asked for), which keep the baseline tone.
+function syscallMapLegendHtml(counts, unscanned) {
+    const measured = counts !== null && typeof counts === 'object';
+    let html = '';
+    for (const state of SYSCALL_STATES) {
+        const n = measured ? Number(counts[state]) : NaN;
+        html += `<span class="syscall-legend-item" title="${escapeHtml(SYSCALL_STATE_HELP[state])}">` +
+                `<span class="syscall-legend-dot syscall-state-${cssToken(state)}"></span>` +
+                `<span class="syscall-legend-name">${escapeHtml(state)}</span>` +
+                `<span class="syscall-legend-count">${Number.isFinite(n) ? n.toLocaleString('en-US') : '–'}</span></span>`;
+    }
+    if (measured && unscanned > 0) {
+        html += `<span class="syscall-legend-note">${Number(unscanned).toLocaleString('en-US')} not scanned</span>`;
+    }
+    return html;
+}
+
+// One row of the catalog under the map: the dot of its state, its name, its module and its number. `state` is
+// the measured state, absent without a scan; `selected` marks the chosen syscall. `unplaced`: the past measurement on
+// the map did measure it, but its cells cannot be placed on this baseline, so it has no state here and is no
+// syscall that was not scanned.
+function syscallRowHtml(entry) {
+    const name = String(entry.name === null || entry.name === undefined ? '' : entry.name);
+    const state = entry.state ? String(entry.state) : '';
+    const module = String(entry.module || '').replace(/\.dll$/i, '');
+    const none = entry.unplaced ? 'measured, its cell not placed on this baseline' : 'not scanned';
+    return `<button type="button" class="syscall-row${entry.selected ? ' selected' : ''}"${entry.selected ? ' aria-current="true"' : ''} ` +
+           `data-name="${escapeHtml(name)}" ` +
+           `aria-label="${escapeHtml(`${name}, ${state || none}`)}" onclick="syscallSelect(${jsArg(name)})">` +
+           `<span class="syscall-row-dot syscall-state-${cssToken(state || 'baseline')}" title="${escapeHtml(state || none)}"></span>` +
+           `<span class="syscall-row-name">${escapeHtml(name)}</span>` +
+           `<span class="syscall-row-module">${escapeHtml(module)}</span>` +
+           `<span class="syscall-row-num" title="${escapeHtml(entry.number)}">${escapeHtml(syscallHex(entry.number))}</span>` +
+           `</button>`;
+}
+
+// A query that reads as a number: decimal, or hex with or without 0x (the server's catalog reads it so too)
+function syscallNumberOf(query) {
+    if (/^[0-9]+$/.test(query)) return parseInt(query, 10);
+    if (/^(0x)?[0-9a-f]+$/i.test(query)) return parseInt(query.replace(/^0x/i, ''), 16);
+    return null;
+}
+
+// Whether the filter matches a syscall: its module, and its name or its number
+function syscallMatches(item, query, module) {
+    const wanted = String(module || '').trim().toLowerCase();
+    if (wanted && String(item.module || '').toLowerCase() !== wanted) return false;
+    const text = String(query || '').trim();
+    if (!text) return true;
+    return String(item.name).toLowerCase().includes(text.toLowerCase()) || item.number === syscallNumberOf(text);
+}
+
+// The names the filter matches, or null when there is no filter and every cell matches
+function syscallMatchSet(items, query, module) {
+    if (!String(query || '').trim() && !String(module || '').trim()) return null;
+    return new Set(items.filter(item => syscallMatches(item, query, module)).map(item => item.name));
+}
+
+// What each view the host needs stands at, from /api/syscalls/status. An arm64 host measures arm64 processes and
+// emulated x64 ones, each against its own view's baseline; an x64 host has the one. ready: the baseline of this
+// build is there; extracting; indistinguishable: the x64 binary under emulation saw the arm64 view, so that
+// extraction was discarded on purpose (not a failure of NTSleuth, and no baseline either); failed; stale: only
+// the baseline of another build; unusable: a file that cannot be read; missing.
+function syscallViewStates(status) {
+    const known = status && typeof status === 'object' ? status : {};
+    const views = known.default_view === 'arm64' ? ['arm64', 'x64'] : ['x64'];
+    const baselines = Array.isArray(known.baselines) ? known.baselines : [];
+    const extraction = known.extraction || {};
+    const running = Array.isArray(extraction.running) ? extraction.running : [];
+    const failed = Array.isArray(extraction.failed) ? extraction.failed : [];
+    return views.map(view => {
+        const ofView = baselines.filter(b => b.view === view);
+        const current = ofView.find(b => b.current);
+        if (current && current.error) {
+            return { view, state: 'unusable', text: `The baseline file ${current.file || ''} cannot be read: ${current.error}` };
+        }
+        if (current) return { view, state: 'ready', text: `Build ${current.build}` };
+        if (running.some(r => r.view === view)) {
+            return { view, state: 'extracting', text: 'NTSleuth is extracting the baseline; this takes a few seconds.' };
+        }
+        const failure = failed.find(f => f.view === view && (!known.build || f.build === known.build));
+        if (failure && failure.indistinguishable) {
+            return { view, state: 'indistinguishable',
+                     text: `ntsleuth-${view}.exe under emulation produced the same view as the native arm64 one, so the ${view} ` +
+                           `baseline was discarded instead of measuring against a wrong reference. Emulated ${view} processes ` +
+                           'cannot be measured on this host.' };
+        }
+        if (failure) return { view, state: 'failed', text: `The extraction failed: ${failure.reason}` };
+        if (ofView.length) {
+            return { view, state: 'stale',
+                     text: `The baseline is of build ${ofView[0].build}, this system is build ${known.build || 'unknown'}.` };
+        }
+        const exe = known.executables && known.executables[view] === false && known.installed
+            ? ` ntsleuth-${view}.exe is not installed.` : '';
+        return { view, state: 'missing',
+                 text: known.installed === false ? 'No baseline. Install NTSleuth to extract one.'
+                                                 : `No baseline for build ${known.build || 'unknown'} yet.${exe}` };
+    });
+}
+
+// The notices over the map: NTSleuth missing, each view that has no baseline (and why), an incomplete parameter table
+function syscallNotices(status, baseline) {
+    const notices = [];
+    if (status && status.installed === false) {
+        notices.push({ kind: 'not-installed', tone: 'warn', title: 'NTSleuth not installed',
+                       text: status.path ? `Expected in ${status.path}. Baselines that exist already still work.` : '' });
+    }
+    const titles = { extracting: 'extracting the baseline', indistinguishable: 'not distinguishable on this host',
+                     failed: 'extraction failed', stale: 'baseline of another build', unusable: 'baseline unusable',
+                     missing: 'no baseline' };
+    const tones = { extracting: 'info', failed: 'error', unusable: 'error' };
+    if (status) {
+        for (const v of syscallViewStates(status)) {
+            if (v.state === 'ready') continue;
+            notices.push({ kind: v.state, tone: tones[v.state] || 'warn', title: `${v.view}: ${titles[v.state]}`, text: v.text });
+        }
+    }
+    if (baseline && baseline.symbols === false) {
+        notices.push({ kind: 'symbols', tone: 'info', title: 'Parameter table incomplete',
+                       text: 'This baseline was extracted without the symbol server. Numbers, RVAs and stub bytes come ' +
+                             'from the disassembly, so the measurement is not affected.' });
+    }
+    return notices;
+}
+
+function syscallNoticesHtml(notices) {
+    return notices.map(n => `<div class="syscall-notice syscall-notice-${cssToken(n.tone)} syscall-notice-${cssToken(n.kind)}">` +
+        `<span class="syscall-notice-title">${escapeHtml(n.title)}</span>` +
+        (n.text ? `<span class="syscall-notice-text">${escapeHtml(n.text)}</span>` : '') + '</div>').join('');
+}
+
+// The line under the tab's title: the stock of the baseline
+function syscallSubtitle(baseline) {
+    if (!baseline || !baseline.items) return 'Syscall baseline and live stub measurement';
+    const total = baseline.items.length;
+    const parts = [`${total.toLocaleString('en-US')} syscall${total === 1 ? '' : 's'}`];
+    for (const band of syscallBands(baseline.items)) parts.push(`${band.module} ${band.items.length.toLocaleString('en-US')}`);
+    if (baseline.build) parts.push(`build ${baseline.build}`);
+    if (baseline.view) parts.push(baseline.view);
+    return parts.join(' · ');
+}
+
+// The <option>s of the target picker: the running processes the UI knows, by name and PID. An exited instance
+// (its PID may be reused) and anything whose PID is no number is left out.
+function syscallTargetsHtml(processes, selected) {
+    const targets = [];
+    for (const proc of Object.values(processes && typeof processes === 'object' ? processes : {})) {
+        if (!proc || proc.exit_time || String(proc.key === undefined ? '' : proc.key).includes('@')) continue;
+        const pid = /^[0-9]+$/.test(String(proc.pid)) ? parseInt(proc.pid, 10) : 0;
+        if (pid > 0) targets.push({ pid, name: String(proc.name || proc.image || 'unknown') });
+    }
+    targets.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()) || a.pid - b.pid);
+    return '<option value="">-- select a process --</option>' + targets.map(t =>
+        `<option value="${t.pid}"${String(t.pid) === String(selected) ? ' selected' : ''}>${escapeHtml(t.name)} (${t.pid})</option>`).join('');
+}
+
+// The line a scan leaves under the toolbar, as text
+function syscallScanSummary(scan) {
+    const counts = scan.counts || {};
+    const total = SYSCALL_STATES.reduce((sum, s) => sum + (Number(counts[s]) || 0), 0);
+    const deviations = total - (Number(counts.intact) || 0);
+    const unreadable = Number(counts.unreadable) || 0;
+    const name = String(scan.process || '').split(/[\\/]/).pop();
+    let text = `PID ${scan.pid}` + (name ? ` (${name})` : '');
+    if (scan.view) text += ` · ${scan.view}`;
+    if (scan.build) text += ` · build ${scan.build}`;
+    // an unreadable stub is one nobody read: a scan of nothing else measured nothing and found no deviation
+    text += total === 0 ? ': no stub measured'
+        : total === unreadable ? `: no stub could be read (${unreadable.toLocaleString('en-US')} unreadable)`
+        : `: ${deviations === 0 ? 'no deviations' : `${deviations} deviation${deviations === 1 ? '' : 's'}`} of ${total.toLocaleString('en-US')} stubs`;
+    const evidence = scan.evidence;
+    if (evidence && evidence.label) {
+        text += ` · ${evidence.label}` + (typeof evidence.score === 'number' ? ` ${evidence.score.toFixed(2)}` : '');
+    }
+    if (scan.note) text += ` · ${scan.note}`;
+    else if (scan.partial) text += ' · partial result';
+    return text;
+}
+
+// The time of a measurement as the history wrote it (the VM's clock, ISO), to the second: '2026-11-20 09:15:42'.
+// It is shown as written and not converted: the browser's zone need not be the VM's.
+function syscallWhen(iso) {
+    const text = String(iso ?? '');
+    const m = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})/.exec(text);
+    return m ? `${m[1]} ${m[2]}` : (text || 'an unknown time');
+}
+
+// The choices of the past-measurement control: the measurements /api/syscalls/measurements names, newest first, each
+// as process · PID · time · view. `selected` is the id on the map; `error` a list that could not be read, which is
+// said instead of looking like an empty history.
+function syscallPastOptionsHtml(list, selected, error) {
+    let html = '<option value="">— a past measurement —</option>';
+    if (error) html += `<option value="" disabled>the scan history could not be read: ${escapeHtml(error)}</option>`;
+    for (const m of Array.isArray(list) ? list : []) {
+        if (!m || typeof m.id !== 'string' || !m.id) continue;
+        const label = `${m.process || 'unknown process'} · PID ${m.pid} · ${syscallWhen(m.at)} · ${m.view || 'unknown view'}`;
+        html += `<option value="${escapeHtml(m.id)}"${m.id === selected ? ' selected' : ''}>${escapeHtml(label)}</option>`;
+    }
+    return html;
+}
+
+// The banner over the map while a past measurement is shown: { tone, html }. It says that it is one, whose and when,
+// that it is not a scan of now, and why its cells are not drawn when they are not, and it leads back to live.
+function syscallPastBannerHtml(past) {
+    const tag = '<span class="syscall-notice-title syscall-past-tag">PAST MEASUREMENT</span>';
+    const back = '<button type="button" class="btn btn-xs syscall-past-back" onclick="syscallBackToLive()" ' +
+                 'title="Put the past measurement away: the map shows the baseline again, and SCAN measures now">BACK TO LIVE</button>';
+    const text = t => `<span class="syscall-notice-text">${escapeHtml(t)}</span>`;
+    if (past.loading) return { tone: 'warn', html: tag + text(`Loading the measurement ${past.id}… It is not a scan of now.`) + back };
+    if (!past.data) return { tone: 'error', html: tag + text(`The measurement ${past.id} could not be loaded: ${past.error}`) + back };
+    const d = past.data;
+    // the history writes the chamber's datetime.now() and no zone: the time is said to be the chamber's, once, here
+    let html = tag + text(`Measured ${syscallWhen(d.measured_at)} by the chamber's clock (no time zone recorded), not a scan of now: ` +
+                          'the process may have changed since, or be gone. ' +
+                          syscallScanSummary(d));
+    if (past.refusal) html += `<span class="syscall-notice-text syscall-past-refusal">No map: ${escapeHtml(past.refusal)}. ` +
+                              'Its figures and its deviations are its own and are shown.</span>';
+    return { tone: past.refusal ? 'error' : 'warn', html: html + back };
+}
+
+// --- The detail panel, the deviation list and the rule draft: markup from what the baseline, the target and a
+// drafted rule hold. Every string of them goes through escapeHtml; a rule is shown as text, never as markup. ---
+
+// A hex string as its bytes ('4c8b' → ['4c', '8b']); null for anything that is not whole bytes of hex
+function syscallBytesOf(hex) {
+    const text = typeof hex === 'string' ? hex.trim().toLowerCase() : '';
+    return /^(?:[0-9a-f]{2})+$/.test(text) ? text.match(/../g) : null;
+}
+
+// The bytes of `own` as markup, the runs that differ from `other` marked and the rest plain. Without an `other`
+// (null, or not hex) nothing is marked; a byte past the end of `other` differs. '' for what is not bytes.
+function syscallBytesHtml(own, other) {
+    const mine = syscallBytesOf(own);
+    if (!mine) return '';
+    const theirs = syscallBytesOf(other);
+    const runs = [];
+    mine.forEach((byte, i) => {
+        const differs = theirs !== null && byte !== theirs[i];
+        const last = runs[runs.length - 1];
+        if (last && last.differs === differs) last.text += byte;
+        else runs.push({ differs, text: byte });
+    });
+    return runs.map(r => `<span class="syscall-bytes-${r.differs ? 'diff' : 'same'}">${escapeHtml(r.text)}</span>`).join('');
+}
+
+// How many bytes of `a` and `b` differ, over the longer of the two; 0 when either is not bytes
+function syscallBytesDiffer(a, b) {
+    const left = syscallBytesOf(a), right = syscallBytesOf(b);
+    if (!left || !right) return 0;
+    let n = 0;
+    for (let i = 0; i < Math.max(left.length, right.length); i++) if (left[i] !== right[i]) n++;
+    return n;
+}
+
+// Who a jump goes to: a module by name, memory no file backs, a mapped view of a file, or nobody that could be found out
+function syscallOwnerHtml(owner) {
+    if (owner === 'private') return '<span class="syscall-owner syscall-owner-private">private</span> memory, no file backs it';
+    if (owner === 'mapped') return 'a <span class="syscall-owner syscall-owner-private">mapped view</span> of a file, no loaded module';
+    if (typeof owner === 'string' && owner) return `<span class="syscall-owner">${escapeHtml(owner)}</span>`;
+    return '<span class="syscall-owner syscall-owner-unresolved">unresolved</span>';
+}
+
+// The signature as one text to copy: the return type, the name and each parameter with its SAL annotation. A baseline
+// extracted without the symbol server has no parameters to list, which is not the same as none.
+function syscallSignature(sc) {
+    const name = String(sc.name ?? '');
+    const ret = String(sc.return_type || '?');
+    const params = Array.isArray(sc.parameters) ? sc.parameters.filter(p => p && typeof p === 'object') : [];
+    if (!params.length) return `${ret} ${name}(${sc.symbols === false ? '/* parameters unknown */' : 'VOID'});`;
+    const lines = params.map(p => '    ' + [p.sal_annotation, p.type, p.name]
+        .filter(v => v !== undefined && v !== null && v !== '').map(String).join(' '));
+    return `${ret} ${name}(\n${lines.join(',\n')}\n);`;
+}
+
+// One syscall as the detail panel shows it. `sc` is what /api/syscalls/<name> returns, with what a scan measured
+// of it (state, pattern, target_owner, expected, actual, number_matches, allowlisted) and what the panel knows
+// (symbols: false when the baseline was extracted without the symbol server; scanned: false when a scan did not
+// cover this syscall; rizin: true when it can be opened in Rizin, rizin_note: why not). Nothing of it is markup.
+function renderSyscallDetail(sc) {
+    if (!sc || typeof sc !== 'object') return '<p class="syscall-empty">Choose a syscall on the map or in the catalog.</p>';
+    const name = String(sc.name ?? '');
+    const state = typeof sc.state === 'string' ? sc.state : '';
+    const known = Object.prototype.hasOwnProperty.call(SYSCALL_STATE_COLORS, state);
+    const fact = (label, value) => `<dt>${label}</dt><dd>${value}</dd>`;
+    const hasNumber = sc.number !== undefined && sc.number !== null && Number.isFinite(Number(sc.number));
+    const facts = [];
+    facts.push(fact('Number', hasNumber ? `${escapeHtml(syscallHex(sc.number))} (${escapeHtml(sc.number)})` : escapeHtml(sc.number)));
+    facts.push(fact('Module', escapeHtml(sc.module)));
+    if (sc.rva !== undefined && sc.rva !== null) facts.push(fact('RVA', escapeHtml(syscallHex(sc.rva))));
+    if (sc.return_type) facts.push(fact('Returns', escapeHtml(sc.return_type)));
+    if (sc.calling_convention) facts.push(fact('Convention', escapeHtml(sc.calling_convention)));
+    if (sc.build || sc.view) facts.push(fact('Baseline', escapeHtml([sc.build && `build ${sc.build}`, sc.view].filter(Boolean).join(' · '))));
+
+    let html = `<div class="syscall-detail-name"><span class="syscall-row-dot syscall-state-${cssToken(state || 'baseline')}"></span>` +
+               `<span class="syscall-detail-sc">${escapeHtml(name)}</span>` +
+               (state ? `<span class="syscall-detail-state">${escapeHtml(state)}</span>` : '') + '</div>' +
+               `<dl class="syscall-facts">${facts.join('')}</dl>`;
+
+    if (sc.scanned === false) {
+        html += sc.past === true
+            ? '<p class="syscall-detail-note">This syscall is not part of this past measurement (win32u is left out unless it is asked for).</p>'
+            : '<p class="syscall-detail-note">This syscall is not part of the last scan (win32u is left out unless it is asked for).</p>';
+    } else if (sc.past === true && !state) {
+        html += '<p class="syscall-detail-note">The past measurement on the map cannot be placed on this baseline, so nothing it measured is shown here: DEVIATIONS lists what it recorded.</p>';
+    }
+    const jumps = state === 'hooked' || state === 'patched' || state === 'diverged';
+    if (state) {
+        let finding = `<div class="syscall-finding-help">${escapeHtml(known ? SYSCALL_STATE_HELP[state]
+            : 'A state this tab does not know: it is read as diverged and never as quiet.')}</div>`;
+        const rows = [];
+        if (jumps) {
+            rows.push(fact('Jump target', syscallOwnerHtml(sc.target_owner)));
+            const relay = Array.isArray(sc.relay) ? sc.relay.filter(h => h && typeof h === 'object') : [];
+            if (relay.length) {
+                rows.push(fact('Relay', relay.map(h => `${escapeHtml(syscallHex(h.address))} ${syscallOwnerHtml(h.owner)}` +
+                    (h.pattern ? ` (${escapeHtml(h.pattern)})` : ' (not read)')).join(' → ') +
+                    ' · the first jump lands here, and the owner above is where the relay leads'));
+            }
+            if (sc.pattern) rows.push(fact('Pattern', escapeHtml(sc.pattern)));
+            // number_matches is true, false or null: null is a jump over the prologue, which shows no number
+            const bytes = sc.past === true ? 'The bytes read then' : 'The live bytes';
+            if (sc.number_matches === true) rows.push(fact('Number', `${bytes} carry the number of the baseline.`));
+            else if (sc.number_matches === false) rows.push(fact('Number', `<strong class="syscall-number-differs">${bytes} do NOT carry the number of the baseline: the stub names another syscall.</strong> That is a finding of its own.`));
+            else rows.push(fact('Number', `${bytes} do not show a number: a jump overwrote the prologue.`));
+        }
+        if (rows.length) finding += `<dl class="syscall-facts">${rows.join('')}</dl>`;
+        if (state === 'hooked' && sc.allowlisted === true) {
+            finding += `<p class="syscall-known-hook">Known hook: ${syscallOwnerHtml(sc.target_owner)} is on the hook allowlist for this build and view, ` +
+                       'so this hook does not score. It stays listed on purpose: it is there, and a module that hooks ntdll in this process is worth knowing.</p>';
+        }
+        html += `<div class="syscall-finding syscall-finding-${cssToken(state)}">${finding}</div>`;
+    }
+
+    // the stub: the baseline's bytes as far as they are compared, and after a scan the bytes read, the differences marked
+    const baselineHex = typeof sc.expected === 'string' ? sc.expected : typeof sc.stub_hex === 'string' ? sc.stub_hex : '';
+    const baselineBytes = syscallBytesOf(baselineHex);
+    const prefix = Number(sc.prefix_len) > 0 && baselineBytes ? baselineBytes.slice(0, Number(sc.prefix_len)).join('') : baselineHex;
+    const measured = state !== '';
+    const readBytes = measured ? syscallBytesOf(sc.actual) : null;
+    const compared = syscallBytesOf(prefix) ? syscallBytesOf(prefix).length : 0;
+    if (compared) {
+        let stub = `<div class="syscall-stub-line"><span class="syscall-stub-label">baseline</span><code class="syscall-bytes" title="${escapeHtml(prefix)}">${syscallBytesHtml(prefix, readBytes ? sc.actual : null)}</code></div>`;
+        if (readBytes) {
+            stub += `<div class="syscall-stub-line"><span class="syscall-stub-label">read</span><code class="syscall-bytes" title="${escapeHtml(sc.actual)}">${syscallBytesHtml(sc.actual, prefix)}</code></div>`;
+        }
+        let note = `${compared} bytes compared`;
+        if (readBytes) {
+            const differ = syscallBytesDiffer(prefix, sc.actual);
+            note += differ ? `, ${differ} differ` : ', all alike';
+            if (state === 'unreadable') note += ' · the stub reads as zeros, or too short to compare: a page that is not paged in, or a wiped stub';
+        } else if (sc.past === true && state === 'intact') {
+            // the history keeps the bytes of a deviation only: these were read, found as the baseline has them, and not kept
+            note += ' · found intact; the bytes read are not kept with a past measurement';
+        } else if (state === 'unreadable' || measured) {
+            note += ' · No bytes could be read.';
+        }
+        html += `<div class="syscall-section"><div class="syscall-section-title">STUB</div>${stub}<div class="syscall-stub-note">${escapeHtml(note)}</div></div>`;
+    } else if (measured && readBytes) {
+        html += `<div class="syscall-section"><div class="syscall-section-title">STUB</div><div class="syscall-stub-line"><span class="syscall-stub-label">read</span>` +
+                `<code class="syscall-bytes" title="${escapeHtml(sc.actual)}">${syscallBytesHtml(sc.actual, null)}</code></div></div>`;
+    }
+
+    const params = Array.isArray(sc.parameters) ? sc.parameters : [];
+    let rows = params.map((p, i) => {
+        const param = p && typeof p === 'object' ? p : {};
+        return `<tr><td class="view-table-num" data-sort-value="${i}">${i}</td><td>${escapeHtml(param.type)}</td>` +
+               `<td>${escapeHtml(param.name)}</td><td>${escapeHtml(param.sal_annotation)}</td></tr>`;
+    }).join('');
+    if (!params.length) {
+        const why = sc.symbols === false ? 'The parameter table of this baseline is incomplete: it was extracted without the symbol server.'
+                                         : 'This syscall takes no parameters.';
+        rows = `<tr data-sort-skip><td colspan="4" class="view-table-empty">${escapeHtml(why)}</td></tr>`;
+    }
+    html += '<div class="syscall-section"><div class="syscall-section-title">PARAMETERS</div><div class="view-table-wrap">' +
+            '<table class="view-table" data-sortable data-sort-id="syscall-params"><thead><tr><th>#</th><th>TYPE</th><th>NAME</th><th>SAL</th></tr></thead>' +
+            `<tbody>${rows}</tbody></table></div></div>`;
+    html += '<div class="syscall-section"><div class="syscall-section-title">SIGNATURE ' +
+            '<button type="button" class="btn btn-xs" onclick="syscallCopySignature()" title="Copy the signature">Copy</button></div>' +
+            `<pre class="syscall-signature">${escapeHtml(syscallSignature(sc))}</pre></div>`;
+
+    let links = '';
+    if (name) {
+        links += `<a class="btn btn-sm" href="${escapeHtml(SYSCALL_DOC_URL + encodeURIComponent(name).toLowerCase())}" target="_blank" ` +
+                 'rel="noopener noreferrer" title="Documentation on ntdoc.m417z.com (opens in a new tab, needs a network)">ntdoc</a> ';
+    }
+    links += `<a class="btn btn-sm" href="${escapeHtml(SYSCALL_WINGRAPH_URL)}" target="_blank" rel="noopener noreferrer" ` +
+             'title="WinGraph, a dependency graph of the System32 binaries. This opens the site at its root, not one module (it has no address for one); nothing is fetched from it.">WinGraph</a> ';
+    if (sc.rizin === true) {
+        links += '<button type="button" class="btn btn-sm" onclick="syscallOpenRizin()" title="Open the module in the RIZIN tab and go to this syscall">Open in Rizin</button>';
+    } else if (sc.rizin_note) {
+        links += `<span class="syscall-detail-note">${escapeHtml(sc.rizin_note)}</span>`;
+    }
+    if (links) html += `<div class="syscall-links">${links}</div>`;
+    return html;
+}
+
+// The deviations of a scan as a table, the loudest first. `list` is what /scan holds under `deviations`: every state
+// but intact, unreadable and diverged included, so a row is not always a finding. options: scanned (false: no scan
+// yet), selected (a name), scores (name → what the stub added to the evidence score), past (the list is of a past
+// measurement, whose bytes were read then). A hook the allowlist knows
+// stays in the list, with its owner, and says that it does not score: an EDR that hooks ntdll in this process is
+// something to see, even though it is not evidence.
+function renderSyscallDeviations(list, options) {
+    const opts = options && typeof options === 'object' ? options : {};
+    const scores = opts.scores && typeof opts.scores === 'object' ? opts.scores : {};
+    const rank = d => Object.prototype.hasOwnProperty.call(SYSCALL_SEVERITY_RANK, d.state)
+        ? SYSCALL_SEVERITY_RANK[d.state] : SYSCALL_SEVERITY_RANK.diverged;
+    const items = (Array.isArray(list) ? list : []).filter(d => d && typeof d === 'object')
+        .sort((a, b) => rank(a) - rank(b) || (Number(a.number) - Number(b.number)) || 0);
+    const drawable = d => (d.state === 'hooked' || d.state === 'patched' || d.state === 'diverged')
+        && d.allowlisted !== true && typeof d.actual === 'string' && d.actual !== '';
+    const rows = items.slice(0, SYSCALL_ROWS_MAX).map(d => {
+        const name = String(d.name ?? '');
+        const state = String(d.state ?? '');
+        const known = state === 'hooked' && d.allowlisted === true;
+        const own = Object.prototype.hasOwnProperty.call(scores, name) ? Number(scores[name]) : NaN;
+        let score;
+        if (known) {
+            score = '<td data-sort-value="0"><span class="syscall-known" title="This hook is on the hook allowlist for this build and view. ' +
+                    'It stays listed because it is there, but it does not score.">on the allowlist · not scored</span></td>';
+        } else if (Number.isFinite(own)) {
+            score = `<td class="view-table-num" data-sort-value="${own}">+${own.toFixed(2)}</td>`;
+        } else {
+            score = '<td class="view-table-num" data-sort-value="-1" title="Not scored: a patched stub and a hook that is not on the allowlist score, a diverged or unreadable stub does not">–</td>';
+        }
+        const bytes = (own, other) => (typeof own === 'string' && syscallBytesOf(own)
+            ? `<code class="syscall-bytes view-table-clip" title="${escapeHtml(own)}">${syscallBytesHtml(own, other)}</code>` : '<span class="syscall-muted">–</span>');
+        return `<tr${name === opts.selected ? ' class="selected"' : ''}>` +
+            `<td data-sort-value="${escapeHtml(name)}"><button type="button" class="syscall-link" onclick="syscallSelect(${jsArg(name)})">${escapeHtml(name)}</button>` +
+            (d.number_matches === false ? ` <span class="syscall-flag" title="${opts.past ? 'The bytes read then carry' : 'The live bytes carry'} another syscall number than the baseline">number differs</span>` : '') + '</td>' +
+            `<td class="view-table-num" data-sort-value="${escapeHtml(d.number)}">${escapeHtml(syscallHex(d.number))}</td>` +
+            `<td data-sort-value="${rank(d)}"><span class="syscall-row-dot syscall-state-${cssToken(state)}"></span> ${escapeHtml(state)}</td>` +
+            `<td>${bytes(d.expected, d.actual)}</td><td>${bytes(d.actual, d.expected)}</td>` +
+            `<td title="${escapeHtml(d.pattern || '')}">${state === 'unreadable' ? '<span class="syscall-muted">–</span>' : syscallOwnerHtml(d.target_owner)}</td>` +
+            score +
+            `<td>${drawable(d) ? `<button type="button" class="btn btn-xs" onclick="syscallDraftRule(${jsArg(name)})" title="Draft a signature entry from this stub. Nothing is written.">Draft rule</button>` : ''}</td></tr>`;
+    });
+    if (!items.length) {
+        const why = opts.scanned === false ? 'Scan a process to list the stubs that deviate from the baseline.' : 'No deviations: every stub measured is as the baseline has it.';
+        rows.push(`<tr data-sort-skip><td colspan="8" class="view-table-empty">${escapeHtml(why)}</td></tr>`);
+    } else if (items.length > SYSCALL_ROWS_MAX) {
+        const more = `Showing the first ${SYSCALL_ROWS_MAX} of ${items.length.toLocaleString('en-US')}, the loudest first.`;
+        rows.push(`<tr data-sort-skip><td colspan="8" class="view-table-empty">${escapeHtml(more)}</td></tr>`);
+    }
+    return '<table class="view-table" data-sortable data-sort-id="syscall-deviations"><thead><tr><th>SYSCALL</th><th>NUMBER</th><th>STATE</th>' +
+           `<th>BASELINE</th><th>READ</th><th>JUMP TARGET</th><th>SCORE</th><th></th></tr></thead><tbody>${rows.join('')}</tbody></table>`;
+}
+
+// A rule that was drafted, as the panel shows it. `draft` is what /api/syscalls/rule answers: a YARA rule ({ name,
+// text, target }, kind 'yara' or none) or a signature entry ({ kind: 'signature', entry, text, target, covered_by }).
+// The text is the one thing in it that a sample writes, and it is set as text, never as markup. A draft only drafts:
+// a YARA rule is applied (written where Rustinel reads, now, on this VM) or downloaded (handed back for the repo, to
+// commit; that a committed rule is loaded again after a rebuild is not verified) by a press of its own button, and
+// the two say what they do. options: busy (an apply is
+// under way), note ({ tone, text }: what the last apply answered).
+function showSyscallRuleDraft(draft, options) {
+    const d = draft && typeof draft === 'object' ? draft : {};
+    const opts = options && typeof options === 'object' ? options : {};
+    const signature = d.kind === 'signature';
+    const name = String(d.name ?? '');
+    const text = String(d.text ?? '');
+    const target = String(d.target ?? '');
+    const title = signature ? String(d.entry && d.entry.family || 'Signature entry') : name || 'Rule';
+    let html = '<section class="syscall-draft-card" aria-label="Rule draft"><div class="syscall-panel-head"><h3 class="syscall-panel-title">RULE DRAFT</h3>' +
+               '<button type="button" class="btn btn-xs" onclick="syscallCopyDraft()" title="Copy the text of the draft">Copy</button>' +
+               '<button type="button" class="btn btn-xs" onclick="syscallCloseDraft()" title="Close the draft">Close</button></div>' +
+               `<div class="syscall-draft-name">${escapeHtml(title)}</div>` +
+               `<div class="syscall-draft-meta">${signature ? 'Signature entry' : 'YARA rule'}${target ? ` · ${escapeHtml(target)}` : ''}</div>` +
+               `<pre class="syscall-draft-text">${escapeHtml(text)}</pre>`;
+    const note = opts.note && typeof opts.note === 'object' && opts.note.text ? opts.note : null;
+    if (signature) {
+        html += `<p class="syscall-draft-hint">Add this entry by hand to <code>${escapeHtml(target || 'webui/syscall_signatures.json')}</code> after replacing any address or displacement in the pattern. Nothing has been written.</p>`;
+        const covered = Array.isArray(d.covered_by) ? d.covered_by.filter(c => c && typeof c === 'object') : [];
+        if (covered.length) {
+            html += '<p class="syscall-draft-hint">Already covered by an entry of that file: ' +
+                    covered.map(c => `${escapeHtml(c.family)} (${escapeHtml(c.pattern)}, ${escapeHtml(c.match)})`).join('; ') + '.</p>';
+        }
+    } else if (name) {
+        const file = target || `${name}.yar`;
+        if (!note) html += '<p class="syscall-draft-hint">Nothing has been written yet. Choose what happens to this rule:</p>';
+        html += '<div class="syscall-draft-actions">' +
+            '<div class="syscall-draft-action syscall-draft-vm"><div class="syscall-draft-action-title">ON THIS VM · now</div>' +
+            `<p>Writes <code>${escapeHtml(file)}</code> into the folder Rustinel reads its rules from. Rustinel should load it within about 2 seconds, without a restart; that is not yet verified on a VM, so check its log. ` +
+            'A rebuilt VM does not have it.</p>' +
+            `<button type="button" class="btn btn-sm btn-primary" onclick="applySyscallRule(${jsArg(name)})"${opts.busy ? ' disabled' : ''}>APPLY TO THIS VM</button></div>` +
+            '<div class="syscall-draft-action syscall-draft-repo"><div class="syscall-draft-action-title">IN THE REPO · reviewable</div>' +
+            '<p>Saves the same rule as a file and writes nothing on this VM. Commit it under <code>rules/yara/</code> to keep it in version control and reviewable. Whether a committed rule is loaded again after a rebuild is not yet verified.</p>' +
+            `<a class="btn btn-sm btn-outline" href="${escapeHtml(`/api/syscalls/rule/download?name=${encodeURIComponent(name)}&text=${encodeURIComponent(text)}`)}" ` +
+            `download="${escapeHtml(`${name}.yar`)}">DOWNLOAD FOR THE REPO</a></div></div>`;
+    }
+    if (note) html += `<div class="syscall-draft-result syscall-draft-result-${cssToken(note.tone)}" role="status">${escapeHtml(note.text)}</div>`;
+    return html + '</section>';
+}
+
+// The key of a hook as the list keeps it: the syscall and the lower-case owner
+function syscallHookKey(name, owner) {
+    return `${name}|${String(owner).trim().toLowerCase()}`;
+}
+
+// The hooks of a scan that recording would add, as the server would take them: a hooked stub of ntdll (the one module
+// the server measures when it records) that a module owns, and that the list does not know. One pair once.
+function syscallHookPairs(scan) {
+    const pairs = new Map();
+    for (const d of Array.isArray(scan && scan.deviations) ? scan.deviations : []) {
+        if (d && d.state === 'hooked' && d.allowlisted !== true && String(d.module || '').toLowerCase() === 'ntdll.dll'
+            && typeof d.target_owner === 'string' && d.target_owner.trim() && d.target_owner !== 'private') {
+            pairs.set(syscallHookKey(d.name, d.target_owner), { name: String(d.name), owner: d.target_owner });
+        }
+    }
+    return [...pairs.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// What the keys `actual` have that `expected` has not (extra) and the other way round (missing)
+function syscallHookDifference(expected, actual) {
+    const have = new Set(expected), got = new Set(actual);
+    return { extra: [...got].filter(k => !have.has(k)).sort(), missing: [...have].filter(k => !got.has(k)).sort() };
+}
+
+// Why a scan taken now cannot stand in for the one the analyst reviewed, or '' when it can: another build or view,
+// another process behind the PID (it was reused), other hooks than those that were reviewed
+function syscallHookDrift(reviewed, now) {
+    const reasons = [];
+    if (String(now.build || '') !== String(reviewed.build || '') || String(now.view || '') !== String(reviewed.view || '')) {
+        reasons.push(`it is measured as build ${now.build}, ${now.view} view now, and was build ${reviewed.build}, ${reviewed.view} view`);
+    }
+    if (String(now.process || '').toLowerCase() !== String(reviewed.process || '').toLowerCase()) {
+        reasons.push(`PID ${reviewed.pid} is ${now.process || 'unknown'} now and was ${reviewed.process || 'unknown'}: the PID was reused`);
+    }
+    const label = key => key.replace('|', ' → ');
+    const diff = syscallHookDifference(syscallHookPairs(reviewed).map(p => syscallHookKey(p.name, p.owner)),
+                                       syscallHookPairs(now).map(p => syscallHookKey(p.name, p.owner)));
+    if (diff.extra.length) reasons.push(`new since: ${diff.extra.map(label).join(', ')}`);
+    if (diff.missing.length) reasons.push(`gone since: ${diff.missing.map(label).join(', ')}`);
+    return reasons.length ? `The hooks of PID ${reviewed.pid} are no longer those of the scan you reviewed (${reasons.join('; ')}).` : '';
+}
+
+// The sentence under the warning of the hook control: what pressing it records, and what that costs when the host is not clean
+function syscallHookWarning(scan) {
+    const what = scan && scan.pid
+        ? `This records the hooks that PID ${scan.pid}${scan.name ? ` (${scan.name})` : ''} shows as known, whoever installed them: from then on they stop counting as evidence in every process on this host, `
+        : 'Scan a process first. This records the hooks of that run as known, whoever installed them, so that from then on they stop counting as evidence in every process on this host, ';
+    return what + 'and recording the hooks of an infected host hides real findings until the list is cleared. A patched stub is never recorded. ' +
+           'The process is measured again first, and nothing is recorded if its hooks are no longer those of this scan.';
+}
+
+function syscallCaptureQuestion(scan) {
+    const n = Number(scan && scan.hookable) || 0;
+    const pairs = Array.isArray(scan && scan.pairs) ? scan.pairs : [];
+    const named = pairs.slice(0, 8).map(p => `  ${p.name} → ${p.owner}`).join('\n') + (pairs.length > 8 ? `\n  and ${pairs.length - 8} more` : '');
+    return 'Record the hooks of this run as known?\n\n' +
+           `PID ${scan && scan.pid}${scan && scan.name ? ` (${scan.name})` : ''} shows ${n} hooked stub${n === 1 ? '' : 's'} that ${n === 1 ? 'is' : 'are'} not known yet` +
+           `${named ? `:\n${named}\n` : '. '}` +
+           'From then on they stop counting as evidence in every process on this host, whoever installed them.\n\n' +
+           'Only do this on a host you believe is clean: recording the hooks of an infected host hides real findings until the list is cleared.';
+}
+
+// The hooks that are known on this host, and the control that records more. state: entries ({ syscall, owner, build,
+// view }), loaded, problem (the file cannot be used), error (the list could not be read), note ({ tone, text }), busy,
+// scope ({ build, view } of the baseline on the map, or null) and scan ({ pid, name, hookable: hooked stubs of the last
+// scan that are not known yet, allowlist: what that scan says about the list }, or null before a scan). The control
+// records the hooks of THIS RUN and says that this is only for a host believed to be clean.
+function renderHookAllowlist(state) {
+    const st = state && typeof state === 'object' ? state : {};
+    const scan = st.scan && typeof st.scan === 'object' ? st.scan : null;
+    const entries = Array.isArray(st.entries) ? st.entries.filter(e => e && typeof e === 'object') : [];
+    const notices = [];
+    if (st.error) notices.push({ kind: 'hooks-error', tone: 'error', title: 'Known hooks unavailable', text: String(st.error) });
+    if (st.problem) notices.push({ kind: 'hooks-problem', tone: 'error', title: 'Hook allowlist unusable', text: String(st.problem) });
+    if (scan && scan.allowlist && scan.allowlist.applied === false && scan.allowlist.reason) {
+        notices.push({ kind: 'hooks-not-applied', tone: 'warn', title: 'Allowlist not applied to the last scan', text: String(scan.allowlist.reason) });
+    }
+    let rows = entries.map(e => `<tr><td>${escapeHtml(e.syscall)}</td><td>${escapeHtml(e.owner)}</td><td>${escapeHtml(e.build)}</td><td>${escapeHtml(e.view)}</td></tr>`).join('');
+    if (!entries.length) {
+        const why = st.loaded ? 'No hook is recorded as known: every hook a scan finds is scored.' : (st.error ? 'The list could not be read.' : 'Loading the known hooks…');
+        rows = `<tr data-sort-skip><td colspan="4" class="view-table-empty">${escapeHtml(why)}</td></tr>`;
+    }
+    const hookable = scan ? Number(scan.hookable) || 0 : 0;
+    const record = !scan || hookable === 0 || st.busy === true || st.loaded !== true;
+    const recordTitle = st.loaded !== true ? 'The known hooks have not been read yet: recording waits for them'
+        : st.past === true ? 'A past measurement is on the map: go back to live and scan, the hooks of a run of now are what gets recorded'
+        : !scan ? 'Scan a process first: the hooks of that run are what gets recorded'
+        : hookable === 0 ? 'The last scan found no hook that is not known already' : 'Record the hooks of the last scan as known (asks first)';
+    const forgetThis = !st.scope || !entries.length || st.busy === true;
+    const forgetAll = !entries.length || st.busy === true;
+    return syscallNoticesHtml(notices) +
+        '<div class="view-table-wrap"><table class="view-table" data-sortable data-sort-id="syscall-hooks"><thead><tr><th>SYSCALL</th><th>OWNER</th><th>BUILD</th><th>VIEW</th></tr></thead>' +
+        `<tbody>${rows}</tbody></table></div>` +
+        '<div class="syscall-hook-capture">' +
+        `<p class="syscall-hook-warning" role="note"><strong>Only on a host you believe is clean.</strong> ${escapeHtml(syscallHookWarning(scan))}</p>` +
+        '<div class="syscall-hook-actions">' +
+        `<button type="button" class="btn btn-sm syscall-hook-record" onclick="syscallCaptureHooks()"${record ? ' disabled' : ''} title="${escapeHtml(recordTitle)}">RECORD THE HOOKS OF THIS RUN AS KNOWN</button>` +
+        `<button type="button" class="btn btn-sm" onclick="syscallClearHooks('this')"${forgetThis ? ' disabled' : ''} title="Forget the known hooks of the build and view on the map">FORGET THIS BUILD AND VIEW</button>` +
+        `<button type="button" class="btn btn-sm" onclick="syscallClearHooks('all')"${forgetAll ? ' disabled' : ''} title="Forget every known hook, of every build and view">FORGET ALL</button>` +
+        '</div></div>' +
+        (st.note && st.note.text ? `<div class="syscall-draft-result syscall-draft-result-${cssToken(st.note.tone)}" role="status">${escapeHtml(st.note.text)}</div>` : '');
+}
+
+// The syscall stubs a sample carries itself, found in its process memory and in its file. Whether the sample imports
+// the function is known as a rule, through its import set widened by the curated Win32 to Nt table: not imported
+// (import_present false) is a proven bypass, imported too (true) a hint. It is unknown (null) where no curated row
+// leads to the syscall or the import table could not be read, and for a stub in process memory whenever a module loaded
+// in the process is one the binary graph of this system does not hold: that memory is not the sample's alone, so it is
+// judged against the doors every loaded module imports, and only a complete union can prove. For a process hit true and
+// false speak of those modules, never of the sample, and true is nearly every one: kernelbase imports the Nt functions. A stub whose number this build does not have
+// (number_known false) suggests a sample made for another build. A file hit whose door is the file's own export of
+// that stub (own_export) says so instead of "imported too": it is the module's own code, as in a copy of ntdll.
+// model: hits ({ ...hit, source: 'process' | 'file' }), notes ({ tone, title, text }), summary, partial.
+function renderSyscallStubs(model) {
+    const m = model && typeof model === 'object' ? model : {};
+    const all = Array.isArray(m.hits) ? m.hits : [];
+    const notes = (Array.isArray(m.notes) ? m.notes : []).filter(n => n && typeof n === 'object')
+        .map(n => ({ kind: 'stubs', tone: n.tone, title: n.title || 'Stub search', text: n.text }));
+    const rows = [];
+    all.forEach((h, i) => {
+        if (!h || typeof h !== 'object') return;
+        const known = h.number_known !== false;
+        const where = h.source === 'file' ? `file offset ${syscallHex(h.offset)}` : `process memory ${syscallHex(h.address)}`;
+        let imported;
+        // in process memory the answer is about every loaded module, never the sample alone (memory_evidence says the same)
+        const inProcess = h.source !== 'file';
+        if (h.import_present === true && !inProcess && h.own_export === true) {
+            // the file exports this very stub under its own Nt or Zw name: its own code, so no word of its imports
+            imported = '<span title="The file exports this stub under its own name: the module\'s own code, as in a copy of ntdll, not a stub carried past the documented path. A weaker hint.">own export</span>';
+        } else if (h.import_present === true) {
+            imported = inProcess
+                ? '<span title="A module loaded in the process imports a door to this syscall, so the documented path is in the address space: a weaker hint. ' +
+                  'That is nearly every process hit, since kernelbase.dll, loaded in every process, imports the Nt functions itself; it says nothing of the sample\'s own imports.">imported too</span>'
+                : '<span title="The sample imports this function as well: a weaker hint.">imported too</span>';
+        } else if (h.import_present === false) {
+            imported = inProcess
+                ? '<span title="No module loaded in the process imports a door to this syscall, by import sets widened through the curated Win32 to Nt table: a proven bypass of the import path.">not imported</span>'
+                : '<span title="Not imported by the sample, by an import set widened through the curated Win32 to Nt table: a proven bypass of the import path.">not imported</span>';
+        } else {
+            imported = '<span class="syscall-muted" title="No curated Win32 to Nt row leads to this syscall, the import table could not be read, or the stub ' +
+                       'is in process memory and a module loaded there is not in the binary graph of this system: a missing import proves nothing.">unknown</span>';
+        }
+        const drawable = typeof h.stub_hex === 'string' && h.stub_hex !== '' && Number.isInteger(h.number);
+        rows.push('<tr>' +
+            `<td data-sort-value="${escapeHtml(h.syscall || '')}">${known && h.syscall ? escapeHtml(h.syscall) : '<span class="syscall-muted">–</span>'}</td>` +
+            `<td class="view-table-num" data-sort-value="${escapeHtml(h.number)}">${escapeHtml(syscallHex(h.number))}</td>` +
+            (known ? '<td data-sort-value="1">in this build</td>'
+                   : '<td data-sort-value="0"><span class="syscall-flag" title="This build has no syscall with this number: the stub was probably made for another Windows build.">not in this build</span></td>') +
+            `<td>${escapeHtml(where)}</td><td>${escapeHtml(h.pattern)}</td><td>${imported}</td>` +
+            `<td>${drawable ? `<button type="button" class="btn btn-xs" onclick="syscallDraftStubRule(${jsInt(i)})" title="Draft a YARA rule for these bytes. Nothing is written.">Draft rule</button>` : ''}</td></tr>`);
+    });
+    if (!rows.length) {
+        const why = m.partial ? 'No hit, but what was searched was not all of it: this is not a clean result.'
+                              : 'No syscall stub of its own was found in what was searched.';
+        rows.push(`<tr data-sort-skip><td colspan="7" class="view-table-empty">${escapeHtml(why)}</td></tr>`);
+    }
+    return syscallNoticesHtml(notes) +
+        (m.summary ? `<div class="syscall-stubs-summary">${escapeHtml(m.summary)}</div>` : '') +
+        '<p class="syscall-draft-hint"><strong>Proof or hint.</strong> A syscall stub in the sample file whose function the sample does not import, ' +
+        'judged by its import set widened through the curated Win32 to Nt table, is a proven bypass of ntdll. ' +
+        'It stays a hint where the sample imports the function as well, where no curated row leads to the syscall, or where its import table could not be read. ' +
+        'A stub in process memory is judged against the doors every loaded module imports, and only when the binary graph of this system holds every one of them. ' +
+        'That practically never proves: kernelbase.dll, loaded in every process, imports the Nt functions itself, so the documented path is in the address space even when the sample does not use it. ' +
+        'The proof comes from the sample file. Look at each hit before drafting a rule.</p>' +
+        '<div class="view-table-wrap"><table class="view-table" data-sortable data-sort-id="syscall-stubs"><thead><tr><th>SYSCALL</th><th>NUMBER</th><th>BUILD</th>' +
+        `<th>FOUND</th><th>PATTERN</th><th>IMPORTED</th><th></th></tr></thead><tbody>${rows.join('')}</tbody></table></div>`;
+}
+
+const SYSCALL_VIEW_NAMES = ['map', 'graph'];
+const syscallState = {
+    ready: false,
+    // whether the win32u box was ticked when a baseline without win32u switched it off, to tick it again after
+    win32uWanted: false,
+    status: null, statusError: '',
+    // The baseline of one view: { view, build, symbols, items: [{ name, module, number }] }
+    // loading counts the refreshes under way; loadSeq numbers the reads of the baseline, of which only the last counts
+    baseline: null, baselineError: '', loading: 0, loadSeq: 0,
+    bands: [], bandsKey: 0, layouts: new Map(),
+    // The last scan: its answer, the state of each measured syscall (name → state) and the line under the toolbar
+    scan: null, states: null, scanning: false, note: null,
+    query: '', module: '', match: null,
+    selected: '', hover: '', hoverAt: null,
+    // The syscall of the detail panel: its lookup, as the server answered it; the rule drafted last ({ draft, note,
+    // busy } or { error }); the known hooks and what the last recording or forgetting said
+    detail: { name: '', data: null, error: '', loading: false }, detailSeq: 0,
+    draft: null, draftSeq: 0,
+    hooks: { entries: [], loaded: false, problem: '', error: '', note: null, busy: false },
+    // The stub search: where it stands, and what each of its two ways in answered ({ ok, data, sample } or { ok, error } or { skipped })
+    stubs: { searched: false, running: false, pid: 0, name: '', sources: {} },
+    pane: 'map',
+    view: 'map',
+    // The scan panels under the surface: folded by the graph view, until the reader folds or opens them by hand
+    lowerFolded: false, lowerByHand: false,
+    targets: {}, target: '',
+    timer: null,
+    // A past measurement on the map in place of a scan of now: null while the map is live, else { id, loading } and
+    // then { id, data } or { id, error }. `refusal` says why its cells are not drawn. pastSeq drops late answers.
+    past: null, pastSeq: 0,
+    // What /api/syscalls/measurements named: the choices of the control
+    pastList: [], pastListError: '',
+};
+
+// A request to /api/syscalls/...: never throws, `data` is an object whatever the answer was
+async function syscallApi(url, options) {
+    try {
+        const resp = await fetch(url, options);
+        let data = null;
+        try { data = await resp.json(); } catch { data = null; }
+        return { ok: resp.ok, status: resp.status, data: data && typeof data === 'object' ? data : {} };
+    } catch (e) {
+        return { ok: false, status: 0, data: { error: e && e.message ? e.message : 'Connection lost' } };
+    }
+}
+
+function syscallErrorText(result) {
+    const text = result.data && typeof result.data.error === 'string' ? result.data.error : '';
+    return text || `The server answered with status ${result.status}.`;
+}
+
+async function syscallLoadStatus() {
+    const r = await syscallApi('/api/syscalls/status');
+    syscallState.statusError = r.ok ? '' : syscallErrorText(r);
+    if (r.ok) syscallState.status = r.data;
+    return r.ok;
+}
+
+// The whole baseline of `view` (this host's own when empty), read page by page and lean: a name, a module and a
+// number of each syscall, which is all the map draws (the parameters and stub bytes of one come from its lookup). On success it replaces the baseline: { ok: true }; otherwise { ok: false, error }, or
+// { ok: false, superseded: true } when a newer load started meanwhile.
+async function syscallLoadBaseline(view) {
+    const seq = ++syscallState.loadSeq;
+    const items = [];
+    let meta = null, total = Infinity;
+    while (items.length < total) {
+        const params = new URLSearchParams({ offset: String(items.length), limit: String(SYSCALL_PAGE), lean: '1' });
+        if (view) params.set('view', view);
+        const r = await syscallApi(`/api/syscalls/baseline?${params}`);
+        if (seq !== syscallState.loadSeq) return { ok: false, superseded: true };
+        if (!r.ok) return { ok: false, error: syscallErrorText(r) };
+        meta = r.data;
+        const page = Array.isArray(r.data.items) ? r.data.items : [];
+        total = Number.isFinite(r.data.total) ? r.data.total : 0;
+        for (const item of page) {
+            items.push({ name: String(item.name), module: String(item.module || '').toLowerCase(), number: Number(item.number) });
+        }
+        if (!page.length) break;
+    }
+    syscallState.baseline = { view: meta.view, build: meta.build, symbols: meta.symbols, items };
+    syscallState.bands = syscallBands(items);
+    syscallState.bandsKey++;
+    if (syscallState.selected && !items.some(item => item.name === syscallState.selected)) syscallState.selected = '';
+    syscallDropForeignScan();
+    return { ok: true };
+}
+
+// The states of a scan belong to the view it measured. When the baseline on the map is another one (or none), the
+// measurement is cleared: a cell never shows what was measured against another reference.
+function syscallDropForeignScan() {
+    const scan = syscallState.scan, baseline = syscallState.baseline;
+    if (!scan || (baseline && baseline.view === scan.view)) return;
+    // a refused past measurement draws no cell on any baseline: another one changes nothing about it
+    if (syscallPastRefusal()) return;
+    const past = scan.live === false;
+    syscallState.scan = null;
+    syscallState.states = null;
+    if (past) {
+        syscallState.past = null;
+        syscallState.pastSeq++;
+    }
+    syscallState.note = {
+        tone: 'warn',
+        text: past
+            ? `The past measurement of PID ${scan.pid} ${scan.view ? `measured the ${scan.view} view` : 'names no view'}, so it cannot be placed ` +
+              `${baseline ? `on the ${baseline.view} baseline the map now shows` : 'while the map shows no baseline'}: it is put away. ` +
+              'Choose it again to see its figures and deviations.'
+            : `The scan of PID ${scan.pid} ${scan.view ? `measured the ${scan.view} view` : 'names no view'}, but the map shows ` +
+              `${baseline ? `the ${baseline.view} baseline` : 'no baseline'}: its measurement is cleared.`,
+    };
+}
+
+// The status always, the baseline when there is none yet or when `force`. While an extraction runs it looks again
+// every few seconds (not with force: the baseline is read again only when it is missing).
+async function syscallRefresh(force) {
+    syscallState.loading++;
+    syscallRenderAll();
+    try {
+        const wanted = force === true || !syscallState.baseline;
+        const [, loaded] = await Promise.all([syscallLoadStatus(), wanted ? syscallLoadBaseline('') : { ok: true }]);
+        // a read that another one overtook says nothing about the baseline: the newer read decides
+        if (!loaded.superseded) {
+            if (loaded.ok) {
+                syscallState.baselineError = '';
+            } else {
+                syscallState.baseline = null;
+                syscallState.bands = [];
+                syscallState.bandsKey++;
+                syscallState.baselineError = loaded.error;
+                syscallDropForeignScan();
+            }
+        }
+    } finally {
+        syscallState.loading--;
+    }
+    syscallApplyFilter();
+    syscallRenderAll();
+    syscallSchedulePoll();
+}
+
+function syscallSchedulePoll() {
+    clearTimeout(syscallState.timer);
+    syscallState.timer = null;
+    const extraction = syscallState.status && syscallState.status.extraction;
+    if (extraction && Array.isArray(extraction.running) && extraction.running.length && state.activeTab === 'syscalls') {
+        syscallState.timer = setTimeout(() => {
+            if (state.activeTab === 'syscalls') syscallRefresh();
+        }, SYSCALL_POLL_MS);
+    }
+}
+
+async function syscallLoadTargets() {
+    const r = await syscallApi('/api/processes?min_threats=0&max=0');
+    if (r.ok) syscallState.targets = r.data;
+    renderSyscallTargets();
+}
+
+function renderSyscallTargets() {
+    const select = document.getElementById('syscall-target');
+    if (!select) return;
+    select.innerHTML = syscallTargetsHtml(syscallState.targets, syscallState.target);
+    syscallState.target = select.value;
+    renderSyscallToolbar();
+}
+
+function syscallOnTarget() {
+    const select = document.getElementById('syscall-target');
+    syscallState.target = select ? select.value : '';
+    renderSyscallToolbar();
+}
+
+// What the map shows in place of cells
+function syscallEmptyText() {
+    if (syscallState.loading) return 'Loading the baseline…';
+    if (syscallState.baselineError) return syscallState.baselineError;
+    const refusal = syscallPastRefusal();
+    if (refusal) return `No map of this past measurement: ${refusal}`;
+    if (syscallState.baseline) return 'The baseline has no syscalls.';
+    return 'No baseline loaded.';
+}
+
+// Why the past measurement on the map has no cells, '' when it has them or none is shown. A cell is drawn only on
+// the baseline the measurement was rebuilt against: never on another one.
+function syscallPastRefusal() {
+    const past = syscallState.past;
+    return past && past.data && past.refusal ? past.refusal : '';
+}
+
+// The bands' markup: a heading and a canvas per module, built again only when the baseline (or what stands in
+// its place) changed
+function syscallEnsureBands(host) {
+    const drawn = syscallState.bands.length && !syscallPastRefusal();
+    const key = drawn ? `bands:${syscallState.bandsKey}` : `empty:${syscallEmptyText()}`;
+    if (host.dataset.key === key) return;
+    host.dataset.key = key;
+    host.replaceChildren();
+    syscallState.layouts.clear();
+    if (!drawn) {
+        const empty = document.createElement('p');
+        empty.className = 'syscall-empty';
+        empty.textContent = syscallEmptyText();
+        host.appendChild(empty);
+        return;
+    }
+    for (const band of syscallState.bands) {
+        const section = document.createElement('section');
+        section.className = 'syscall-band';
+        section.dataset.module = band.module;
+        const head = document.createElement('h3');
+        head.className = 'syscall-band-head';
+        const name = document.createElement('span');
+        name.className = 'syscall-band-name';
+        name.textContent = band.module;
+        const count = document.createElement('span');
+        count.className = 'syscall-band-count';
+        count.textContent = band.items.length.toLocaleString('en-US');
+        head.appendChild(name);
+        head.appendChild(count);
+        const canvas = document.createElement('canvas');
+        canvas.className = 'syscall-canvas';
+        canvas.dataset.module = band.module;
+        canvas.setAttribute('role', 'img');
+        canvas.setAttribute('aria-label', `Map of the ${band.items.length} syscalls of ${band.module}, one cell each`);
+        section.appendChild(head);
+        section.appendChild(canvas);
+        host.appendChild(section);
+    }
+}
+
+// One band onto its canvas, at the density of the screen. A canvas with no width (its tab is not shown) is left
+// for when the tab is shown.
+function syscallPaintCanvas(canvas) {
+    const band = syscallState.bands.find(b => b.module === canvas.dataset.module);
+    if (!band) return;
+    const width = Math.floor(canvas.getBoundingClientRect().width);
+    if (width < 1) return;
+    const layout = syscallBandLayout(band.items.length, width);
+    const ratio = window.devicePixelRatio || 1;
+    const pixelsWide = Math.round(width * ratio), pixelsHigh = Math.round(layout.height * ratio);
+    if (canvas.width !== pixelsWide) canvas.width = pixelsWide;
+    if (canvas.height !== pixelsHigh) canvas.height = pixelsHigh;
+    canvas.style.height = `${layout.height}px`;
+    syscallState.layouts.set(band.module, layout);
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    syscallDrawBand(ctx, layout, band.items, syscallModel());
+}
+
+// What the map draws: the states of the scan, the filter, the cell chosen and the cell under the pointer
+function syscallModel() {
+    return { states: syscallState.states, match: syscallState.match, selected: syscallState.selected, hover: syscallState.hover };
+}
+
+// The cells that changed, as [{ module, index }] (a null is left out): only their own bands are drawn again, and in
+// them only the cells round those. A band that was not drawn yet is drawn whole.
+function syscallRepaintCells(at) {
+    const host = document.getElementById('syscall-map');
+    if (!host) return;
+    const byModule = new Map();
+    for (const cell of at) {
+        if (!cell) continue;
+        if (!byModule.has(cell.module)) byModule.set(cell.module, []);
+        byModule.get(cell.module).push(cell.index);
+    }
+    for (const canvas of host.querySelectorAll('canvas')) {
+        const indexes = byModule.get(canvas.dataset.module);
+        if (!indexes) continue;
+        const band = syscallState.bands.find(b => b.module === canvas.dataset.module);
+        const layout = syscallState.layouts.get(canvas.dataset.module);
+        if (!band || !layout) syscallPaintCanvas(canvas);
+        else syscallDrawBand(canvas.getContext('2d'), layout, band.items, syscallModel(), indexes);
+    }
+}
+
+function renderSyscallMap() {
+    const host = document.getElementById('syscall-map');
+    if (!host) return;
+    syscallEnsureBands(host);
+    for (const canvas of host.querySelectorAll('canvas')) syscallPaintCanvas(canvas);
+}
+
+function renderSyscallLegend() {
+    const host = document.getElementById('syscall-legend');
+    if (!host) return;
+    const counts = syscallState.scan ? syscallState.scan.counts || {} : null;
+    const measured = counts ? SYSCALL_STATES.reduce((sum, s) => sum + (Number(counts[s]) || 0), 0) : 0;
+    const total = syscallState.baseline && !syscallPastRefusal() ? syscallState.baseline.items.length : 0;
+    host.innerHTML = syscallMapLegendHtml(counts, Math.max(total - measured, 0));
+}
+
+// The rows of the catalog under the map: the baseline as far as the filter matches, the first SYSCALL_ROWS_MAX
+function renderSyscallRows() {
+    const host = document.getElementById('syscall-rows');
+    const head = document.getElementById('syscall-catalog-head');
+    const items = syscallState.baseline ? syscallState.baseline.items : [];
+    const match = syscallState.match;
+    const matching = match ? items.filter(item => match.has(item.name)) : items;
+    const shown = matching.slice(0, SYSCALL_ROWS_MAX);
+    // under a refusal: the modules the measurement covered, whose rows have no state only because none is drawn
+    const unplaced = syscallPastRefusal() && syscallState.scan
+        ? new Set((Array.isArray(syscallState.scan.modules) ? syscallState.scan.modules : ['ntdll.dll']).map(m => String(m).toLowerCase()))
+        : null;
+    if (head) {
+        head.textContent = `Catalog · ${matching.length.toLocaleString('en-US')} of ${items.length.toLocaleString('en-US')} syscalls` +
+            (matching.length > shown.length ? ` · the first ${shown.length} listed, narrow the filter for the rest` : '');
+    }
+    if (!host) return;
+    const top = host.scrollTop;
+    host.innerHTML = shown.length
+        ? shown.map(item => syscallRowHtml({
+            ...item, state: syscallState.states ? syscallState.states.get(item.name) : '', selected: item.name === syscallState.selected,
+            unplaced: !!unplaced && unplaced.has(item.module),
+        })).join('')
+        : (items.length ? '<div class="syscall-empty">No syscall matches the filter.</div>' : '');
+    host.scrollTop = top;
+}
+
+function renderSyscallNotices() {
+    const host = document.getElementById('syscall-notices');
+    if (!host) return;
+    const notices = syscallNotices(syscallState.status, syscallState.baseline);
+    if (syscallState.statusError) {
+        notices.unshift({ kind: 'unreachable', tone: 'error', title: 'Status unavailable', text: syscallState.statusError });
+    }
+    host.innerHTML = syscallNoticesHtml(notices);
+    host.hidden = notices.length === 0;
+}
+
+// SCAN waits for a target and while a scan runs; the toggles show the surface that is on. While a past measurement
+// is on the map nothing measures now: a map half of then and half of now would read as one measurement.
+function renderSyscallToolbar() {
+    const past = !!syscallState.past;
+    const back = 'A past measurement is on the map: go back to live to measure now';
+    const scan = document.getElementById('syscall-scan');
+    if (scan) {
+        scan.disabled = past || syscallState.scanning || !syscallState.target;
+        scan.textContent = syscallState.scanning ? 'SCANNING…' : 'SCAN';
+        scan.title = past ? back : syscallState.target ? 'Measure the syscall stubs of the chosen process against the baseline'
+                                                       : 'Choose a process first';
+    }
+    const stubs = document.getElementById('syscall-stubs-run');
+    if (stubs) {
+        stubs.disabled = past || syscallState.stubs.running || syscallState.scanning || !syscallState.target;
+        stubs.textContent = syscallState.stubs.running ? 'SEARCHING…' : 'STUBS';
+        stubs.title = past ? back : syscallState.target ? 'Search the process memory and the image file of the chosen process for syscall stubs of their own'
+                                                        : 'Choose a process first';
+    }
+    const choice = document.getElementById('syscall-past');
+    if (choice) {
+        const busy = syscallState.scanning || syscallState.stubs.running || syscallState.hooks.busy;
+        choice.disabled = busy;
+        choice.title = busy ? 'A measurement of now is under way: a past one can be chosen when it is done'
+            : 'Look at a measurement the scan history kept, a detonation\'s among them: it is drawn as it was measured then, nothing is measured again';
+    }
+    for (const name of SYSCALL_VIEW_NAMES) {
+        const button = document.getElementById(`syscall-view-${name}`);
+        if (button) button.setAttribute('aria-pressed', name === syscallState.view ? 'true' : 'false');
+    }
+    // the narrow toggle names the surface that takes turns with the detail panel
+    const pane = document.getElementById('syscall-pane-map');
+    if (pane) pane.textContent = syscallState.view.toUpperCase();
+    const win32u = document.getElementById('syscall-win32u');
+    if (win32u) {
+        const missing = syscallWin32uMissing(syscallState.baseline);
+        if (missing && !win32u.disabled) {
+            syscallState.win32uWanted = win32u.checked;
+            win32u.checked = false;
+        } else if (!missing && win32u.disabled) {
+            win32u.checked = syscallState.win32uWanted;
+        }
+        win32u.disabled = !!missing;
+        win32u.title = missing || SYSCALL_WIN32U_TITLE;
+        if (win32u.parentElement) win32u.parentElement.title = win32u.title;
+    }
+}
+
+// Why the loaded baseline offers no win32u to scan, '' when it does or none is loaded. Read off the baseline, not
+// off its view: the x64 view of an ARM64 host has held none, and another build or host may differ.
+function syscallWin32uMissing(baseline) {
+    if (!baseline || !Array.isArray(baseline.items) || !baseline.items.length) return '';
+    if (baseline.items.some(item => item.module === 'win32u.dll')) return '';
+    return `The ${baseline.view} baseline of build ${baseline.build} holds no win32u.dll syscalls: there is nothing of win32u to scan`;
+}
+
+// The line under the toolbar: what the last scan found, or why it did not
+function renderSyscallScan() {
+    const host = document.getElementById('syscall-scan-result');
+    if (!host) return;
+    const note = syscallState.note;
+    host.textContent = note ? note.text : '';
+    host.className = note ? `syscall-scan-result syscall-scan-result-${cssToken(note.tone)}` : 'syscall-scan-result';
+    host.hidden = !note;
+}
+
+function syscallSetScanNote(tone, text) {
+    syscallState.note = text ? { tone, text } : null;
+    renderSyscallScan();
+}
+
+function syscallRenderAll() {
+    const subtitle = document.getElementById('syscalls-subtitle');
+    if (subtitle) subtitle.textContent = syscallSubtitle(syscallState.baseline);
+    renderSyscallToolbar();
+    renderSyscallPastList();
+    renderSyscallPast();
+    renderSyscallNotices();
+    renderSyscallScan();
+    renderSyscallLegend();
+    renderSyscallMap();
+    renderBinaryGraph();
+    renderSyscallRows();
+    syscallSyncDetail();
+    renderSyscallDetailPanel();
+    renderSyscallDeviationPanel();
+    renderSyscallDraft();
+    renderSyscallHooks();
+    renderSyscallStubsPanel();
+    syscallApplyLower();
+}
+
+// The bar over the scan panels, which is all the reader has of them while the graph view keeps them folded. A panel
+// that is not there at all (the stub search has not run) is left out: the bar may only promise what the row holds.
+// A count alone would hide a search that read only one of its two ways in, or one the server marked partial, and an
+// empty hooks count looks exactly like "nothing to report" when the list could not be read at all.
+function syscallLowerNote() {
+    const el = id => document.getElementById(id);
+    const parts = [];
+    const add = (title, head, trouble) => {
+        const said = [(el(head)?.textContent || '').trim(), trouble].filter(Boolean).join(', ');
+        parts.push(said ? `${title} (${said})` : title);
+    };
+    add('DEVIATIONS', 'syscall-deviations-head');
+    const stubs = syscallState.stubs;
+    if (!el('syscall-stubs')?.hidden) {
+        const model = stubs.searched && !stubs.running ? syscallStubsModel() : null;
+        add('DIRECT SYSCALL STUBS', 'syscall-stubs-head', model && model.partial ? 'not complete' : '');
+    }
+    const hooks = syscallState.hooks;
+    // two causes, two words: `error` is a read that failed (a count beside it is the last good one, not current),
+    // `problem` is a list that was read and is unusable. "Could not be read" was wrong for both.
+    add('KNOWN HOOKS', 'syscall-hooks-head',
+        hooks.error ? 'the last read failed' : hooks.problem ? 'unusable' : '');
+    return parts.join(' · ');
+}
+
+// DEVIATIONS, DIRECT SYSCALL STUBS and KNOWN HOOKS are all about a process scanned on the map, and on the VM they
+// took 320px of the column the graph canvas sits in, which never grew past its 240px floor. GRAPH therefore folds
+// them away, and that is where the canvas gets its height. Folded is not silent: the bar keeps naming the panels
+// with their counts, because a stub run in the graph view writes the proof of the whole feature into that row.
+function syscallApplyLower() {
+    const row = document.getElementById('syscall-lower');
+    if (!row) return false;
+    const folded = !!syscallState.lowerFolded;
+    row.classList.toggle('syscall-lower-folded', folded);
+    const button = document.getElementById('syscall-lower-fold');
+    if (button) {
+        button.setAttribute('aria-expanded', String(!folded));
+        const whose = syscallState.scan && syscallState.scan.live === false ? 'the past measurement on the map' : 'the last scan';
+        button.title = folded ? `Show the panels of ${whose}` : `Fold the panels of ${whose} away`;
+        button.setAttribute('aria-label', button.title);
+    }
+    const note = document.getElementById('syscall-lower-note');
+    if (note) note.textContent = syscallLowerNote();
+    return true;
+}
+
+// A fold or unfold by hand wins over the view's default from then on: a view that keeps reclosing what the reader
+// opened is worse than one that never folded.
+function syscallToggleLower() {
+    syscallState.lowerFolded = !syscallState.lowerFolded;
+    syscallState.lowerByHand = true;
+    return syscallApplyLower();
+}
+
+// The modules the filter offers: those the loaded baseline has entries for, so no choice can only dim every cell.
+// Without a baseline, the modules a baseline may hold. A chosen module that is no longer offered is let go.
+function syscallSyncModuleFilter() {
+    const modules = syscallState.baseline ? syscallState.bands.map(band => band.module) : SYSCALL_MODULES;
+    if (syscallState.module && !modules.includes(syscallState.module)) syscallState.module = '';
+    const select = document.getElementById('syscall-module-filter');
+    if (!select) return;
+    const key = modules.join('|');
+    if (select.dataset.key !== key) {
+        select.dataset.key = key;
+        select.innerHTML = `<option value="">${modules.length === 2 ? 'both modules' : 'every module'}</option>`
+            + modules.map(m => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join('');
+    }
+    select.value = syscallState.module;
+}
+
+// The filter changed (or the baseline did): which cells match, then the map, the catalog and the graph
+function syscallApplyFilter() {
+    syscallSyncModuleFilter();
+    const items = syscallState.baseline ? syscallState.baseline.items : [];
+    syscallState.match = syscallMatchSet(items, syscallState.query, syscallState.module);
+    renderSyscallMap();
+    renderSyscallRows();
+    renderBinaryGraph();
+}
+
+function syscallOnFilter() {
+    const input = document.getElementById('syscall-filter');
+    const module = document.getElementById('syscall-module-filter');
+    syscallState.query = input ? input.value : '';
+    syscallState.module = module ? module.value : '';
+    syscallApplyFilter();
+}
+
+// The name the map holds for a syscall: `name`, or its Nt or Zw twin when the baseline holds that one instead. One
+// number, one stub: the baseline keeps whichever name NTSleuth listed first (ZwWriteVirtualMemory in the x64 view of
+// 26200.9974), and the graph names every syscall by its Nt name
+function syscallMapName(name) {
+    const items = syscallState.baseline ? syscallState.baseline.items : [];
+    if (!/^(Nt|Zw)./.test(name) || items.some(item => item.name === name)) return name;
+    const twin = (name.startsWith('Nt') ? 'Zw' : 'Nt') + name.slice(2);
+    return items.some(item => item.name === twin) ? twin : name;
+}
+
+// A syscall is chosen, on the map, in the catalog or in the graph. The map rings it, the catalog and the graph mark it.
+function syscallSelect(name) {
+    syscallState.selected = syscallMapName(String(name || ''));
+    binaryGraphFollowMap(syscallState.selected.replace(/^Zw(?=.)/, 'Nt'));
+    renderSyscallMap();
+    renderSyscallRows();
+    renderSyscallDeviationPanel();
+    const body = document.getElementById('syscall-detail-body');
+    if (body) body.scrollTop = 0;
+    syscallLoadDetail(syscallState.selected);
+    if (syscallState.selected && typeof window.matchMedia === 'function' && window.matchMedia(SYSCALL_NARROW).matches) syscallSetPane('detail');
+}
+
+// The cell under a pointer event on the map: { band, item, index } or null
+function syscallCellFromEvent(event) {
+    const canvas = event.target && event.target.closest ? event.target.closest('canvas.syscall-canvas') : null;
+    if (!canvas) return null;
+    const band = syscallState.bands.find(b => b.module === canvas.dataset.module);
+    const layout = syscallState.layouts.get(canvas.dataset.module);
+    if (!band || !layout) return null;
+    const rect = canvas.getBoundingClientRect();
+    const index = syscallCellAt(layout, event.clientX - rect.left, event.clientY - rect.top);
+    return index < 0 ? null : { band, item: band.items[index], index };
+}
+
+function syscallShowTip(hit, event) {
+    const tip = document.getElementById('syscall-tip');
+    if (!tip) return;
+    if (!hit) {
+        tip.hidden = true;
+        return;
+    }
+    const state = syscallState.states ? syscallState.states.get(hit.item.name) : '';
+    tip.textContent = `${hit.item.name} · ${syscallHex(hit.item.number)} (${hit.item.number}) · ${hit.band.module}` +
+        (state ? ` · ${state}` : '');
+    tip.hidden = false;
+    const panel = tip.parentElement;
+    const box = panel && panel.getBoundingClientRect ? panel.getBoundingClientRect() : { left: 0, top: 0, width: 0 };
+    let left = event.clientX - box.left + 14;
+    if (box.width && left + tip.offsetWidth > box.width) left = Math.max(event.clientX - box.left - tip.offsetWidth - 14, 0);
+    tip.style.left = `${left}px`;
+    tip.style.top = `${event.clientY - box.top + 16}px`;
+}
+
+function syscallHideTip() {
+    syscallShowTip(null);
+}
+
+function syscallOnMapMove(event) {
+    const hit = syscallCellFromEvent(event);
+    syscallShowTip(hit, event);
+    const name = hit ? hit.item.name : '';
+    if (name === syscallState.hover) return;
+    const previous = syscallState.hoverAt;
+    syscallState.hover = name;
+    syscallState.hoverAt = hit ? { module: hit.band.module, index: hit.index } : null;
+    syscallRepaintCells([previous, syscallState.hoverAt]);
+}
+
+function syscallOnMapLeave() {
+    syscallHideTip();
+    if (!syscallState.hover) return;
+    const previous = syscallState.hoverAt;
+    syscallState.hover = '';
+    syscallState.hoverAt = null;
+    syscallRepaintCells([previous]);
+}
+
+function syscallOnMapClick(event) {
+    const hit = syscallCellFromEvent(event);
+    if (hit) syscallSelect(hit.item.name);
+}
+
+// SCAN: the chosen process, ntdll and, if asked for, win32u. A scan that fails clears the measurement: the map goes
+// back to the baseline, so no cell shows what was measured in another process or before.
+async function runSyscallScan() {
+    if (syscallState.scanning || syscallState.past) return;
+    const select = document.getElementById('syscall-target');
+    const pid = parseInt(select ? select.value : syscallState.target, 10);
+    if (!(pid > 0)) {
+        syscallSetScanNote('warn', 'Choose a process to scan first.');
+        return;
+    }
+    const win32u = document.getElementById('syscall-win32u');
+    const modules = win32u && win32u.checked && !win32u.disabled ? ['ntdll.dll', 'win32u.dll'] : ['ntdll.dll'];
+    syscallState.scanning = true;
+    syscallSetScanNote('info', `Scanning PID ${pid}…`);
+    renderSyscallToolbar();
+    const r = await syscallApi('/api/syscalls/scan', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pid, modules }),
+    });
+    // measured in another view: the cells are that view's, so is the catalog; without its baseline the states are not drawn
+    let problem = '';
+    if (r.ok && syscallState.baseline && r.data.view !== syscallState.baseline.view) {
+        const loaded = await syscallLoadBaseline(r.data.view);
+        if (loaded.superseded) problem = 'reading its baseline was overtaken by another read; scan again.';
+        else if (!loaded.ok) problem = `its baseline could not be loaded: ${loaded.error}`;
+    }
+    const fits = r.ok && syscallState.baseline && syscallState.baseline.view === r.data.view;
+    if (r.ok && !fits && !problem) problem = 'the baseline of that view is not loaded.';
+    syscallState.scanning = false;
+    if (!fits) {
+        syscallState.scan = null;
+        syscallState.states = null;
+        syscallSetScanNote('error', r.ok ? `The scan measured the ${r.data.view} view, but ${problem}` : syscallErrorText(r));
+    } else {
+        syscallState.scan = r.data;
+        syscallState.states = new Map(Object.entries(r.data.states || {}).map(([name, s]) => [name, s && s.state]));
+        const counts = r.data.counts || {};
+        const quiet = SYSCALL_STATES.every(s => s === 'intact' || !Number(counts[s]));
+        syscallSetScanNote(quiet && !r.data.partial ? 'ok' : 'warn', syscallScanSummary(r.data));
+    }
+    syscallApplyFilter();
+    syscallRenderAll();
+    // the scan went into the history: it is one of the past measurements from now on
+    if (r.ok) syscallLoadPastList();
+}
+
+// --- A past measurement on the map ----------------------------------------------------------------------------
+// /api/syscalls/measurement answers in the shape of a scan, so the map reads it as it reads a scan. What it may never
+// do is read as a scan of now: the banner says what it is, SCAN and STUBS are off while it is shown, the live scan and
+// stub search are put away when it comes, and its cells are drawn only on the baseline its states were rebuilt for.
+
+async function syscallLoadPastList() {
+    const r = await syscallApi('/api/syscalls/measurements');
+    if (r.ok) {
+        syscallState.pastList = Array.isArray(r.data.measurements) ? r.data.measurements : [];
+        syscallState.pastListError = '';
+    } else {
+        syscallState.pastListError = syscallErrorText(r);
+    }
+    renderSyscallPastList();
+    return r.ok;
+}
+
+// The control names the measurement on the map even when the list read before it was made does not hold it yet
+function renderSyscallPastList() {
+    const select = document.getElementById('syscall-past');
+    if (!select) return;
+    const past = syscallState.past, list = syscallState.pastList.slice();
+    if (past && past.data && !list.some(m => m && m.id === past.id)) {
+        const d = past.data;
+        list.unshift({ id: past.id, at: d.measured_at, pid: d.pid, process: String(d.process || '').split(/[\\/]/).pop(), view: d.view });
+    }
+    select.innerHTML = syscallPastOptionsHtml(list, past ? past.id : '', syscallState.pastListError);
+    select.value = past ? past.id : '';
+}
+
+function renderSyscallPast() {
+    const host = document.getElementById('syscall-past-banner');
+    if (!host) return;
+    const past = syscallState.past;
+    const banner = past ? syscallPastBannerHtml(past) : null;
+    host.innerHTML = banner ? banner.html : '';
+    host.className = `syscall-notice syscall-past-banner${banner ? ` syscall-notice-${cssToken(banner.tone)}` : ''}`;
+    host.hidden = !banner;
+}
+
+function syscallOnPast() {
+    const select = document.getElementById('syscall-past');
+    const id = select ? select.value : '';
+    return id ? syscallOpenMeasurement(id) : syscallBackToLive();
+}
+
+// Put the measurement `id` of the scan history on the map. Not while a measurement of now runs: its answer would land
+// on the past one. Its states are drawn only when the server could rebuild them (`problem` is null) and the map holds
+// the baseline of the measurement's own build and view, loaded for its view when it is another one. The map can load
+// only this system's build (/api/syscalls/baseline has no build), so a measurement of another build has no cells here
+// even where the server rebuilt them against a baseline of that build: other numbers, other places.
+async function syscallOpenMeasurement(id) {
+    const wanted = String(id ?? '');
+    if (!wanted) return syscallBackToLive();
+    if (syscallState.scanning || syscallState.stubs.running || syscallState.hooks.busy) {
+        syscallSetScanNote('warn', 'A measurement of now is under way: choose the past one when it is done.');
+        renderSyscallPastList();
+        return false;
+    }
+    const seq = ++syscallState.pastSeq;
+    syscallState.past = { id: wanted, loading: true };
+    syscallState.scan = null;
+    syscallState.states = null;
+    syscallState.note = null;
+    syscallState.stubs = { searched: false, running: false, pid: 0, name: '', sources: {} };
+    syscallState.draftSeq++;
+    syscallState.draft = null;
+    syscallApplyFilter();
+    syscallRenderAll();
+    const r = await syscallApi(`/api/syscalls/measurement?id=${encodeURIComponent(wanted)}`);
+    if (seq !== syscallState.pastSeq) return false;
+    if (!r.ok) {
+        syscallState.past = { id: wanted, error: syscallErrorText(r) };
+        syscallRenderAll();
+        return false;
+    }
+    const data = r.data, view = String(data.view || '');
+    let unloaded = '';
+    // a read of the baseline that another one overtook (the tab's own refresh, when it was opened from a detonation)
+    // decides nothing: it is read again
+    for (let tries = 0; !data.problem && view && tries < 3 && !(syscallState.baseline && syscallState.baseline.view === view); tries++) {
+        const loaded = await syscallLoadBaseline(view);
+        if (seq !== syscallState.pastSeq) return false;
+        if (!loaded.ok && !loaded.superseded) {
+            unloaded = loaded.error;
+            break;
+        }
+    }
+    const baseline = syscallState.baseline;
+    let refusal = '';
+    if (data.problem) refusal = String(data.problem);
+    else if (!data.states || typeof data.states !== 'object') refusal = 'the server sent no map of it';
+    else if (!baseline || baseline.view !== view) refusal = `the ${view} baseline of this system could not be loaded${unloaded ? ` (${unloaded})` : ''}`;
+    else if (String(baseline.build) !== String(data.build)) {
+        refusal = `it was measured on build ${data.build}, and the map holds only this system's baseline, build ${baseline.build} ` +
+                  `(${baseline.view}): its cells are not drawn on the baseline of another build`;
+    }
+    syscallState.past = { id: wanted, data, refusal };
+    syscallState.scan = data;
+    syscallState.states = refusal ? null : new Map(Object.entries(data.states).map(([name, s]) => [name, s && s.state]));
+    syscallApplyFilter();
+    syscallRenderAll();
+    if (!syscallState.pastList.some(m => m && m.id === wanted)) syscallLoadPastList();
+    return !refusal;
+}
+
+// BACK TO LIVE: the past measurement leaves the map with what came from it (its states, a rule drafted from it), the
+// map is the baseline again and SCAN and STUBS measure now. A live scan on the map is left alone.
+function syscallBackToLive() {
+    syscallState.pastSeq++;
+    if (syscallState.past) {
+        syscallState.past = null;
+        if (syscallState.scan && syscallState.scan.live === false) {
+            syscallState.scan = null;
+            syscallState.states = null;
+        }
+        syscallState.draftSeq++;
+        syscallState.draft = null;
+        syscallState.note = null;
+    }
+    syscallApplyFilter();
+    syscallRenderAll();
+    return true;
+}
+
+// --- The detail panel, the deviation list, the rule draft and the known hooks ---------------------------------
+
+// The syscall of the detail panel as renderSyscallDetail wants it: its lookup, and what the last scan measured of
+// it. A scan that did not cover it (win32u is left out unless asked for) is told apart from one that found nothing.
+function syscallDetailModel() {
+    const detail = syscallState.detail, baseline = syscallState.baseline, scan = syscallState.scan;
+    if (!detail.data) return null;
+    const model = { ...detail.data };
+    if (baseline) model.symbols = baseline.symbols;
+    // a past measurement whose cells are not drawn says nothing about this syscall either
+    if (scan && scan.live === false) model.past = true;
+    if (scan && !(scan.live === false && !syscallState.states)) {
+        const measured = scan.states && Object.prototype.hasOwnProperty.call(scan.states, detail.name) ? scan.states[detail.name] : null;
+        if (measured && typeof measured === 'object') {
+            for (const key of ['state', 'pattern', 'target_owner', 'expected', 'actual', 'number_matches', 'allowlisted']) {
+                if (key in measured) model[key] = measured[key];
+            }
+        } else {
+            model.scanned = false;
+        }
+    }
+    const rizin = syscallRizinTarget();
+    if (rizin && rizin.path) model.rizin = true;
+    else if (rizin) model.rizin_note = rizin.note;
+    return model;
+}
+
+// Where Rizin can open the module of the chosen syscall: the module on this host, but only for the view that file
+// shows by itself. An ARM64X file is two views, and Rizin shows the native one: for the emulated x64 view of an
+// arm64 host it would show other bytes at other addresses, so it is not offered.
+function syscallRizinTarget() {
+    const data = syscallState.detail.data, baseline = syscallState.baseline, status = syscallState.status;
+    if (!data || !baseline || !status || !status.default_view || !/^[A-Za-z0-9_]+\.dll$/.test(String(data.module || ''))) return null;
+    if (baseline.view !== status.default_view) {
+        return { path: null, note: `Rizin shows the native view of ${data.module} (${status.default_view}), not the ${baseline.view} view of this syscall.` };
+    }
+    return { path: SYSCALL_SYSTEM_DIR + data.module, note: '' };
+}
+
+function renderSyscallDetailPanel() {
+    const host = document.getElementById('syscall-detail-body');
+    if (!host) return;
+    const detail = syscallState.detail;
+    const graphItem = binaryGraphDetailItem();
+    let html;
+    if (binaryGraphMetricShown()) html = binaryGraphMetricHtml(binaryGraphState.metric);
+    else if (graphItem) html = binaryGraphDetailHtml(graphItem);
+    else if (!syscallState.selected || !detail.name) html = renderSyscallDetail(null);
+    else if (detail.loading) html = `<p class="syscall-empty">Loading ${escapeHtml(detail.name)}…</p>`;
+    else if (detail.error) html = `<p class="syscall-empty syscall-empty-error">${escapeHtml(detail.error)}</p>`;
+    else html = renderSyscallDetail(syscallDetailModel());
+    const top = host.scrollTop;
+    host.innerHTML = html;
+    host.scrollTop = top;
+}
+
+// The lookup of one syscall in the view of the map. A newer choice overtakes the answer of an older one.
+async function syscallLoadDetail(name) {
+    const seq = ++syscallState.detailSeq;
+    if (!name) {
+        syscallState.detail = { name: '', data: null, error: '', loading: false };
+        renderSyscallDetailPanel();
+        return false;
+    }
+    syscallState.detail = { name, data: null, error: '', loading: true };
+    renderSyscallDetailPanel();
+    const view = syscallState.baseline ? syscallState.baseline.view : '';
+    const r = await syscallApi(`/api/syscalls/${encodeURIComponent(name)}${view ? `?view=${encodeURIComponent(view)}` : ''}`);
+    if (seq !== syscallState.detailSeq) return false;
+    syscallState.detail = r.ok ? { name, data: r.data, error: '', loading: false } : { name, data: null, error: syscallErrorText(r), loading: false };
+    renderSyscallDetailPanel();
+    return r.ok;
+}
+
+// The panel follows the map: a syscall that is gone from the baseline leaves it, and one that was read in another
+// view than the baseline now shows is read again in this one (its address and its bytes are the view's)
+function syscallSyncDetail() {
+    const detail = syscallState.detail, baseline = syscallState.baseline;
+    if (!syscallState.selected) {
+        if (detail.name) {
+            syscallState.detailSeq++;
+            syscallState.detail = { name: '', data: null, error: '', loading: false };
+        }
+    } else if (detail.data && baseline && detail.data.view && detail.data.view !== baseline.view) {
+        syscallLoadDetail(syscallState.selected);
+    }
+}
+
+function syscallCopyText(text) {
+    if (typeof navigator === 'undefined' || !navigator.clipboard) return false;
+    const value = String(text ?? '');
+    navigator.clipboard.writeText(value).then(() => showToast('info', 'Copied', `${value.length.toLocaleString('en-US')} characters`),
+                                              () => showToast('error', 'Not copied', 'The browser refused the clipboard.'));
+    return true;
+}
+
+function syscallCopySignature() {
+    const model = syscallDetailModel();
+    return model ? syscallCopyText(syscallSignature(model)) : false;
+}
+
+function syscallCopyDraft() {
+    const st = syscallState.draft;
+    return st && st.draft ? syscallCopyText(st.draft.text) : false;
+}
+
+// Open in Rizin: the module of the syscall in the RIZIN tab, then the syscall's name as the place to go to. Rizin
+// resolves the name (or says it cannot, in its own note).
+async function syscallOpenRizin() {
+    const target = syscallRizinTarget(), name = syscallState.selected;
+    if (!target || !target.path || !name) return false;
+    if (!(await openInRizin(target.path))) return false;
+    return rizinSeek(name, 'syscalls');
+}
+
+// What each stub of the scan added to the evidence score, by syscall name (a syscall that is not in it was not scored)
+function syscallScores(scan) {
+    const scores = Object.create(null);
+    const findings = scan && scan.evidence && Array.isArray(scan.evidence.findings) ? scan.evidence.findings : [];
+    for (const f of findings) {
+        if (f && typeof f.kind === 'string' && f.kind.startsWith('syscall_stub_') && typeof f.syscall === 'string' && Number.isFinite(f.score)) {
+            scores[f.syscall] = (scores[f.syscall] || 0) + f.score;
+        }
+    }
+    return scores;
+}
+
+function renderSyscallDeviationPanel() {
+    const host = document.getElementById('syscall-deviations');
+    const head = document.getElementById('syscall-deviations-head');
+    const scan = syscallState.scan;
+    const list = scan && Array.isArray(scan.deviations) ? scan.deviations : [];
+    if (head) {
+        const total = scan ? SYSCALL_STATES.reduce((sum, s) => sum + (Number((scan.counts || {})[s]) || 0), 0) : 0;
+        // a past measurement's deviations are of its process then, and the head says whose and when
+        const whose = scan && scan.live === false ? ` · PID ${scan.pid} at ${syscallWhen(scan.measured_at)}, a past measurement` : '';
+        head.textContent = scan ? `${list.length.toLocaleString('en-US')} of ${total.toLocaleString('en-US')} measured${whose}` : '';
+    }
+    if (!host) return;
+    const top = host.scrollTop;
+    host.innerHTML = renderSyscallDeviations(list, { scanned: !!scan, selected: syscallState.selected, scores: syscallScores(scan),
+                                                     past: !!scan && scan.live === false });
+    host.scrollTop = top;
+}
+
+function renderSyscallDraft() {
+    const host = document.getElementById('syscall-draft');
+    if (!host) return;
+    const st = syscallState.draft;
+    if (!st) {
+        host.innerHTML = '';
+        host.hidden = true;
+        return;
+    }
+    host.hidden = false;
+    host.innerHTML = st.error
+        ? '<section class="syscall-draft-card" aria-label="Rule draft"><div class="syscall-panel-head"><h3 class="syscall-panel-title">RULE DRAFT</h3>' +
+          '<button type="button" class="btn btn-xs" onclick="syscallCloseDraft()" title="Close the draft">Close</button></div>' +
+          `<div class="syscall-draft-result syscall-draft-result-error" role="alert">${escapeHtml(st.error)}</div></section>`
+        : showSyscallRuleDraft(st.draft, { busy: st.busy, note: st.note });
+}
+
+// A draft is on the page: it replaces the one before, and where the panes are one at a time the detail comes up
+function syscallShowDraft(draft) {
+    syscallState.draft = { draft, note: null, busy: false };
+    renderSyscallDraft();
+    if (typeof window.matchMedia === 'function' && window.matchMedia(SYSCALL_NARROW).matches) syscallSetPane('detail');
+    const host = document.getElementById('syscall-draft');
+    if (host && typeof host.scrollIntoView === 'function') host.scrollIntoView({ block: 'nearest' });
+}
+
+function syscallCloseDraft() {
+    syscallState.draftSeq++;
+    syscallState.draft = null;
+    renderSyscallDraft();
+}
+
+// Draft rule: the deviation as the scan returned it goes to the server, which drafts a signature entry and writes
+// nothing. A refusal (a hook the allowlist knows, a stub without bytes) is shown where the draft would be.
+async function syscallDraftRule(name) {
+    const scan = syscallState.scan;
+    const deviation = scan && Array.isArray(scan.deviations) ? scan.deviations.find(d => d && d.name === name) : null;
+    if (!deviation) return false;
+    return syscallRequestDraft({ deviation, view: scan.view, build: scan.build });
+}
+
+// The draft of a rule from `body` ({ deviation, view, build } or { hit, view, build, source }). A refusal is shown
+// where the draft would be, and replaces the draft before it; a newer request overtakes an older one.
+async function syscallRequestDraft(body) {
+    const seq = ++syscallState.draftSeq;
+    const r = await syscallApi('/api/syscalls/rule', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    if (seq !== syscallState.draftSeq) return false;
+    if (!r.ok) {
+        syscallState.draft = { error: syscallErrorText(r) };
+        renderSyscallDraft();
+        return false;
+    }
+    syscallShowDraft(r.data);
+    return true;
+}
+
+// STUBS: the process in `pid` (its private, executable memory) and then its image file, each by a request of its own.
+// The process search skips the sample's own mapped image, so a sample that unpacks in place is caught by the file
+// alone. The file is searched in the view the process search reports, or the view of the map when the process cannot
+// be searched (it has exited), and not at all without an image path. The path of a process that has exited is still
+// the path of the sample, so its file is searched.
+function syscallTargetProcess(pid) {
+    for (const proc of Object.values(syscallState.targets && typeof syscallState.targets === 'object' ? syscallState.targets : {})) {
+        if (proc && !String(proc.key === undefined ? '' : proc.key).includes('@') && String(proc.pid) === String(pid)) {
+            return { name: String(proc.name || proc.image || ''), image: typeof proc.image === 'string' ? proc.image : '', exited: !!proc.exit_time };
+        }
+    }
+    return { name: '', image: '', exited: false };
+}
+
+// What the two searches found, as renderSyscallStubs wants it: the hits of both in one list (each with where it came
+// from, the sample it was found in and the build it was numbered for), what to tell besides, and whether the search
+// covered all it set out to
+function syscallStubsModel() {
+    const st = syscallState.stubs;
+    const hits = [], notes = [];
+    let partial = false;
+    const counts = {};
+    for (const source of ['process', 'file']) {
+        const part = st.sources[source];
+        if (!part) continue;
+        const label = source === 'process' ? 'Process memory' : 'File';
+        if (part.skipped) {
+            notes.push({ tone: 'info', title: `${label} not searched`, text: part.skipped });
+            partial = true;
+        } else if (!part.ok) {
+            notes.push({ tone: 'error', title: `${label} not searched`, text: part.error });
+            partial = true;
+        } else {
+            const found = Array.isArray(part.data.hits) ? part.data.hits : [];
+            counts[source] = found.length;
+            for (const h of found) hits.push({ ...h, view: h.view || part.data.view, source, sample: part.sample, build: part.data.build });
+            if (part.data.partial) {
+                partial = true;
+                notes.push({ tone: 'warn', title: `${label} search partial`, text: part.data.note || 'Not all of it could be searched.' });
+            } else if (part.data.note) {
+                notes.push({ tone: 'info', title: label, text: part.data.note });
+            }
+            if (found.length && part.data.doors_complete === false && part.data.doors_note) {
+                notes.push({ tone: 'info', title: `${label}: no proof`, text: `A stub found here stays a hint, as not every door of the process is known: ${part.data.doors_note}.` });
+            }
+        }
+    }
+    const view = (st.sources.process && st.sources.process.ok && st.sources.process.data.view)
+        || (st.sources.file && st.sources.file.ok && st.sources.file.data.view) || '';
+    const where = Object.entries(counts).map(([source, n]) => `${n} in ${source === 'process' ? 'process memory' : 'the file'}`).join(', ');
+    const summary = `PID ${st.pid}${st.name ? ` (${st.name})` : ''}${view ? ` · ${view}` : ''} · ${hits.length} hit${hits.length === 1 ? '' : 's'}${where ? ` (${where})` : ''}`;
+    return { hits, notes, partial, summary };
+}
+
+function renderSyscallStubsPanel() {
+    const st = syscallState.stubs;
+    const panel = document.getElementById('syscall-stubs');
+    const body = document.getElementById('syscall-stubs-body');
+    const head = document.getElementById('syscall-stubs-head');
+    const lower = document.getElementById('syscall-lower');
+    if (lower && lower.classList) lower.classList.toggle('with-stubs', st.searched);
+    if (panel) panel.hidden = !st.searched;
+    if (st.searched) {
+        const model = syscallStubsModel();
+        if (head) head.textContent = st.running ? `Searching PID ${st.pid}…` : `PID ${st.pid} · ${model.hits.length} hit${model.hits.length === 1 ? '' : 's'}`;
+        if (body) {
+            const top = body.scrollTop;
+            body.innerHTML = st.running ? `<p class="syscall-empty">Searching PID ${escapeHtml(st.pid)}…</p>` : renderSyscallStubs(model);
+            body.scrollTop = top;
+        }
+    }
+    // in the graph view this row is folded and the bar over it is the only trace of this panel
+    syscallApplyLower();
+}
+
+async function runSyscallStubs() {
+    const st = syscallState.stubs;
+    if (st.running || syscallState.past) return false;
+    const select = document.getElementById('syscall-target');
+    const pid = parseInt(select ? select.value : syscallState.target, 10);
+    if (!(pid > 0)) {
+        syscallSetScanNote('warn', 'Choose a process to search first.');
+        return false;
+    }
+    const target = syscallTargetProcess(pid);
+    Object.assign(st, { searched: true, running: true, pid, name: target.name, sources: {} });
+    renderSyscallToolbar();
+    renderSyscallStubsPanel();
+    const post = body => syscallApi('/api/syscalls/stubs', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    // a process that has exited is not measured: its memory is gone, and its PID may be another process's by now
+    let proc = null;
+    if (target.exited) {
+        st.sources.process = { skipped: `PID ${pid} has exited: its memory is gone, and the PID may belong to another process by now, so only its file was searched.` };
+    } else {
+        proc = await post({ pid });
+        st.sources.process = proc.ok ? { ok: true, data: proc.data, sample: target.name } : { ok: false, error: syscallErrorText(proc) };
+    }
+    const view = (proc && proc.ok && proc.data.view) || (syscallState.baseline && syscallState.baseline.view) || '';
+    if (!target.image) {
+        st.sources.file = { skipped: 'No image path is known for this process, so its file was not searched.' };
+    } else if (!view) {
+        st.sources.file = { skipped: 'The view to search the file in is not known, so its file was not searched.' };
+    } else {
+        const file = await post({ path: target.image, view });
+        st.sources.file = file.ok ? { ok: true, data: file.data, sample: target.image.split(/[\\/]/).pop() } : { ok: false, error: syscallErrorText(file) };
+    }
+    st.running = false;
+    renderSyscallToolbar();
+    renderSyscallStubsPanel();
+    return true;
+}
+
+// Draft rule on a hit: the stub goes to the server, which drafts a YARA rule for its bytes and writes nothing; apply
+// and download follow from the draft
+async function syscallDraftStubRule(index) {
+    const item = syscallStubsModel().hits[index];
+    if (!item) return false;
+    const { source, build, ...hit } = item;
+    return syscallRequestDraft({ hit, view: hit.view, build, source: source === 'file' ? 'stub search of a file' : 'stub search of a process' });
+}
+
+// APPLY TO THIS VM: the draft goes back to the server as it came, which writes it where Rustinel reads its rules. Only
+// the draft that is on the page, and only a YARA rule, and not while another apply is under way. A rule that is there
+// already is an answer, not a failure.
+async function applySyscallRule(name) {
+    const st = syscallState.draft;
+    if (!st || !st.draft || st.busy || st.draft.kind === 'signature' || st.draft.name !== name) return false;
+    st.busy = true;
+    st.note = null;
+    renderSyscallDraft();
+    const r = await syscallApi('/api/syscalls/rule/apply', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(st.draft),
+    });
+    st.busy = false;
+    const path = typeof r.data.path === 'string' ? r.data.path : '';
+    if (r.ok) {
+        const seconds = Number(r.data.reload_seconds) > 0 ? Number(r.data.reload_seconds) : 2;
+        st.note = { tone: 'ok', text: `Written${path ? ` to ${path}` : ''}. Rustinel should load it within about ${seconds} seconds, which is not yet verified on a VM: check its log. ` +
+                    'This copy lives on this VM only; a rebuilt VM does not have it. ' +
+                    'Download the rule as well and commit it under rules/yara/ to keep it in version control. ' +
+                    'Whether a committed rule is loaded again after a rebuild is not yet verified.' };
+    } else if (r.status === 409 && r.data.status === 'exists') {
+        st.note = { tone: 'info', text: `A rule of this name is there already${path ? ` (${path})` : ''}: it is the same stub, build and view. It was left alone. Nothing was written.` };
+    } else {
+        st.note = { tone: 'error', text: syscallErrorText(r) };
+    }
+    if (syscallState.draft === st) renderSyscallDraft();
+    return r.ok;
+}
+
+// The known hooks and the scan on the map, as renderHookAllowlist wants them. pairs are the hooks that recording would
+// add (the hooked ntdll stubs of the scan that a module owns and the list does not know), hookable their number.
+function syscallHooksModel() {
+    const h = syscallState.hooks, baseline = syscallState.baseline, scan = syscallState.scan;
+    const model = {
+        entries: h.entries, loaded: h.loaded, problem: h.problem, error: h.error, note: h.note, busy: h.busy, scan: null,
+        past: !!scan && scan.live === false,
+        scope: baseline && baseline.build && baseline.view ? { build: String(baseline.build), view: String(baseline.view) } : null,
+    };
+    // recording measures the process again, now: a past measurement is not what it would be checked against
+    if (scan && scan.live !== false) {
+        const hooked = (Array.isArray(scan.deviations) ? scan.deviations : [])
+            .filter(d => d && d.state === 'hooked' && typeof d.target_owner === 'string' && d.target_owner && d.target_owner !== 'private');
+        const pairs = syscallHookPairs(scan);
+        const hookable = pairs.length;
+        model.scan = { pid: scan.pid, name: String(scan.process || '').split(/[\\/]/).pop(), hookable, pairs,
+                       known: hooked.filter(d => d.allowlisted === true).length, allowlist: scan.allowlist || null };
+    }
+    return model;
+}
+
+function renderSyscallHooks() {
+    const host = document.getElementById('syscall-hooks');
+    const head = document.getElementById('syscall-hooks-head');
+    const h = syscallState.hooks;
+    if (head) head.textContent = h.loaded ? `${h.entries.length.toLocaleString('en-US')} known` : '';
+    if (!host) return;
+    const top = host.scrollTop;
+    host.innerHTML = renderHookAllowlist(syscallHooksModel());
+    host.scrollTop = top;
+    syscallApplyLower();
+    // recording measures now: the choice of a past measurement waits for it
+    renderSyscallToolbar();
+}
+
+async function syscallLoadHooks() {
+    const r = await syscallApi('/api/syscalls/hook-baseline');
+    const h = syscallState.hooks;
+    if (r.ok) {
+        h.entries = Array.isArray(r.data.entries) ? r.data.entries : [];
+        h.problem = typeof r.data.problem === 'string' ? r.data.problem : '';
+        h.error = '';
+        h.loaded = true;
+    } else {
+        h.error = syscallErrorText(r);
+    }
+    renderSyscallHooks();
+    return r.ok;
+}
+
+// RECORD THE HOOKS OF THIS RUN AS KNOWN. The server records the hooks it measures in the process when the request
+// arrives, not the ones the analyst looked at, so the label would not be true by itself. Before anything is sent the
+// process is measured again and compared with the scan that was reviewed (the build and view, the process behind the
+// PID, the hooks); if they differ nothing is recorded and the difference is said. After the recording the entries that
+// are new in the list are compared once more with the reviewed ones, because the server measured again. It asks first
+// and says what it costs on a host that is not clean.
+async function syscallCaptureHooks() {
+    const h = syscallState.hooks, model = syscallHooksModel(), reviewed = syscallState.scan;
+    if (h.busy || !model.scan || !(model.scan.hookable > 0)) return false;
+    // what is new in the list afterwards is told from what was there by the list as it is now: without it every known
+    // hook would look like one the analyst did not review
+    if (!h.loaded && !(await syscallLoadHooks())) {
+        h.note = { tone: 'error', text: 'Nothing was recorded: the list of known hooks has not been read, so what is new in it could not be told from what was there. ' +
+                   `Try again when it can be read${h.error ? ` (${h.error})` : ''}.` };
+        renderSyscallHooks();
+        return false;
+    }
+    if (typeof confirm !== 'function' || !confirm(syscallCaptureQuestion(model.scan))) return false;
+    const pid = model.scan.pid, expected = model.scan.pairs.map(p => syscallHookKey(p.name, p.owner));
+    const stop = text => {
+        h.busy = false;
+        h.note = { tone: 'error', text };
+        renderSyscallHooks();
+        return false;
+    };
+    h.busy = true;
+    h.note = { tone: 'info', text: `Measuring PID ${pid} again, to check that its hooks are still those you reviewed…` };
+    renderSyscallHooks();
+    const now = await syscallApi('/api/syscalls/scan', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pid, modules: ['ntdll.dll'] }),
+    });
+    if (!now.ok) return stop(`Nothing was recorded: PID ${pid} could not be measured again (${syscallErrorText(now)}). Scan it again and review the result.`);
+    const drift = syscallHookDrift(reviewed, now.data);
+    if (drift) return stop(`Nothing was recorded. ${drift} Scan it again and review the new result.`);
+    const known = new Set(h.entries.map(e => `${syscallHookKey(e.syscall, e.owner)}|${e.build}|${e.view}`));
+    const r = await syscallApi('/api/syscalls/hook-baseline', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pid }),
+    });
+    if (!r.ok) return stop(syscallErrorText(r));
+    const loaded = await syscallLoadHooks();
+    h.busy = false;
+    const label = key => key.replace('|', ' → ');
+    const recorded = h.entries.filter(e => e.build === r.data.build && e.view === r.data.view
+        && !known.has(`${syscallHookKey(e.syscall, e.owner)}|${e.build}|${e.view}`)).map(e => syscallHookKey(e.syscall, e.owner));
+    const diff = syscallHookDifference(expected, recorded);
+    const where = `PID ${pid}, build ${r.data.build}, ${r.data.view} view`;
+    if (!loaded) {
+        h.note = { tone: 'error', text: `The server recorded ${Number(r.data.added) || 0} hook(s) of ${where}, but the list could not be read again to check them against the scan you reviewed.` };
+    } else if (diff.extra.length) {
+        h.note = { tone: 'error', text: `Recorded hooks that you did not review: ${diff.extra.map(label).join(', ')} (${where}). The server measured the process again and found them; ` +
+                   'they are not in the scan you looked at. FORGET THIS BUILD AND VIEW undoes it (the whole set of that build and view, earlier entries too).' };
+    } else if (diff.missing.length) {
+        h.note = { tone: 'warn', text: `Not recorded, although the scan showed them: ${diff.missing.map(label).join(', ')} (${where}). The server did not find them when it measured again.` };
+    } else if (!recorded.length) {
+        h.note = { tone: 'ok', text: `No new hook: those of ${where} were known already.` };
+    } else {
+        const added = recorded.length;
+        h.note = { tone: 'ok', text: `Recorded ${added} new hook${added === 1 ? '' : 's'} of ${where}: ${recorded.map(label).join(', ')}. ` +
+                   `The list holds ${Number(r.data.entries) || 0} for it. Scan again: the stubs on the map are not marked as known yet.` +
+                   (r.data.partial ? ' The measurement was partial.' : '') };
+    }
+    renderSyscallHooks();
+    return true;
+}
+
+// FORGET: the known hooks of the build and view on the map ('this') or all of them ('all'), after a question
+async function syscallClearHooks(scope) {
+    const h = syscallState.hooks, baseline = syscallState.baseline;
+    if ((scope !== 'this' && scope !== 'all') || h.busy) return false;
+    if (scope === 'this' && !(baseline && baseline.build && baseline.view)) return false;
+    const question = scope === 'this'
+        ? `Forget the known hooks of build ${baseline.build}, ${baseline.view} view?\n\nEvery hook of that set counts as evidence again.`
+        : 'Forget every known hook, of every build and view?\n\nEvery hook counts as evidence again.';
+    if (typeof confirm !== 'function' || !confirm(question)) return false;
+    h.busy = true;
+    h.note = null;
+    renderSyscallHooks();
+    const query = scope === 'this' ? `?build=${encodeURIComponent(baseline.build)}&view=${encodeURIComponent(baseline.view)}` : '';
+    const r = await syscallApi(`/api/syscalls/hook-baseline${query}`, { method: 'DELETE' });
+    h.busy = false;
+    h.note = r.ok ? { tone: 'ok', text: 'Forgotten. Scan again: the stubs on the map are marked as known by the list as it was.' }
+                  : { tone: 'error', text: syscallErrorText(r) };
+    await syscallLoadHooks();
+    return r.ok;
+}
+
+// MAP | DETAIL below SYSCALL_NARROW, where the map and the detail panel take turns on one place; above it both are
+// shown and this changes nothing. A map that was out of sight has no width and is drawn when it comes back.
+function syscallSetPane(name) {
+    if (!SYSCALL_PANE_NAMES.includes(name)) return false;
+    syscallState.pane = name;
+    const work = document.getElementById('syscall-work');
+    if (work) work.dataset.pane = name;
+    for (const other of SYSCALL_PANE_NAMES) {
+        const button = document.getElementById(`syscall-pane-${other}`);
+        if (button) button.setAttribute('aria-pressed', other === name ? 'true' : 'false');
+    }
+    if (name === 'map') {
+        renderSyscallMap();
+        renderBinaryGraph();
+    }
+    return true;
+}
+
+// MAP / GRAPH: the surface that is on; a view whose button is missing or disabled is not switched to. The detail
+// panel follows: a node or an edge chosen in the graph is described only while the graph shows.
+function syscallSetView(name) {
+    if (!SYSCALL_VIEW_NAMES.includes(name)) return false;
+    const button = document.getElementById(`syscall-view-${name}`);
+    if (!button || button.disabled) return false;
+    syscallState.view = name;
+    for (const other of SYSCALL_VIEW_NAMES) {
+        const surface = document.getElementById(`syscall-surface-${other}`);
+        if (surface) surface.hidden = other !== name;
+    }
+    if (!syscallState.lowerByHand) syscallState.lowerFolded = name === 'graph';
+    syscallApplyLower();
+    renderSyscallToolbar();
+    if (name === 'map') {
+        renderSyscallMap();
+    } else {
+        renderBinaryGraph();
+        binaryGraphApplyMax();
+        binaryGraphMetricsLoad();
+    }
+    renderSyscallDetailPanel();
+    return true;
+}
+
+// The map's box changed size: its cells are laid out again, but only while it is on screen
+function syscallResized() {
+    if (state.activeTab === 'syscalls') renderSyscallMap();
+}
+
+function initSyscalls() {
+    if (syscallState.ready) return;
+    syscallState.ready = true;
+    const host = document.getElementById('syscall-map');
+    if (host) {
+        host.addEventListener('pointermove', syscallOnMapMove);
+        host.addEventListener('pointerleave', syscallOnMapLeave);
+        host.addEventListener('click', syscallOnMapClick);
+        if (typeof ResizeObserver !== 'undefined') new ResizeObserver(() => requestAnimationFrame(syscallResized)).observe(host);
+    }
+    binaryGraphOnQuery();
+    syscallRenderAll();
+}
+
+// The tab is shown: the targets and the status are asked for again (processes come and go, an extraction may be
+// done), the baseline only if there is none, and the map is drawn at the size it has now
+function syscallsTabShown() {
+    initSyscalls();
+    renderSyscallMap();
+    syscallLoadTargets();
+    syscallLoadPastList();
+    syscallLoadHooks();
+    syscallRefresh();
+}
+
+// --- GRAPH: the binary graph's answers as layered paths ------------------------------------------------------------
+// One question to /api/binary-graph/query, drawn left to right with one layer per hop. An edge's origin is its claim:
+// "derived" is read from the binaries, "curated" is the word of the hand-curated Win32 to Nt table. The curated hop
+// is drawn dashed, in its own colour and tagged in words, named in the legend and said in the detail panel: a reader
+// who takes it for a derived edge draws wrong conclusions from the graph.
+// Red stays the map's: a syscall whose stub deviated in the last scan is drawn in the map's colour of its state, and so
+// is every edge on a path into it. A filter match gets a ring of its own (--graph-match), never a deviation tone.
+
+// The box of a node and the room between layers and rows, in px; the dash of a curated edge; how many characters of
+// a label fit in a box
+// a dash for an edge whose origin the answer does not name as derived or curated
+const BINARY_GRAPH = { boxW: 176, boxH: 40, gapX: 76, gapY: 14, pad: 16, curatedDash: '6 4', unknownDash: '1 4', labelMax: 24, subMax: 28 };
+const BINARY_GRAPH_SYSCALL = 'syscall:';
+// node kind -> its colour and what the legend calls it; a function has no colour of its own and takes the text's
+const BINARY_GRAPH_KINDS = {
+    dll: { color: '--graph-node-dll', name: 'DLL' },
+    exe: { color: '--graph-node-exe', name: 'EXE' },
+    'api-set': { color: '--graph-node-apiset', name: 'api set' },
+    function: { color: '--text-secondary', name: 'function' },
+    syscall: { color: '--graph-node-syscall', name: 'syscall' },
+};
+// query -> the parameter the start field and the function field are sent as ('' where the query reads none), with
+// their placeholders
+const BINARY_GRAPH_QUERIES = {
+    'path-to-syscall': { first: 'module', second: 'function', firstHint: 'Module, such as kernel32.dll', secondHint: 'Function, such as OpenProcess' },
+    importers: { first: 'module', second: 'function', firstHint: 'Module that is imported', secondHint: 'Only this function (optional)' },
+    imports: { first: 'module', second: '', firstHint: 'Module whose imports to draw', secondHint: '' },
+    'syscall-callers': { first: 'syscall', second: '', firstHint: 'Syscall, such as NtOpenProcess', secondHint: '' },
+    forwarders: { first: 'module', second: '', firstHint: 'Module whose forwarders to follow', secondHint: '' },
+    shared: { first: 'module', second: 'other', firstHint: 'One module', secondHint: 'The other module' },
+};
+const BINARY_GRAPH_EDGE_WORDS = {
+    imports: 'imports', forwards_to: 'forwards to', resolves_to: 'resolves to', reaches_syscall: 'reaches syscall',
+};
+
+// An entry of one of the tables above by a key from the answer, never a member every object inherits ('constructor')
+function binaryGraphOwn(table, key) {
+    return typeof key === 'string' && Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined;
+}
+
+// What an edge claims: 'derived' only when the answer says exactly that, 'curated', and 'unknown' for anything else.
+// A missing or unexpected origin must never read as read from a binary.
+function binaryGraphOrigin(edge) {
+    const origin = edge && edge.origin;
+    return origin === 'derived' || origin === 'curated' ? origin : 'unknown';
+}
+
+// `module` is what the start field holds, whichever parameter the query sends it as; `function` the second field's
+// figures: the table of the whole stock (null until it was read), figuresNote why it could not be; metric: the list of a figure the detail panel shows
+const binaryGraphState = { answer: null, query: 'path-to-syscall', module: '', function: '', depth: 1, loading: false, selected: null, note: '', nodes: [], edges: [],
+    figures: null, figuresNote: '', figuresLoading: false, metric: null, maxed: false, maxedByHand: false };
+// numbers the queries, of which only the last answer counts
+const binaryGraphRequests = { seq: 0, metric: 0 };
+
+// The layers: a node one layer right of the deepest node that has an edge into it, so a path runs left to right in
+// the order of its hops. In a layer, the nodes keep the answer's order, then move toward the middle of those that
+// lead to them. A node of a cycle is put right of what of it was placed. { boxes: [{ id, node, layer, x, y, w, h, root }],
+// edges (as given: an edge is known by its index in them), width, height }
+function binaryGraphLayout(nodes, edges, roots) {
+    const g = BINARY_GRAPH;
+    const ids = [], byId = new Map();
+    for (const node of Array.isArray(nodes) ? nodes : []) {
+        if (node && typeof node.id === 'string' && !byId.has(node.id)) {
+            ids.push(node.id);
+            byId.set(node.id, node);
+        }
+    }
+    const known = new Set(ids);
+    const list = Array.isArray(edges) ? edges : [];
+    const links = list.filter(e => e && known.has(e.source) && known.has(e.target) && e.source !== e.target);
+    const into = new Map(ids.map(id => [id, 0])), out = new Map(ids.map(id => [id, []]));
+    for (const e of links) {
+        into.set(e.target, into.get(e.target) + 1);
+        out.get(e.source).push(e.target);
+    }
+    const layer = new Map(), left = new Map(into);
+    const queue = ids.filter(id => into.get(id) === 0);
+    for (const id of queue) layer.set(id, 0);
+    for (let i = 0; i < queue.length; i++) {
+        const id = queue[i];
+        for (const target of out.get(id)) {
+            layer.set(target, Math.max(layer.get(target) || 0, layer.get(id) + 1));
+            left.set(target, left.get(target) - 1);
+            if (left.get(target) === 0) queue.push(target);
+        }
+    }
+    for (const id of ids) if (!layer.has(id)) layer.set(id, 0);
+    const count = ids.length ? Math.max(...layer.values()) + 1 : 0;
+    const columns = Array.from({ length: count }, () => []);
+    for (const id of ids) columns[layer.get(id)].push(id);
+    const row = new Map();
+    columns.forEach((column, i) => {
+        if (i > 0) {
+            const centre = id => {
+                const from = links.filter(e => e.target === id && row.has(e.source)).map(e => row.get(e.source));
+                return from.length ? from.reduce((a, b) => a + b, 0) / from.length : Infinity;
+            };
+            const at = new Map(column.map((id, k) => [id, [centre(id), k]]));
+            column.sort((a, b) => (at.get(a)[0] - at.get(b)[0]) || (at.get(a)[1] - at.get(b)[1]));
+        }
+        column.forEach((id, k) => row.set(id, k));
+    });
+    const tallest = columns.reduce((most, column) => Math.max(most, column.length), 0);
+    const pitch = g.boxH + g.gapY;
+    const boxes = [];
+    columns.forEach((column, i) => {
+        const offset = (tallest - column.length) * pitch / 2;
+        column.forEach((id, k) => boxes.push({ id, node: byId.get(id), layer: i, x: g.pad + i * (g.boxW + g.gapX), y: g.pad + offset + k * pitch, w: g.boxW, h: g.boxH }));
+    });
+    const rootSet = new Set(Array.isArray(roots) ? roots : []);
+    for (const box of boxes) box.root = rootSet.has(box.id);
+    return {
+        boxes, edges: list,
+        width: count ? 2 * g.pad + count * g.boxW + (count - 1) * g.gapX : 0,
+        height: tallest ? 2 * g.pad + tallest * g.boxH + (tallest - 1) * g.gapY : 0,
+    };
+}
+
+// How an edge is drawn: a derived edge solid in the muted line colour, the curated one dashed in its own, one of an
+// unknown origin dotted in the secondary text colour. A tone (the state of a deviating syscall it leads to) takes the
+// colour; the dash stays, the curated hop is still curated.
+function binaryGraphEdgeLook(edge, tone) {
+    const origin = binaryGraphOrigin(edge);
+    const look = origin === 'curated' ? { color: themeColor('--graph-edge-curated'), width: 2, dash: BINARY_GRAPH.curatedDash }
+        : origin === 'derived' ? { color: themeColor('--text-muted'), width: 1.5, dash: '' }
+        : { color: themeColor('--text-secondary'), width: 1.5, dash: BINARY_GRAPH.unknownDash };
+    if (tone && SYSCALL_STATE_COLORS[tone]) {
+        look.color = themeColor(SYSCALL_STATE_COLORS[tone]);
+        look.width += 0.5;
+    }
+    return look;
+}
+
+// How a node's box is drawn: the colour of its kind, or of the state its stub deviated to
+function binaryGraphNodeLook(node, tone) {
+    const kind = binaryGraphOwn(BINARY_GRAPH_KINDS, node && node.kind);
+    if (tone && SYSCALL_STATE_COLORS[tone]) {
+        return { stroke: themeColor(SYSCALL_STATE_COLORS[tone]), fill: themeColor(SYSCALL_STATE_COLORS[tone], 0.18), width: 2.5 };
+    }
+    return { stroke: themeColor(kind ? kind.color : '--text-muted'), fill: themeColor('--bg-secondary'), width: 1.5 };
+}
+
+// The deviations of a scan on the answer: the state of each syscall node whose stub is not intact, and for each edge
+// the state of a deviating syscall it leads to (the most severe, where it leads to several). `states` is the scan's
+// name -> state, or null without one. { nodes: Map id -> state, edges: Map index -> state }
+function binaryGraphTones(nodes, edges, states) {
+    const tones = { nodes: new Map(), edges: new Map() };
+    if (!states) return tones;
+    const list = Array.isArray(edges) ? edges : [];
+    const worse = (a, b) => (SYSCALL_SEVERITY_RANK[a] ?? 2) <= (SYSCALL_SEVERITY_RANK[b] ?? 2) ? a : b;
+    for (const node of Array.isArray(nodes) ? nodes : []) {
+        if (!node || node.kind !== 'syscall' || typeof node.id !== 'string' || !node.id.startsWith(BINARY_GRAPH_SYSCALL)) continue;
+        const state = states.get(node.id.slice(BINARY_GRAPH_SYSCALL.length));
+        if (!state || state === 'intact' || !SYSCALL_STATE_COLORS[state]) continue;
+        tones.nodes.set(node.id, state);
+        // back along the edges from the syscall: every edge on a path into it
+        const seen = new Set([node.id]), queue = [node.id];
+        for (let i = 0; i < queue.length; i++) {
+            list.forEach((e, k) => {
+                if (!e || e.target !== queue[i]) return;
+                tones.edges.set(k, tones.edges.has(k) ? worse(tones.edges.get(k), state) : state);
+                if (!seen.has(e.source)) {
+                    seen.add(e.source);
+                    queue.push(e.source);
+                }
+            });
+        }
+    }
+    return tones;
+}
+
+// The nodes the filter of the tab matches: a syscall node as its cell on the map does, any other node by its name.
+// `match` is the map's set of matching names (null without a filter), `query` the filter's text.
+function binaryGraphMatches(nodes, match, query) {
+    const found = new Set();
+    if (!match) return found;
+    const text = String(query || '').trim().toLowerCase();
+    for (const node of Array.isArray(nodes) ? nodes : []) {
+        if (!node || typeof node.id !== 'string') continue;
+        if (node.kind === 'syscall') {
+            if (node.id.startsWith(BINARY_GRAPH_SYSCALL) && match.has(node.id.slice(BINARY_GRAPH_SYSCALL.length))) found.add(node.id);
+        } else if (text && node.id.toLowerCase().includes(text)) {
+            found.add(node.id);
+        }
+    }
+    return found;
+}
+
+// A text cut to `max` characters
+function binaryGraphCut(text, max) {
+    const value = String(text ?? '');
+    return value.length > max ? value.slice(0, max - 1) + '…' : value;
+}
+
+// The SVG of a layout. model: { tones (binaryGraphTones), match (a set of node ids), selected (an id or null) }
+function binaryGraphSvg(layout, model) {
+    if (!layout || !Array.isArray(layout.boxes) || !layout.boxes.length) return '';
+    const g = BINARY_GRAPH;
+    const m = model || {};
+    const tones = m.tones || { nodes: new Map(), edges: new Map() };
+    const match = m.match || new Set();
+    const c = v => String(Math.round(v * 10) / 10);
+    const at = new Map(layout.boxes.map(box => [box.id, box]));
+    let svg = `<svg class="binary-graph-svg" xmlns="http://www.w3.org/2000/svg" width="${c(layout.width)}" height="${c(layout.height)}" `
+        + `viewBox="0 0 ${c(layout.width)} ${c(layout.height)}" role="img" aria-label="${escapeHtml(`${layout.boxes.length} nodes of the binary graph, one layer per hop`)}"><g class="binary-graph-edges">`;
+    (Array.isArray(layout.edges) ? layout.edges : []).forEach((edge, index) => {
+        const from = edge && at.get(edge.source), to = edge && at.get(edge.target);
+        if (!from || !to || from === to) return;
+        const tone = tones.edges.get(index) || '';
+        const look = binaryGraphEdgeLook(edge, tone);
+        const x1 = from.x + from.w, y1 = from.y + from.h / 2, x2 = to.x, y2 = to.y + to.h / 2;
+        const bend = Math.max(24, Math.abs(x2 - x1) / 2);
+        const d = `M${c(x1)} ${c(y1)}C${c(x1 + bend)} ${c(y1)} ${c(x2 - bend)} ${c(y2)} ${c(x2)} ${c(y2)}`;
+        const origin = binaryGraphOrigin(edge);
+        const id = `edge:${index}`;
+        const claim = { curated: edge.label === 'curated: zw-alias' ? 'curated: a naming convention, not read from any binary'
+                                                                    : 'curated: from the Win32 to Nt table, not read from any binary',
+                        derived: 'derived: read from the binaries',
+                        unknown: 'origin unknown: the answer does not say where this edge comes from' }[origin];
+        const words = `${edge.source} ${binaryGraphOwn(BINARY_GRAPH_EDGE_WORDS, edge.kind) || edge.kind} ${edge.target} · ${claim}${edge.label ? ` · ${edge.label}` : ''}`;
+        svg += `<g class="binary-graph-edge binary-graph-edge-${origin}${m.selected === id ? ' selected' : ''}" onclick="binaryGraphSelect(${jsArg(id)})">`
+            + `<title>${escapeHtml(words)}</title>`
+            + `<path class="binary-graph-edge-hit" d="${d}"></path>`
+            + `<path class="binary-graph-edge-line binary-graph-edge-${origin}" data-edge="${jsInt(index)}" data-origin="${origin}" `
+            + `data-source="${escapeHtml(edge.source)}" data-target="${escapeHtml(edge.target)}"${tone ? ` data-tone="${cssToken(tone)}"` : ''} d="${d}" fill="none" `
+            + `stroke="${look.color}" stroke-width="${c(m.selected === id ? look.width + 1.5 : look.width)}"${look.dash ? ` stroke-dasharray="${look.dash}"` : ''}></path>`
+            + `<path class="binary-graph-arrow" d="M${c(x2 - 8)} ${c(y2 - 4)}L${c(x2)} ${c(y2)}L${c(x2 - 8)} ${c(y2 + 4)}Z" fill="${look.color}"></path>`;
+        // the word stays in the curated colour on a path in a deviation tone: the tone says "deviated", the tag "curated"
+        if (origin === 'curated') {
+            svg += `<text class="binary-graph-edge-tag" x="${c((x1 + x2) / 2)}" y="${c((y1 + y2) / 2 - 6)}" text-anchor="middle" fill="${themeColor('--graph-edge-curated')}">curated</text>`;
+        }
+        svg += '</g>';
+    });
+    svg += '</g><g class="binary-graph-nodes">';
+    for (const box of layout.boxes) {
+        const node = box.node || { id: box.id, label: box.id, kind: '' };
+        const tone = tones.nodes.get(box.id) || '';
+        const look = binaryGraphNodeLook(node, tone);
+        const bang = box.id.indexOf('!');
+        let sub = '';
+        if (node.kind === 'function' && bang > 0) sub = box.id.slice(0, bang);
+        else if (Number(node.in_degree) > 0) sub = `imported by ${Number(node.in_degree).toLocaleString('en-US')}`;
+        else sub = (binaryGraphOwn(BINARY_GRAPH_KINDS, node.kind) || { name: String(node.kind || '') }).name;
+        // a syscall's label is "NtClose (ntdll.dll, 0xf)": the name on the first line, the module and number under it
+        let label = String(node.label ?? box.id);
+        const paren = node.kind === 'syscall' ? label.indexOf(' (') : -1;
+        if (paren > 0) {
+            sub = label.slice(paren + 2).replace(/\)$/, '');
+            label = label.slice(0, paren);
+        }
+        const flags = (m.selected === box.id ? ' selected' : '') + (match.has(box.id) ? ' match' : '') + (box.root ? ' root' : '');
+        const words = [box.id, node.label && node.label !== box.id ? node.label : '', node.category ? `suspicious import: ${node.category}` : ''].filter(Boolean).join(' · ');
+        svg += `<g class="binary-graph-node binary-graph-node-${cssToken(node.kind)}${flags}" data-id="${escapeHtml(box.id)}" data-layer="${jsInt(box.layer)}"`
+            + `${tone ? ` data-tone="${cssToken(tone)}"` : ''} onclick="binaryGraphSelect(${jsArg(box.id)})"><title>${escapeHtml(words)}</title>`;
+        if (match.has(box.id)) {
+            svg += `<rect class="binary-graph-match-ring" x="${c(box.x - 5)}" y="${c(box.y - 5)}" width="${c(box.w + 10)}" height="${c(box.h + 10)}" rx="6" `
+                + `fill="none" stroke="${themeColor('--graph-match')}" stroke-width="2"></rect>`;
+        }
+        if (m.selected === box.id) {
+            svg += `<rect class="binary-graph-selected-ring" x="${c(box.x - 2.5)}" y="${c(box.y - 2.5)}" width="${c(box.w + 5)}" height="${c(box.h + 5)}" rx="5" `
+                + `fill="none" stroke="${themeColor('--text-primary')}" stroke-width="1.5"></rect>`;
+        }
+        svg += `<rect class="binary-graph-box" x="${c(box.x)}" y="${c(box.y)}" width="${c(box.w)}" height="${c(box.h)}" rx="4" `
+            + `fill="${look.fill}" stroke="${look.stroke}" stroke-width="${c(look.width)}"></rect>`
+            + `<text class="binary-graph-label" x="${c(box.x + 8)}" y="${c(box.y + 16)}" fill="${themeColor('--text-primary')}">${escapeHtml(binaryGraphCut(label, g.labelMax))}</text>`
+            + `<text class="binary-graph-sub" x="${c(box.x + 8)}" y="${c(box.y + 31)}" fill="${themeColor('--text-muted')}">${escapeHtml(binaryGraphCut(sub, g.subMax))}</text>`
+            + '</g>';
+    }
+    return svg + '</g></svg>';
+}
+
+// The legend under the graph: the kinds of node, the two origins of an edge with the stroke each is drawn in, a
+// deviation and a filter match. It names only what the drawing in front of the reader can show: the explore view
+// (mode 'explore', with the edges it draws) has no syscall, deviation or filter match, and a curated or unknown edge
+// only where one is drawn.
+function binaryGraphLegend(mode, edges, past) {
+    const explore = mode === 'explore';
+    const drawn = new Set((Array.isArray(edges) ? edges : []).map(e => binaryGraphOrigin(e)));
+    const item = (key, mark, text, help) =>
+        `<span class="syscall-legend-item binary-graph-legend-item" data-legend="${cssToken(key)}" title="${escapeHtml(help)}">${mark}<span>${escapeHtml(text)}</span></span>`;
+    const box = (stroke, fill, extra) => `<svg class="binary-graph-legend-mark" width="18" height="12" viewBox="0 0 18 12" aria-hidden="true">${extra || ''}`
+        + `<rect x="2" y="2" width="14" height="8" rx="2" fill="${fill}" stroke="${stroke}" stroke-width="1.5"></rect></svg>`;
+    const line = (origin, look) => `<svg class="binary-graph-legend-mark" width="30" height="12" viewBox="0 0 30 12" aria-hidden="true">`
+        + `<line data-origin="${origin}" x1="1" y1="6" x2="29" y2="6" stroke="${look.color}" stroke-width="${look.width}"${look.dash ? ` stroke-dasharray="${look.dash}"` : ''}></line></svg>`;
+    const parts = Object.entries(BINARY_GRAPH_KINDS).filter(([kind]) => !explore || kind !== 'syscall').map(([kind, k]) =>
+        item(`node-${kind}`, box(themeColor(k.color), themeColor('--bg-secondary')), k.name, `A node of the kind ${k.name}.`));
+    parts.push(item('edge-derived', line('derived', binaryGraphEdgeLook({ origin: 'derived' })), 'derived: read from the binaries',
+        'An import, a forwarder or an api-set resolution that the import and export tables of the binaries themselves say.'));
+    if (!explore || drawn.has('curated')) {
+        parts.push(item('edge-curated', line('curated', binaryGraphEdgeLook({ origin: 'curated' })),
+            'curated: the hand-curated Win32 to Nt table or the Zw naming convention, not read from any binary',
+            'The step from a Win32 function to its Nt syscall is the word of a hand-curated table, and the step from a Zw name of ntdll to its Nt syscall a naming convention. No binary of this system was read to draw either.'));
+    }
+    if (!explore || drawn.has('unknown')) {
+        parts.push(item('edge-unknown', line('unknown', binaryGraphEdgeLook({ origin: '' })), 'origin unknown: neither derived nor curated',
+            'An edge whose answer names neither origin. It is not claimed to be read from a binary.'));
+    }
+    if (explore) return parts.join('');
+    // the deviations are those of the measurement on the map: a past one is named as such, never as the last scan
+    const whose = past && typeof past === 'object'
+        ? `the past measurement on the map (PID ${past.pid}, measured ${syscallWhen(past.measured_at)})` : '';
+    parts.push(item('deviation', box(themeColor(SYSCALL_STATE_COLORS.patched), themeColor(SYSCALL_STATE_COLORS.patched, 0.18)),
+        `deviated in ${whose ? 'the past measurement on the map' : 'the last scan'}, and the path to it, in the colour of its state on the map`,
+        `A syscall whose stub ${whose || 'the last scan of this view'} did not find intact, coloured as on the map, and every edge on a path into it.`));
+    parts.push(item('match', box(themeColor('--text-muted'), themeColor('--bg-secondary'),
+        `<rect x="0.5" y="0.5" width="17" height="11" rx="3" fill="none" stroke="${themeColor('--graph-match')}" stroke-width="1"></rect>`),
+        'filter match', 'A node the filter of the tab matches: its name, or for a syscall its name or number as on the map.'));
+    return parts.join('');
+}
+
+// What an answer read over a table cut short says, whatever its note says: a negative or a count over it is not
+// certain. It points at the figure rather than warning on its own, as the exploration does (Ruling 58).
+const BINARY_GRAPH_PARTIAL = 'A table (import, delay-load or export) this answer read was cut short when it was read, '
+    + 'so a negative or a count here is not certain; the figures say how many.';
+
+// What the line above the graph says: the note of an answer that has nodes, that it was cut, if it was, and that a
+// table it read was cut short. { tone, html } with html '' when there is nothing to say.
+function binaryGraphStatus() {
+    const st = binaryGraphState, a = st.answer;
+    // a cut answer says so whether or not it kept a node; the note stands in the canvas when it kept none
+    if (st.loading || !a || (!st.nodes.length && !a.truncated)) return { tone: 'info', html: '' };
+    let html = '';
+    if (a.truncated) {
+        // the numbers are the answer's: the backend's cap is not copied here, where it could go stale
+        const total = Number(a.total) || 0, drawn = st.nodes.length;
+        html += `<strong class="binary-graph-cut">Not the whole answer: it had ${escapeHtml(total.toLocaleString('en-US'))} parts and was cut, `
+            + `${escapeHtml(drawn.toLocaleString('en-US'))} node${drawn === 1 ? ' is' : 's are'} drawn. Whole parts were dropped, never half a path: `
+            + 'a node that is missing here is not shown, which does not mean it is not imported.</strong> ';
+    }
+    if (st.note && st.nodes.length) html += `<span class="binary-graph-note">${escapeHtml(st.note)}</span>`;
+    if (a.partial === true && st.nodes.length) html += ` <span class="binary-graph-partial">${escapeHtml(BINARY_GRAPH_PARTIAL)}</span>`;
+    const stamp = [a.build ? `build ${a.build}` : '', a.arch || ''].filter(Boolean).join(' · ');
+    if (stamp) html += ` <span class="syscall-muted">${escapeHtml(stamp)}</span>`;
+    return { tone: a.truncated ? 'warn' : 'info', html };
+}
+
+// What the graph draws besides the layout: the deviations of the last scan (only of the view the graph was built
+// for: a scan of another view says nothing about these syscalls), the filter's matches and the selection
+function binaryGraphModel() {
+    const st = binaryGraphState, scan = syscallState.scan, a = st.answer;
+    const fits = scan && a && String(scan.view || '').toLowerCase() === String(a.arch || '').toLowerCase();
+    return {
+        tones: binaryGraphTones(st.nodes, st.edges, fits ? syscallState.states : null),
+        match: binaryGraphMatches(st.nodes, syscallState.match, syscallState.query),
+        selected: st.selected,
+    };
+}
+
+function renderBinaryGraph() {
+    const st = binaryGraphState;
+    const status = document.getElementById('binary-graph-status');
+    if (status) {
+        const s = binaryGraphStatus();
+        status.innerHTML = s.html;
+        status.className = `binary-graph-status binary-graph-status-${cssToken(s.tone)}`;
+        status.hidden = !s.html;
+    }
+    const legend = document.getElementById('binary-graph-legend');
+    const scan = syscallState.scan;
+    if (legend) legend.innerHTML = binaryGraphLegend('path', [], scan && scan.live === false ? scan : null);
+    const host = document.getElementById('binary-graph-canvas');
+    if (!host) return;
+    if (st.loading || !st.nodes.length) {
+        const text = st.loading ? 'Asking the binary graph…'
+            : st.note || 'Choose a query and its start, then QUERY: the answer is drawn here, one layer per hop.';
+        const error = !st.loading && !st.answer && st.note;
+        const cut = !st.loading && st.answer && st.answer.partial === true ? ` ${BINARY_GRAPH_PARTIAL}` : '';
+        host.innerHTML = `<p class="syscall-empty${error ? ' syscall-empty-error' : ''}">${escapeHtml(text + cut)}</p>`;
+        return;
+    }
+    host.innerHTML = binaryGraphSvg(binaryGraphLayout(st.nodes, st.edges, st.answer ? st.answer.roots : []), binaryGraphModel());
+}
+
+// The fields of the query bar: their placeholders, and the second one only where the query reads it
+function binaryGraphOnQuery() {
+    const select = document.getElementById('binary-graph-query');
+    const name = select && BINARY_GRAPH_QUERIES[select.value] ? select.value : 'path-to-syscall';
+    binaryGraphState.query = name;
+    const q = BINARY_GRAPH_QUERIES[name];
+    const first = document.getElementById('binary-graph-module'), second = document.getElementById('binary-graph-function');
+    if (first) first.setAttribute('placeholder', q.firstHint);
+    if (second) {
+        second.setAttribute('placeholder', q.secondHint);
+        second.disabled = !q.second;
+        second.hidden = !q.second;
+    }
+}
+
+function binaryGraphSubmit(event) {
+    if (event && typeof event.preventDefault === 'function') event.preventDefault();
+    binaryGraphRun();
+}
+
+// QUERY: the bar's fields as the query's parameters. A newer query overtakes the answer of an older one.
+async function binaryGraphRun() {
+    const st = binaryGraphState;
+    const read = id => {
+        const el = document.getElementById(id);
+        return el ? String(el.value || '').trim() : '';
+    };
+    const select = read('binary-graph-query');
+    st.query = BINARY_GRAPH_QUERIES[select] ? select : st.query;
+    st.module = read('binary-graph-module');
+    st.function = read('binary-graph-function');
+    const q = BINARY_GRAPH_QUERIES[st.query];
+    const params = new URLSearchParams({ q: st.query });
+    if (st.module) params.set(q.first, st.module);
+    if (q.second && st.function) params.set(q.second, st.function);
+    const seq = ++binaryGraphRequests.seq;
+    st.loading = true;
+    renderBinaryGraph();
+    const r = await syscallApi(`/api/binary-graph/query?${params}`);
+    if (seq !== binaryGraphRequests.seq) return false;
+    st.loading = false;
+    const keep = st.selected && st.selected.startsWith(BINARY_GRAPH_SYSCALL) ? st.selected : null;
+    if (r.ok) {
+        st.answer = r.data;
+        st.nodes = Array.isArray(r.data.nodes) ? r.data.nodes.filter(n => n && typeof n.id === 'string') : [];
+        st.edges = Array.isArray(r.data.edges) ? r.data.edges.filter(e => e && typeof e.source === 'string' && typeof e.target === 'string') : [];
+        st.note = typeof r.data.note === 'string' ? r.data.note : '';
+    } else {
+        st.answer = null;
+        st.nodes = [];
+        st.edges = [];
+        st.note = syscallErrorText(r);
+    }
+    st.selected = keep;
+    renderBinaryGraph();
+    renderSyscallDetailPanel();
+    return r.ok;
+}
+
+// What a graph id names: { node } or { edge, index, source, target } (an edge is 'edge:<index>'), or null
+function binaryGraphItem(id) {
+    const st = binaryGraphState, key = String(id || '');
+    const node = st.nodes.find(n => n.id === key);
+    if (node) return { node };
+    const edge = /^edge:(\d+)$/.exec(key);
+    const e = edge ? st.edges[Number(edge[1])] : null;
+    if (!e) return null;
+    return { edge: e, index: Number(edge[1]), source: st.nodes.find(n => n.id === e.source) || null, target: st.nodes.find(n => n.id === e.target) || null };
+}
+
+// A node or an edge is chosen in the graph. A syscall is chosen as on the map (and the map marks its cell); anything
+// else is described in the shared detail panel.
+function binaryGraphSelect(id) {
+    const item = binaryGraphItem(id);
+    if (!item) return false;
+    if (item.node && item.node.kind === 'syscall' && item.node.id.startsWith(BINARY_GRAPH_SYSCALL)) {
+        syscallSelect(item.node.id.slice(BINARY_GRAPH_SYSCALL.length));
+        return true;
+    }
+    binaryGraphMetricForget();
+    binaryGraphState.selected = String(id);
+    renderBinaryGraph();
+    renderSyscallDetailPanel();
+    const body = document.getElementById('syscall-detail-body');
+    if (body) body.scrollTop = 0;
+    if (typeof window.matchMedia === 'function' && window.matchMedia(SYSCALL_NARROW).matches) syscallSetPane('detail');
+    return true;
+}
+
+// The map chose a syscall (or let go of one): the graph marks its node, if it draws one
+function binaryGraphFollowMap(name) {
+    const st = binaryGraphState;
+    if (name) {
+        st.selected = BINARY_GRAPH_SYSCALL + name;
+        binaryGraphMetricForget();
+    } else if (st.selected && st.selected.startsWith(BINARY_GRAPH_SYSCALL)) st.selected = null;
+    renderBinaryGraph();
+}
+
+// The item the detail panel describes for the graph: what is chosen there, unless it is a syscall (the panel's own)
+// or the map is showing
+function binaryGraphDetailItem() {
+    const st = binaryGraphState;
+    if (syscallState.view !== 'graph' || !st.selected || st.selected.startsWith(BINARY_GRAPH_SYSCALL)) return null;
+    return binaryGraphItem(st.selected);
+}
+
+// The detail of a node or an edge of the graph, as the answer has it. An edge says where its claim comes from: a
+// curated one that it is the table's word and not read from any binary.
+function binaryGraphDetailHtml(item) {
+    if (!item) return '';
+    const facts = rows => `<dl class="syscall-facts">${rows.map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(v)}</dd>`).join('')}</dl>`;
+    const title = text => `<div class="syscall-detail-name"><span class="syscall-detail-sc">${escapeHtml(text)}</span></div>`;
+    if (item.node) {
+        const n = item.node, bang = n.id.indexOf('!');
+        const rows = [['Kind', (binaryGraphOwn(BINARY_GRAPH_KINDS, n.kind) || { name: String(n.kind || 'unknown') }).name], ['Id', n.id]];
+        let note = '';
+        if (n.kind === 'function' && bang > 0) {
+            rows.push(['Module', n.id.slice(0, bang)]);
+            note = '<p class="syscall-detail-note">A function is drawn as module!function, with the module as the importer or forwarder wrote it. '
+                + 'The graph draws no edge from a module to its functions: an edge is an import, a forwarder, an api-set resolution or the step to a syscall.</p>';
+        } else {
+            rows.push(['Imported by', `${(Number(n.in_degree) || 0).toLocaleString('en-US')} binaries of System32`]);
+        }
+        if (n.category) rows.push(['Suspicious import', n.category]);
+        return title(n.label || n.id) + facts(rows) + note;
+    }
+    const e = item.edge;
+    const name = node => node ? node.label || node.id : '';
+    const rows = [['From', item.source ? `${name(item.source)} (${item.source.id})` : e.source],
+                  ['To', item.target ? `${name(item.target)} (${item.target.id})` : e.target]];
+    let note;
+    const origin = binaryGraphOrigin(e);
+    if (origin === 'curated') {
+        rows.push(['Origin', 'curated, not derived']);
+        const from = escapeHtml(name(item.source) || e.source), to = escapeHtml(name(item.target) || e.target);
+        // a Zw name of ntdll is its Nt name by convention, which the table calls zw-alias (its own row of that source,
+        // ZwUnmapViewOfSection, says no more). The edge is that convention's word, so the panel names the convention and
+        // not "the table's word that the function ends in this syscall", which reads as a Win32 row someone looked up
+        note = e.label === 'curated: zw-alias'
+            ? '<p class="binary-graph-curated-note"><strong>Curated, not derived.</strong> This step is not read from any binary: that '
+                + `${from} is ${to} is a naming convention, a Zw name of ntdll being its Nt name, which the curated table calls zw-alias. `
+                + 'Both names are exports of ntdll; that they are one syscall is not an import, export or forwarder of a file on this system.</p>'
+            : '<p class="binary-graph-curated-note"><strong>Curated, not derived.</strong> This step is not read from any binary: the mapping from '
+                + `${from} to ${to} comes from the hand-curated Win32 to Nt table. `
+                + 'It is that table\'s word that the function ends in this syscall, not an import, export or forwarder of a file on this system.</p>';
+    } else if (origin === 'derived') {
+        rows.push(['Origin', 'derived']);
+        note = '<p class="syscall-detail-note">Derived: read from the binaries themselves, from their import and export tables and the api-set map of this system.</p>';
+    } else {
+        rows.push(['Origin', 'unknown']);
+        note = '<p class="syscall-detail-note">Origin unknown: the answer names this edge neither as read from a binary nor as taken from the curated table. '
+            + 'Treat it as unverified.</p>';
+    }
+    if (e.label) rows.push(['Label', e.label]);
+    return title(binaryGraphOwn(BINARY_GRAPH_EDGE_WORDS, e.kind) || String(e.kind ?? '')) + facts(rows) + note;
+}
+
+// --- GRAPH, EXPLORE: the same graph, opened one node at a time -------------------------------------------------------
+// The whole stock (3,999 binaries on the build this was measured on) is never drawn. This is the level of the binaries: the nodes are modules and
+// the number of functions one imports from another is carried on the edge between them. An entry point, one binary, is
+// drawn alone; EXPAND opens the neighbours of the chosen module in both directions and keeps what is drawn: the modules
+// it imports from (q=imports, grouped by module, see binaryGraphExploreParts) and the modules that import it
+// (q=importers). FUNCTIONS opens the level deeper: the functions the module imports, one node each, which is what the
+// PATH view draws. A function is opened by who imports it. Both are queries of the PATH view, so the importers come with
+// their in-degree and kind; an imported module is read once for its own (/api/binary-graph/node), as many reads as
+// there are new modules, never one per function.
+// DEPTH is how many hops EXPAND walks, over modules. The canvas holds at most `cap` nodes: what could not be drawn is
+// counted and said, never dropped quietly, and the neighbours that are kept are the first in name order, whole, as the
+// server cuts its own answers. A node's size is how many binaries import it (the cache's in-degree), its colour its kind.
+// cap: the backend's MAX_NODES (tests/test_binary_graph_ui.py holds the two equal); reads: the most requests one walk
+// sends, so a deep walk over a busy module stops and says so; batch: how many modules are read at once; drag: the px a
+// press moves before it is a drag, not a click
+const BINARY_GRAPH_EXPLORE = { cap: 400, depths: [1, 2, 3], radius: { min: 6, max: 38, step: 2.4 }, reads: 60, batch: 16, drag: 3 };
+const binaryGraphExplore = { mode: 'path', nodes: [], edges: [], camera: { x: 0, y: 0, zoom: 1 }, selected: null, hovered: null,
+    dragging: null, panning: false, panStart: { x: 0, y: 0 }, down: { x: 0, y: 0 }, moved: false, loading: false, note: '', seq: 0,
+    ready: false, cut: new Map(), modules: new Map() };
+
+// The disc of a node: the larger the more binaries import it, on a log scale so 4,000 and 400 are both readable
+function binaryGraphNodeRadius(node) {
+    const r = BINARY_GRAPH_EXPLORE.radius;
+    const degree = Math.max(0, Number(node && node.in_degree) || 0);
+    return Math.min(r.max, r.min + r.step * Math.log2(1 + degree));
+}
+
+// What a module is called until the graph says: the loader's reading of the name
+function binaryGraphGuessKind(name) {
+    const lower = String(name || '').toLowerCase();
+    if (lower.startsWith('api-') || lower.startsWith('ext-')) return 'api-set';
+    return lower.endsWith('.exe') ? 'exe' : 'dll';
+}
+
+// The kind of a binary as /api/binary-graph/node names it
+function binaryGraphDetailKind(detail, name) {
+    if (detail && detail.is === 'api-set') return 'api-set';
+    if (detail && detail.is === 'binary' && (detail.kind === 'dll' || detail.kind === 'exe')) return detail.kind;
+    return binaryGraphGuessKind(name);
+}
+
+// The queries that open a node: [{ dir, params, module, via, level }]. A module is read both ways (an api set imports
+// nothing of its own): level 'modules' (EXPAND) asks what it imports, to be grouped by module, and who imports it;
+// level 'functions' (FUNCTIONS) asks only what it imports, to be drawn function by function. A function asks who imports
+// it, and the edges of that answer end at the function (`via`). Anything else has nothing to open.
+function binaryGraphExploreRequests(node, level) {
+    const id = node && typeof node.id === 'string' ? node.id : '';
+    if (!id) return [];
+    const into = { dir: 'in', params: { q: 'importers', module: id }, module: id, via: '', level: 'modules' };
+    const out = { dir: 'out', params: { q: 'imports', module: id }, module: id, via: '', level: level === 'functions' ? 'functions' : 'modules' };
+    if (node.kind === 'dll' || node.kind === 'exe') return level === 'functions' ? [out] : [out, into];
+    if (node.kind === 'api-set') return level === 'functions' ? [] : [into];
+    const bang = id.indexOf('!');
+    if (node.kind === 'function' && bang > 0 && level !== 'functions') {
+        const module = id.slice(0, bang);
+        return [{ dir: 'in', params: { q: 'importers', module, function: id.slice(bang + 1) }, module, via: id, level: 'modules' }];
+    }
+    return [];
+}
+
+// An edge that stands for several is derived only if every one of them is: a missing, curated or unexpected origin among
+// them makes the whole unknown, so grouping never lends an edge a claim that one of its parts did not make.
+function binaryGraphCombineOrigin(a, b) {
+    const x = binaryGraphOrigin({ origin: a }), y = binaryGraphOrigin({ origin: b });
+    return x === y ? x : 'unknown';
+}
+
+// An answer as the parts the server cuts it in. { parts: [{ head, nodes, edges }], server, functions }: `server` is how
+// many parts the server dropped of its own answer (its total less the parts it kept), and `functions` how many imported
+// functions it dropped from a list that is grouped by module instead of kept as parts.
+// One part is one importer of an `importers` answer (with the api set it imports through) and, at level 'functions', one
+// function of an `imports` answer. At level 'modules' the functions of an `imports` answer are grouped by the module
+// each belongs to (the part of its id before "!"), and the part is that module with one edge from the opened one that
+// carries how many functions it imports from it. That is aggregation, not invention: an `imports` edge from app.exe to
+// kernel32.dll!CreateFileW *is* the datum that app.exe imports from kernel32.dll, and counting those reads the answer
+// without adding to it. The origin of the edge is derived only if every edge it stands for is (binaryGraphCombineOrigin).
+// When the server cut the list, the last module's count is a lower bound and the modules after it are missing: the edge
+// says "at least", `functions` of the result says how many functions were cut and `last` which module is the lower bound.
+// When a table the answer read was cut short when the graph was built (`partial` of the answer: for an `imports` answer any
+// table (import, delay-load or export) of the module itself, for an `importers` answer any table of the graph, which it reads whole), every count of it is
+// a lower bound and modules may be missing: `tableCut`.
+function binaryGraphExploreParts(request, answer) {
+    const a = answer && typeof answer === 'object' ? answer : {};
+    const known = new Map((Array.isArray(a.nodes) ? a.nodes : []).filter(n => n && typeof n.id === 'string').map(n => [n.id, n]));
+    const edges = (Array.isArray(a.edges) ? a.edges : []).filter(e => e && typeof e.source === 'string' && typeof e.target === 'string');
+    const root = request.module, total = Math.max(0, Number(a.total) || 0), cutShort = a.truncated === true;
+    if (request.dir === 'out' && request.level === 'modules') {
+        const by = new Map();
+        let shown = 0;
+        for (const e of edges) {
+            if (e.kind !== 'imports' || e.source !== root) continue;
+            shown++;
+            const bang = e.target.indexOf('!'), module = bang > 0 ? e.target.slice(0, bang).toLowerCase() : '';
+            if (!module || module === root) continue;
+            if (!by.has(module)) by.set(module, { functions: new Set(), origin: 'derived' });
+            const group = by.get(module);
+            group.functions.add(e.target);
+            if (binaryGraphOrigin(e) !== 'derived') group.origin = 'unknown';
+        }
+        const last = cutShort && by.size ? [...by.keys()][by.size - 1] : '';
+        const parts = [...by.keys()].sort().map(module => {
+            const n = by.get(module).functions.size, partial = module === last || a.partial === true;
+            const label = `${partial ? 'at least ' : ''}${n.toLocaleString('en-US')} function${n === 1 ? '' : 's'}`;
+            return { head: module, nodes: [{ id: module, label: module, kind: binaryGraphGuessKind(module), in_degree: 0, category: '', guess: true }],
+                     edges: [{ source: root, target: module, kind: 'imports', origin: by.get(module).origin, label, functions: n, partial }] };
+        });
+        return { parts, server: 0, functions: cutShort ? Math.max(0, total - shown) : 0, last, tableCut: a.partial === true };
+    }
+    const end = e => (request.via && e.target === root ? { ...e, target: request.via } : e);
+    const grouped = new Map();
+    for (const e of edges) {
+        if (e.kind !== 'imports') continue;
+        const head = request.dir === 'out' ? (e.source === root ? e.target : '') : (e.source !== root ? e.source : '');
+        if (!head) continue;
+        if (!grouped.has(head)) grouped.set(head, { head, ids: new Set([head]), edges: [] });
+        const part = grouped.get(head);
+        part.edges.push(end(e));
+        if (request.dir === 'in' && e.target !== root) {
+            part.ids.add(e.target);
+            for (const hop of edges) if (hop.source === e.target && hop.target === root && hop.kind === 'resolves_to') part.edges.push(end(hop));
+        }
+    }
+    const parts = [...grouped.values()].filter(p => known.has(p.head))
+        .map(p => ({ head: p.head, nodes: [...p.ids].map(id => known.get(id)).filter(Boolean), edges: p.edges }));
+    return { parts, server: cutShort ? Math.max(0, total - parts.length) : 0, functions: 0, last: '', tableCut: a.partial === true };
+}
+
+// How many nodes of these parts are not drawn yet
+function binaryGraphExploreFresh(st, parts) {
+    const have = new Set(st.nodes.map(n => n.id)), fresh = new Set();
+    for (const p of parts) for (const n of p.nodes) if (!have.has(n.id)) fresh.add(n.id);
+    return fresh.size;
+}
+
+// An edge into the drawing: a new one is added; one that is drawn already keeps its place, gains a count it lacked, and
+// keeps its origin only where both say the same. `seen` maps the key of each drawn edge to it.
+function binaryGraphExploreAddEdge(st, seen, e) {
+    const key = `${e.source}\n${e.target}\n${e.kind}`, old = seen.get(key);
+    if (old) {
+        old.origin = binaryGraphCombineOrigin(old.origin, e.origin);
+        if (old.functions === undefined && e.functions !== undefined) Object.assign(old, { functions: e.functions, label: e.label, partial: e.partial });
+        return;
+    }
+    const edge = { source: e.source, target: e.target, kind: e.kind, origin: e.origin, label: typeof e.label === 'string' ? e.label : '' };
+    if (e.functions !== undefined) Object.assign(edge, { functions: e.functions, partial: e.partial === true });
+    seen.set(key, edge);
+    st.edges.push(edge);
+}
+
+// The parts drawn, whole and in order, until one needs a node that does not fit: the cap, or `limit` new nodes of this
+// answer. That part and every later part that needs a new node is held back (the drawn ones stay the first in name order);
+// a part that needs none costs nothing and is drawn whatever came before it. A held part still draws the edges whose two
+// ends are drawn (the edge from an api set to the opened module is real once both are on the canvas) and comes back whole
+// when the nodes it needs are drawn: both are binaryGraphExploreRelease, which the walk runs after every merge. A node that is drawn already takes the answer's in-degree
+// and kind, unless the answer only guessed them. { added, held }: the ids of the nodes drawn and the parts held back.
+function binaryGraphExploreMerge(st, parts, limit) {
+    const cap = BINARY_GRAPH_EXPLORE.cap, have = new Map(st.nodes.map(n => [n.id, n]));
+    const seen = new Map(st.edges.map(e => [`${e.source}\n${e.target}\n${e.kind}`, e]));
+    const added = [], held = [];
+    let fresh = 0, full = false;
+    for (const part of parts) {
+        const news = part.nodes.filter(n => !have.has(n.id));
+        if (news.length && (full || st.nodes.length + news.length > cap || fresh + news.length > limit)) {
+            full = true;
+            held.push(part);
+            continue;
+        }
+        for (const n of part.nodes) {
+            let node = have.get(n.id);
+            const isNew = !node;
+            if (isNew) {
+                node = { id: n.id, label: typeof n.label === 'string' ? n.label : n.id, kind: n.kind, in_degree: 0, category: '', x: 0, y: 0, placed: false };
+                st.nodes.push(node);
+                have.set(n.id, node);
+                added.push(n.id);
+                fresh++;
+            }
+            if (isNew || !n.guess) {
+                node.kind = n.kind;
+                node.in_degree = Math.max(0, Number(n.in_degree) || 0);
+                node.degreeKnown = !n.guess;
+                node.category = typeof n.category === 'string' ? n.category : '';
+                if (typeof n.machine === 'string' && n.machine) node.machine = n.machine;
+            }
+            node.radius = binaryGraphNodeRadius(node);
+        }
+        for (const e of part.edges) binaryGraphExploreAddEdge(st, seen, e);
+    }
+    return { added, held };
+}
+
+// What was held back comes back when it can: every edge of a held part whose two ends are drawn is drawn, and a part all
+// of whose nodes are drawn is no longer held. Without this a neighbour that is drawn later, by another expansion, would
+// sit beside the node it imports with no edge between them, which reads as "does not import it".
+function binaryGraphExploreRelease(st) {
+    const have = new Set(st.nodes.map(n => n.id)), seen = new Map(st.edges.map(e => [`${e.source}\n${e.target}\n${e.kind}`, e]));
+    for (const record of st.cut.values()) {
+        for (const [head, part] of record.held) {
+            for (const e of part.edges) if (have.has(e.source) && have.has(e.target)) binaryGraphExploreAddEdge(st, seen, e);
+            if (part.nodes.every(n => have.has(n.id))) record.held.delete(head);
+        }
+    }
+}
+
+// What is cut now, per opened node and level: the parts the server dropped of its own answer, the imported functions it
+// dropped from a list grouped by module (and the module whose count is a lower bound), the nodes with a table (import, delay-load or
+// export) that was cut short when the graph was read, the nodes whose importers were read over a cut table, and what the
+// parts held back because they did not fit still miss: the head of each, or where the head is drawn, the nodes of its path
+// that are not, each counted once. { hidden (neighbours known to be
+// missing), server, functions, tables, importers, dropped, any, parents, of, ofFunctions, ofTable, ofImporters, lastDrawn,
+// tableEdges }
+function binaryGraphExploreCut(st) {
+    const drawn = new Set(st.nodes.map(n => n.id)), heads = new Set(), of = new Map(), ofFunctions = new Map(), ofTable = new Set(), ofImporters = new Set(), parents = new Set();
+    let server = 0, functions = 0, lastDrawn = false, tableEdges = false;
+    for (const record of st.cut.values()) {
+        // what a held part still misses: its head while that is not drawn, and once another expansion drew the head,
+        // the nodes of its path that are not (an api set), counted once however many parts miss the same one
+        const held = new Set();
+        for (const [head, part] of record.held) {
+            if (!drawn.has(head)) held.add(head);
+            else part.nodes.forEach(n => { if (!drawn.has(n.id)) held.add(n.id); });
+        }
+        if (!record.server && !record.functions && !record.table && !record.tableIn && !held.size) continue;
+        server += record.server;
+        functions += record.functions;
+        held.forEach(id => heads.add(id));
+        parents.add(record.from);
+        of.set(record.from, (of.get(record.from) || 0) + record.server + held.size);
+        if (record.functions) {
+            ofFunctions.set(record.from, (ofFunctions.get(record.from) || 0) + record.functions);
+            if (record.last && drawn.has(record.last)) lastDrawn = true;
+        }
+        if (record.table) {
+            ofTable.add(record.from);
+            if (st.edges.some(e => e.source === record.from && e.partial)) tableEdges = true;
+        }
+        if (record.tableIn) ofImporters.add(record.from);
+    }
+    return { hidden: server + heads.size, server, functions, tables: ofTable.size, importers: ofImporters.size, dropped: heads.size, any: parents.size > 0,
+             parents: parents.size, of, ofFunctions, ofTable, ofImporters, lastDrawn, tableEdges };
+}
+
+// The line above the canvas: that the picture is cut, in words, and the note of the last step. { tone, html }
+function binaryGraphExploreStatus(st) {
+    if (st.loading) return { tone: 'info', html: '' };
+    const cut = binaryGraphExploreCut(st);
+    const n = (count, one, many) => `${escapeHtml(count.toLocaleString('en-US'))} ${count === 1 ? one : many}`;
+    let html = '';
+    if (cut.any) {
+        const why = [];
+        if (cut.server) why.push(`${n(cut.server, 'was', 'were')} cut by the server from its own answer`);
+        if (cut.functions) {
+            why.push(`${n(cut.functions, 'imported function was', 'imported functions were')} cut by the server from a list of imports, so the modules after the last one it kept are missing`
+                + `${cut.lastDrawn ? ' and the count on that edge is at least what it says' : ''}`);
+        }
+        if (cut.tables) {
+            why.push(`${n(cut.tables, 'opened node has', 'opened nodes have')} a table (import, delay-load or export) that was cut short when it was read, so modules may be missing`
+                + `${cut.tableEdges ? ' and the counts on its edges are at least what they say' : ''}`);
+        }
+        if (cut.importers) {
+            // a fact about the graph, not about this node: the sentence points at the figure that says how big it is
+            why.push(`who imports ${n(cut.importers, 'opened node', 'opened nodes')} may be incomplete: some tables (import, delay-load or export) of the graph were cut short when the graph was read, `
+                + 'and a binary whose table was cut may be one that imports it; the figures say how many');
+        }
+        if (cut.dropped) why.push(`${n(cut.dropped, 'did', 'did')} not fit on this canvas, which holds at most ${escapeHtml(String(BINARY_GRAPH_EXPLORE.cap))} nodes`);
+        html += `<strong class="binary-graph-cut">Not the whole neighbourhood${cut.hidden ? `: ${n(cut.hidden, 'neighbour is', 'neighbours are')} not shown, ` : ', '}`
+            + `of ${n(cut.parents, 'opened node', 'opened nodes')}: ${why.join(' and ')}. Whole neighbours were dropped, in name order: `
+            + 'a node that is missing here is not shown, which does not mean it is not imported.</strong> ';
+    }
+    if (st.note) html += `<span class="binary-graph-note">${escapeHtml(st.note)}</span>`;
+    return { tone: cut.any ? 'warn' : 'info', html };
+}
+
+// What a node says of how many binaries import it: not a number it was not given (a module whose read failed is "not
+// read", not zero), and for a function the module it is of
+function binaryGraphExploreDegree(node) {
+    const bang = node.id.indexOf('!');
+    if (node.kind === 'function' && bang > 0) return `of ${node.id.slice(0, bang)}`;
+    if (node.degreeKnown === false) return 'in-degree not read';
+    return `imported by ${(Number(node.in_degree) || 0).toLocaleString('en-US')} binaries of System32`;
+}
+
+// The line under the canvas: the chosen node, or how much is drawn. Everything from a binary is escaped.
+// What the controls around a chosen node do. START chooses the binary it draws at once, so without this the line
+// that guides a reader ("Choose a node, then EXPAND…") never appears: it only shows while nothing is chosen. A
+// function or an api set has no functions to open, and naming a button that is disabled for it would mislead.
+// DEPTH belongs to EXPAND alone: FUNCTIONS is one hop whatever DEPTH says (binaryGraphOpenFunctions).
+function binaryGraphExploreNextStep(node) {
+    const opens = node && (node.kind === 'dll' || node.kind === 'exe');
+    return 'EXPAND opens the modules around it, as many hops as DEPTH says'
+        + (opens ? '; FUNCTIONS draws the functions it imports, always one hop.' : '.');
+}
+
+function binaryGraphExploreInfo(st) {
+    const node = st.selected ? st.nodes.find(n => n.id === st.selected) : null;
+    if (!node) {
+        if (!st.nodes.length) return '';
+        return `${escapeHtml(st.nodes.length.toLocaleString('en-US'))} nodes, ${escapeHtml(st.edges.length.toLocaleString('en-US'))} edges. `
+            + 'Choose a node, then EXPAND opens its neighbours (a double click does both) and FUNCTIONS the functions it imports.';
+    }
+    const kind = (binaryGraphOwn(BINARY_GRAPH_KINDS, node.kind) || { name: String(node.kind || 'unknown') }).name;
+    let html = `<strong>${escapeHtml(node.label)}</strong> · ${escapeHtml(kind)}${node.machine ? ` · ${escapeHtml(node.machine)}` : ''} · ${escapeHtml(binaryGraphExploreDegree(node))}`;
+    const cut = binaryGraphExploreCut(st), left = cut.of.get(node.id), lost = cut.ofFunctions.get(node.id);
+    if (left) html += ` · ${escapeHtml(left.toLocaleString('en-US'))} of its neighbours are not shown`;
+    if (lost) html += ` · ${escapeHtml(lost.toLocaleString('en-US'))} of its imported functions are not shown`;
+    if (cut.ofTable.has(node.id)) html += ' · it has a table (import, delay-load or export) that was cut short when it was read: modules may be missing';
+    if (cut.ofImporters.has(node.id)) html += ' · the list of its importers may be incomplete: some tables (import, delay-load or export) were cut short when the graph was read (the figures say how many)';
+    return `${html} · ${escapeHtml(binaryGraphExploreNextStep(node))}`;
+}
+
+// New neighbours of `parentId` are laid out around it with the process graph's force layout (applyForceLayout, used as
+// it is: it takes its nodes and edges as arguments), on copies of the parent and the new nodes, then moved to the
+// parent and away from the rest of the picture, so nothing that is drawn moves
+function binaryGraphExploreLayout(st, parentId, added) {
+    if (!added.length) return;
+    const byId = new Map(st.nodes.map(n => [n.id, n])), parent = byId.get(parentId);
+    const fresh = added.map(id => byId.get(id));
+    const copies = [{ id: parent.id, x: 0, y: 0 }, ...fresh.map(n => ({ id: n.id, x: 0, y: 0 }))];
+    const names = new Set(copies.map(c => c.id));
+    applyForceLayout(copies, st.edges.filter(e => names.has(e.source) && names.has(e.target)));
+    const dx = parent.x - copies[0].x, dy = parent.y - copies[0].y;
+    let reach = 0;
+    for (const c of copies.slice(1)) reach = Math.max(reach, Math.hypot(c.x - copies[0].x, c.y - copies[0].y));
+    const others = st.nodes.filter(n => n.placed && n !== parent);
+    let px = 0, py = 0;
+    if (others.length) {
+        const cx = others.reduce((sum, n) => sum + n.x, 0) / others.length, cy = others.reduce((sum, n) => sum + n.y, 0) / others.length;
+        const length = Math.hypot(parent.x - cx, parent.y - cy) || 1;
+        px = (parent.x - cx) / length * reach * 0.6;
+        py = (parent.y - cy) / length * reach * 0.6;
+    }
+    fresh.forEach((n, i) => {
+        n.x = copies[i + 1].x + dx + px;
+        n.y = copies[i + 1].y + dy + py;
+        n.placed = true;
+    });
+}
+
+// One query of the binary graph: { ok, answer } or { ok: false, status, error }
+async function binaryGraphExploreAsk(params) {
+    const r = await syscallApi(`/api/binary-graph/query?${new URLSearchParams(params)}`);
+    return r.ok ? { ok: true, answer: r.data } : { ok: false, status: r.status, error: syscallErrorText(r) };
+}
+
+// START: the binary asked for, drawn alone. A function as the path view names it (module!function) opens its module.
+// A name the graph does not have leaves the picture as it was.
+async function binaryGraphExploreStart(name) {
+    const st = binaryGraphExplore;
+    let text = String(name ?? '').trim();
+    const bang = text.indexOf('!');
+    if (bang > 0) text = text.slice(0, bang);
+    if (!text) {
+        st.note = 'Name a binary to start from, such as kernel32.dll.';
+        binaryGraphExploreRender();
+        return false;
+    }
+    const seq = ++st.seq;
+    st.loading = true;
+    st.note = '';
+    binaryGraphExploreRender();
+    const r = await syscallApi(`/api/binary-graph/node?${new URLSearchParams({ name: text })}`);
+    if (seq !== st.seq) return false;
+    st.loading = false;
+    const d = r.data && typeof r.data === 'object' ? r.data : {};
+    if (!r.ok || typeof d.name !== 'string' || !d.name || (d.is !== 'binary' && d.is !== 'api-set')) {
+        st.note = r.ok ? `${text} is not in the binary graph of this system.` : syscallErrorText(r);
+        binaryGraphExploreRender();
+        return false;
+    }
+    const id = d.name.toLowerCase();
+    const node = { id, label: id, kind: binaryGraphDetailKind(d, id), in_degree: Math.max(0, Number(d.in_degree) || 0), category: '',
+                   machine: typeof d.machine === 'string' ? d.machine : '', degreeKnown: true, x: 0, y: 0, placed: true };
+    node.radius = binaryGraphNodeRadius(node);
+    st.nodes = [node];
+    st.edges = [];
+    st.cut = new Map();
+    st.modules = new Map([[id, { kind: node.kind, in_degree: node.in_degree, machine: node.machine }]]);
+    st.selected = id;
+    st.hovered = null;
+    st.dragging = null;
+    st.panning = false;
+    Object.assign(st.camera, { x: 0, y: 0, zoom: 1 });
+    if (!binaryGraphFit()) binaryGraphExploreRender();
+    return true;
+}
+
+function binaryGraphExploreSubmit(event) {
+    if (event && typeof event.preventDefault === 'function') event.preventDefault();
+    const input = document.getElementById('binary-explore-start');
+    return binaryGraphExploreStart(input ? input.value : '');
+}
+
+// The kind and in-degree of modules, read once each from /api/binary-graph/node and remembered until the next START:
+// `q=imports` names the functions a module imports, not the modules, so a module that EXPAND draws from it has no size
+// of its own yet. A name the graph does not have still says how many binaries import it. Returns how many were read.
+async function binaryGraphExploreModules(st, names) {
+    const todo = [...new Set(names)].filter(name => !st.modules.has(name));
+    for (let i = 0; i < todo.length; i += BINARY_GRAPH_EXPLORE.batch) {
+        await Promise.all(todo.slice(i, i + BINARY_GRAPH_EXPLORE.batch).map(async name => {
+            const r = await syscallApi(`/api/binary-graph/node?${new URLSearchParams({ name })}`);
+            const d = r.data && typeof r.data === 'object' ? r.data : {};
+            if (r.ok) st.modules.set(name, { kind: binaryGraphDetailKind(d, name), in_degree: Math.max(0, Number(d.in_degree) || 0), machine: typeof d.machine === 'string' ? d.machine : '' });
+            else if (r.status === 404) st.modules.set(name, { kind: binaryGraphGuessKind(name), in_degree: Math.max(0, Number(d.in_degree) || 0), machine: '' });
+        }));
+    }
+    return todo.length;
+}
+
+// The modules of these parts that were read take their kind and in-degree
+function binaryGraphExploreFill(st, parts) {
+    for (const part of parts) {
+        for (const n of part.nodes) {
+            const read = n.guess ? st.modules.get(n.id) : null;
+            if (!read) continue;
+            Object.assign(n, { kind: read.kind, in_degree: read.in_degree, machine: read.machine, guess: false });
+        }
+    }
+}
+
+// EXPAND: the neighbours of a node, in both directions, as many hops as DEPTH says, added to what is drawn. Where the
+// canvas has room for only some of both directions each gets its share. A walk stops where the canvas is full or after
+// `reads` requests, and says how many nodes of its last ring it did not open. A newer START or EXPAND overtakes it.
+function binaryGraphExpand(id) {
+    return binaryGraphExploreWalk(id, 'modules');
+}
+
+// FUNCTIONS: the functions a module imports, one node each, the level deeper. One hop, whatever DEPTH says: a function
+// has no neighbours of its own to walk on.
+function binaryGraphOpenFunctions(id) {
+    return binaryGraphExploreWalk(id, 'functions');
+}
+
+async function binaryGraphExploreWalk(id, level) {
+    const st = binaryGraphExplore, g = BINARY_GRAPH_EXPLORE, node = st.nodes.find(n => n.id === id);
+    if (!node || st.loading) return false;
+    const seq = ++st.seq, depth = level === 'functions' ? 1 : binaryGraphState.depth, failed = [], notes = [];
+    st.loading = true;
+    st.note = '';
+    binaryGraphExploreRender();
+    let current = [node.id], reads = 0, unopened = 0, opened = false, grew = false;
+    for (let hop = 0; hop < depth && current.length; hop++) {
+        const next = [];
+        for (let i = 0; i < current.length; i++) {
+            const from = st.nodes.find(n => n.id === current[i]), requests = from ? binaryGraphExploreRequests(from, level) : [];
+            if (!requests.length) continue;
+            if (hop > 0 && (st.nodes.length >= g.cap || reads + requests.length > g.reads)) {
+                unopened = current.length - i;
+                break;
+            }
+            reads += requests.length;
+            const answers = await Promise.all(requests.map(r => binaryGraphExploreAsk(r.params)));
+            if (seq !== st.seq) return false;
+            const results = [];
+            answers.forEach((a, k) => {
+                if (!a.ok) {
+                    if (hop === 0) notes.push(a.error);
+                    else failed.push(from.id);
+                    return;
+                }
+                if (hop === 0) opened = true;
+                const found = binaryGraphExploreParts(requests[k], a.answer);
+                results.push({ request: requests[k], found, note: typeof a.answer.note === 'string' ? a.answer.note : '' });
+            });
+            // the direction with fewer new nodes first, held to its share of the room
+            const room = g.cap - st.nodes.length;
+            results.forEach(r => { r.fresh = binaryGraphExploreFresh(st, r.found.parts); });
+            results.sort((a, b) => a.fresh - b.fresh);
+            const added = [];
+            for (let k = 0; k < results.length; k++) {
+                const r = results[k], other = results.length > 1 ? results[1 - k].fresh : 0;
+                const limit = results.length > 1 && k === 0 ? Math.min(r.fresh, Math.max(Math.floor(room / 2), room - other)) : Infinity;
+                if (r.request.dir === 'out' && r.request.level === 'modules') {
+                    // only the modules that will be drawn are read
+                    const drawn = new Set(st.nodes.map(n => n.id));
+                    const wanted = r.found.parts.filter(p => !drawn.has(p.head)).slice(0, Math.max(0, Math.min(limit, g.cap - st.nodes.length))).map(p => p.head);
+                    reads += await binaryGraphExploreModules(st, wanted);
+                    if (seq !== st.seq) return false;
+                    binaryGraphExploreFill(st, r.found.parts);
+                }
+                const merged = binaryGraphExploreMerge(st, r.found.parts, limit);
+                const key = `${from.id}\n${r.request.dir}\n${r.request.level}`;
+                if (r.found.server || r.found.functions || r.found.tableCut || merged.held.length) {
+                    st.cut.set(key, { from: from.id, server: r.found.server, functions: r.found.functions, last: r.found.last, table: r.found.tableCut && r.request.dir === 'out', tableIn: r.found.tableCut && r.request.dir === 'in',
+                                      held: new Map(merged.held.map(part => [part.head, part])) });
+                } else {
+                    st.cut.delete(key);
+                }
+                binaryGraphExploreLayout(st, from.id, merged.added);
+                binaryGraphExploreRelease(st);
+                added.push(...merged.added);
+                if (hop === 0 && !merged.added.length && r.note) notes.push(r.note);
+            }
+            if (added.length) grew = true;
+            next.push(...added.filter(a => { const n = st.nodes.find(x => x.id === a); return n && (n.kind === 'dll' || n.kind === 'exe' || n.kind === 'api-set'); }));
+        }
+        current = next;
+        binaryGraphExploreRender();
+        if (unopened) break;
+    }
+    const said = [];
+    if (unopened) {
+        said.push(`The walk of depth ${depth} stopped ${st.nodes.length >= g.cap ? 'because the canvas is full' : `after ${reads} requests`}: ${unopened.toLocaleString('en-US')} ${unopened === 1 ? 'node' : 'nodes'} of its last ring ${unopened === 1 ? 'was' : 'were'} not opened.`);
+    }
+    if (failed.length) {
+        said.push(`${failed.length.toLocaleString('en-US')} ${failed.length === 1 ? 'node' : 'nodes'} could not be read just now, so ${failed.length === 1 ? 'its' : 'their'} neighbours may be missing.`);
+    }
+    if (!grew) said.push(...notes);
+    st.note = said.join(' ');
+    st.loading = false;
+    binaryGraphExploreRender();
+    return opened;
+}
+
+// Every node laid out again, and the view fitted
+function binaryGraphRelayout() {
+    const st = binaryGraphExplore;
+    if (!st.nodes.length) return false;
+    applyForceLayout(st.nodes, st.edges);
+    st.nodes.forEach(n => { n.placed = true; });
+    return binaryGraphFit();
+}
+
+// DEPTH: 1 to 3 hops, and no number outside them; nothing is rounded or clamped into range
+function binaryGraphSetDepth(n) {
+    if (typeof n !== 'number' || !BINARY_GRAPH_EXPLORE.depths.includes(n)) return false;
+    binaryGraphState.depth = n;
+    binaryGraphExploreRender();
+    return true;
+}
+
+// PATH / EXPLORE: the view that is on. The path's query bar and canvas and the explorer's are separate elements.
+// ⇱ gives the graph the height of the figures table, the way the RIZIN tab's ⇱ gives one half the width. It folds
+// the rows and nothing above them: the caveat that a binary's table was cut short when the graph was read sits in
+// the figures' own status line, and every path and explore answer points the reader at that line. A folded pointer
+// would dangle, so the bar, RELOAD and that line stay.
+function binaryGraphApplyMax() {
+    const surface = document.getElementById('syscall-surface-graph');
+    if (!surface) return false;
+    const maxed = !!binaryGraphState.maxed;
+    surface.classList.toggle('binary-graph-maxed', maxed);
+    const button = document.getElementById('binary-graph-max');
+    if (button) {
+        button.setAttribute('aria-pressed', String(maxed));
+        button.title = maxed ? 'Give the figures their rows back' : 'Give the graph the height of the figures table';
+        button.setAttribute('aria-label', button.title);
+    }
+    // the stage's own ResizeObserver resizes the canvas when it grows, so nothing is redrawn from here
+    return true;
+}
+
+// A fold or unfold by hand wins over the view's default from then on, the same rule the scan panels follow: a view
+// that keeps reclosing what the reader opened is worse than one that never folded.
+function binaryGraphToggleMax() {
+    binaryGraphState.maxed = !binaryGraphState.maxed;
+    binaryGraphState.maxedByHand = true;
+    return binaryGraphApplyMax();
+}
+
+function binaryGraphSetMode(mode) {
+    if (mode !== 'path' && mode !== 'explore') return false;
+    binaryGraphExplore.mode = mode;
+    const path = document.getElementById('binary-graph-path'), explore = document.getElementById('binary-explore');
+    if (path) path.hidden = mode !== 'path';
+    if (explore) explore.hidden = mode !== 'explore';
+    for (const name of ['path', 'explore']) {
+        const button = document.getElementById(`binary-graph-mode-${name}`);
+        if (button) button.setAttribute('aria-pressed', String(name === mode));
+    }
+    // EXPLORE works on the canvas and wants the height; PATH draws a short answer and its reader wants the figures
+    // beside it. At 1280x900 that is the difference between 254px of canvas and 438.
+    if (!binaryGraphState.maxedByHand) binaryGraphState.maxed = mode === 'explore';
+    binaryGraphApplyMax();
+    if (mode === 'explore') {
+        initBinaryGraphExplore();
+        binaryGraphExploreRender();
+    } else {
+        renderBinaryGraph();
+    }
+    return true;
+}
+
+// The elements around the canvas, then the canvas
+function binaryGraphExploreRender() {
+    const st = binaryGraphExplore, el = id => document.getElementById(id);
+    const status = el('binary-explore-status');
+    if (status) {
+        const s = binaryGraphExploreStatus(st);
+        status.innerHTML = s.html;
+        status.className = `binary-graph-status binary-graph-status-${cssToken(s.tone)}`;
+        status.hidden = !s.html;
+    }
+    const info = el('binary-explore-info');
+    if (info) info.innerHTML = binaryGraphExploreInfo(st);
+    const legend = el('binary-explore-legend');
+    if (legend) legend.innerHTML = binaryGraphLegend('explore', st.edges);
+    const expand = el('binary-explore-expand');
+    if (expand) {
+        expand.disabled = st.loading || !st.selected;
+        // a disabled button says what to do first, the way SCAN says "Choose a process first"
+        expand.title = !expand.disabled ? 'Open the neighbours of the chosen node'
+            : st.loading ? 'Wait for what is being opened' : 'Choose a node first: click one on the canvas';
+    }
+    const functions = el('binary-explore-functions'), chosen = st.selected ? st.nodes.find(n => n.id === st.selected) : null;
+    if (functions) {
+        functions.disabled = st.loading || !chosen || (chosen.kind !== 'dll' && chosen.kind !== 'exe');
+        functions.title = !functions.disabled ? 'Draw the functions the chosen module imports, one node each'
+            : st.loading ? 'Wait for what is being opened'
+            : !chosen ? 'Choose a module first: click one on the canvas'
+            : 'Only a module imports functions: this node is not one';
+    }
+    for (const n of BINARY_GRAPH_EXPLORE.depths) {
+        const button = el(`binary-explore-depth-${n}`);
+        if (button) button.setAttribute('aria-pressed', String(binaryGraphState.depth === n));
+    }
+    const zoom = el('binary-explore-zoom');
+    if (zoom) zoom.textContent = `${Math.round(st.camera.zoom * 100)}%`;
+    binaryGraphDraw();
+}
+
+function binaryGraphDraw() {
+    const st = binaryGraphExplore, canvas = document.getElementById('binary-explore-canvas');
+    if (!canvas || typeof canvas.getContext !== 'function') return false;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (!st.nodes.length) {
+        ctx.save();
+        ctx.fillStyle = themeColor('--text-muted');
+        ctx.font = '14px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(st.loading ? 'Opening…' : st.note || 'Name a binary and START: it is drawn alone, and EXPAND opens its neighbours one node at a time.',
+                     canvas.width / 2, canvas.height / 2);
+        ctx.restore();
+        return true;
+    }
+    const camera = st.camera, byId = new Map(st.nodes.map(n => [n.id, n]));
+    ctx.save();
+    ctx.translate(camera.x, camera.y);
+    ctx.scale(camera.zoom, camera.zoom);
+    // an edge of the chosen node is drawn heavier and in full, the others step back. Edges between the same two nodes
+    // (an import and a forwarder) are drawn side by side.
+    const lanes = new Map();
+    for (const e of st.edges) {
+        const a = byId.get(e.source), b = byId.get(e.target);
+        if (!a || !b || a === b) continue;
+        const hot = !!st.selected && (e.source === st.selected || e.target === st.selected);
+        const look = binaryGraphEdgeLook(e);
+        const pair = e.source < e.target ? `${e.source}\n${e.target}` : `${e.target}\n${e.source}`;
+        const lane = lanes.get(pair) || 0;
+        lanes.set(pair, lane + 1);
+        const length = Math.hypot(b.x - a.x, b.y - a.y) || 1, ux = (b.x - a.x) / length, uy = (b.y - a.y) / length;
+        const ox = -uy * lane * 5, oy = ux * lane * 5;
+        ctx.globalAlpha = !st.selected || hot ? 1 : 0.25;
+        ctx.strokeStyle = look.color;
+        ctx.fillStyle = look.color;
+        ctx.lineWidth = hot ? look.width + 1.5 : look.width;
+        ctx.setLineDash(look.dash ? look.dash.split(' ').map(Number) : []);
+        ctx.beginPath();
+        ctx.moveTo(a.x + ox, a.y + oy);
+        ctx.lineTo(b.x + ox, b.y + oy);
+        ctx.stroke();
+        const tipX = b.x + ox - ux * b.radius, tipY = b.y + oy - uy * b.radius;
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.moveTo(tipX, tipY);
+        ctx.lineTo(tipX - ux * 9 - uy * 4, tipY - uy * 9 + ux * 4);
+        ctx.lineTo(tipX - ux * 9 + uy * 4, tipY - uy * 9 - ux * 4);
+        ctx.closePath();
+        ctx.fill();
+        // the number of functions an edge stands for, on the edges of the chosen node, or on all of a small picture
+        if (e.functions !== undefined && camera.zoom >= 0.5 && (hot || (!st.selected && st.edges.length <= 40))) {
+            ctx.fillStyle = themeColor('--text-secondary');
+            ctx.font = '10px monospace';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'alphabetic';
+            ctx.fillText(e.label, (a.x + b.x) / 2 + ox, (a.y + b.y) / 2 + oy - 4);
+        }
+    }
+    ctx.globalAlpha = 1;
+    ctx.setLineDash([]);
+    for (const n of st.nodes) {
+        const look = binaryGraphNodeLook(n, '');
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
+        ctx.fillStyle = look.fill;
+        ctx.fill();
+        ctx.strokeStyle = look.stroke;
+        ctx.lineWidth = look.width;
+        ctx.stroke();
+        if (n.id === st.selected) {
+            ctx.beginPath();
+            ctx.arc(n.x, n.y, n.radius + 4, 0, Math.PI * 2);
+            ctx.strokeStyle = themeColor('--text-primary');
+            ctx.lineWidth = 2;
+            ctx.stroke();
+        }
+        if (camera.zoom >= 0.7 || n.radius >= 16 || n.id === st.selected || n === st.hovered) {
+            ctx.fillStyle = themeColor('--text-primary');
+            ctx.font = '11px monospace';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'alphabetic';
+            ctx.fillText(binaryGraphCut(n.label, 28), n.x, n.y + n.radius + 13);
+        }
+    }
+    ctx.restore();
+    const cut = binaryGraphExploreCut(st);
+    ctx.save();
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    if (cut.any) {
+        const pieces = [];
+        if (cut.hidden) pieces.push(`${cut.hidden.toLocaleString('en-US')} not shown`);
+        if (cut.functions) pieces.push(`${cut.functions.toLocaleString('en-US')} imported functions not shown`);
+        if (cut.tables) pieces.push(`${cut.tables.toLocaleString('en-US')} ${cut.tables === 1 ? 'opened node has' : 'opened nodes have'} a table cut short`);
+        if (cut.importers) pieces.push('importers may be incomplete (some tables cut short, the figures say how many)');
+        ctx.fillStyle = themeColor('--severity-medium');
+        ctx.fillText(`Not the whole neighbourhood: ${pieces.join(', ')} (the canvas holds ${BINARY_GRAPH_EXPLORE.cap} nodes)`, 12, 10);
+    }
+    if (st.loading) {
+        ctx.fillStyle = themeColor('--text-muted');
+        ctx.fillText('Opening…', 12, canvas.height - 22);
+    }
+    ctx.restore();
+    return true;
+}
+
+// The camera of this view: four small functions over `binaryGraphExplore.camera` and #binary-explore-canvas. They exist
+// because the process graph's own (screenToWorld, worldToScreen, findNodeAt, graphFitView, graphZoomIn, graphZoomOut)
+// bind `graphState` and #graph-canvas directly, and making them take a state would mean editing a working tab to serve
+// a second caller. Both views share applyForceLayout, which takes its data as arguments, and no state.
+function binaryGraphToWorld(sx, sy) {
+    const c = binaryGraphExplore.camera;
+    return { x: (sx - c.x) / c.zoom, y: (sy - c.y) / c.zoom };
+}
+
+// The node under a point of the world; a small node on a zoomed-out canvas can still be hit
+function binaryGraphNodeAt(wx, wy) {
+    const st = binaryGraphExplore, reach = 8 / st.camera.zoom;
+    for (let i = st.nodes.length - 1; i >= 0; i--) {
+        const n = st.nodes[i], r = Math.max(n.radius, reach);
+        if ((wx - n.x) ** 2 + (wy - n.y) ** 2 < r * r) return n;
+    }
+    return null;
+}
+
+// Every node in view
+function binaryGraphFit() {
+    const st = binaryGraphExplore, canvas = document.getElementById('binary-explore-canvas');
+    if (!canvas || !st.nodes.length) return false;
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const n of st.nodes) {
+        minX = Math.min(minX, n.x - n.radius);
+        maxX = Math.max(maxX, n.x + n.radius);
+        minY = Math.min(minY, n.y - n.radius);
+        maxY = Math.max(maxY, n.y + n.radius + 14);
+    }
+    const w = maxX - minX + 120, h = maxY - minY + 120;
+    const zoom = Math.max(0.1, Math.min(canvas.width / w, canvas.height / h, 2));
+    st.camera.zoom = zoom;
+    st.camera.x = canvas.width / 2 - (minX + maxX) / 2 * zoom;
+    st.camera.y = canvas.height / 2 - (minY + maxY) / 2 * zoom;
+    binaryGraphExploreRender();
+    return true;
+}
+
+// Zoom by a factor toward a point of the canvas (its middle without one)
+function binaryGraphZoom(factor, sx, sy) {
+    const st = binaryGraphExplore, canvas = document.getElementById('binary-explore-canvas');
+    if (!canvas || !(factor > 0)) return false;
+    const c = st.camera, old = c.zoom;
+    c.zoom = Math.max(0.1, Math.min(5, old * factor));
+    const x = sx === undefined ? canvas.width / 2 : sx, y = sy === undefined ? canvas.height / 2 : sy;
+    c.x = x - (x - c.x) * (c.zoom / old);
+    c.y = y - (y - c.y) * (c.zoom / old);
+    binaryGraphExploreRender();
+    return true;
+}
+
+// The stage changed size: the camera holds a screen offset, so without moving it the drawing stays anchored to the
+// old corner and slides out of view - after ⇱ gave the figures their rows back, the node sat half outside with its
+// label cut off. Moving the camera by half the change keeps the world point that was in the middle in the middle,
+// at the same zoom. A first size (no canvas yet) moves nothing: there was no middle to keep.
+function binaryGraphCanvasResized(canvas, w, h) {
+    if (!canvas || !(w > 0) || !(h > 0)) return false;
+    const c = binaryGraphExplore.camera;
+    if (canvas.width > 0 && canvas.height > 0) {
+        c.x += (w - canvas.width) / 2;
+        c.y += (h - canvas.height) / 2;
+    }
+    canvas.width = w;
+    canvas.height = h;
+    return true;
+}
+
+function binaryGraphOnCanvasDown(ev) {
+    const st = binaryGraphExplore, w = binaryGraphToWorld(ev.offsetX, ev.offsetY), node = binaryGraphNodeAt(w.x, w.y);
+    st.moved = false;
+    st.down = { x: ev.offsetX, y: ev.offsetY };
+    if (node) {
+        st.dragging = node;
+    } else {
+        st.panning = true;
+        st.panStart = { x: ev.offsetX, y: ev.offsetY };
+    }
+}
+
+function binaryGraphOnCanvasMove(ev) {
+    const st = binaryGraphExplore;
+    if (st.dragging || st.panning) {
+        if (!st.moved && Math.hypot(ev.offsetX - st.down.x, ev.offsetY - st.down.y) < BINARY_GRAPH_EXPLORE.drag) return;
+        st.moved = true;
+        if (st.dragging) {
+            const w = binaryGraphToWorld(ev.offsetX, ev.offsetY);
+            st.dragging.x = w.x;
+            st.dragging.y = w.y;
+        } else {
+            st.camera.x += ev.offsetX - st.panStart.x;
+            st.camera.y += ev.offsetY - st.panStart.y;
+            st.panStart = { x: ev.offsetX, y: ev.offsetY };
+        }
+        binaryGraphDraw();
+        return;
+    }
+    const w = binaryGraphToWorld(ev.offsetX, ev.offsetY), node = binaryGraphNodeAt(w.x, w.y);
+    if (node === st.hovered) return;
+    st.hovered = node;
+    const canvas = document.getElementById('binary-explore-canvas');
+    if (canvas) canvas.title = node ? `${node.id} · ${binaryGraphExploreDegree(node)}` : '';
+    binaryGraphDraw();
+}
+
+function binaryGraphOnCanvasUp() {
+    const st = binaryGraphExplore;
+    st.dragging = null;
+    st.panning = false;
+}
+
+function binaryGraphOnCanvasLeave() {
+    const st = binaryGraphExplore;
+    st.dragging = null;
+    st.panning = false;
+    if (st.hovered) {
+        st.hovered = null;
+        binaryGraphDraw();
+    }
+}
+
+function binaryGraphOnCanvasWheel(ev) {
+    if (typeof ev.preventDefault === 'function') ev.preventDefault();
+    binaryGraphZoom(ev.deltaY > 0 ? 0.9 : 1.1, ev.offsetX, ev.offsetY);
+}
+
+// A click chooses the node under it, or lets go of the choice on empty ground. The click that ends a drag is no choice.
+function binaryGraphOnCanvasClick(ev) {
+    const st = binaryGraphExplore;
+    if (st.moved) {
+        st.moved = false;
+        return false;
+    }
+    const w = binaryGraphToWorld(ev.offsetX, ev.offsetY), node = binaryGraphNodeAt(w.x, w.y);
+    st.selected = node ? node.id : null;
+    binaryGraphExploreRender();
+    return !!node;
+}
+
+// A double click chooses the node and opens its neighbours
+function binaryGraphOnCanvasDblClick(ev) {
+    const st = binaryGraphExplore, w = binaryGraphToWorld(ev.offsetX, ev.offsetY), node = binaryGraphNodeAt(w.x, w.y);
+    if (!node) return false;
+    st.selected = node.id;
+    return binaryGraphExpand(node.id);
+}
+
+// The canvas follows the box it is in, and the pointer is read from the canvas
+function initBinaryGraphExplore() {
+    const st = binaryGraphExplore, canvas = document.getElementById('binary-explore-canvas'), stage = document.getElementById('binary-explore-stage');
+    if (st.ready || !canvas || !stage) return;
+    st.ready = true;
+    const resize = () => {
+        const w = stage.clientWidth, h = stage.clientHeight;
+        if (!w || !h || (canvas.width === w && canvas.height === h)) return;
+        binaryGraphCanvasResized(canvas, w, h);
+        binaryGraphDraw();
+    };
+    resize();
+    if (typeof ResizeObserver !== 'undefined') new ResizeObserver(resize).observe(stage);
+    else window.addEventListener('resize', resize);
+    canvas.addEventListener('mousedown', binaryGraphOnCanvasDown);
+    canvas.addEventListener('mousemove', binaryGraphOnCanvasMove);
+    canvas.addEventListener('mouseup', binaryGraphOnCanvasUp);
+    canvas.addEventListener('mouseleave', binaryGraphOnCanvasLeave);
+    canvas.addEventListener('wheel', binaryGraphOnCanvasWheel, { passive: false });
+    canvas.addEventListener('click', binaryGraphOnCanvasClick);
+    canvas.addEventListener('dblclick', binaryGraphOnCanvasDblClick);
+}
+
+// --- GRAPH, FIGURES: the whole stock as a table, each number opening its list --------------------------------------------
+// Figures over the whole of System32 do not belong in a cloud of nodes, where they would be unreadable: they are a table
+// under the canvases, one row per figure (/api/binary-graph/metrics). A number opens the list behind it in the shared
+// detail panel (/api/binary-graph/query?q=metric), and a row of that list starts an exploration from that binary. A figure
+// of zero is a row without a link, because an empty list is a dead end the reader had to click to find; a figure the server
+// could not give says n/a, which is not 0.
+// figure -> its name in the table, what it counts, and where a row of its list leads: 'binary' (EXPLORE from it), 'syscall'
+// (who reaches the syscall the row leads to), '' (nowhere: a file that is not in the graph has no neighbours to open)
+const BINARY_GRAPH_METRICS = {
+    binaries: { name: 'Binaries', means: 'The DLLs and EXEs of System32 that the graph read.', jump: 'binary' },
+    edges: { name: 'Import edges', means: 'A binary and a module it imports, by the name the importer wrote: an api set counts as itself.', jump: 'binary' },
+    api_sets_resolved: { name: 'Api sets resolved', means: 'Api sets that binaries import and the map of this system has a host for.', jump: 'binary' },
+    forwarders: { name: 'Forwarded exports', means: 'Exports that name a function of another module instead of holding its code.', jump: 'binary' },
+    isolated: { name: 'Isolated binaries', means: 'Nothing imports them, and they import nothing else of System32.', jump: 'binary' },
+    circular_pairs: { name: 'Circular pairs', means: 'Two binaries that import each other, counted as one pair.', jump: 'binary' },
+    curated_transitions: { name: 'Curated transitions', means: 'Rows of the Win32 to Nt table: its word, not read from any binary.', jump: 'syscall' },
+    most_imported: { name: 'Most imported', means: 'The modules most binaries import.', jump: 'binary' },
+    skipped: { name: 'Skipped files', means: 'Files of System32 that could not be read and are not in the graph.', jump: '' },
+    partial: { name: 'Binaries with a cut table', means: 'Binaries with a table (import, delay-load or export) that was cut short when it was read.', jump: 'binary' },
+};
+// how many neighbours a row of a list names before it says how many more there are
+const BINARY_GRAPH_MEMBER_LINKS = 6;
+
+// The figures as rows, in the order of the table: { key, name, means, value (a number, or null where the server gave none),
+// open (there is a list to open: a figure above zero) }
+function binaryGraphMetricRows(figures) {
+    if (!figures || typeof figures !== 'object') return [];
+    return Object.keys(BINARY_GRAPH_METRICS).map(key => {
+        const meta = BINARY_GRAPH_METRICS[key], raw = figures[key];
+        let value = null, means = meta.means;
+        if (key === 'most_imported') {
+            // an empty top is a zero (nothing is imported); only a list that is not there is not known
+            const top = Array.isArray(raw) && raw.length && raw[0] && typeof raw[0] === 'object' ? raw[0] : null;
+            const degree = top ? Number(top.in_degree) : NaN;
+            if (top && typeof top.name === 'string' && Number.isFinite(degree) && degree >= 0) {
+                value = degree;
+                means += ` The first is ${top.name}, imported by ${degree.toLocaleString('en-US')} ${degree === 1 ? 'binary' : 'binaries'}.`;
+            } else if (Array.isArray(raw) && !raw.length) {
+                value = 0;
+            }
+        } else if (typeof raw === 'number' && Number.isFinite(raw) && raw >= 0) {
+            value = raw;
+        }
+        return { key, name: meta.name, means, value, open: value !== null && value > 0 };
+    });
+}
+
+function binaryGraphMetricRowHtml(row) {
+    const shown = row.value === null ? 'n/a' : row.value.toLocaleString('en-US');
+    const cell = row.open
+        ? `<button type="button" class="binary-graph-figure" title="List what it counts" onclick="binaryGraphMetricOpen(${jsArg(row.key)})">${escapeHtml(shown)}</button>`
+        : escapeHtml(shown);
+    const sort = row.value === null ? '' : ` data-sort-value="${row.value}"`;
+    return `<tr><td>${escapeHtml(row.name)}</td><td class="view-table-num"${sort}>${cell}</td><td class="binary-graph-means">${escapeHtml(row.means)}</td></tr>`;
+}
+
+// The line above the table: what is being read or why it could not be, and otherwise the caveat of the figures and the stamp
+// of the graph they are of. { tone, html } with html '' when there is nothing to say.
+function binaryGraphMetricsStatus() {
+    const st = binaryGraphState, f = st.figures;
+    if (!f) return { tone: st.figuresNote ? 'warn' : 'info', html: st.figuresLoading ? 'Reading the figures…' : escapeHtml(st.figuresNote) };
+    let html = '';
+    const cut = typeof f.partial === 'number' && f.partial > 0 ? f.partial : 0;
+    if (cut) {
+        html += `<strong class="binary-graph-cut">${escapeHtml(cut.toLocaleString('en-US'))} ${cut === 1 ? 'binary has' : 'binaries have'} a table (import, delay-load or export) that was cut short when the graph was read: `
+            + 'the counts that read tables are lower bounds, and the number of isolated binaries is an upper one.</strong> ';
+    }
+    // `skipped` is of the same class as `partial` and belongs beside it: the figures table, its only other home, is
+    // what EXPLORE folds away. What is missing is the skipped file's own imports and exports; a binary that imports
+    // one is still counted, because _reach deliberately links to a file nobody could read rather than claim an
+    // absence over it. And `skipped` also counts a name that is a duplicate in another case, which was passed over
+    // rather than unreadable - hence "not read", not "could not be read".
+    const lost = typeof f.skipped === 'number' && f.skipped > 0 ? f.skipped : 0;
+    if (lost) {
+        html += `<strong class="binary-graph-cut">${escapeHtml(lost.toLocaleString('en-US'))} ${lost === 1 ? 'file of System32 was' : 'files of System32 were'} not read when the graph was built: `
+            + `what ${lost === 1 ? 'it imports and exports is' : 'they import and export is'} in no count and in no answer, though a binary that imports `
+            + `${lost === 1 ? 'it' : 'one of them'} still is.</strong> `;
+    }
+    const stamp = [f.build ? `build ${f.build}` : '', f.arch || ''].filter(Boolean).join(' · ');
+    if (stamp) html += `<span class="syscall-muted">${escapeHtml(stamp)}</span>`;
+    return { tone: cut || lost ? 'warn' : 'info', html };
+}
+
+function renderBinaryGraphMetrics() {
+    const st = binaryGraphState, el = id => document.getElementById(id);
+    const status = el('binary-graph-metrics-status');
+    if (status) {
+        const s = binaryGraphMetricsStatus();
+        status.innerHTML = s.html;
+        status.className = `binary-graph-status binary-graph-status-${cssToken(s.tone)}`;
+        status.hidden = !s.html;
+    }
+    const body = el('binary-graph-metrics-body');
+    if (!body) return false;
+    const rows = binaryGraphMetricRows(st.figures);
+    body.innerHTML = rows.length ? rows.map(row => binaryGraphMetricRowHtml(row)).join('')
+        : `<tr data-sort-skip><td colspan="3" class="view-table-empty">${escapeHtml(st.figuresLoading ? 'Reading the figures…' : st.figuresNote || 'The figures have not been read yet.')}</td></tr>`;
+    return true;
+}
+
+// The figures, read when the surface is shown and still not had (a graph that was not there yet is asked for again the next
+// time), or on RELOAD
+async function binaryGraphMetricsLoad(force) {
+    const st = binaryGraphState;
+    if (st.figuresLoading || (st.figures && !force)) return false;
+    st.figuresLoading = true;
+    renderBinaryGraphMetrics();
+    const r = await syscallApi('/api/binary-graph/metrics');
+    st.figuresLoading = false;
+    st.figures = r.ok ? r.data : null;
+    st.figuresNote = r.ok ? '' : syscallErrorText(r);
+    renderBinaryGraphMetrics();
+    return r.ok;
+}
+
+// What the panel shows: the list of a figure, while the graph is the surface and nothing else was chosen since
+function binaryGraphMetricShown() {
+    return syscallState.view === 'graph' && !!binaryGraphState.metric;
+}
+
+// A choice of something else lets go of the list, and an answer still on its way is not shown when it comes
+function binaryGraphMetricForget() {
+    binaryGraphRequests.metric++;
+    if (!binaryGraphState.metric) return false;
+    binaryGraphState.metric = null;
+    return true;
+}
+
+function binaryGraphMetricClose() {
+    binaryGraphMetricForget();
+    renderSyscallDetailPanel();
+    return true;
+}
+
+// A number was clicked: the list behind it, in the shared detail panel. A figure of zero, one that is not there and a name
+// that is no figure have no list, and none is asked for.
+async function binaryGraphMetricOpen(key) {
+    const st = binaryGraphState;
+    const row = binaryGraphOwn(BINARY_GRAPH_METRICS, key) ? binaryGraphMetricRows(st.figures).find(r => r.key === key) : null;
+    if (!row || !row.open) return false;
+    const seq = ++binaryGraphRequests.metric;
+    st.metric = { key, loading: true, answer: null, error: '' };
+    renderSyscallDetailPanel();
+    const body = document.getElementById('syscall-detail-body');
+    if (body) body.scrollTop = 0;
+    if (typeof window.matchMedia === 'function' && window.matchMedia(SYSCALL_NARROW).matches) syscallSetPane('detail');
+    const r = await syscallApi(`/api/binary-graph/query?${new URLSearchParams({ q: 'metric', metric: key })}`);
+    if (seq !== binaryGraphRequests.metric) return false;
+    st.metric = r.ok ? { key, loading: false, answer: r.data, error: '' } : { key, loading: false, answer: null, error: syscallErrorText(r) };
+    renderSyscallDetailPanel();
+    return r.ok;
+}
+
+// Where a row of the list leads in the graph, or null: { mode: 'explore', name } starts an exploration from the binary,
+// { mode: 'syscall', name } asks who reaches the syscall the row leads to (a Win32 function of the table is no module,
+// there is nothing to explore from), each with the hint of its button
+function binaryGraphMetricJump(key, node, edges) {
+    const meta = binaryGraphOwn(BINARY_GRAPH_METRICS, key);
+    if (!meta || !node || typeof node.id !== 'string') return null;
+    if (meta.jump === 'binary') {
+        // START opens the module of a function (module!function): the name given is the one it would show
+        const bang = node.id.indexOf('!');
+        return { mode: 'explore', name: bang > 0 ? node.id.slice(0, bang) : node.id, hint: 'Start an exploration from it' };
+    }
+    if (meta.jump === 'syscall') {
+        const edge = edges.find(e => e && e.source === node.id && typeof e.target === 'string' && e.target.startsWith(BINARY_GRAPH_SYSCALL));
+        return edge ? { mode: 'syscall', name: edge.target.slice(BINARY_GRAPH_SYSCALL.length), hint: 'Show the binaries that reach the syscall it leads to' } : null;
+    }
+    return null;
+}
+
+// The neighbours of a row, as the answer's edges give them: the other end of each edge with its direction, and what the edge
+// claims. An edge the table drew says so, an edge that names no origin says that, and one read from the binaries names only the
+// api set it goes through: a claim is stated where it is not the default, and never lent.
+function binaryGraphMetricLinks(id, byId, edges) {
+    const others = new Map();
+    for (const e of edges) {
+        if (!e || typeof e.source !== 'string' || typeof e.target !== 'string') continue;
+        const out = e.source === id, into = e.target === id;
+        if (!out && !into) continue;
+        const other = out ? e.target : e.source;
+        const entry = others.get(other) || { out: false, into: false, tags: [] };
+        entry.out = entry.out || out;
+        entry.into = entry.into || into;
+        const origin = binaryGraphOrigin(e), label = typeof e.label === 'string' ? e.label : '';
+        let tag = '';
+        if (origin === 'curated') tag = /^curated\b/i.test(label) ? label : `curated${label ? `: ${label}` : ''}`;
+        else if (origin === 'unknown') tag = 'origin unknown';
+        else if (label) tag = `via ${label}`;
+        if (tag && !entry.tags.includes(tag)) entry.tags.push(tag);
+        others.set(other, entry);
+    }
+    const shown = [...others].slice(0, BINARY_GRAPH_MEMBER_LINKS).map(([other, entry]) => {
+        const node = byId.get(other), name = node && node.kind === 'syscall' ? node.label || other : other;
+        const arrow = entry.out && entry.into ? '⇄' : entry.out ? '→' : '←';
+        return `<span class="binary-graph-link">${arrow} ${escapeHtml(name)}${entry.tags.length ? ` <span class="binary-graph-link-tag">(${escapeHtml(entry.tags.join(', '))})</span>` : ''}</span>`;
+    });
+    const more = others.size - shown.length;
+    if (more > 0) shown.push(`<span class="syscall-muted">and ${escapeHtml(more.toLocaleString('en-US'))} more</span>`);
+    return shown.join(' ');
+}
+
+// The list behind a figure, as the detail panel shows it: one row per root of the answer, a button where the row leads into the graph
+function binaryGraphMetricHtml(metric) {
+    const meta = binaryGraphOwn(BINARY_GRAPH_METRICS, metric.key) || { name: String(metric.key || ''), jump: '' };
+    const head = `<div class="syscall-detail-name"><span class="syscall-detail-sc">${escapeHtml(meta.name)}</span>`
+        + '<button type="button" class="btn btn-sm binary-graph-close" onclick="binaryGraphMetricClose()">CLOSE</button></div>';
+    if (metric.loading) return head + '<p class="syscall-empty">Asking the binary graph…</p>';
+    if (!metric.answer) return head + `<p class="syscall-empty syscall-empty-error">${escapeHtml(metric.error)}</p>`;
+    const a = metric.answer;
+    const nodes = Array.isArray(a.nodes) ? a.nodes.filter(n => n && typeof n.id === 'string') : [];
+    const edges = Array.isArray(a.edges) ? a.edges : [];
+    const byId = new Map(nodes.map(n => [n.id, n]));
+    const roots = (Array.isArray(a.roots) ? a.roots : []).filter(id => byId.has(id));
+    let html = head;
+    if (a.truncated) {
+        html += `<p class="binary-graph-cut">Not the whole list: ${escapeHtml(roots.length.toLocaleString('en-US'))} of ${escapeHtml((Number(a.total) || 0).toLocaleString('en-US'))} are shown, `
+            + 'whole parts of it, and what is not shown is not absent.</p>';
+    }
+    if (typeof a.note === 'string' && a.note) html += `<p class="syscall-detail-note">${escapeHtml(a.note)}</p>`;
+    html += '<ul class="binary-graph-members">' + roots.map(id => {
+        const node = byId.get(id), jump = binaryGraphMetricJump(metric.key, node, edges);
+        const text = node.kind === 'function' ? node.id : String(node.label || node.id);
+        const name = jump
+            ? `<button type="button" class="binary-graph-member-name" title="${escapeHtml(jump.hint)}" onclick="binaryGraphMetricGo(${jsArg(node.id)})">${escapeHtml(text)}</button>`
+            : `<span class="binary-graph-member-name">${escapeHtml(text)}</span>`;
+        const kind = (binaryGraphOwn(BINARY_GRAPH_KINDS, node.kind) || { name: '' }).name;
+        const degree = meta.jump === 'binary' && node.kind !== 'function' ? ` · imported by ${(Number(node.in_degree) || 0).toLocaleString('en-US')}` : '';
+        const links = binaryGraphMetricLinks(node.id, byId, edges);
+        return `<li class="binary-graph-member">${name} <span class="syscall-muted">${escapeHtml(kind)}${escapeHtml(degree)}</span>${links ? `<div class="binary-graph-links">${links}</div>` : ''}</li>`;
+    }).join('') + '</ul>';
+    return html;
+}
+
+// A row of the list was clicked: into the graph. A row that leads nowhere, or is not in the list, does nothing. The list stays,
+// to be walked down; on a narrow screen the graph comes back to the front.
+function binaryGraphMetricGo(id) {
+    const m = binaryGraphState.metric, a = m && m.answer;
+    if (!a || !Array.isArray(a.nodes)) return false;
+    const edges = Array.isArray(a.edges) ? a.edges : [];
+    const jump = binaryGraphMetricJump(m.key, a.nodes.find(n => n && n.id === id), edges);
+    if (!jump) return false;
+    const el = name => document.getElementById(name);
+    if (typeof window.matchMedia === 'function' && window.matchMedia(SYSCALL_NARROW).matches) syscallSetPane('map');
+    if (jump.mode === 'explore') {
+        binaryGraphSetMode('explore');
+        const input = el('binary-explore-start');
+        if (input) input.value = jump.name;
+        return binaryGraphExploreStart(jump.name);
+    }
+    binaryGraphSetMode('path');
+    const select = el('binary-graph-query'), first = el('binary-graph-module'), second = el('binary-graph-function');
+    if (select) select.value = 'syscall-callers';
+    if (first) first.value = jump.name;
+    if (second) second.value = '';
+    binaryGraphOnQuery();
+    return binaryGraphRun();
 }

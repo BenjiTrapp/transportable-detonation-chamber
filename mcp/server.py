@@ -12,6 +12,7 @@ import datetime
 import functools
 import json
 import os
+import re
 import sys
 from typing import Optional
 
@@ -1648,6 +1649,148 @@ def tdc_logs_search(query: str = "*", earliest: str = "-24h", limit: int = 100) 
         lines.append(f"{ev.get('time', '')} {ev.get('source', ''):<10} {_one_line(ev.get('message'))}")
     if count > len(events):
         lines.append(f"... {count - len(events)} more; narrow the query or raise limit")
+    return "\n".join(lines)
+
+
+# --- Firewall (read-only: nothing here blocks, isolates, decides, kills or enables) ---
+
+_RELATIVE_UNITS = {"m": 60, "h": 3600, "d": 86400}
+
+
+def _fw_since(since: str) -> Optional[str]:
+    """The ``since`` the API takes (ISO-8601 or epoch seconds) for -15m / -2h / -7d, an ISO time, or all."""
+    text = (since or "").strip()
+    if not text or text.lower() == "all":
+        return None
+    if text.startswith("-") and text[1:-1].isdigit() and text[-1:].lower() in _RELATIVE_UNITS:
+        seconds = int(text[1:-1]) * _RELATIVE_UNITS[text[-1].lower()]
+        return f"{datetime.datetime.now(datetime.timezone.utc).timestamp() - seconds:.0f}"
+    return text
+
+
+# The schemes that are always one, as in the FIREWALL tab's fwDefang (app.js), which this follows rule for rule
+_FW_SCHEMES = frozenset({
+    "http", "https", "ftp", "ftps", "sftp", "file", "smb", "javascript", "vbscript", "jscript", "data", "blob",
+    "about", "mailto", "tel", "ws", "wss", "ldap", "ms-msdt", "search-ms", "ms-officecmd", "ms-word", "ms-excel",
+    "mhtml"})
+_BIDI = re.compile("[\u061c\u200e\u200f\u202a-\u202e\u2066-\u2069]")
+
+
+def _defang(text) -> str:
+    """A URL or host name as the FIREWALL tab shows it: hxxp://, example[.]com. Never a working link.
+
+    A known scheme is always one (javascript:1/alert(1)); another word before a colon is one only without a dot and
+    not followed by digits (host:port). The host is what follows the scheme, with or without // or \\\\ before it."""
+    s = _BIDI.sub("", _one_line(text, 300))
+    if not s:
+        return ""
+    m = re.match(r"([a-z][a-z0-9+.-]*):", s, re.I)
+    scheme = ""
+    if m:
+        after = s[m.end():]
+        if m.group(1).lower() in _FW_SCHEMES or ("." not in m.group(1) and not re.match(r"\d+(?:[/?#\\]|$)", after)):
+            scheme = m.group(1)
+    head, rest = "", s
+    if scheme:
+        rest = s[len(scheme) + 1:]
+        web = scheme.lower() in ("http", "https")
+        head = (scheme.replace("t", "x").replace("T", "X") + ":") if web else scheme + "[:]"
+        if not web and not re.match(r"[/\\]{2}", rest):
+            return head + rest.replace(".", "[.]")
+    lead = re.match(r"[/\\]*", rest).group(0)
+    after = rest[len(lead):]
+    cut = re.search(r"[/\\?#]", after)
+    host, tail = (after, "") if cut is None else (after[:cut.start()], after[cut.start():])
+    return head + lead + host.replace(".", "[.]") + tail
+
+
+def _fw_base(image) -> str:
+    return str(image or "?").replace("/", "\\").rsplit("\\", 1)[-1]
+
+
+@mcp.tool()
+def tdc_firewall_connections(since: str = "-24h", tag: str = "", process: str = "", limit: int = 100) -> str:
+    """List the chamber's network connections as the FIREWALL tab bundles and tags them (read-only).
+
+    One line per flow (process, PID, protocol, destination): severity, state (allowed, blocked by a TDC-FW-*
+    rule, or pending a decision), the image, the endpoint with its host name (defanged), country and AS
+    organisation, the number of connections, the tags and the last packet. Most severe first. There are no
+    byte counts: Sysmon records none. "blocked" means a verified rule stands, not that packets were dropped,
+    and a tcp rule also marks a udp flow to the same endpoint as blocked (the rule's protocol is not
+    compared). The firewall log's drops belong to the endpoint, not the process (endpoint_dropped).
+    Nothing in this tool blocks, isolates or decides anything.
+
+    Tags: ioc, beacon (critical); sigma, detonated, direct-ip, download, tdc-anomaly (high); lolbin, dga,
+    risky-tld, dead-drop, rare-port (medium); newborn (low).
+
+    Args:
+        since: Start of the range: -15m, -4h, -7d (on this machine's clock), an ISO-8601 time, or "all" (default -24h)
+        tag: Only flows with this tag, e.g. beacon, download, direct-ip (default: all)
+        process: Only flows whose image contains this text, case-insensitive (default: all)
+        limit: Most flows to list, 1-5000 (default 100)
+    """
+    params = {"max": max(1, min(int(limit), 5000))}
+    start = _fw_since(since)
+    if start is not None:
+        params["since"] = start
+    if tag:
+        params["tag"] = tag
+    if process:
+        params["process"] = process
+    r = _call("GET", "/api/firewall/connections", params=params)
+    if not isinstance(r, dict):
+        return "Unexpected answer from /api/firewall/connections"
+    if r.get("error"):
+        return f"Error: {r['error']}"
+    flows = r.get("connections") or []
+    count = r.get("count", len(flows))
+    head = f"{count} connections" + (f", the {len(flows)} most severe shown" if r.get("truncated") else "")
+    head += f" | ISOLATED {'on' if r.get('isolated') else 'off'} | ASK {r.get('ask_mode', '?')}"
+    lines = [head]
+    if r.get("rules_error"):
+        lines.append(f"The firewall rules could not be read ({_one_line(r['rules_error'], 200)}): nothing is claimed as blocked.")
+    for f in flows:
+        geo = f.get("geo") or {}
+        where = "local" if geo.get("scope") == "local" else " ".join(
+            str(v) for v in (geo.get("cc"), f"AS{geo['asn']}" if geo.get("asn") else None, geo.get("as_org")) if v) or "-"
+        host = f" ({_defang(f['dst_hostname'])})" if f.get("dst_hostname") else ""
+        rule = f" {f['rule_id']}" if f.get("state") == "blocked" and f.get("rule_id") else ""
+        tags = ",".join(f.get("tags") or []) or "-"
+        dropped = f" endpoint_dropped={f['fw_dropped']}" if f.get("fw_dropped") else ""
+        own = " [TDC]" if f.get("self") else ""
+        lines.append(f"{f.get('severity', 'info'):<8} {f.get('state', '?')}{rule} | {_fw_base(f.get('image'))} "
+                     f"(PID {f.get('pid', '?')}){own} -> {f.get('protocol', '?')} {f.get('dst_ip', '?')}:{f.get('dst_port', '?')}"
+                     f"{host} | {where} | {f.get('count', 0)}x, last {f.get('last_seen', '?')} | {tags}{dropped}")
+    if not flows:
+        lines.append("No connections in this range.")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def tdc_firewall_captures(limit: int = 50) -> str:
+    """List the samples TDC fetched itself when a detonated process tried to download a file (read-only).
+
+    Newest first: when, SHA-256, size, file type by its first bytes, the URL (defanged), the endpoint, the
+    process that asked for it, and the path in the VM. A capture is never executed; the path can go to
+    tdc_pe_analyze, tdc_file_hex or tdc_file_signature. Nothing in this tool fetches, blocks or decides.
+
+    Args:
+        limit: Most captures to list, newest first (default 50)
+    """
+    r = _call("GET", "/api/firewall/captures")
+    if not isinstance(r, dict):
+        return "Unexpected answer from /api/firewall/captures"
+    if r.get("error"):
+        return f"Error: {r['error']}"
+    caps = r.get("captures") or []
+    shown = caps[:max(1, int(limit))]
+    lines = [f"{len(caps)} captures" + (f", the newest {len(shown)} shown" if len(shown) < len(caps) else "")]
+    for c in shown:
+        lines.append(f"{c.get('fetched_at', '?')} {c.get('sha256', '?')} {c.get('size', '?')} B "
+                     f"{c.get('magic') or '?'} | {_defang(c.get('url'))} via {c.get('dst_ip', '?')}:{c.get('dst_port', '?')} "
+                     f"| {_fw_base(c.get('image'))} (PID {c.get('pid', '?')}) | {c.get('path') or '-'}")
+    if not caps:
+        lines.append("No samples secured yet.")
     return "\n".join(lines)
 
 

@@ -22,7 +22,8 @@ param(
         'help','prerequisites','install','run','run-debug','dev','uninstall',
         'up','halt','destroy','reload','provision','provision-webui',
         'deploy','deploy-app','restart','deploy-restart','open','logs',
-        'ssh','rdp','status','services','alerts','test','unit-test','submit',
+        'ssh','rdp','status','services','alerts','test','unit-test','docs',
+        'site','site-serve','submit',
         'clean','clean-all'
     )]
     [string]$Target = 'help',
@@ -36,7 +37,16 @@ param(
 
     [Parameter()]
     [Alias('IP')]
-    [string]$VMIp = '172.17.251.7'
+    [string]$VMIp = '172.17.251.7',
+
+    # The documentation website: the build folder and the port the local
+    # preview listens on - the same two knobs the Makefile has (SITE_DIR,
+    # SITE_PORT), so the two front ends cannot drift apart.
+    [Parameter()]
+    [string]$SiteDir = 'site',
+
+    [Parameter()]
+    [int]$SitePort = 8099
 )
 
 # --- Configuration ---
@@ -74,6 +84,11 @@ switch ($Target) {
         Write-Host ""
         Write-Host "  Setup:" -ForegroundColor Yellow
         Write-Host "    .\make.ps1 prerequisites   Check/install all prerequisites"
+        Write-Host ""
+        Write-Host "  Documentation:" -ForegroundColor Yellow
+        Write-Host "    .\make.ps1 docs            Build the offline wiki -> webui\static\wiki.html"
+        Write-Host "    .\make.ps1 site            Build the documentation website -> $SiteDir\ (builds the wiki too)"
+        Write-Host "    .\make.ps1 site-serve      Build it and serve it on http://localhost:$SitePort/"
         Write-Host ""
         Write-Host "  Local (no VM required):" -ForegroundColor Yellow
         Write-Host "    .\make.ps1 install         Install Python venv + dependencies"
@@ -144,6 +159,57 @@ switch ($Target) {
         } else {
             Write-Host "[unit-test] MCP tests skipped (mcp\.venv not found)" -ForegroundColor Yellow
         }
+    }
+
+    'docs' {
+        # The offline wiki is built on the host, never on the VM: the generator
+        # is plain Python 3 (standard library only), and the deploy paths carry
+        # the finished file up. It stops with a message when
+        # scripts\wiki\mermaid.min.js is missing or its checksum does not
+        # match, so a wiki whose diagrams are dead text is never written.
+        Write-Host "[docs] Building the offline wiki from docs\ ..." -ForegroundColor Cyan
+        $DocsPy = "webui\.venv\Scripts\python.exe"
+        if (-not (Test-Path $DocsPy)) { $DocsPy = "python" }
+        & $DocsPy scripts\build-wiki.py -o webui\static\wiki.html
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[docs] the wiki was not built" -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    }
+
+    'site' {
+        # The website is the second output of the same generator: one folder
+        # per page for GitHub Pages. The wiki is built first, because the
+        # download the header offers (webui\static\wiki.html) is git-ignored
+        # and is not there in a fresh clone - a site without it would promise
+        # a file nobody can get. The Makefile says `site: docs`; here the arm
+        # is called the same way site-serve calls this one, so the wiki is
+        # built in one place only.
+        & $PSCommandPath docs
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        $SitePy = Join-Path $PSScriptRoot "webui\.venv\Scripts\python.exe"
+        if (-not (Test-Path $SitePy)) { $SitePy = "python" }
+        Write-Host "[site] Building the documentation website from docs\ and README.md ..." -ForegroundColor Cyan
+        & $SitePy scripts\build-wiki.py --site $SiteDir -o webui\static\wiki.html
+        if ($LASTEXITCODE -ne 0) {
+            Write-Host "[site] the website was not built" -ForegroundColor Red
+            exit $LASTEXITCODE
+        }
+    }
+
+    'site-serve' {
+        # A look at what would be published, before it is: the site has to open
+        # from a plain folder too.
+        & $PSCommandPath site -SiteDir $SiteDir
+        if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+        # The interpreter is named from the script's own folder, and before
+        # Push-Location: a relative path would be looked for inside the folder
+        # that is being served, where there is no venv.
+        $SitePy = Join-Path $PSScriptRoot "webui\.venv\Scripts\python.exe"
+        if (-not (Test-Path $SitePy)) { $SitePy = "python" }
+        Write-Host "[site-serve] http://localhost:$SitePort/ - Ctrl-C stops it" -ForegroundColor Cyan
+        Push-Location (Join-Path $PSScriptRoot $SiteDir)
+        try { & $SitePy -m http.server $SitePort } finally { Pop-Location }
     }
 
     'install' {
@@ -334,6 +400,14 @@ switch ($Target) {
             Copy-Item 'webui\net_tls.py' -Destination 'C:\DetonationChamberUI\net_tls.py' -ToSession $s -Force
             Invoke-Command -Session $s -ScriptBlock { New-Item -ItemType Directory -Path 'C:\DetonationChamberUI\rules\network' -Force | Out-Null }
             Copy-Item 'rules\network\default.yaml' -Destination 'C:\DetonationChamberUI\rules\network\default.yaml' -ToSession $s -Force
+            Copy-Item 'webui\syscall_baseline.py' -Destination 'C:\DetonationChamberUI\syscall_baseline.py' -ToSession $s -Force
+            Copy-Item 'webui\syscall_scan.py' -Destination 'C:\DetonationChamberUI\syscall_scan.py' -ToSession $s -Force
+            Copy-Item 'webui\syscall_rules.py' -Destination 'C:\DetonationChamberUI\syscall_rules.py' -ToSession $s -Force
+            Copy-Item 'webui\syscall_signatures.json' -Destination 'C:\DetonationChamberUI\syscall_signatures.json' -ToSession $s -Force
+            Copy-Item 'webui\win32_to_nt.py' -Destination 'C:\DetonationChamberUI\win32_to_nt.py' -ToSession $s -Force
+            Copy-Item 'webui\win32_to_nt.json' -Destination 'C:\DetonationChamberUI\win32_to_nt.json' -ToSession $s -Force
+            Copy-Item 'webui\binary_graph.py' -Destination 'C:\DetonationChamberUI\binary_graph.py' -ToSession $s -Force
+            Copy-Item 'webui\binary_graph_query.py' -Destination 'C:\DetonationChamberUI\binary_graph_query.py' -ToSession $s -Force
             Copy-Item 'webui\minidump_analysis.py' -Destination 'C:\DetonationChamberUI\minidump_analysis.py' -ToSession $s -Force
             Copy-Item 'webui\pipe_analysis.py' -Destination 'C:\DetonationChamberUI\pipe_analysis.py' -ToSession $s -Force
             Copy-Item 'webui\pipe_signatures.json' -Destination 'C:\DetonationChamberUI\pipe_signatures.json' -ToSession $s -Force
@@ -341,17 +415,40 @@ switch ($Target) {
             Copy-Item 'webui\pipe_proxy.py' -Destination 'C:\DetonationChamberUI\pipe_proxy.py' -ToSession $s -Force
             Copy-Item 'webui\log_search.py' -Destination 'C:\DetonationChamberUI\log_search.py' -ToSession $s -Force
             Copy-Item 'webui\log_store.py' -Destination 'C:\DetonationChamberUI\log_store.py' -ToSession $s -Force
+            Copy-Item 'webui\dashboards.py' -Destination 'C:\DetonationChamberUI\dashboards.py' -ToSession $s -Force
             Copy-Item 'webui\rizin_sessions.py' -Destination 'C:\DetonationChamberUI\rizin_sessions.py' -ToSession $s -Force
+            Copy-Item 'webui\rizin_emulation.py' -Destination 'C:\DetonationChamberUI\rizin_emulation.py' -ToSession $s -Force
             Copy-Item 'webui\tool_updates.py' -Destination 'C:\DetonationChamberUI\tool_updates.py' -ToSession $s -Force
+            Copy-Item 'webui\firewall.py' -Destination 'C:\DetonationChamberUI\firewall.py' -ToSession $s -Force
+            Copy-Item 'webui\firewall_fetch.py' -Destination 'C:\DetonationChamberUI\firewall_fetch.py' -ToSession $s -Force
+            Copy-Item 'webui\firewall_rules.py' -Destination 'C:\DetonationChamberUI\firewall_rules.py' -ToSession $s -Force
+            Copy-Item 'webui\firewall_rules.ps1' -Destination 'C:\DetonationChamberUI\firewall_rules.ps1' -ToSession $s -Force
+            Copy-Item 'webui\firewall_store.py' -Destination 'C:\DetonationChamberUI\firewall_store.py' -ToSession $s -Force
+            Copy-Item 'webui\geoip.py' -Destination 'C:\DetonationChamberUI\geoip.py' -ToSession $s -Force
             Copy-Item 'webui\templates\index.html' -Destination 'C:\DetonationChamberUI\templates\index.html' -ToSession $s -Force
             Copy-Item 'webui\static\css\style.css' -Destination 'C:\DetonationChamberUI\static\css\style.css' -ToSession $s -Force
             Copy-Item 'webui\static\css\theme-layout.css' -Destination 'C:\DetonationChamberUI\static\css\theme-layout.css' -ToSession $s -Force
             Copy-Item 'webui\static\css\theme-cyberpunk.css' -Destination 'C:\DetonationChamberUI\static\css\theme-cyberpunk.css' -ToSession $s -Force
             Copy-Item 'webui\static\js\app.js' -Destination 'C:\DetonationChamberUI\static\js\app.js' -ToSession $s -Force
+            # Data directories, whole: the offline geo index and the world map
+            Invoke-Command -Session $s -ScriptBlock { New-Item -ItemType Directory -Path 'C:\DetonationChamberUI\data', 'C:\DetonationChamberUI\static\data' -Force | Out-Null }
+            foreach ($dataDir in @('data', 'static\data')) {
+                foreach ($dataFile in @(Get-ChildItem "webui\$dataDir" -File)) {
+                    Copy-Item $dataFile.FullName -Destination "C:\DetonationChamberUI\$dataDir\$($dataFile.Name)" -ToSession $s -Force
+                }
+            }
             Copy-Item 'webui\static\icon.png' -Destination 'C:\DetonationChamberUI\static\icon.png' -ToSession $s -Force -ErrorAction SilentlyContinue
-            # Install scripts for the tool updates
+            # The offline wiki: built on the host by `.\make.ps1 docs`, git-ignored,
+            # and the only documentation on a VM that has no network. A fresh
+            # clone has none, and a deploy must not stop for that.
+            if (Test-Path 'webui\static\wiki.html') {
+                Copy-Item 'webui\static\wiki.html' -Destination 'C:\DetonationChamberUI\static\wiki.html' -ToSession $s -Force
+            } else {
+                Write-Host "[deploy] no webui\static\wiki.html - build the wiki with: .\make.ps1 docs" -ForegroundColor Yellow
+            }
+            # Install scripts for the tool updates, the logging set-up and the way out of ISOLATED
             Invoke-Command -Session $s -ScriptBlock { New-Item -ItemType Directory -Path 'C:\tdc\scripts' -Force | Out-Null }
-            foreach ($installScript in @(Get-ChildItem 'scripts' -Filter 'install-*.ps1') + @(Get-Item 'scripts\configure-logging.ps1')) {
+            foreach ($installScript in @(Get-ChildItem 'scripts' -Filter 'install-*.ps1') + @(Get-Item 'scripts\configure-logging.ps1', 'scripts\tdc-unisolate.ps1', 'scripts\build-binary-graph.ps1')) {
                 Copy-Item $installScript.FullName -Destination "C:\tdc\scripts\$($installScript.Name)" -ToSession $s -Force
             }
             Write-Host "[deploy] Files synced successfully." -ForegroundColor Green
@@ -381,6 +478,14 @@ switch ($Target) {
             Copy-Item 'webui\net_tls.py' -Destination 'C:\DetonationChamberUI\net_tls.py' -ToSession $s -Force
             Invoke-Command -Session $s -ScriptBlock { New-Item -ItemType Directory -Path 'C:\DetonationChamberUI\rules\network' -Force | Out-Null }
             Copy-Item 'rules\network\default.yaml' -Destination 'C:\DetonationChamberUI\rules\network\default.yaml' -ToSession $s -Force
+            Copy-Item 'webui\syscall_baseline.py' -Destination 'C:\DetonationChamberUI\syscall_baseline.py' -ToSession $s -Force
+            Copy-Item 'webui\syscall_scan.py' -Destination 'C:\DetonationChamberUI\syscall_scan.py' -ToSession $s -Force
+            Copy-Item 'webui\syscall_rules.py' -Destination 'C:\DetonationChamberUI\syscall_rules.py' -ToSession $s -Force
+            Copy-Item 'webui\syscall_signatures.json' -Destination 'C:\DetonationChamberUI\syscall_signatures.json' -ToSession $s -Force
+            Copy-Item 'webui\win32_to_nt.py' -Destination 'C:\DetonationChamberUI\win32_to_nt.py' -ToSession $s -Force
+            Copy-Item 'webui\win32_to_nt.json' -Destination 'C:\DetonationChamberUI\win32_to_nt.json' -ToSession $s -Force
+            Copy-Item 'webui\binary_graph.py' -Destination 'C:\DetonationChamberUI\binary_graph.py' -ToSession $s -Force
+            Copy-Item 'webui\binary_graph_query.py' -Destination 'C:\DetonationChamberUI\binary_graph_query.py' -ToSession $s -Force
             Copy-Item 'webui\minidump_analysis.py' -Destination 'C:\DetonationChamberUI\minidump_analysis.py' -ToSession $s -Force
             Copy-Item 'webui\pipe_analysis.py' -Destination 'C:\DetonationChamberUI\pipe_analysis.py' -ToSession $s -Force
             Copy-Item 'webui\pipe_signatures.json' -Destination 'C:\DetonationChamberUI\pipe_signatures.json' -ToSession $s -Force
@@ -388,9 +493,25 @@ switch ($Target) {
             Copy-Item 'webui\pipe_proxy.py' -Destination 'C:\DetonationChamberUI\pipe_proxy.py' -ToSession $s -Force
             Copy-Item 'webui\log_search.py' -Destination 'C:\DetonationChamberUI\log_search.py' -ToSession $s -Force
             Copy-Item 'webui\log_store.py' -Destination 'C:\DetonationChamberUI\log_store.py' -ToSession $s -Force
+            Copy-Item 'webui\dashboards.py' -Destination 'C:\DetonationChamberUI\dashboards.py' -ToSession $s -Force
             Copy-Item 'webui\rizin_sessions.py' -Destination 'C:\DetonationChamberUI\rizin_sessions.py' -ToSession $s -Force
+            Copy-Item 'webui\rizin_emulation.py' -Destination 'C:\DetonationChamberUI\rizin_emulation.py' -ToSession $s -Force
             Copy-Item 'webui\tool_updates.py' -Destination 'C:\DetonationChamberUI\tool_updates.py' -ToSession $s -Force
-            Write-Host "[deploy-app] app.py and modules synced." -ForegroundColor Green
+            Copy-Item 'webui\firewall.py' -Destination 'C:\DetonationChamberUI\firewall.py' -ToSession $s -Force
+            Copy-Item 'webui\firewall_fetch.py' -Destination 'C:\DetonationChamberUI\firewall_fetch.py' -ToSession $s -Force
+            Copy-Item 'webui\firewall_rules.py' -Destination 'C:\DetonationChamberUI\firewall_rules.py' -ToSession $s -Force
+            Copy-Item 'webui\firewall_rules.ps1' -Destination 'C:\DetonationChamberUI\firewall_rules.ps1' -ToSession $s -Force
+            Copy-Item 'webui\firewall_store.py' -Destination 'C:\DetonationChamberUI\firewall_store.py' -ToSession $s -Force
+            Copy-Item 'webui\geoip.py' -Destination 'C:\DetonationChamberUI\geoip.py' -ToSession $s -Force
+            # What the modules need at run time: the FIREWALL data and the way out of ISOLATED
+            Invoke-Command -Session $s -ScriptBlock { New-Item -ItemType Directory -Path 'C:\DetonationChamberUI\data', 'C:\DetonationChamberUI\static\data', 'C:\tdc\scripts' -Force | Out-Null }
+            foreach ($dataDir in @('data', 'static\data')) {
+                foreach ($dataFile in @(Get-ChildItem "webui\$dataDir" -File)) {
+                    Copy-Item $dataFile.FullName -Destination "C:\DetonationChamberUI\$dataDir\$($dataFile.Name)" -ToSession $s -Force
+                }
+            }
+            Copy-Item 'scripts\tdc-unisolate.ps1' -Destination 'C:\tdc\scripts\tdc-unisolate.ps1' -ToSession $s -Force
+            Write-Host "[deploy-app] app.py, modules, FIREWALL data and tdc-unisolate.ps1 synced." -ForegroundColor Green
         } finally {
             Remove-PSSession $s
         }

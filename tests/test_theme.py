@@ -766,6 +766,28 @@ def test_graph_node_kinds_are_distinguishable():
     assert not problems, "\n".join(problems)
 
 
+# The kinds of node the binary graph of the SYSCALLS tab draws (a function takes the text's colour)
+BINARY_GRAPH_KINDS = ["--graph-node-dll", "--graph-node-exe", "--graph-node-apiset", "--graph-node-syscall"]
+
+
+def test_binary_graph_node_kinds_are_distinguishable():
+    """Each kind of node of the binary graph keeps a colour of its own and stands out from the canvas, in each theme;
+    the curated edge and a filter match each have a colour, with the -rgb triplet a drawing with alpha reads."""
+    def distance(a, b):
+        return sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5
+    problems = []
+    for theme, values in (("Telemetry", _root_values()), ("Cyberpunk", _cyberpunk_palette())):
+        rgb = {kind: _hex_rgb(values[kind]) for kind in BINARY_GRAPH_KINDS}
+        background = _hex_rgb(values["--bg-primary"])
+        problems += [f"{theme}: {a} and {b} look alike" for i, a in enumerate(BINARY_GRAPH_KINDS)
+                     for b in BINARY_GRAPH_KINDS[i + 1:] if distance(rgb[a], rgb[b]) < 48]
+        problems += [f"{theme}: {kind} is too close to the background" for kind in BINARY_GRAPH_KINDS
+                     if distance(rgb[kind], background) < 150]
+        problems += [f"{theme}: {name} has no -rgb" for name in BINARY_GRAPH_KINDS + ["--graph-edge-curated", "--graph-match"]
+                     if not values.get(name + "-rgb")]
+    assert not problems, "\n".join(problems)
+
+
 # --- Telemetry (the theme with the id classic) -----------------------------------
 
 # The palette of docs/superpowers/specs/2026-11-16-classic-telemetry-design.md
@@ -869,9 +891,11 @@ def test_reduced_motion_disables_new_animations():
 # --- Theme switch ------------------------------------------------------------
 
 def _const_source(name):
-    """A top-level `const NAME = ...;` of app.js, for a Node prelude: one line,
-    or up to the first line that ends with `;`."""
-    m = re.search(r"^const %s = .*?;$" % re.escape(name), _read(APP_JS), re.M | re.S)
+    """A top-level `const NAME = ...;` (or `let`) of app.js, for a Node
+    prelude: one line, or up to the first line that ends with `;` (a trailing
+    comment behind it is part of that line)."""
+    m = re.search(r"^(?:const|let) %s = .*?;(?=[ \t]*(?://[^\n]*)?$)" % re.escape(name),
+                  _read(APP_JS), re.M | re.S)
     assert m, f"const {name} not found in app.js"
     return m.group(0)
 
@@ -1087,6 +1111,9 @@ globalThis.document = Object.assign(new EventTarget(), {
     createElement: tag => new El({ tag, attrs: {}, children: [] }),
 });
 globalThis.getComputedStyle = el => el.computed || {};
+// The ⋯ menus of the Dashboard tab are no part of this DOM: handleGlobalKeydown
+// asks them whether one of them was open
+globalThis.closeDashboardMenus = () => false;
 const calls = [];
 for (const f of ['initTabs', 'initGraphControls', 'refreshAll']) globalThis[f] = () => calls.push(f);
 globalThis.location = { reload: () => calls.push('location.reload') };
@@ -1799,6 +1826,25 @@ def test_every_layout_variable_is_defined_in_both_themes():
     assert not problems, "\n".join(problems)
 
 
+def test_both_themes_shape_the_logs_result_and_the_own_dashboards():
+    """The COMMANDS card, the result tabs with the form switches, the save dialog and the tiles of an own
+    dashboard came after the split, so their rules live in theme-layout.css under [data-theme]: Classic
+    is shaped like Cyberpunk and only the palette differs. In theme-cyberpunk.css (the palette) such a
+    rule would reach Cyberpunk alone, and Classic would keep the plainer style.css version."""
+    layout = _strip_comments(_raw(LAYOUT_CSS))
+    missing = [cls for cls in
+               ("logs-commands", "logs-commands-head", "logs-commands-toggle", "logs-cmd-group", "logs-cmd-head",
+                "logs-cmd-text", "logs-result-head", "logs-tab", "logs-forms", "logs-form", "logs-chart-card",
+                "logs-save-btn", "logs-save-content", "logs-save-title", "logs-save-pick",
+                "dashboard-pages", "dashboard-page", "dashboard-own-title", "dashboard-panels", "dashboard-panel",
+                "dashboard-panel-title", "dashboard-panel-form", "dashboard-panel-menu", "dashboard-panel-error")
+               if not re.search(r"\[data-theme\][^{]*\.%s\b" % cls, layout)]
+    assert not missing, "theme-layout.css has no rule for: " + ", ".join("." + c for c in missing)
+    own = re.findall(r"\[data-theme=[\"']cyberpunk[\"']\][^{]*\.(?:logs|dashboard)-[\w-]+",
+                     _strip_comments(_raw(THEME_CSS)))
+    assert not own, "LOGS or dashboard rules in theme-cyberpunk.css; Classic would not get them:\n" + "\n".join(own)
+
+
 def _declarations(body):
     """The declarations of a rule body as a set of 'property: value' (whitespace normalised)."""
     out, depth, start, quote = set(), 0, 0, None
@@ -1842,19 +1888,30 @@ def _as_cyberpunk(selector):
     return re.sub(r"\[data-theme\]", '[data-theme="cyberpunk"]', selector)
 
 
+# The rules of what came after the split (the FIREWALL tab, the decision toast): new, so not in the old sheet
+AFTER_THE_SPLIT = re.compile(r"\.fw-|#tab-firewall\b|#firewall-|\.toast-decision\b|\.decision-")
+
+
 def test_cyberpunk_rules_unchanged():
     """Splitting theme-cyberpunk.css into theme-layout.css and the palette must not change Cyberpunk: every
     rule of the file as of e11a9dd (before the split; tests/samples/) is still there, with the same
-    declarations, once the [data-theme] prefix of the layout is read as [data-theme="cyberpunk"]; nothing
-    else is added. The :root blocks (variables) are compared by their effective values."""
+    declarations, once the [data-theme] prefix of the layout is read as [data-theme="cyberpunk"]. Nothing
+    is added for an element the old sheet already styled; rules for elements that came after the split
+    (the COMMANDS card, the result tabs, the own dashboards) are allowed, and only for those. The :root
+    blocks (variables) are compared by their effective values."""
     def non_root(rules):
         return {k: v for k, v in rules.items() if ":root" not in k[1]}
     old = non_root(_flat_rules(_raw(OLD_THEME_CSS)))
     new = {(c, _as_cyberpunk(s)): v
-           for (c, s), v in non_root({**_flat_rules(_raw(LAYOUT_CSS)), **_flat_rules(_raw(THEME_CSS))}).items()}
+           for (c, s), v in non_root({**_flat_rules(_raw(LAYOUT_CSS)), **_flat_rules(_raw(THEME_CSS))}).items()
+           if not AFTER_THE_SPLIT.search(s)}
     assert old and len(old) > 700, "the old sheet was not read"
+    # The classes the old sheet knows: a rule may be new only if every class it names is outside them,
+    # so it belongs to an element that did not exist yet and cannot change how an old one looks.
+    old_classes = set(re.findall(r"\.([\w-]+)", _raw(OLD_THEME_CSS)))
     missing = sorted(set(old) - set(new))
-    extra = sorted(set(new) - set(old))
+    extra = sorted(key for key in set(new) - set(old)
+                   if not set(re.findall(r"\.([\w-]+)", key[1])) - old_classes)
     assert not missing and not extra, f"missing: {missing[:5]}\nextra: {extra[:5]}"
     changed = [key for key in old if sorted(map(sorted, old[key])) != sorted(map(sorted, new[key]))]
     assert not changed, "rules with other declarations:\n" + "\n".join(f"{c}{s}" for c, s in changed[:10])
@@ -1868,6 +1925,24 @@ def test_cyberpunk_rules_unchanged():
         old_vars.update((n, v.strip()) for n, v in re.findall(r"(--[\w-]+)\s*:([^;]*);", m.group(2)))
     new_vars = {**_root_values(), **_cyberpunk_values()}
     assert {n: re.sub(r"\s+", "", v) for n, v in old_vars.items()} == {n: re.sub(r"\s+", "", new_vars[n]) for n in old_vars}
+
+
+def test_the_cut_button_takes_its_colours_from_the_theme_and_does_not_pulse():
+    """The panic cut of the FIREWALL tab (.fw-cut-card, .fw-cut): its own block in style.css paints only with
+    variables both themes define, and its skull does not take the hover pulse of UPDATE ALL (nothing pulses on
+    a button whose state matters), with or without prefers-reduced-motion."""
+    style = _flat_rules(_raw(STYLE_CSS))
+    cut = {key: decls for key, decls in style.items() if re.search(r"\.fw-cut\b|\.fw-cut-", key[1])}
+    assert any(s.strip() == ".fw-cut-card" for _, s in cut), "no .fw-cut-card rule in style.css"
+    text = "\n".join(";".join(sorted(d)) for decls in cut.values() for d in decls)
+    assert not LITERAL_COLOR.search(text), text
+    classic = set(re.findall(r"(--[\w-]+)\s*:", ROOT_BLOCK.search(_strip_comments(_read(STYLE_CSS))).group(0)))
+    cyberpunk = classic | set(re.findall(r"(--[\w-]+)\s*:", _read(THEME_CSS)))
+    used = set(re.findall(r"var\(\s*(--[\w-]+)", text))
+    assert used and used <= classic and used <= cyberpunk, used - (classic & cyberpunk)
+    stilled = [d for (ctx, s), decls in cut.items() if ":hover" in s and "btn-skull-art" in s and "reduced-motion" not in ctx
+               for d in decls]
+    assert any("animation:none" in {x.replace(" ", "") for x in d} for d in stilled), stilled
 
 
 @needs_node
@@ -2045,11 +2120,12 @@ ALERT_ROW_FUNCTIONS = ALERT_FUNCTIONS + ["alertRowsHtml", "alertInstanceIndex", 
                                          "escapeHtml", "jsArg", "cssToken", "procKey", "sortTimeValue",
                                          "severitySortValue"]
 # The building blocks of the charts (block CHARTS of app.js) and their constants
-CHART_CONSTS = ["SEVERITY_ORDER", "SEVERITY_COLORS", "CHART_PALETTE", "CHART_MONTHS", "CHART_MAX_BINS"]
+CHART_CONSTS = ["SEVERITY_ORDER", "SEVERITY_COLORS", "CHART_PALETTE", "CHART_MONTHS", "CHART_MAX_BINS",
+                "CHART_LABEL_MAX"]
 CHART_FUNCTIONS = ["alertCategory", "countBy", "binByTime", "stackedBarsSvg", "donutSvg", "pieSvg", "chartLegendHtml",
-                   "sparklineSvg", "scatterSvg", "verdictBarsSvg", "chartEmptyHtml", "_chartSentence", "_chartColor",
-                   "_chartNumber", "_chartShare", "_chartCoord", "_chartSegments", "_chartPeriodStart", "_chartPeriodNext",
-                   "_chartDate", "_chartClock", "_chartPeriodLabel", "_chartTicks", "_chartFineStep",
+                   "sparklineSvg", "lineSvg", "scatterSvg", "verdictBarsSvg", "chartEmptyHtml", "_chartSentence",
+                   "_chartColor", "_chartNumber", "_chartShare", "_chartCoord", "_chartSegments", "_chartPeriodStart",
+                   "_chartPeriodNext", "_chartDate", "_chartClock", "_chartPeriodLabel", "_chartTicks", "_chartFineStep",
                    "topWithOther", "alertFlow", "_chartFlow", "layoutSankey", "sankeySvg", "_sankeyFit", "_chartEllipsis"]
 # A range drawn across bars (initBarsBrush), which OVER TIME of the Alerts tab shares with ALERT ACTIVITY of the
 # dashboard, and its state: the Alerts tab's prelude declares it, the dashboard's has it from there (once)
@@ -2093,9 +2169,27 @@ DASHBOARD_CHART_FUNCTIONS = ["renderDashboardCharts", "setDashboardRange", "_das
                              "_dashboardFollowTheClock", "_dashboardSparkCounts", "dashboardCategoryItems",
                              "releaseDashboardCounts", "_drawDashboardSparks", "_drawDashboardBars",
                              "_drawDashboardDonuts", "_drawDashboardRange", "_dashboardBarsSize",
-                             "onDashboardChartClick", "initDashboardCharts", "redrawDashboardChartsOnResize"]
+                             "onDashboardChartClick", "initDashboardCharts", "redrawDashboardChartsOnResize",
+                             # The pages of the tab (SERVICES and the own dashboards) and their tiles
+                             "dashboardOwnPage", "dashboardPanelOf", "panelState", "panelSet", "renderOwnClock",
+                             "dashboardPanelId", "dashboardPanelSortId",
+                             "dashboardPanelWidth", "dashboardRangeWord", "panelFormsFor", "panelNoteHtml",
+                             "panelBodyHtml", "panelCardHtml", "renderPanelCard", "dashboardPanelView",
+                             "renderOwnDashboard", "redrawPanelsOnResize", "renderDashboardPages", "dashboardStoredPage",
+                             "setDashboardPage",
+                             "loadDashboardPages", "dashboardStopPanels", "loadPanels", "loadOnePanel",
+                             "refreshPanel", "openPanelInLogs", "togglePanelMenu", "toggleDashboardMenu",
+                             "closeDashboardMenus", "dashboardWrite", "dashboardAskName", "addDashboard",
+                             "renameDashboard", "deleteDashboard", "panelMenu", "dashboardTabShown",
+                             "initDashboardPages"]
 DASHBOARD_CHART_CONSTS = ["DASHBOARD_RANGES", "DASHBOARD_SPARK_DAYS", "dashboardRange", "dashboardBarsRange",
-                          "_dashboardMemo", "_dashboardDrawn", "DASHBOARD_BARS_BRUSH"]
+                          "_dashboardMemo", "_dashboardDrawn", "DASHBOARD_BARS_BRUSH",
+                          # The pages and the tiles: their names, their caps and their state
+                          "DASHBOARD_PAGE_KEY", "DASHBOARD_SERVICES", "DASHBOARD_PANEL_ROWS",
+                          "DASHBOARD_PANEL_HEIGHT", "DASHBOARD_PANEL_WIDE", "DASHBOARD_PANEL_COLUMNS",
+                          "DASHBOARD_QUERY_MAX", "DASHBOARD_PANEL_WAIT", "DASHBOARD_PANEL_ACTIONS",
+                          "dashboardPages", "dashboardPanelState", "dashboardQueue", "dashboardAbort",
+                          "dashboardPageRead", "dashboardOwnMenu", "dashboardDrawnWidth", "dashboardFlight"]
 
 # Four alerts as the engines write them: severity and engine in either case,
 # the process by name, by image only or by PID only, time zones mixed (as a
@@ -2812,11 +2906,16 @@ def test_every_data_table_is_sortable():
             used.update(exempt)
             continue
         sort_id = re.search(r'\sdata-sort-id="([a-z0-9-]+)"', tag)
-        if not re.search(r"\sdata-sortable(?=[\s>])", tag) or not sort_id:
+        # A table that is drawn more than once with a sort state of its own
+        # (a tile of a dashboard) builds its id; its caller keeps those apart
+        # (tests/test_dashboards_ui.py::test_each_table_tile_sorts_on_its_own)
+        built = re.search(r'\sdata-sort-id="\$\{[^"]+\}"', tag)
+        if not re.search(r"\sdata-sortable(?=[\s>])", tag) or not (sort_id or built):
             problems.append(f"{where}:{line}: {tag} is no sortable table (data-sortable data-sort-id) "
                             f"and not in SORT_EXEMPT")
             continue
-        ids.setdefault(sort_id.group(1), []).append(f"{where}:{line}")
+        if sort_id:
+            ids.setdefault(sort_id.group(1), []).append(f"{where}:{line}")
     problems += [f"data-sort-id {sort_id} is used by {', '.join(places)}" for sort_id, places in ids.items()
                  if len(places) > 1]
     problems += [f"SORT_EXEMPT {key} matches no table" for key in SORT_EXEMPT if key not in used]
@@ -3048,13 +3147,13 @@ def test_info_texts_cover_every_tab():
         return lambda e: name in e["attrs"].get("class", "").split()
 
     headers = find(elements.root, with_class("content-header"))
-    assert len(headers) == 13, "a tab head is missing or the pattern is out of date"
+    assert len(headers) == 15, "a tab head is missing or the pattern is out of date"
     rows = find(elements.root, with_class("rtrace-header")) + find(elements.root, with_class("graph-toolbar"))
     assert len(rows) == 2, "the head rows of Tracing and Graph"
     assert [h["children"][0]["text"] if h["children"] else "" for h in headers if not has_info(h)] == []
     assert all(has_info(row) for row in rows), "Tracing or Graph without (i)"
     tabs = find(elements.root, with_class("tab-content"))
-    assert len(tabs) == 15 and all(has_info(tab) for tab in tabs)
+    assert len(tabs) == 17 and all(has_info(tab) for tab in tabs)
     texts = INFO_ATTR.findall(html) + INFO_ATTR.findall(_read(APP_JS))
     assert len(texts) >= 30
     for text in texts:
@@ -3075,6 +3174,8 @@ def test_info_buttons_explain_headings_in_a_popover():
             document.body.innerHTML = BODY;
             globalThis.state = { detailOpen: false };
             globalThis.cardClicks = 0;
+            // The ⋯ menus of the Dashboard tab are no part of this DOM
+            globalThis.closeDashboardMenus = () => false;
             initCardControls();
             const r = {};
             const holders = document.querySelectorAll('[data-info]');
@@ -3143,6 +3244,9 @@ DRAWER_INFO_FUNCTIONS = INFO_TEST_FUNCTIONS + ["onTopbarOutsideClick", "openDraw
 DRAWER_INFO_SETUP = r"""
     document.body.innerHTML = BODY;
     globalThis.state = { detailOpen: false };
+    // The ⋯ menus of the Dashboard tab are no part of this DOM: Escape asks
+    // them whether one of them was open
+    globalThis.closeDashboardMenus = () => false;
     document.addEventListener('click', onTopbarOutsideClick, true);
     initCardControls();
     document.documentElement.setAttribute('data-theme', 'cyberpunk');

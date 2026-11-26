@@ -35,6 +35,7 @@ HOST_IP = "192.168.64.1"   # UTM shared-network gateway (host as seen by VM)
 PORT = 8766
 
 # repo-relative source -> remote runtime path used by the DetonationChamberUI task
+WIKI_FILE = "webui/static/wiki.html"
 FILES = {
     "webui/app.py": r"C:\DetonationChamberUI\app.py",
     "webui/memory_evidence.py": r"C:\DetonationChamberUI\memory_evidence.py",
@@ -51,6 +52,14 @@ FILES = {
     "webui/net_raw.py": r"C:\DetonationChamberUI\net_raw.py",
     "webui/net_rules.py": r"C:\DetonationChamberUI\net_rules.py",
     "webui/net_tls.py": r"C:\DetonationChamberUI\net_tls.py",
+    "webui/syscall_baseline.py": r"C:\DetonationChamberUI\syscall_baseline.py",
+    "webui/syscall_scan.py": r"C:\DetonationChamberUI\syscall_scan.py",
+    "webui/syscall_rules.py": r"C:\DetonationChamberUI\syscall_rules.py",
+    "webui/syscall_signatures.json": r"C:\DetonationChamberUI\syscall_signatures.json",
+    "webui/win32_to_nt.py": r"C:\DetonationChamberUI\win32_to_nt.py",
+    "webui/win32_to_nt.json": r"C:\DetonationChamberUI\win32_to_nt.json",
+    "webui/binary_graph.py": r"C:\DetonationChamberUI\binary_graph.py",
+    "webui/binary_graph_query.py": r"C:\DetonationChamberUI\binary_graph_query.py",
     "webui/minidump_analysis.py": r"C:\DetonationChamberUI\minidump_analysis.py",
     "webui/pipe_analysis.py": r"C:\DetonationChamberUI\pipe_analysis.py",
     "webui/pipe_signatures.json": r"C:\DetonationChamberUI\pipe_signatures.json",
@@ -58,8 +67,16 @@ FILES = {
     "webui/pipe_proxy.py": r"C:\DetonationChamberUI\pipe_proxy.py",
     "webui/log_search.py": r"C:\DetonationChamberUI\log_search.py",
     "webui/log_store.py": r"C:\DetonationChamberUI\log_store.py",
+    "webui/dashboards.py": r"C:\DetonationChamberUI\dashboards.py",
     "webui/rizin_sessions.py": r"C:\DetonationChamberUI\rizin_sessions.py",
+    "webui/rizin_emulation.py": r"C:\DetonationChamberUI\rizin_emulation.py",
     "webui/tool_updates.py": r"C:\DetonationChamberUI\tool_updates.py",
+    "webui/firewall.py": r"C:\DetonationChamberUI\firewall.py",
+    "webui/firewall_fetch.py": r"C:\DetonationChamberUI\firewall_fetch.py",
+    "webui/firewall_rules.py": r"C:\DetonationChamberUI\firewall_rules.py",
+    "webui/firewall_rules.ps1": r"C:\DetonationChamberUI\firewall_rules.ps1",
+    "webui/firewall_store.py": r"C:\DetonationChamberUI\firewall_store.py",
+    "webui/geoip.py": r"C:\DetonationChamberUI\geoip.py",
     "webui/static/js/app.js": r"C:\DetonationChamberUI\static\js\app.js",
     "webui/static/css/style.css": r"C:\DetonationChamberUI\static\css\style.css",
     "webui/static/css/theme-layout.css": r"C:\DetonationChamberUI\static\css\theme-layout.css",
@@ -68,15 +85,39 @@ FILES = {
     "webui/static/icon.png": r"C:\DetonationChamberUI\static\icon.png",
     # network analysis rules, read from <app dir>\rules\network
     "rules/network/default.yaml": r"C:\DetonationChamberUI\rules\network\default.yaml",
+    # The offline wiki, built on the host by `make docs` and git-ignored: the VM
+    # has no network, so this one file is the documentation there. A fresh clone
+    # has none, and the loop below skips what is not on disk.
+    WIKI_FILE: r"C:\DetonationChamberUI\static\wiki.html",
 }
+
+# Data directories, shipped whole: the offline geo index (webui/data) and the world map (webui/static/data)
+DATA_DIRS = {
+    "webui/data": r"C:\DetonationChamberUI\data",
+    "webui/static/data": r"C:\DetonationChamberUI\static\data",
+}
+DATA_FILES = {
+    f"{local}/{name}": remote + "\\" + name
+    for local, remote in DATA_DIRS.items()
+    if os.path.isdir(os.path.join(REPO, local))
+    for name in sorted(os.listdir(os.path.join(REPO, local)))
+    if not name.startswith(".") and os.path.isfile(os.path.join(REPO, local, name))
+}
+
+# Where the network analysis rules live on the VM, created before the copy
+RULES_REMOTE_DIR = r"C:\DetonationChamberUI\rules\network"
 
 # The install scripts the tool updates re-run, kept next to the provisioning copy
 SCRIPTS_REMOTE_DIR = r"C:\tdc\scripts"
-# (plus configure-logging.ps1, which an existing VM runs once to turn on the logs of the LOGS tab)
+# (plus configure-logging.ps1, which an existing VM runs once to turn on the logs of the LOGS and FIREWALL tabs,
+# tdc-unisolate.ps1, the way out of ISOLATED when the web UI cannot be reached, and build-binary-graph.ps1, which
+# builds the binary graph cache)
 SCRIPT_FILES = {
     f"scripts/{os.path.basename(path)}": SCRIPTS_REMOTE_DIR + "\\" + os.path.basename(path)
     for path in sorted(glob.glob(os.path.join(REPO, "scripts", "install-*.ps1"))
-                       + [os.path.join(REPO, "scripts", "configure-logging.ps1")])
+                       + [os.path.join(REPO, "scripts", "configure-logging.ps1"),
+                          os.path.join(REPO, "scripts", "tdc-unisolate.ps1"),
+                          os.path.join(REPO, "scripts", "build-binary-graph.ps1")])
 }
 
 RESTART_PS = (
@@ -159,18 +200,30 @@ def do_deploy(sess, args):
     httpd = serve()
     print(f"[*] Host HTTP server on :{PORT}, deploying to {args.vm_ip} ...")
     try:
-        ps = f'New-Item -ItemType Directory -Path "{SCRIPTS_REMOTE_DIR}" -Force | Out-Null'
-        run_ps(sess, ps, label="scripts dir")
-        run_ps(sess, 'New-Item -ItemType Directory -Path "C:\\DetonationChamberUI\\rules\\network" -Force | Out-Null',
-               label="rules dir")
-        for local, remote in {**FILES, **SCRIPT_FILES}.items():
+        dirs = ",".join(f'"{d}"' for d in [SCRIPTS_REMOTE_DIR, RULES_REMOTE_DIR, *DATA_DIRS.values()])
+        ps = f'New-Item -ItemType Directory -Path {dirs} -Force | Out-Null'
+        run_ps(sess, ps, label="directories")
+        for local, remote in {**FILES, **DATA_FILES, **SCRIPT_FILES}.items():
             if not os.path.isfile(os.path.join(REPO, local)):
-                print(f"  [-] skip {local} (not found)")
+                hint = " - build the wiki with: make docs" if local == WIKI_FILE else ""
+                print(f"  [-] skip {local} (not found){hint}")
                 continue
             url = f"http://{HOST_IP}:{PORT}/{local}"
+            # The copy keeps the date of the file it is a copy of - every file,
+            # not only the wiki: a copy that carries its original's date tells
+            # the truth about what is on the VM, and a download would otherwise
+            # stamp all of them with the deploy's clock. One statement in the
+            # same remote command; `vagrant upload` and `Copy-Item -ToSession`
+            # (the other two deploy paths) have no equivalent, which is why the
+            # help says the wiki's date is the date of the copy here, that a
+            # deploy *can* renew it, and that the build stamp is in the wiki's
+            # own footer.
+            mtime = int(os.path.getmtime(os.path.join(REPO, local)))
             ps = (
-                '$ErrorActionPreference="Stop";'
+                '$ErrorActionPreference="Stop"; $ProgressPreference="SilentlyContinue";'
                 f'Invoke-WebRequest -Uri "{url}" -OutFile "{remote}" -UseBasicParsing;'
+                f'(Get-Item "{remote}").LastWriteTimeUtc = '
+                f'[datetimeoffset]::FromUnixTimeSeconds({mtime}).UtcDateTime;'
                 f'(Get-Item "{remote}").Length'
             )
             out = run_ps(sess, ps, label=local)

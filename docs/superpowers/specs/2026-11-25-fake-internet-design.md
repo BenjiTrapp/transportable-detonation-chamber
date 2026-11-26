@@ -560,11 +560,16 @@ Diese Tests brechen garantiert und müssen mit:
 
 ## Herkunft: NetLens ist Vorbild, nicht Quelle
 
-**Entscheidung des Betreibers: aus NetLens wird nichts übernommen.** TDC hat
-keine Lizenzdatei und bleibt privat; Apache-2.0-Material soll gar nicht
-einfließen. Das ist strenger als die Lizenz verlangt und macht die Sache
-einfach: **keine Datei, kein Codefragment, keine Regel, kein Fixture** aus
-NetLens wird kopiert, angepasst oder übersetzt.
+**Entscheidung des Betreibers: aus NetLens wird nichts übernommen.**
+Apache-2.0-Material soll gar nicht einfließen. Das ist strenger als die Lizenz
+verlangt und macht die Sache einfach: **keine Datei, kein Codefragment, keine
+Regel, kein Fixture** aus NetLens wird kopiert, angepasst oder übersetzt.
+
+> **Nachtrag (26.11.):** Bei dieser Entscheidung war TDC noch lizenzlos und
+> privat. `main` hat seither eine `LICENSE` eingebracht — TDC ist MIT und
+> öffentlich. An der Entscheidung ändert das nichts, aber am Gewicht: was im
+> privaten Repo eine Vorsichtsmaßnahme war, ist im veröffentlichten
+> MIT-Projekt eine Aussage, auf die sich Dritte verlassen.
 
 Was dennoch unproblematisch ist, weil es nicht NetLens gehört:
 
@@ -591,9 +596,9 @@ Nicht nachgebaut wird ohnehin: Qt-GUI, WinDivert und alles darauf, ein eigener
 ETW-Tracer, eine eigene Memory-Inspektion — Prozessbaum und Memory hat TDC
 schon, und doppelt wäre schlechter als einmal.
 
-> **Nebenwirkung der Lizenzlage:** Ohne `LICENSE`-Datei ist TDC
-> „alle Rechte vorbehalten". Das ist ein gültiger Zustand, aber einer, den man
-> bewusst wählen sollte — er schließt auch aus, dass andere beitragen.
+> **Nebenwirkung der Lizenzlage — inzwischen entschieden:** Ohne
+> `LICENSE`-Datei wäre TDC „alle Rechte vorbehalten" gewesen, und das schließt
+> auch aus, dass andere beitragen. `main` hat die Wahl bewusst getroffen: MIT.
 
 ## Phasen
 
@@ -677,7 +682,7 @@ beantwortet und oben eingearbeitet:
 | Frage | Antwort |
 |---|---|
 | Wann endet eine Session? | Dynamisch, Startbudget 300 s, Ruhe-Ende, Verlängerung am erkannten Intervall, Obergrenze 30 min, Operator kann jederzeit stoppen und verlängern |
-| Lizenz von TDC | Keine, privat — aus NetLens wird **nichts** übernommen |
+| Lizenz von TDC | Zur Zeit der Antwort: keine, privat. Inzwischen MIT und öffentlich (`LICENSE` aus `main`) — aus NetLens wird weiterhin **nichts** übernommen |
 | VM zum Verifizieren | Beide, UTM/ARM64 und Hyper-V/x64 |
 | Fingerprints gegen Rollback | Host holt automatisch ab, plus Zähler für ungesicherte Läufe |
 

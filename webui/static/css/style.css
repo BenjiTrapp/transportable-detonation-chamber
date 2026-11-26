@@ -55,6 +55,17 @@
     /* The colour of a log source in the LOGS tab (chip, badge, bars): set per source there */
     --logs-src: var(--text-secondary);
     --logs-src-rgb: 163, 171, 214;
+    /* The FIREWALL tab: the colour of each severity (rows, chips, arcs and
+       points of its map; a .fw-tone-* class also sets it as --fw-tone), and
+       the land, graticule and chamber of the map */
+    --fw-tone-critical: var(--severity-critical);
+    --fw-tone-high: var(--severity-high);
+    --fw-tone-medium: var(--severity-medium);
+    --fw-tone-low: var(--severity-low);
+    --fw-tone-info: var(--severity-info);
+    --fw-land: var(--bg-tertiary);
+    --fw-grat: var(--border-primary);
+    --fw-chamber: var(--accent-cyan);
     --c-white: #fff;
     --c-white-rgb: 255, 255, 255;
     --c-black: #000;
@@ -156,6 +167,20 @@
     --net-file: #ff9a3c;
     --net-behavior: #ff2bd6;
     --net-other: #6c7399;
+    /* The binary graph of the SYSCALLS tab: a kind of node each, the curated edge (the word of the Win32 to Nt
+       table, not of a binary) and a filter match; neither of the last two may look like a deviation state */
+    --graph-node-dll: #9b8cff;
+    --graph-node-dll-rgb: 155, 140, 255;
+    --graph-node-exe: #34f5a0;
+    --graph-node-exe-rgb: 52, 245, 160;
+    --graph-node-apiset: #4d8dff;
+    --graph-node-apiset-rgb: 77, 141, 255;
+    --graph-node-syscall: #e8ecff;
+    --graph-node-syscall-rgb: 232, 236, 255;
+    --graph-edge-curated: #ff2bd6;
+    --graph-edge-curated-rgb: 255, 43, 214;
+    --graph-match: #d4ff00;
+    --graph-match-rgb: 212, 255, 0;
     --pe-code: #4d8dff;
     --pe-data: #34f5a0;
     --pe-readonly: #6c7399;
@@ -180,6 +205,20 @@
     --assess-protected-tint-rgb: 255, 191, 38;
     --assess-suspicious: #ffbf26;
     --assess-suspicious-rgb: 255, 191, 38;
+    /* The SYSCALLS map: the state each syscall stub was measured in. intact is held near the surface, so a map
+       without a deviation draws no eye; every deviation is bright and has a hue of its own: hooked amber (a
+       jump into another module, an EDR hook), patched red (a jump into private memory), diverged blue (the
+       bytes differ, nothing is guessed), unreadable a light grey (drawn as an outline) */
+    --syscall-intact: #323b75;
+    --syscall-intact-rgb: 50, 59, 117;
+    --syscall-hooked: #ffbf26;
+    --syscall-hooked-rgb: 255, 191, 38;
+    --syscall-patched: #ff2b4a;
+    --syscall-patched-rgb: 255, 43, 74;
+    --syscall-diverged: #3dbdff;
+    --syscall-diverged-rgb: 61, 189, 255;
+    --syscall-unreadable: #8089b8;
+    --syscall-unreadable-rgb: 128, 137, 184;
     --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
     --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     --radius: 4px;
@@ -203,6 +242,7 @@
     --cp-card-rgb: 13, 15, 28;
     --cp-raised: #181c36;
     --cp-line: #23284a;
+    --cp-line-rgb: 35, 40, 74;
     --cp-text: #e8ecff;
     --cp-text-muted: #a3abd6;
     --cp-text-muted-rgb: 163, 171, 214;
@@ -241,6 +281,9 @@
     --alerts-path-height: 0px;
     /* The same for the Sysmon tab (initSysmonTab sets it on #sysmon-table) */
     --sysmon-bar-height: 0px;
+    /* And for the LOGS search bar, which is sticky too: the COMMANDS card
+       stands under it instead of over it (initLogs sets it on .logs-side) */
+    --logs-bar-height: 0px;
     /* Nor this: how many times wider than at zoom 1 the lines of the RIZIN
        graph are drawn, so that they stay about as wide on screen however far
        it is zoomed out (rizinGraphApplyView sets it on the graph's SVG) */
@@ -683,6 +726,7 @@ body.hex-resizing {
     color: var(--text-muted);
 }
 
+.rtrace-firewall { flex: none; }
 .rtrace-path {
     font-size: 11px;
     color: var(--text-muted);
@@ -5946,6 +5990,25 @@ body.hex-resizing {
 
 .help-muted { color: var(--text-muted) !important; font-size: 11px !important; }
 
+/* The way to the offline wiki, at the top of the help. One of its two lines is
+   shown once /api/wiki answered (initHelpWiki); both are hidden before that. */
+.help-wiki {
+    background: var(--bg-card);
+    border: 1px solid var(--border-primary);
+    border-left: 2px solid var(--accent-cyan);
+    border-radius: var(--radius);
+    padding: 12px 14px;
+    margin: 0 0 16px 0;
+}
+.help-wiki[hidden],
+.help-wiki p[hidden] { display: none; }
+.help-wiki p:last-child { margin-bottom: 0; }
+.help-wiki a {
+    color: var(--accent-cyan);
+    text-decoration: none;
+}
+.help-wiki a:hover { text-decoration: underline; }
+
 .help-api-table {
     width: 100%;
     border-collapse: collapse;
@@ -6078,6 +6141,11 @@ body.hex-resizing {
     gap: 8px;
     pointer-events: none;
     max-width: 420px;
+    /* Three decisions, a "+ n more" and the other toasts fit on a short screen: the stack scrolls */
+    max-height: calc(100vh - var(--topbar-height) - 28px);
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
 }
 .toast {
     position: relative;
@@ -6161,6 +6229,114 @@ body.hex-resizing {
     from { opacity: 0; transform: translateX(30px); }
     to { opacity: 1; transform: translateX(0); }
 }
+
+/* --- The decision toast (showDecisionToast; block FIREWALL of app.js) ---
+   A firewall decision: it stands above the other toasts until it is
+   answered. The edge says its state: red while it asks or the time is up,
+   amber when the block is not confirmed or something failed, cyan for a
+   result. It slides in once, when it comes (is-new), never again when it is
+   drawn anew; the countdown is text, not a motion. --- */
+.decision-stack { display: flex; flex-direction: column; gap: 8px; }
+.decision-stack:empty { display: none; }
+.toast.toast-decision {
+    flex-direction: column;
+    align-items: stretch;
+    gap: 5px;
+    padding: 11px 14px 10px;
+    border-color: rgba(var(--severity-critical-rgb), 0.45);
+    border-left: 3px solid var(--severity-critical);
+    background: var(--bg-card);
+    animation: none;
+}
+.toast.toast-decision.is-new { animation: toastSlideIn 0.25s ease-out; }
+.toast.toast-decision.is-warn,
+.toast.toast-decision.is-fail {
+    border-color: rgba(var(--accent-yellow-rgb), 0.45);
+    border-left-color: var(--accent-yellow);
+}
+.toast.toast-decision.is-done,
+.toast.toast-decision.is-away {
+    border-color: rgba(var(--accent-cyan-rgb), 0.4);
+    border-left-color: var(--accent-cyan);
+}
+.decision-head { display: flex; align-items: baseline; gap: 10px; padding-right: 18px; }
+.decision-head .toast-title { flex: 1; min-width: 0; margin: 0; }
+.decision-clock {
+    flex: 0 0 auto;
+    font-family: var(--font-mono);
+    font-size: 15px;
+    font-weight: 700;
+    font-variant-numeric: tabular-nums;
+    color: var(--severity-critical);
+    cursor: help;
+}
+.toast-decision.is-warn .decision-clock { color: var(--accent-yellow); }
+.decision-who {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+}
+.decision-url-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.decision-url-row .fw-url { flex: 1; font-size: 11px; color: var(--text-primary); }
+.decision-via { font-size: 10.5px; color: var(--text-muted); }
+.decision-line { font-size: 11.5px; line-height: 1.4; color: var(--text-secondary); overflow-wrap: anywhere; }
+.decision-line strong { color: var(--text-primary); }
+.decision-note { color: var(--accent-yellow); }
+.decision-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; margin-top: 3px; }
+.decision-actions .btn-xs { font-size: 10.5px; padding: 4px 9px; }
+.decision-actions .fw-logs { margin-left: auto; }
+.decision-btn { font-weight: 600; letter-spacing: 0.03em; }
+.decision-btn.is-primary {
+    color: var(--text-primary);
+    background: rgba(var(--severity-critical-rgb), 0.2);
+    border-color: var(--severity-critical);
+    font-weight: 700;
+}
+.decision-btn.is-primary:hover:not(:disabled) { background: rgba(var(--severity-critical-rgb), 0.32); }
+.decision-btn.is-allow { color: var(--accent-yellow); border-color: rgba(var(--accent-yellow-rgb), 0.5); }
+.decision-actions .btn-xs:disabled { opacity: 0.45; cursor: not-allowed; }
+.decision-actions .btn-xs:focus-visible,
+.decision-more:focus-visible { outline: 2px solid var(--accent-cyan); outline-offset: 2px; }
+.decision-more {
+    align-self: flex-end;
+    pointer-events: auto;
+    padding: 4px 10px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--text-primary);
+    background: var(--bg-card);
+    border: 1px solid rgba(var(--severity-critical-rgb), 0.5);
+    border-radius: 6px;
+    cursor: pointer;
+}
+.decision-more:hover { border-color: var(--severity-critical); }
+
+/* DECISIONS, the fourth view of the FIREWALL tab: open decisions on top, with their answers */
+.fw-dec-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    padding: 0 2px 8px;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.fw-dec-row.is-open { background: rgba(var(--severity-critical-rgb), 0.06); }
+.fw-dec-what { white-space: nowrap; font-family: var(--font-mono); font-size: 10.5px; font-weight: 700; }
+.fw-dec-what.is-open { color: var(--severity-critical); }
+.fw-dec-url .fw-url { display: inline-block; max-width: 260px; vertical-align: bottom; }
+.fw-dec-block.is-fail,
+.fw-dec-fail { color: var(--accent-yellow); }
+.fw-dec-wait,
+.fw-dec-none { color: var(--text-muted); }
+.fw-dec-cap { font-family: var(--font-mono); font-size: 10.5px; margin-right: 6px; }
+.fw-dec-fetch .btn-xs { margin-left: 4px; }
+.fw-dec-actions { white-space: nowrap; }
+.fw-dec-actions .decision-btn { margin-right: 4px; font-size: 10px; }
+.fw-dec-actions .decision-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 
 /* === ETW Browser === */
 .etw-controls {
@@ -8332,6 +8508,13 @@ table[data-sortable] > thead > tr > th:focus-visible {
     stroke-linejoin: round;
     stroke-linecap: round;
 }
+/* A line of a timechart (lineSvg): its colour comes inline, the shape here */
+.chart-line {
+    fill: none;
+    stroke-width: 2;
+    stroke-linejoin: round;
+    stroke-linecap: round;
+}
 .chart-threshold {
     stroke: var(--border-dashed);
     stroke-width: 1;
@@ -8370,6 +8553,107 @@ table[data-sortable] > thead > tr > th:focus-visible {
 }
 .chart-svg .sankey-value {
     fill: var(--text-muted);
+}
+/* World map of the FIREWALL tab (worldMapSvg): the land is cut at the edges
+   of the map; a point or an arc takes the colour of its severity as
+   currentColor. Only an arc with an open decision moves: a dash runs from
+   the chamber outwards (still under prefers-reduced-motion). */
+.chart-svg.fw-map {
+    overflow: hidden;
+}
+.fw-grat {
+    fill: none;
+    stroke: var(--fw-grat);
+    stroke-width: 0.5;
+}
+.fw-land {
+    fill: var(--fw-land);
+    stroke: var(--border-accent);
+    stroke-width: 0.5;
+    stroke-linejoin: round;
+}
+.fw-tone-critical { --fw-tone: var(--fw-tone-critical); color: var(--fw-tone-critical); }
+.fw-tone-high { --fw-tone: var(--fw-tone-high); color: var(--fw-tone-high); }
+.fw-tone-medium { --fw-tone: var(--fw-tone-medium); color: var(--fw-tone-medium); }
+.fw-tone-low { --fw-tone: var(--fw-tone-low); color: var(--fw-tone-low); }
+.fw-tone-info { --fw-tone: var(--fw-tone-info); color: var(--fw-tone-info); }
+.fw-chamber { color: var(--fw-chamber); }
+/* The strip under the map that holds the chamber: a panel, not more sea, so
+   the device in it reads as no place */
+.fw-dock {
+    fill: var(--bg-secondary);
+}
+.fw-dock-edge {
+    fill: none;
+    stroke: var(--border-accent);
+    stroke-width: 1;
+}
+.chart-svg .fw-dock-note {
+    fill: var(--text-muted);
+    font-size: 8px;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+    pointer-events: none;
+}
+.fw-device {
+    fill: var(--bg-card);
+    stroke: currentColor;
+    stroke-width: 1.25;
+}
+.fw-device-led {
+    fill: currentColor;
+}
+.chart-svg .fw-device-label {
+    fill: currentColor;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+}
+.fw-arc-hit {
+    fill: none;
+    stroke: transparent;
+    stroke-width: 8;
+}
+.fw-arc-line {
+    fill: none;
+    stroke: currentColor;
+    stroke-linecap: round;
+    opacity: 0.7;
+    pointer-events: none;
+    transition: opacity 0.15s;
+}
+.fw-arc:hover .fw-arc-line {
+    opacity: 1;
+}
+.fw-arc-pending .fw-arc-line {
+    stroke-dasharray: 6 4;
+    animation: fw-arc-dash 0.8s linear infinite;
+}
+@keyframes fw-arc-dash {
+    to { stroke-dashoffset: -10; }
+}
+.fw-dot {
+    fill: currentColor;
+    stroke: var(--bg-card);
+    stroke-width: 1;
+}
+.fw-pill {
+    fill: var(--bg-card);
+    stroke: currentColor;
+    stroke-width: 0.75;
+    opacity: 0.9;
+}
+.chart-svg .fw-label {
+    fill: var(--text-primary);
+}
+/* A label is no target: the dot and the arcs under its pill are */
+.fw-pill,
+.fw-label {
+    pointer-events: none;
+}
+.chart-clickable .fw-arc,
+.chart-clickable .fw-point,
+.chart-clickable .fw-chamber {
+    cursor: pointer;
 }
 .chart-clickable .chart-seg,
 .chart-clickable .chart-bin,
@@ -9045,6 +9329,131 @@ table[data-sortable] > thead > tr > th:focus-visible {
     min-width: 28px;
 }
 
+/* The emulation's run line (rizinRenderRunStrip), between the toolbar and the work area, there only while the
+   emulation runs. Buttons and the PC first, then the registers the last run changed, why it stands and the
+   offer for a call at the PC; the parts that run short are cut with an ellipsis (in full on hover), and where
+   they do not fit one line the strip wraps to a second (below 1400 px by design) instead of cutting its buttons.
+   The PC and the changed registers carry a sign and a shape (a glyph, a dashed edge, a bar), not only a colour. */
+.rizin-run {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 10px;
+    margin: 6px 14px 0;
+    padding: 4px 10px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-left: 3px solid var(--accent-orange);
+    border-radius: var(--radius);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-secondary);
+}
+.rizin-run[hidden] {
+    display: none;
+}
+.rizin-run-buttons {
+    display: flex;
+    flex: 0 0 auto;
+    gap: 4px;
+}
+.rizin-run-btn {
+    white-space: nowrap;
+}
+.rizin-run-pc {
+    flex: 0 0 auto;
+    white-space: nowrap;
+}
+.rizin-run-pc-label {
+    font-weight: 600;
+    color: var(--accent-orange);
+}
+.rizin-run-pc-value {
+    color: var(--text-primary);
+}
+/* The changed registers are what a step is for: they wrap inside their box (RIZIN_EMU.regs of them at most)
+   rather than being cut */
+.rizin-run-regs {
+    flex: 2 1 36ch;
+    min-width: 0;
+}
+.rizin-run-reg {
+    display: inline-block;
+    padding: 0 6px 0 4px;
+    margin-right: 4px;
+    font-weight: 600;
+    white-space: nowrap;
+    border-left: 2px solid var(--accent-orange);
+}
+.rizin-run-delta {
+    margin-right: 3px;
+    color: var(--accent-orange);
+}
+.rizin-run-reg-name {
+    color: var(--text-primary);
+}
+.rizin-run-reg-value {
+    color: var(--accent-cyan);
+}
+.rizin-run-none,
+.rizin-run-more {
+    color: var(--text-muted);
+}
+/* The reason a run stood is what the strip is for: it wraps rather than being cut */
+.rizin-run-why {
+    flex: 1 1 24ch;
+    min-width: 0;
+    overflow-wrap: anywhere;
+    color: var(--text-primary);
+}
+.rizin-run-why-wait {
+    font-style: italic;
+    color: var(--accent-yellow);
+}
+.rizin-run-why-note {
+    color: var(--c-red-300);
+}
+.rizin-run-assist {
+    display: flex;
+    flex: 2 1 36ch;
+    align-items: center;
+    gap: 6px;
+    min-width: 0;
+}
+.rizin-run-assist[hidden] {
+    display: none;
+}
+.rizin-run-assist-text {
+    flex: 1 1 auto;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--accent-yellow);
+}
+.rizin-run-assist-label {
+    flex: 0 0 auto;
+    color: var(--text-muted);
+}
+.rizin-run-value {
+    flex: 0 0 auto;
+    width: 20ch;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+}
+@media (max-width: 1400px) {
+    .rizin-run {
+        padding: 4px 8px;
+    }
+    .rizin-run-regs,
+    .rizin-run-why {
+        flex: 1 1 30ch;
+    }
+    .rizin-run-assist {
+        flex: 1 1 100%;
+    }
+}
+
 .rizin-work {
     flex: 1;
     min-height: 0;
@@ -9363,6 +9772,81 @@ table[data-sortable] > thead > tr > th:focus-visible {
     background: rgba(var(--accent-cyan-rgb), .14);
     box-shadow: inset 2px 0 0 var(--accent-cyan);
 }
+/* The emulation's PC: a ▶ in the margin of the line and a dashed edge, apart from the solid mark of the current line */
+.rizin-op.pc {
+    position: relative;
+    outline: 1px dashed var(--accent-orange);
+    outline-offset: -1px;
+}
+.rizin-op.pc::before {
+    content: "▶";
+    position: absolute;
+    left: 1px;
+    font-size: 8px;
+    color: var(--accent-orange);
+    /* a mark, not a control: the gutter's hit area reaches the row's edge, under it, and a click on a pseudo-element
+       lands on the row */
+    pointer-events: none;
+}
+/* The gutter, left of the address: a ● where a breakpoint is set (one click sets or removes it), a faint ○ on every
+   other line so that the column can be seen and aimed at, the same ○ stronger under the pointer; then a cell for a
+   line patched by hand (≠). Each is a fixed width, set apart from the line's text, so that the columns stay in line
+   whether a line has a mark or not; neither is text to copy.
+   The three marks of a line are three shapes, none of them colour alone: this ● in the gutter, the PC's ▶ and dashed
+   edge, the current line's solid bar. DECOMPILER's gutter (.rizin-dec-gutter, before the C of a line with an
+   address) is this same cell, so it shares each rule.
+   The hit area is 10px + 2ch (~24px): left of the glyph's room it takes the row's own 10px of padding (a click there
+   jumped), and the glyph stays where it was, centred (text-align) in the 2ch. box-sizing is content-box because the
+   global border-box would take the padding out of the width: the whole cell would collapse to 2ch, its room to 4.4px
+   (the ○ ~3.6px left of its column), and the margin box (-10px + that) would pull the ≠ cell and the C 10px left. With
+   content-box the content is still 2ch and where it was, and the negative margin gives back what the padding took, so
+   the margin box is 2ch and what follows starts where it did. The 10px is the left padding of .rizin-op and
+   .rizin-dec-line (a test keeps the three equal).
+   The cell is user-select: none and now covers the row's first 10px, so a drag that begins there selects nothing
+   (the row's first 10px was a place to begin a selection); a click there toggles instead of jumping. */
+.rizin-gutter,
+.rizin-dec-gutter {
+    display: inline-block;
+    box-sizing: content-box;
+    width: 2ch;
+    padding-left: 10px;
+    margin-left: -10px;
+    vertical-align: top;
+    text-align: center;
+    color: var(--accent-red);
+    cursor: pointer;
+    user-select: none;
+}
+.rizin-gutter-busy .rizin-gutter,
+.rizin-gutter-busy .rizin-dec-gutter {
+    cursor: progress;
+}
+.rizin-gutter:not(.on)::before,
+.rizin-dec-gutter:not(.on)::before {
+    content: "○";
+    color: var(--text-dim);
+}
+.rizin-gutter:not(.on):hover::before,
+.rizin-dec-gutter:not(.on):hover::before {
+    color: var(--text-secondary);
+}
+.rizin-gutter.on,
+.rizin-dec-gutter.on {
+    font-weight: 700;
+}
+.rz-pm {
+    display: inline-block;
+    width: 2ch;
+    margin-right: .5ch;
+    vertical-align: top;
+    text-align: center;
+    color: var(--accent-yellow);
+    user-select: none;
+}
+.rizin-op.patched .rz-mnem {
+    text-decoration: underline wavy;
+    text-underline-offset: 3px;
+}
 /* The colours of the instructions: addresses cyan, calls pink, jumps green,
    returns violet, symbols and strings yellow, comments dim */
 .rz-addr {
@@ -9449,6 +9933,14 @@ table[data-sortable] > thead > tr > th:focus-visible {
     padding: 0 10px;
     white-space: pre;
     color: var(--c-slate-300);
+}
+/* The place of the gutter on a line without an address (the signature, a brace): empty, as wide as the cell, so that
+   the C of every line starts on the same column */
+.rizin-dec-pad {
+    display: inline-block;
+    width: 2ch;
+    vertical-align: top;
+    user-select: none;
 }
 .rizin-dec-line.rizin-dec-jump {
     cursor: pointer;
@@ -9613,6 +10105,12 @@ table[data-sortable] > thead > tr > th:focus-visible {
     fill: rgba(var(--accent-cyan-rgb), .1);
     stroke: var(--accent-cyan);
     stroke-width: calc(2px * var(--rizin-stroke));
+}
+/* The block of the emulation's PC: a dashed edge, which the solid edge of the current block does not have */
+.rizin-block.pc .rizin-block-box {
+    stroke: var(--accent-orange);
+    stroke-width: calc(2px * var(--rizin-stroke));
+    stroke-dasharray: 6 3;
 }
 .rizin-block-addr {
     font-weight: 600;
@@ -9980,6 +10478,215 @@ table[data-sortable] > thead > tr > th:focus-visible {
 .rizin-import-name {
     color: var(--text-primary);
 }
+/* EMULATION: registers and stack on the left, breakpoints and patches on the right, each column scrolling in itself
+   (neither the pane nor the dock grows with the rows). A changed register carries a sign (Δ), a bar and a heavier name,
+   and the run's patches a dashed edge against the hand-made ones' solid one, so that no colour carries a meaning alone. */
+.rizin-emu-pane {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr);
+    gap: 0 16px;
+    overflow: hidden;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    line-height: 1.6;
+}
+.rizin-emu-pane[hidden] {
+    display: none;
+}
+.rizin-emu-col {
+    min-width: 0;
+    min-height: 0;
+    overflow: auto;
+    padding: 0 4px 6px 0;
+}
+.rizin-emu-head {
+    margin: 4px 0 2px;
+    overflow: hidden;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: .08em;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    color: var(--accent-cyan);
+}
+.rizin-emu-head b {
+    letter-spacing: .02em;
+    color: var(--accent-pink);
+}
+/* The head of PATCHES holds the button that clears the whole cache */
+.rizin-emu-head-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+.rizin-emu-head-row .rizin-tool {
+    letter-spacing: normal;
+}
+.rizin-emu-empty {
+    padding: 4px 0;
+}
+.rizin-emu-regs {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(26ch, 1fr));
+    gap: 1px 10px;
+}
+.rizin-emu-reg {
+    display: grid;
+    grid-template-columns: 2ch 6ch minmax(0, 1fr);
+    align-items: center;
+    gap: 0 4px;
+    padding: 0 4px;
+    border-left: 2px solid transparent;
+}
+.rizin-emu-reg.changed {
+    font-weight: 700;
+    border-left-color: var(--accent-orange);
+}
+.rizin-emu-delta {
+    font-weight: 700;
+    color: var(--accent-orange);
+}
+.rizin-emu-reg-name {
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+    color: var(--text-primary);
+}
+.rizin-emu-reg-input {
+    width: 100%;
+    min-width: 0;
+    padding: 0 4px;
+    font: inherit;
+    color: var(--accent-cyan);
+}
+.rizin-emu-row {
+    grid-template-columns: 19ch minmax(0, 1fr) minmax(0, 1.3fr) 3.2ch;
+}
+.rizin-emu-bp {
+    grid-template-columns: 19ch minmax(0, 1fr) auto 3.2ch;
+}
+.rizin-emu-stack {
+    grid-template-columns: 19ch 19ch minmax(0, 1fr);
+}
+.rizin-emu-value[data-addr] {
+    text-decoration: underline dotted;
+    text-underline-offset: 3px;
+}
+.rizin-emu-fn {
+    color: var(--text-primary);
+}
+.rizin-emu-hint {
+    color: var(--accent-yellow);
+}
+.rizin-emu-bytes {
+    color: var(--c-amber-300);
+}
+.rizin-emu-del {
+    padding: 0 4px;
+    line-height: 1.3;
+}
+/* The two groups of patches: apart, each with its own edge */
+.rizin-emu-group {
+    margin: 6px 0 8px;
+    padding: 2px 0 2px 8px;
+    border-left: 3px solid var(--border-primary);
+}
+.rizin-emu-hand {
+    border-left: 3px solid var(--accent-green);
+}
+.rizin-emu-run {
+    border-left: 3px dashed var(--accent-orange);
+}
+.rizin-emu-subhead {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 2px 8px;
+    font-weight: 600;
+    color: var(--text-primary);
+}
+.rizin-emu-actions {
+    display: flex;
+    gap: 4px;
+    margin-left: auto;
+}
+.rizin-emu-fate {
+    font-weight: 400;
+    font-style: italic;
+    color: var(--text-muted);
+}
+.rizin-emu-run .rizin-emu-fate {
+    color: var(--accent-orange);
+}
+/* What waits (held back over a run's bytes, not in the cache): a dotted edge, between the solid of the hand-made group
+   and the dashed of the run's, and a row of its own with the reason under it and two buttons */
+.rizin-emu-waiting {
+    border-left: 3px dotted var(--accent-yellow);
+}
+.rizin-emu-waiting .rizin-emu-fate {
+    color: var(--accent-yellow);
+}
+.rizin-emu-wait {
+    grid-template-columns: 19ch minmax(0, 1fr) minmax(0, 1.3fr) auto 3.2ch;
+}
+.rizin-emu-wait .rizin-emu-wait-why {
+    grid-column: 1 / -1;
+    overflow: visible;
+    white-space: normal;
+    text-overflow: clip;
+}
+/* The restore button, at the head of the column that holds the lists */
+.rizin-emu-restore {
+    display: flex;
+    gap: 8px;
+    margin: 4px 0 2px;
+}
+.rizin-emu-warn {
+    color: var(--accent-yellow);
+}
+.rizin-emu-warn::before,
+.rizin-emu-urgent::before {
+    content: "⚠ ";
+}
+/* A patch set over bytes a run wrote: its "before" is the run's byte, which need not be the file's */
+.rizin-emu-over-mark {
+    margin-right: 3px;
+    font-weight: 600;
+    color: var(--accent-yellow);
+}
+.rizin-emu-note {
+    margin: 2px 0;
+    overflow-wrap: anywhere;
+    color: var(--text-secondary);
+}
+.rizin-emu-note-wait {
+    font-style: italic;
+    color: var(--accent-yellow);
+}
+.rizin-emu-note-error {
+    color: var(--c-red-300);
+}
+.rizin-emu-urgent {
+    font-weight: 600;
+    color: var(--accent-yellow);
+}
+.rizin-emu-export {
+    margin: 2px 0;
+    padding: 2px 6px;
+    overflow-wrap: anywhere;
+    color: var(--text-secondary);
+    border: 1px dashed var(--border-primary);
+}
+.rizin-emu-export pre {
+    max-height: 9em;
+    margin: 2px 0 0;
+    overflow: auto;
+    font: inherit;
+    white-space: pre-wrap;
+    color: var(--text-muted);
+}
 /* Rename and Comment on a right-click, at the mouse */
 .rizin-menu {
     position: fixed;
@@ -10008,6 +10715,14 @@ table[data-sortable] > thead > tr > th:focus-visible {
 }
 .rizin-menu-items[hidden] {
     display: none;
+}
+.rizin-menu-item[hidden],
+.rizin-menu-sep[hidden] {
+    display: none;
+}
+.rizin-menu-sep {
+    margin: 3px 0;
+    border-top: 1px solid var(--border-primary);
 }
 .rizin-menu-item {
     display: block;
@@ -10069,6 +10784,13 @@ table[data-sortable] > thead > tr > th:focus-visible {
 }
 .rizin-menu-note.rizin-menu-wait {
     color: var(--accent-yellow);
+}
+/* Under the items, why some of them are off (not an error) */
+.rizin-menu-note.rizin-menu-hint {
+    color: var(--text-muted);
+}
+.rizin-menu > .rizin-menu-note {
+    padding: 3px 8px 2px;
 }
 /* A file dragged over the tab: dropped, it is uploaded and opened */
 #tab-rizin.rizin-dragover .rizin-work {
@@ -10433,10 +11155,14 @@ body.maintenance-active #app {
 @media (prefers-reduced-motion: reduce) {
     .btn-skull:not(:disabled):hover .btn-skull-art,
     .btn-skull:not(:disabled):focus-visible .btn-skull-art,
-    .tdc-confirm {
+    .tdc-confirm,
+    .fw-arc-pending .fw-arc-line,
+    .toast.toast-decision.is-new {
         animation: none;
     }
-    .btn-skull-art {
+    .btn-skull-art,
+    .fw-arc-line,
+    .fw-caret {
         transition: none;
     }
 }
@@ -10582,7 +11308,7 @@ body.maintenance-active #app {
     color: var(--accent-cyan);
     word-break: break-all;
 }
-.logs-syntax { min-width: 28px; cursor: help; }
+.logs-syntax { min-width: 28px; }
 .logs-error {
     display: flex;
     flex-wrap: wrap;
@@ -10612,6 +11338,14 @@ body.maintenance-active #app {
     border-radius: 2px;
 }
 .logs-bar-row { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
+/* The way back to the tab a jump came from (openLogsTab): ← FIREWALL and its × */
+.logs-back-row { display: flex; }
+.logs-back-row[hidden] { display: none; }
+.logs-back { display: inline-flex; align-items: stretch; gap: 2px; max-width: 100%; }
+.logs-back-go { min-width: 0; border-color: var(--accent-cyan); }
+.logs-back-go .alerts-filter-chip-kind { color: var(--accent-cyan); }
+.logs-back-x { padding: 3px 7px; }
+.logs-range-note { font-size: 11px; color: var(--accent-yellow); }
 .logs-range { display: inline-flex; align-items: center; gap: 8px; }
 .logs-range .chart-range-btn { height: 22px; padding: 0 10px; font-size: 10px; }
 .logs-sources { display: flex; flex-wrap: wrap; gap: 6px; }
@@ -10664,7 +11398,6 @@ body.maintenance-active #app {
     font-size: 10px;
     color: var(--text-muted);
 }
-.logs-timechart .logs-legend { margin: 8px 0 0; }
 .logs-legend-swatch {
     display: inline-block;
     width: 8px;
@@ -10681,6 +11414,98 @@ body.maintenance-active #app {
     align-items: start;
     padding: 12px 20px 20px;
 }
+/* The left column: the COMMANDS card over FIELDS. It stretches over the whole
+   result so the sticky card can stay at the top while the result scrolls. */
+.logs-side {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+    min-width: 0;
+    align-self: stretch;
+}
+.logs-commands {
+    position: sticky;
+    top: var(--logs-bar-height);
+    z-index: 3;
+    padding: 10px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-accent);
+    border-radius: var(--radius-lg);
+}
+/* Shut, the card is one line high: the head stays, the list folds away */
+.logs-commands.is-shut .logs-commands-list { display: none; }
+.logs-commands.is-shut .logs-commands-head { margin-bottom: 0; }
+.logs-commands-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 6px;
+    margin-bottom: 6px;
+    cursor: pointer;
+}
+.logs-commands-toggle {
+    display: inline-flex;
+    flex: none;
+    align-items: center;
+    padding: 2px 4px;
+    color: var(--text-muted);
+    background: transparent;
+    border: 0;
+    cursor: pointer;
+}
+.logs-commands-head:hover .logs-commands-toggle,
+.logs-commands-toggle:focus-visible { color: var(--text-primary); }
+.logs-commands-toggle:focus-visible { outline: 2px solid var(--accent-cyan); outline-offset: -2px; }
+.logs-commands:not(.is-shut) .logs-commands-toggle .logs-caret { transform: rotate(90deg); }
+.logs-commands-list { max-height: 52vh; overflow-y: auto; }
+.logs-cmd-group { padding: 1px 0; }
+.logs-cmd-group + .logs-cmd-group { border-top: 1px solid var(--border-primary); }
+.logs-cmd-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    padding: 4px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    text-align: left;
+    color: var(--text-muted);
+    background: transparent;
+    border: 0;
+    border-radius: var(--radius);
+    cursor: pointer;
+}
+.logs-cmd-head:hover { color: var(--text-primary); background: var(--bg-card-hover); }
+.logs-cmd-head:focus-visible,
+.logs-cmd:focus-visible { outline: 2px solid var(--accent-cyan); outline-offset: -2px; }
+.logs-cmd-group.is-open > .logs-cmd-head .logs-caret { transform: rotate(90deg); }
+.logs-cmd-group-name { flex: 1; min-width: 0; }
+.logs-cmd-count { flex: none; font-family: var(--font-mono); font-size: 10px; color: var(--text-dim); }
+.logs-cmd-list { margin: 0 0 6px; padding: 0; list-style: none; }
+.logs-cmd-group:not(.is-open) > .logs-cmd-list { display: none; }
+.logs-cmd {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    column-gap: 6px;
+    width: 100%;
+    padding: 2px 6px;
+    text-align: left;
+    background: transparent;
+    border: 0;
+    border-radius: 3px;
+    cursor: pointer;
+}
+.logs-cmd:hover { background: var(--bg-card-hover); }
+.logs-cmd-text {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--accent-cyan);
+    overflow-wrap: anywhere;
+}
+.logs-cmd-hint { font-size: 10px; line-height: 1.3; color: var(--text-muted); }
+.logs-cmd:hover .logs-cmd-hint { color: var(--text-secondary); }
 .logs-fields {
     min-width: 0;
     max-height: 72vh;
@@ -10748,6 +11573,256 @@ body.maintenance-active #app {
 .logs-value-text { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .logs-value-count { flex: none; color: var(--text-muted); }
 .logs-main { min-width: 0; }
+/* Over the result the three tabs (EVENTS, STATISTICS, VISUALIZATION) and, for
+   a result the pipes made, the form of its chart. A tab or a form the result
+   cannot carry stays on the row, grey and aria-disabled, with the reason in
+   its title: a grey button says more than an empty picture. The right end of
+   the row is free for a button that works on the result. */
+.logs-result-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 16px;
+    margin-bottom: 10px;
+    border-bottom: 1px solid var(--border-primary);
+}
+.logs-tabs { display: flex; flex-wrap: wrap; }
+.logs-tab {
+    padding: 5px 12px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    color: var(--text-muted);
+    background: transparent;
+    border: 0;
+    border-bottom: 2px solid transparent;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s;
+}
+.logs-tab:hover { color: var(--text-primary); }
+.logs-tab[aria-selected="true"] {
+    color: var(--accent-cyan);
+    border-bottom-color: var(--accent-cyan);
+}
+.logs-tab[aria-disabled="true"] {
+    color: var(--text-dim);
+    opacity: 0.5;
+    cursor: default;
+}
+.logs-tab[aria-disabled="true"]:hover { color: var(--text-dim); }
+.logs-tab:focus-visible,
+.logs-form:focus-visible { outline: 2px solid var(--accent-cyan); outline-offset: -2px; }
+.logs-forms { display: flex; flex-wrap: wrap; gap: 4px; }
+.logs-forms[hidden] { display: none; }
+.logs-form {
+    padding: 2px 8px;
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+    background: transparent;
+    border: 1px solid var(--border-accent);
+    border-radius: 3px;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s, background-color 0.15s;
+}
+.logs-form:hover { color: var(--accent-cyan); border-color: var(--accent-cyan); }
+.logs-form[aria-pressed="true"] {
+    color: var(--accent-cyan);
+    background: rgba(var(--accent-cyan-rgb), 0.12);
+    border-color: var(--accent-cyan);
+}
+.logs-form[aria-disabled="true"] {
+    color: var(--text-dim);
+    background: transparent;
+    border-color: var(--border-primary);
+    border-style: dashed;
+    cursor: default;
+}
+.logs-form[aria-disabled="true"]:hover { color: var(--text-dim); border-color: var(--border-primary); }
+/* SAVE at the free end of the tab row: the result as a tile on a dashboard.
+   Locked while the result has no form, with the reason in its title. */
+.logs-save-btn {
+    margin-left: auto;
+    padding: 2px 10px;
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    color: var(--accent-cyan);
+    background: transparent;
+    border: 1px solid var(--accent-cyan);
+    border-radius: 3px;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s, background-color 0.15s;
+}
+.logs-save-btn:hover { background: rgba(var(--accent-cyan-rgb), 0.12); }
+.logs-save-btn[aria-disabled="true"] {
+    color: var(--text-dim);
+    background: transparent;
+    border-color: var(--border-primary);
+    border-style: dashed;
+    cursor: default;
+}
+.logs-save-btn[aria-disabled="true"]:hover { color: var(--text-dim); border-color: var(--border-primary); }
+.logs-save-btn:focus-visible { outline: 2px solid var(--accent-cyan); outline-offset: -2px; }
+/* The dialog that puts the result on a dashboard: a backdrop and the content
+   beside it, like the help window. It never grows past the window (1280x800). */
+.logs-save {
+    position: fixed;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    z-index: 10000;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+.logs-save.hidden { display: none; }
+.logs-save-backdrop {
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    bottom: 0;
+    background: rgba(var(--c-black-rgb), 0.7);
+}
+.logs-save-content {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    width: 90vw;
+    max-width: 520px;
+    max-height: 85vh;
+    overflow: hidden;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius-lg);
+    box-shadow: 0 20px 60px rgba(var(--c-black-rgb), 0.6);
+}
+.logs-save-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 12px 16px;
+    background: var(--bg-primary);
+    border-bottom: 1px solid var(--border-primary);
+}
+.logs-save-title {
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 1px;
+    color: var(--text-primary);
+}
+.logs-save-body {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+    padding: 16px;
+    overflow-y: auto;
+}
+.logs-save-field {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    min-width: 0;
+}
+.logs-save-label {
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    color: var(--text-muted);
+}
+.logs-save-input { width: 100%; }
+.logs-save-input[hidden] { display: none; }
+.logs-save-form {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    color: var(--accent-cyan);
+}
+.logs-save-picks { display: flex; flex-wrap: wrap; gap: 6px; }
+.logs-save-pick {
+    max-width: 100%;
+    overflow: hidden;
+    padding: 4px 10px;
+    font-size: 11px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-secondary);
+    background: transparent;
+    border: 1px solid var(--border-accent);
+    border-radius: 3px;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s, background-color 0.15s;
+}
+.logs-save-pick:hover { color: var(--accent-cyan); border-color: var(--accent-cyan); }
+.logs-save-pick[aria-pressed="true"] {
+    color: var(--accent-cyan);
+    background: rgba(var(--accent-cyan-rgb), 0.12);
+    border-color: var(--accent-cyan);
+}
+.logs-save-pick[aria-disabled="true"] {
+    color: var(--text-dim);
+    background: transparent;
+    border-color: var(--border-primary);
+    border-style: dashed;
+    cursor: default;
+}
+.logs-save-pick[aria-disabled="true"]:hover { color: var(--text-dim); border-color: var(--border-primary); }
+.logs-save-pick:focus-visible,
+.logs-save-input:focus-visible { outline: 2px solid var(--accent-cyan); outline-offset: -2px; }
+/* Why a save was refused: the sentence of the server, in the dialog */
+.logs-save-error {
+    font-size: 11px;
+    color: var(--accent-red);
+}
+.logs-save-error[hidden] { display: none; }
+.logs-save-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 8px;
+}
+/* VISUALIZATION: the chart beside its legend (a timechart's chips under it)
+   and, where the chart stands for less than the whole, the line that says so */
+.logs-chart-card { padding: 12px; }
+.logs-chart {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 12px;
+    min-width: 0;
+}
+.logs-chart .chart-split { flex: 1 1 auto; min-width: 0; }
+/* The legend keeps a column of its own: a name and its count stay side by side */
+.logs-chart .chart-legend { flex: 0 1 300px; }
+.logs-chart .logs-legend { flex-basis: 100%; margin: 0; }
+/* The line under a chart that stands for less than the whole. Only the one
+   that takes a click (a table result, where | sort -count | head 20 helps) is
+   a button; a timechart's line is plain text. */
+.logs-trunc {
+    display: block;
+    width: 100%;
+    margin-top: 8px;
+    padding: 4px 2px;
+    font-size: 11px;
+    text-align: left;
+    color: var(--accent-yellow);
+    background: transparent;
+    border: 0;
+}
+button.logs-trunc { cursor: pointer; }
+button.logs-trunc:hover { color: var(--accent-orange); text-decoration: underline; }
+.logs-trunc:focus-visible { outline: 2px solid var(--accent-cyan); outline-offset: -2px; }
+.logs-trunc code { font-family: var(--font-mono); font-size: 11px; color: inherit; }
 .logs-results { min-width: 0; transition: opacity 0.15s; }
 .logs-results.is-loading { opacity: 0.55; }
 .logs-empty { padding: 28px 16px; font-size: 12px; text-align: center; color: var(--text-muted); }
@@ -10854,7 +11929,6 @@ body.maintenance-active #app {
 }
 .logs-raw-note { margin-top: 4px; font-size: 10px; color: var(--text-muted); }
 .logs-more { margin-top: 10px; }
-.logs-timechart { margin-bottom: 12px; }
 .logs-table-wrap {
     overflow-x: auto;
     background: var(--bg-card);
@@ -10888,9 +11962,17 @@ body.maintenance-active #app {
 .logs-cell-num { font-variant-numeric: tabular-nums; text-align: right; color: var(--text-primary); }
 .logs-cell-time { color: var(--text-muted); }
 .logs-cell-empty { color: var(--text-dim); }
-@media (max-width: 900px) {
+/* Too narrow for a column beside the result: the COMMANDS card lies over the
+   result, FIELDS below it, and the card does not stay while it scrolls. */
+@media (max-width: 1100px) {
     .logs-body { grid-template-columns: minmax(0, 1fr); }
-    .logs-fields { max-height: 260px; }
+    .logs-side { display: contents; }
+    .logs-commands { position: static; order: 0; }
+    .logs-commands-list { max-height: 40vh; }
+    .logs-main { order: 1; }
+    .logs-fields { order: 2; max-height: 260px; }
+}
+@media (max-width: 900px) {
     .logs-event-row { grid-template-columns: 10px minmax(0, 1fr); }
     .logs-event-row .logs-time,
     .logs-event-row .logs-src { grid-column: 2; }
@@ -10898,6 +11980,711 @@ body.maintenance-active #app {
 @media (prefers-reduced-motion: reduce) {
     .logs-live[aria-pressed="true"] .logs-live-dot { animation: none; }
     .logs-caret { transition: none; }
+}
+
+/* --- FIREWALL tab (block FIREWALL of app.js) ---
+   The head with LIVE, ASK (a menu), ISOLATED (red while it is on) and the
+   range; the bands of what is not enforced (red: the firewall off, ISOLATED,
+   a way out a fetch left open); the process tree, MAP | LIST | ASN with the
+   hints and the secured samples, the summary. Where these stand is
+   theme-layout.css's (.fw-grid). A row, a chip and an arc take the colour of
+   their most severe tag from .fw-tone-* (as color and as --fw-tone); the
+   text in them keeps its own. Nothing moves but the dash of an arc with an
+   open decision, the LIVE dot and the carets, all still under
+   prefers-reduced-motion. A URL or a host is text, selectable in one click. --- */
+#tab-firewall { overflow-x: hidden; overflow-y: auto; }
+.fw-head { flex-wrap: wrap; justify-content: flex-end; gap: 8px; }
+.fw-count {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.fw-ask-wrap { position: relative; }
+.fw-ask-btn.is-off {
+    color: var(--accent-yellow);
+    border-color: var(--accent-yellow);
+}
+.fw-ask-menu {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: 20;
+    width: 340px;
+    max-width: 80vw;
+    padding: 6px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-accent);
+    border-radius: var(--radius-lg);
+    box-shadow: 0 10px 30px rgba(var(--c-black-rgb), 0.5);
+}
+.fw-ask-menu[hidden] { display: none; }
+.fw-ask-item {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    width: 100%;
+    padding: 6px 8px;
+    font-size: 11.5px;
+    text-align: left;
+    color: var(--text-muted);
+    background: transparent;
+    border: 0;
+    border-radius: var(--radius);
+    cursor: pointer;
+}
+.fw-ask-item:hover,
+.fw-ask-item:focus-visible { background: var(--bg-card-hover); outline: none; }
+.fw-ask-label { font-size: 12px; font-weight: 600; color: var(--text-primary); }
+.fw-ask-item[aria-checked="true"] .fw-ask-label { color: var(--accent-cyan); }
+.fw-isolated.is-on {
+    color: var(--c-white);
+    font-weight: 700;
+    background: var(--severity-critical);
+    border-color: var(--severity-critical);
+}
+.fw-isolated:disabled { opacity: 0.5; cursor: not-allowed; }
+.fw-bands { display: flex; flex-direction: column; gap: 6px; }
+.fw-bands[hidden] { display: none; }
+.fw-band {
+    padding: 8px 12px;
+    font-size: 12px;
+    line-height: 1.45;
+    color: var(--text-secondary);
+    background: rgba(var(--accent-yellow-rgb), 0.08);
+    border: 1px solid rgba(var(--accent-yellow-rgb), 0.4);
+    border-left-width: 3px;
+    border-radius: var(--radius);
+}
+.fw-band strong { color: var(--text-primary); }
+.fw-band-off,
+.fw-band-isolated,
+.fw-band-hole {
+    background: rgba(var(--severity-critical-rgb), 0.1);
+    border-color: rgba(var(--severity-critical-rgb), 0.55);
+}
+.fw-band-off strong,
+.fw-band-isolated strong,
+.fw-band-hole strong { color: var(--severity-critical); }
+/* A way out that stands open is a hole, not a state: dashed, with a thick edge */
+.fw-band-hole { border-style: dashed; border-left: 6px solid var(--severity-critical); }
+.fw-empty { padding: 14px 10px; font-size: 12px; color: var(--text-muted); }
+
+/* The tree */
+.fw-tree-pane {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    background: var(--bg-card);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius-lg);
+}
+.fw-pane-head { padding: 10px 12px 6px; }
+.fw-search { box-sizing: border-box; width: auto; margin: 0 10px 8px; }
+.fw-tree { flex: 1 1 auto; min-height: 0; padding: 0 6px 8px; overflow-y: auto; font-size: 12px; }
+.fw-group + .fw-group { margin-top: 6px; padding-top: 6px; border-top: 1px solid var(--border-primary); }
+.fw-group-head {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    padding: 5px 6px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    letter-spacing: 1px;
+    text-align: left;
+    color: var(--text-muted);
+    background: transparent;
+    border: 0;
+    border-radius: var(--radius);
+    cursor: pointer;
+}
+.fw-group-head:hover { background: var(--bg-card-hover); }
+.fw-group-name { font-weight: 600; }
+.fw-caret {
+    flex: 0 0 auto;
+    width: 0;
+    height: 0;
+    border-top: 4px solid transparent;
+    border-bottom: 4px solid transparent;
+    border-left: 5px solid currentColor;
+    transition: transform 0.15s;
+}
+[aria-expanded="true"] > .fw-caret { transform: rotate(90deg); }
+.fw-proc {
+    margin: 2px 0;
+    border-left: 2px solid var(--fw-tone, transparent);
+    border-radius: 0 var(--radius) var(--radius) 0;
+}
+/* A detonated process is shaded, as in the graph */
+.fw-proc.is-detonated { background: rgba(var(--graph-detonated-rgb), 0.05); }
+.fw-proc.is-selected > .fw-proc-row,
+.fw-ep.is-selected { background: var(--bg-card-hover); }
+.fw-proc-row,
+.fw-ep-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.fw-proc-row { padding: 3px 4px 3px 2px; }
+.fw-ep-row { padding: 2px 4px 2px 6px; }
+.fw-caret-btn {
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    width: 18px;
+    height: 18px;
+    padding: 0;
+    color: var(--text-muted);
+    background: transparent;
+    border: 0;
+    cursor: pointer;
+}
+.fw-name,
+.fw-ep-main {
+    display: flex;
+    flex: 1 1 auto;
+    align-items: baseline;
+    gap: 6px;
+    min-width: 0;
+    padding: 0;
+    overflow: hidden;
+    font-family: var(--font-mono);
+    text-align: left;
+    white-space: nowrap;
+    background: transparent;
+    border: 0;
+    cursor: pointer;
+}
+.fw-name { font-size: 12px; color: var(--text-primary); }
+.fw-ep-main { font-size: 11.5px; color: var(--text-secondary); }
+.fw-name-text,
+.fw-ep-host,
+.fw-ep-addr { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+.fw-name:hover .fw-name-text,
+.fw-ep-main:hover .fw-ep-host { text-decoration: underline; }
+.fw-ep-host { color: var(--text-primary); }
+.fw-ep-sub { display: flex; align-items: center; gap: 6px; min-width: 0; padding: 0 4px 3px 6px; }
+.fw-ep-addr { flex: 0 1 auto; font-family: var(--font-mono); font-size: 10.5px; white-space: nowrap; color: var(--text-muted); }
+.fw-pid,
+.fw-cc { flex: 0 0 auto; font-size: 10px; color: var(--text-dim); }
+.fw-det {
+    flex: 0 0 auto;
+    padding: 0 4px;
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.06em;
+    color: var(--graph-detonated);
+    border: 1px solid var(--graph-detonated);
+    border-radius: 3px;
+}
+.fw-spark { flex: 0 0 48px; width: 48px; height: 12px; fill: var(--fw-tone, var(--text-muted)); }
+.fw-spark-base { fill: none; stroke: var(--border-primary); stroke-width: 1; }
+.fw-num {
+    flex: 0 0 auto;
+    min-width: 28px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-variant-numeric: tabular-nums;
+    text-align: right;
+    color: var(--text-secondary);
+}
+.fw-switch {
+    display: inline-flex;
+    flex: 0 0 auto;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    min-width: 58px;
+    padding: 2px 6px;
+    font-family: var(--font-mono);
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.04em;
+    color: var(--accent-green);
+    background: rgba(var(--accent-green-rgb), 0.08);
+    border: 1px solid rgba(var(--accent-green-rgb), 0.5);
+    border-radius: 10px;
+    cursor: pointer;
+}
+.fw-switch:hover:not(:disabled) { border-color: var(--accent-green); }
+.fw-switch.is-deny {
+    color: var(--severity-critical);
+    background: rgba(var(--severity-critical-rgb), 0.12);
+    border-color: var(--severity-critical);
+}
+.fw-switch.is-pending {
+    color: var(--accent-yellow);
+    background: rgba(var(--accent-yellow-rgb), 0.1);
+    border-color: var(--accent-yellow);
+}
+/* The rule is for another protocol than this connection: it may not hold */
+.fw-switch.is-mismatch { border-style: dashed; }
+.fw-switch.is-unknown {
+    color: var(--text-muted);
+    background: transparent;
+    border: 1px dashed var(--border-dashed);
+    cursor: help;
+}
+.fw-switch:disabled { opacity: 0.45; cursor: not-allowed; }
+.fw-proto { font-weight: 400; opacity: 0.85; }
+.fw-proc-tags { display: flex; gap: 4px; padding: 0 4px 3px 26px; overflow: hidden; }
+.fw-ep-tags { display: flex; flex: 0 1 auto; gap: 3px; min-width: 0; overflow: hidden; }
+.fw-tag {
+    flex: 0 0 auto;
+    max-width: 140px;
+    padding: 0 5px;
+    overflow: hidden;
+    font-family: var(--font-mono);
+    font-size: 9.5px;
+    line-height: 15px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--fw-tone, var(--text-muted));
+    border: 1px solid currentColor;
+    border-radius: 3px;
+}
+.fw-tag.fw-tag-more { color: var(--text-muted); cursor: help; }
+.fw-eps { padding: 0 0 4px 18px; }
+.fw-ep {
+    margin: 1px 0;
+    border-left: 2px solid var(--fw-tone, transparent);
+    border-radius: 0 var(--radius) var(--radius) 0;
+}
+.fw-fwrec { flex: 0 0 auto; font-family: var(--font-mono); font-size: 9.5px; color: var(--text-dim); cursor: help; }
+.fw-ep-url { display: flex; align-items: baseline; gap: 6px; min-width: 0; padding: 0 6px 3px 12px; }
+.fw-url-state {
+    flex: 0 0 auto;
+    font-family: var(--font-mono);
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: 0.05em;
+    color: var(--accent-yellow);
+}
+.fw-url {
+    min-width: 0;
+    overflow: hidden;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-secondary);
+    user-select: all;
+}
+.fw-more { margin: 4px 0 2px 8px; }
+.fw-row-actions { display: flex; justify-content: flex-end; gap: 6px; padding: 0 4px 4px; }
+.fw-kill { color: var(--severity-critical); border-color: rgba(var(--severity-critical-rgb), 0.5); }
+.fw-kill:disabled { opacity: 0.45; cursor: not-allowed; }
+.fw-logs { white-space: nowrap; }
+.fw-enable { margin-left: 4px; color: var(--severity-critical); border-color: var(--severity-critical); font-weight: 700; }
+.fw-stale { margin: 0 0 8px; font-size: 11px; color: var(--accent-yellow); }
+/* DENY with a rule the server did not name: still a claim of a block, with an open question */
+.fw-switch.is-unknown-rule { border-style: dashed; cursor: help; }
+.fw-cell-state.is-mismatch { text-decoration: underline dashed; text-underline-offset: 3px; }
+
+/* MAP | LIST | ASN */
+.fw-center { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.fw-view { min-height: 160px; }
+.fw-map-wrap { position: relative; }
+.fw-map-wrap .fw-map { display: block; width: 100%; height: auto; }
+/* in LOGS ▸ on the selected point: just right of it, never wider than the map */
+.fw-map-pin { position: absolute; transform: translate(10px, -50%); pointer-events: none; }
+.fw-map-pin.is-left { transform: translate(calc(-100% - 10px), -50%); }
+.fw-map-pin .fw-logs { pointer-events: auto; background: var(--bg-card); }
+.fw-map-notes {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+    padding: 6px 2px 0;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.fw-table-wrap { max-height: 560px; overflow: auto; }
+.fw-list-row { cursor: pointer; }
+.fw-list-row > td:first-child { box-shadow: inset 3px 0 0 var(--fw-tone, transparent); }
+.logs-table tbody tr.fw-list-row.is-selected { background: var(--bg-card-hover); }
+.fw-table td.fw-cell-ips { min-width: 180px; white-space: normal; }
+.fw-cell-tags .fw-tag { display: inline-block; margin: 1px 3px 1px 0; vertical-align: middle; }
+.fw-state-deny { font-weight: 700; color: var(--severity-critical); }
+.fw-state-pending { color: var(--accent-yellow); }
+.fw-state-allow { color: var(--accent-green); }
+.fw-state-unknown { color: var(--text-muted); }
+.fw-ip {
+    margin: 1px 3px 1px 0;
+    padding: 0 5px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--text-primary);
+    background: transparent;
+    border: 1px solid var(--fw-tone, var(--border-primary));
+    border-radius: 3px;
+    cursor: pointer;
+}
+
+/* HUNT FURTHER */
+.fw-sel { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 0 0 8px; font-size: 12px; }
+.fw-sel-what {
+    flex: 1 1 260px;
+    min-width: 0;
+    overflow: hidden;
+    font-family: var(--font-mono);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-primary);
+}
+.fw-sel-none { color: var(--text-muted); }
+.fw-sel-actions { display: flex; gap: 6px; }
+.fw-block-all { color: var(--severity-critical); border-color: rgba(var(--severity-critical-rgb), 0.5); }
+.fw-hint-list { display: flex; flex-direction: column; gap: 4px; margin: 0; padding: 0; list-style: none; }
+.fw-hint {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: baseline;
+    gap: 2px 12px;
+    width: 100%;
+    padding: 6px 8px;
+    text-align: left;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+    cursor: pointer;
+}
+.fw-hint:hover,
+.fw-hint:focus-visible { border-color: var(--accent-cyan); outline: none; }
+.fw-hint-label { flex: 0 0 220px; font-size: 11.5px; color: var(--text-secondary); }
+.fw-hint-query {
+    flex: 1 1 260px;
+    min-width: 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--accent-cyan);
+    word-break: break-all;
+}
+
+/* SECURED SAMPLES */
+.fw-cap-list { margin: 0; padding: 0; list-style: none; }
+.fw-cap {
+    display: grid;
+    grid-template-columns: auto minmax(0, 1fr) auto;
+    grid-template-areas: "time url actions" "meta meta actions";
+    align-items: center;
+    gap: 2px 10px;
+    padding: 6px 0;
+    border-top: 1px solid var(--border-primary);
+}
+.fw-cap-time { grid-area: time; font-family: var(--font-mono); font-size: 10.5px; white-space: nowrap; color: var(--text-muted); }
+.fw-cap .fw-url { grid-area: url; }
+.fw-cap-meta {
+    display: flex;
+    flex-wrap: wrap;
+    grid-area: meta;
+    gap: 4px 10px;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    color: var(--text-secondary);
+}
+.fw-cap-magic { padding: 0 4px; font-weight: 700; color: var(--accent-pink); border: 1px solid currentColor; border-radius: 3px; }
+.fw-cap-sha { color: var(--text-dim); user-select: all; }
+.fw-cap-proc { color: var(--text-muted); }
+.fw-cap-actions { display: flex; grid-area: actions; gap: 4px; }
+
+/* The summary */
+.fw-summary { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+
+/* The network cut under the summary: the UPDATE ALL skull, larger, its label under it and the stage in it. Its
+   skull does not pulse on hover: a state that matters is not one that blinks. */
+.fw-cut-card { display: flex; flex-direction: column; align-items: stretch; }
+/* It stays in view while the column scrolls: at the top once the summary has gone up, at the bottom while the
+   summary is taller than the window (over its end, then). The id outweighs the cards' position: relative. */
+#tab-firewall .fw-summary > .fw-cut-card {
+    position: sticky;
+    top: 14px;
+    bottom: 14px;
+    z-index: 2;
+}
+.fw-cut-slot { display: flex; justify-content: center; padding: 6px 0 2px; }
+.fw-cut {
+    flex-direction: column;
+    gap: 8px;
+    padding: 4px 8px;
+    text-align: center;
+}
+.fw-cut .btn-skull-art { width: 84px; height: 84px; }
+.fw-cut:not(:disabled):hover .btn-skull-art,
+.fw-cut:not(:disabled):focus-visible .btn-skull-art { animation: none; }
+.fw-cut[aria-pressed="true"] .btn-skull-label { color: var(--skull-red-light); }
+.fw-cut.fw-cut-reopened .btn-skull-label,
+.fw-cut.fw-cut-unconfirmed .btn-skull-label,
+.fw-cut.fw-cut-unsecured .btn-skull-label,
+.fw-cut.fw-cut-cutunconfirmed .btn-skull-label { color: var(--accent-yellow); }
+.fw-cut[aria-busy="true"] { cursor: progress; }
+.fw-cut-note {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin: 8px 0 0;
+    font-size: 11px;
+    line-height: 1.45;
+    text-align: center;
+    color: var(--text-secondary);
+}
+.fw-cut-fetch { color: var(--text-muted); }
+.fw-tiles { display: grid; gap: 8px; margin-bottom: 4px; }
+.fw-tile {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    min-width: 0;
+    padding: 8px 10px;
+    color: var(--text-primary);
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+}
+.fw-tile-label { font-size: 9.5px; font-weight: 600; letter-spacing: 1.2px; color: var(--text-muted); }
+.fw-tile-value { font-family: var(--font-mono); font-size: 20px; font-weight: 700; }
+.fw-tile[class*="fw-tone-"] .fw-tile-value { color: var(--fw-tone, var(--text-primary)); }
+.fw-tile-sub { font-size: 10px; color: var(--text-dim); }
+.fw-top { margin-top: 10px; }
+.fw-top-title { margin: 0 0 4px; font-size: 9.5px; font-weight: 600; letter-spacing: 1.2px; color: var(--text-muted); }
+.fw-top-list { display: flex; flex-direction: column; gap: 3px; margin: 0; padding: 0; list-style: none; }
+.fw-top-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 3px 6px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-secondary);
+    background: linear-gradient(90deg, rgba(var(--accent-cyan-rgb), 0.14) var(--share, 0%), transparent var(--share, 0%));
+    border-radius: var(--radius);
+}
+.fw-top-btn {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: 100%;
+    min-width: 0;
+    padding: 0;
+    font: inherit;
+    text-align: left;
+    color: inherit;
+    background: transparent;
+    border: 0;
+    cursor: pointer;
+}
+.fw-top-label { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fw-top-none { font-size: 11px; color: var(--text-dim); }
+.fw-sum-note { margin: 12px 0 0; font-size: 11px; line-height: 1.45; color: var(--text-muted); }
+
+/* --- The pages of the Dashboard tab and the tiles of an own dashboard ---
+   Under the header a row of pages: SERVICES (the stats, the charts and the
+   service cards, which .dashboard-body holds) and one per own dashboard,
+   plus + NEW. The two bodies are siblings and only one of them is on screen;
+   .dashboard-body is a flex column, so `hidden` alone would not hide it. */
+.dashboard-pages {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 10px 20px;
+    border-bottom: 1px solid var(--border-primary);
+}
+.dashboard-page {
+    max-width: 240px;
+    overflow: hidden;
+    padding: 4px 12px;
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.08em;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-secondary);
+    background: transparent;
+    border: 1px solid var(--border-accent);
+    border-radius: 3px;
+    cursor: pointer;
+    transition: color 0.15s, border-color 0.15s, background-color 0.15s;
+}
+.dashboard-page:not([aria-disabled="true"]):hover { color: var(--accent-cyan); border-color: var(--accent-cyan); }
+.dashboard-page[aria-pressed="true"] {
+    color: var(--accent-cyan);
+    background: rgba(var(--accent-cyan-rgb), 0.12);
+    border-color: var(--accent-cyan);
+}
+.dashboard-page[aria-disabled="true"] {
+    color: var(--text-dim);
+    background: transparent;
+    border-color: var(--border-primary);
+    border-style: dashed;
+    cursor: default;
+}
+.dashboard-page-new { letter-spacing: 0.12em; }
+.dashboard-page:focus-visible { outline: 2px solid var(--accent-cyan); outline-offset: 1px; }
+.dashboard-body[hidden] { display: none; }
+.dashboard-own {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow-y: auto;
+}
+.dashboard-own[hidden] { display: none; }
+.dashboard-own-head {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 10px;
+    padding: 12px 20px 0;
+}
+.dashboard-own-title {
+    margin: 0;
+    overflow: hidden;
+    font-size: 13px;
+    font-weight: 600;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-primary);
+}
+.dashboard-own-count { font-size: 11px; color: var(--text-muted); }
+.dashboard-own-tools { display: inline-flex; align-items: center; gap: 8px; margin-left: auto; }
+.dashboard-own-time { font-family: var(--font-mono); font-size: 11px; color: var(--text-muted); }
+.dashboard-own-empty {
+    padding: 28px 20px;
+    font-size: 12px;
+    text-align: center;
+    color: var(--text-muted);
+}
+/* Two tiles side by side; a table, a line or a sankey takes the whole row */
+.dashboard-panels {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    gap: 12px;
+    padding: 12px 20px 20px;
+    align-items: start;
+}
+.dashboard-panel { min-width: 0; }
+.dashboard-panel-wide { grid-column: 1 / -1; }
+.dashboard-panel-head { flex-wrap: wrap; }
+.dashboard-panel-title {
+    max-width: 100%;
+    overflow: hidden;
+    font-size: 11px;
+    letter-spacing: 0.08em;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-primary);
+}
+.dashboard-panel-tools { flex-wrap: wrap; }
+.dashboard-panel-range { font-size: 10px; color: var(--text-muted); }
+.dashboard-panel-time { font-family: var(--font-mono); font-size: 10px; color: var(--text-muted); }
+.dashboard-panel-tool {
+    padding: 0 4px;
+    font-size: 13px;
+    line-height: 1.2;
+    color: var(--text-muted);
+    background: transparent;
+    border: 0;
+    cursor: pointer;
+}
+.dashboard-panel-tool:not([aria-disabled="true"]):hover { color: var(--accent-cyan); }
+.dashboard-panel-tool[aria-disabled="true"] { color: var(--text-dim); cursor: default; }
+.dashboard-panel-tool:focus-visible { outline: 2px solid var(--accent-cyan); outline-offset: 1px; }
+.dashboard-panel-body { min-width: 0; min-height: 60px; }
+.dashboard-panel-body .logs-chart { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.dashboard-panel-body .logs-table-wrap { max-height: 280px; overflow: auto; }
+.dashboard-panel-wait {
+    padding: 26px 8px;
+    font-size: 11px;
+    letter-spacing: 0.1em;
+    text-align: center;
+    color: var(--text-muted);
+}
+/* The same word over the numbers a tile still has while it computes again */
+.dashboard-panel-wait.is-again { padding: 0 0 6px; text-align: left; }
+.dashboard-panel-error {
+    padding: 10px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--accent-red);
+    background: rgba(var(--accent-red-rgb), 0.08);
+    border: 1px solid rgba(var(--accent-red-rgb), 0.4);
+    border-radius: var(--radius);
+    word-break: break-word;
+}
+.dashboard-panel-why { margin-top: 6px; font-size: 11px; color: var(--accent-yellow); }
+.dashboard-panel-foot { margin-top: 8px; overflow: hidden; }
+.dashboard-panel-query {
+    display: block;
+    overflow: hidden;
+    font-family: var(--font-mono);
+    font-size: 10.5px;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    color: var(--text-dim);
+}
+/* The ⋯ menus of a tile and of the page */
+.dashboard-menu-wrap { position: relative; display: inline-flex; }
+.dashboard-menu,
+.dashboard-panel-menu {
+    position: absolute;
+    top: calc(100% + 6px);
+    right: 0;
+    z-index: 20;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    width: 220px;
+    padding: 6px;
+    text-align: left;
+    background: var(--bg-card);
+    border: 1px solid var(--border-accent);
+    border-radius: var(--radius-lg);
+    box-shadow: 0 10px 30px rgba(var(--c-black-rgb), 0.5);
+}
+.dashboard-menu[hidden],
+.dashboard-panel-menu[hidden] { display: none; }
+.dashboard-menu-item,
+.dashboard-panel-item {
+    width: 100%;
+    padding: 6px 8px;
+    font-size: 11.5px;
+    text-align: left;
+    color: var(--text-secondary);
+    background: transparent;
+    border: 0;
+    border-radius: var(--radius);
+    cursor: pointer;
+}
+.dashboard-menu-item:hover,
+.dashboard-panel-item:not([aria-disabled="true"]):hover { background: var(--bg-card-hover); }
+.dashboard-menu-item:focus-visible,
+.dashboard-panel-item:focus-visible { outline: 2px solid var(--accent-cyan); outline-offset: -2px; }
+.dashboard-panel-item[aria-disabled="true"] { color: var(--text-dim); cursor: default; }
+.dashboard-panel-head-row {
+    padding: 6px 8px 2px;
+    font-size: 9px;
+    font-weight: 600;
+    letter-spacing: 0.15em;
+    color: var(--text-muted);
+}
+.dashboard-panel-forms { display: flex; flex-wrap: wrap; gap: 4px; padding: 0 8px 4px; }
+.dashboard-panel-form {
+    padding: 2px 7px;
+    font-size: 10px;
+    color: var(--text-secondary);
+    background: transparent;
+    border: 1px solid var(--border-accent);
+    border-radius: 3px;
+    cursor: pointer;
+}
+.dashboard-panel-form:not([aria-disabled="true"]):hover { color: var(--accent-cyan); border-color: var(--accent-cyan); }
+.dashboard-panel-form[aria-pressed="true"] { color: var(--accent-cyan); border-color: var(--accent-cyan); }
+.dashboard-panel-form[aria-disabled="true"] {
+    color: var(--text-dim);
+    border-color: var(--border-primary);
+    border-style: dashed;
+    cursor: default;
+}
+/* Too narrow for two tiles beside each other: one column, every tile wide */
+@media (max-width: 1100px) {
+    .dashboard-panels { grid-template-columns: minmax(0, 1fr); }
 }
 
 /* --- Telemetry: the effects of the "fibre telemetry" page ---
@@ -11259,4 +13046,1028 @@ body.maintenance-active #app {
     border: 1px solid var(--border-accent);
     border-radius: 3px;
     cursor: pointer;
+}
+
+/* =============================================
+   SYSCALLS tab (block SYSCALLS of app.js): the toolbar in one line that wraps in a narrow window, the notices
+   over the map, then the work area that fills the tab: the map (a canvas per module, drawn by app.js) and the
+   catalog under it, each scrolling in itself. The colours of the states are variables of both themes; the
+   canvas reads them through themeColor().
+   ============================================= */
+.syscall-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 16px;
+    margin: 10px 14px 0;
+    padding: 6px 10px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-secondary);
+}
+.syscall-group {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+}
+.syscall-filter-group {
+    margin-left: auto;
+}
+/* The MAP / GRAPH switch is the chart-range group of the other tabs, as tall as the buttons beside it */
+.syscall-toolbar .chart-range .chart-range-btn {
+    height: 22px;
+    padding: 0 12px;
+    font-size: 11px;
+}
+.syscall-switch .chart-range-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+.syscall-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
+}
+.syscall-filter-group .filter-input {
+    width: 190px;
+}
+.syscall-notices {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 10px 14px 0;
+}
+.syscall-notices[hidden],
+.syscall-scan-result[hidden],
+.syscall-tip[hidden],
+.syscall-main[hidden] {
+    display: none;
+}
+.syscall-notice {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 10px;
+    padding: 6px 10px;
+    font-size: 12px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-primary);
+    border-left: 3px solid var(--border-accent);
+    border-radius: var(--radius);
+}
+.syscall-notice-title {
+    font-family: var(--font-mono);
+    font-weight: 600;
+    color: var(--text-primary);
+}
+.syscall-notice-text {
+    min-width: 0;
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
+}
+.syscall-notice-info {
+    border-left-color: var(--severity-info);
+}
+.syscall-notice-warn {
+    border-left-color: var(--severity-medium);
+    background: rgba(var(--severity-medium-rgb), 0.06);
+}
+.syscall-notice-error {
+    border-left-color: var(--severity-critical);
+    background: rgba(var(--severity-critical-rgb), 0.08);
+}
+/* A view that cannot be told from the other one is a decision of the extraction, not a missing file: own accent */
+.syscall-notice-indistinguishable {
+    border-left-color: var(--accent-purple);
+    background: rgba(var(--accent-purple-rgb), 0.08);
+}
+/* A past measurement on the map: a notice of the warning tone (the error tone when its cells are not drawn), its tag
+   in the tone's colour, and the way back to live at the end of the line */
+.syscall-past-banner {
+    align-items: center;
+    margin: 10px 14px 0;
+}
+.syscall-past-banner[hidden] {
+    display: none;
+}
+.syscall-past-tag {
+    color: var(--severity-medium);
+    letter-spacing: 0.06em;
+}
+.syscall-notice-error .syscall-past-tag,
+.syscall-past-refusal {
+    color: var(--severity-critical);
+}
+.syscall-past-back {
+    margin-left: auto;
+}
+.syscall-scan-result {
+    margin: 8px 14px 0;
+    padding: 4px 10px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-secondary);
+    border-left: 3px solid var(--border-accent);
+    overflow-wrap: anywhere;
+}
+.syscall-scan-result-ok {
+    border-left-color: var(--accent-green);
+}
+.syscall-scan-result-warn {
+    border-left-color: var(--severity-medium);
+}
+.syscall-scan-result-error {
+    border-left-color: var(--severity-critical);
+    color: var(--severity-critical);
+}
+/* The work area: the map and the catalog on the left, the detail panel on the right, the deviations and the
+   known hooks under the map. Below 1400px the map and the detail panel take turns (MAP | DETAIL in the toolbar). */
+.syscall-work {
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(340px, 28%);
+    grid-template-rows: minmax(0, 1fr) auto;
+    gap: 8px;
+    padding: 8px 14px 12px;
+}
+.syscall-main {
+    grid-column: 1;
+    grid-row: 1;
+    min-height: 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.syscall-detail {
+    grid-column: 2;
+    grid-row: 1 / span 2;
+}
+.syscall-lower {
+    grid-column: 1;
+    grid-row: 2;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+/* The bar that stays when the row is folded: ▾ and what is behind it, so a stub run in the graph view is not silent */
+.syscall-lower-bar {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
+}
+.syscall-lower-fold {
+    flex: 0 0 auto;
+    padding: 0 6px;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 1.3;
+    color: var(--accent-cyan);
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 3px;
+    cursor: pointer;
+}
+.syscall-lower-fold:hover {
+    border-color: var(--border-accent);
+}
+.syscall-lower-folded .syscall-lower-fold {
+    transform: rotate(-90deg);
+}
+.syscall-lower-note {
+    min-width: 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+    overflow-wrap: anywhere;
+}
+.syscall-lower-body {
+    flex: 1 1 auto;
+    height: clamp(170px, 30vh, 320px);
+    min-height: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+    gap: 8px;
+}
+.syscall-lower.with-stubs .syscall-lower-body {
+    height: clamp(260px, 42vh, 440px);
+}
+.syscall-lower.syscall-lower-folded > .syscall-lower-body {
+    display: none;
+}
+.syscall-lower-left {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+    min-height: 0;
+}
+.syscall-lower-left > .syscall-panel {
+    flex: 1 1 0;
+}
+.syscall-stubs[hidden] {
+    display: none;
+}
+.syscall-stubs-summary {
+    margin-bottom: 4px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+.syscall-pane-switch {
+    display: none;
+}
+@media (max-width: 1399px) {
+    .syscall-work {
+        grid-template-columns: minmax(0, 1fr);
+    }
+    .syscall-main,
+    .syscall-detail {
+        grid-column: 1;
+        grid-row: 1;
+    }
+    .syscall-lower {
+        grid-row: 2;
+    }
+    .syscall-work[data-pane="map"] .syscall-detail,
+    .syscall-work[data-pane="detail"] .syscall-main {
+        display: none;
+    }
+    .syscall-pane-switch {
+        display: inline-flex;
+    }
+}
+.syscall-map-panel,
+.syscall-catalog {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    background: var(--bg-card);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+}
+.syscall-map-panel {
+    flex: 3 1 0;
+}
+.syscall-catalog {
+    flex: 2 1 0;
+}
+/* The GRAPH surface: the query bar, the line an answer leaves, the layered paths (scrolling in themselves, never
+   squeezed: a path keeps the size it is readable at) and the legend. When the views and the figures together do not
+   fit, the panel scrolls instead of painting them over each other or over the panels below it. */
+.binary-graph-panel {
+    flex: 1 1 0;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    overflow-y: auto;
+    background: var(--bg-card);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+}
+.binary-graph-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 8px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border-primary);
+}
+.binary-graph-bar .filter-input {
+    flex: 1 1 180px;
+    min-width: 0;
+}
+.binary-graph-bar .filter-input[hidden] {
+    display: none;
+}
+.binary-graph-status {
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border-primary);
+    border-left: 3px solid var(--border-primary);
+    font-size: 12px;
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
+}
+.binary-graph-status[hidden] {
+    display: none;
+}
+.binary-graph-status-warn {
+    border-left-color: var(--severity-medium);
+}
+.binary-graph-cut {
+    color: var(--text-primary);
+    font-weight: 600;
+}
+.binary-graph-canvas {
+    flex: 1 1 0;
+    min-height: 120px;
+    overflow: auto;
+}
+.binary-graph-svg {
+    display: block;
+}
+.binary-graph-svg text {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    white-space: pre;
+    pointer-events: none;
+}
+.binary-graph-svg .binary-graph-sub,
+.binary-graph-svg .binary-graph-edge-tag {
+    font-size: 10px;
+}
+.binary-graph-edge-tag {
+    font-weight: 600;
+    letter-spacing: 0.04em;
+}
+.binary-graph-node,
+.binary-graph-edge {
+    cursor: pointer;
+}
+.binary-graph-edge-hit {
+    fill: none;
+    stroke: transparent;
+    stroke-width: 12px;
+    pointer-events: stroke;
+}
+.binary-graph-legend {
+    border-top: 1px solid var(--border-primary);
+    border-bottom: 0;
+}
+.binary-graph-legend-mark {
+    flex: 0 0 auto;
+}
+/* The explore view beside the path: its own bar, its canvas (the stage is the box the canvas follows) and the line under it */
+.binary-graph-modes {
+    display: flex;
+    align-items: center;
+    padding: 8px 12px 0;
+}
+/* Never shorter than their content: at min-height 0 the path view shrank to 158px while its bar, canvas and legend
+   needed 270, and the legend (the only place that tells a derived edge from a curated one) was painted over the
+   figures. Neither do the figures shrink: when the three do not fit together, the panel scrolls. */
+.binary-graph-pathview,
+.binary-explore {
+    flex: 1 1 0;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: min-content;
+}
+.binary-graph-pathview[hidden],
+.binary-explore[hidden] {
+    display: none;
+}
+.binary-explore-depth-label {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.binary-explore-view {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+}
+.binary-explore-zoom {
+    min-width: 40px;
+    text-align: center;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+.binary-explore-stage {
+    position: relative;
+    flex: 1 1 0;
+    min-height: 240px;
+    overflow: hidden;
+}
+.binary-explore-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    display: block;
+    cursor: grab;
+}
+.binary-explore-info {
+    padding: 6px 12px;
+    border-top: 1px solid var(--border-primary);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
+}
+/* ⇱ folds the figures' rows away and gives their height to the graph; the bar, RELOAD and the caveats stay */
+.binary-graph-max {
+    margin-left: auto;
+    flex: 0 0 auto;
+}
+.binary-graph-maxed .binary-graph-metrics-wrap {
+    display: none;
+}
+/* The figures of the whole stock under the canvases, and the list of one in the detail panel. They never shrink below
+   their content (up to 260px, past which their body scrolls): shrunk, they left a 30px window with no whole row. */
+.binary-graph-metrics {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    max-height: 260px;
+    border-top: 1px solid var(--border-primary);
+}
+.binary-graph-metrics .binary-graph-bar {
+    flex: 0 0 auto;
+    padding-top: 6px;
+    padding-bottom: 6px;
+}
+.binary-graph-metrics-wrap {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+}
+.view-table td.binary-graph-means {
+    white-space: normal;
+    color: var(--text-secondary);
+}
+.binary-graph-figure,
+.binary-graph-member-name:is(button) {
+    padding: 0;
+    border: 0;
+    background: none;
+    font: inherit;
+    font-family: var(--font-mono);
+    color: var(--accent-cyan);
+    text-decoration: underline;
+    cursor: pointer;
+    overflow-wrap: anywhere;
+    text-align: left;
+}
+.binary-graph-figure:hover,
+.binary-graph-member-name:is(button):hover {
+    color: var(--text-primary);
+}
+.binary-graph-close {
+    margin-left: auto;
+}
+.binary-graph-members {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+}
+.binary-graph-member {
+    padding: 4px 0;
+    border-bottom: 1px solid rgba(var(--border-primary-rgb), 0.5);
+    overflow-wrap: anywhere;
+}
+.binary-graph-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 12px;
+    margin-top: 2px;
+    color: var(--text-secondary);
+}
+.binary-graph-link-tag {
+    color: var(--text-muted);
+}
+.binary-graph-curated-note {
+    margin: 8px 0;
+    padding: 6px 8px;
+    border-left: 3px solid var(--graph-edge-curated);
+    background: rgba(var(--graph-edge-curated-rgb), 0.08);
+    font-size: 12px;
+    color: var(--text-primary);
+}
+.syscall-legend {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 18px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border-primary);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+.syscall-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    cursor: help;
+}
+.syscall-legend-count {
+    color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+}
+.syscall-legend-note {
+    color: var(--text-muted);
+}
+.syscall-legend-dot,
+.syscall-row-dot {
+    flex: 0 0 auto;
+    width: 10px;
+    height: 10px;
+    border: 1px solid transparent;
+    border-radius: 2px;
+}
+.syscall-state-intact {
+    background: var(--syscall-intact);
+}
+.syscall-state-baseline {
+    background: rgba(var(--syscall-intact-rgb), 0.75);
+}
+.syscall-state-hooked {
+    background: var(--syscall-hooked);
+}
+.syscall-state-patched {
+    background: var(--syscall-patched);
+    box-shadow: 0 0 0 2px rgba(var(--syscall-patched-rgb), 0.35);
+}
+.syscall-state-diverged {
+    background: var(--syscall-diverged);
+    box-shadow: 0 0 0 2px rgba(var(--syscall-diverged-rgb), 0.35);
+}
+.syscall-state-unreadable {
+    background: transparent;
+    border-color: var(--syscall-unreadable);
+    box-shadow: 0 0 0 2px rgba(var(--syscall-unreadable-rgb), 0.35);
+}
+.syscall-map {
+    flex: 1 1 0;
+    min-height: 0;
+    padding: 10px 12px 12px;
+    overflow-x: hidden;
+    overflow-y: auto;
+    scrollbar-gutter: stable;
+}
+.syscall-band + .syscall-band {
+    margin-top: 14px;
+}
+.syscall-band-head {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin: 0 0 6px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    color: var(--text-secondary);
+}
+.syscall-band-count {
+    font-weight: 400;
+    color: var(--text-muted);
+}
+.syscall-canvas {
+    display: block;
+    width: 100%;
+}
+.syscall-empty {
+    padding: 16px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text-muted);
+    overflow-wrap: anywhere;
+}
+.syscall-tip {
+    position: absolute;
+    z-index: 5;
+    padding: 4px 8px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-primary);
+    white-space: nowrap;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-accent);
+    border-radius: var(--radius);
+    pointer-events: none;
+}
+.syscall-catalog-head {
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border-primary);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.syscall-rows {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+}
+.syscall-row {
+    display: grid;
+    grid-template-columns: 12px minmax(0, 1fr) 64px 64px;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 3px 12px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-secondary);
+    text-align: left;
+    background: transparent;
+    border: 0;
+    border-bottom: 1px solid var(--border-primary);
+    cursor: pointer;
+}
+.syscall-row:hover {
+    background: var(--bg-card-hover);
+}
+.syscall-row:focus-visible {
+    outline: 1px solid var(--accent-cyan);
+    outline-offset: -1px;
+}
+.syscall-row.selected {
+    background: rgba(var(--accent-cyan-rgb), 0.12);
+}
+.syscall-row-name {
+    overflow: hidden;
+    color: var(--text-primary);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.syscall-row-module {
+    color: var(--text-muted);
+}
+.syscall-row-num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+/* The detail panel, the deviations and the known hooks: panels as the Rizin tab has them */
+.syscall-panel {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    padding: 8px 10px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+}
+.syscall-panel-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    margin-bottom: 6px;
+}
+.syscall-panel-title {
+    display: flex;
+    align-items: center;
+    margin: 0;
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: .1em;
+    white-space: nowrap;
+    color: var(--accent-cyan);
+}
+.syscall-panel-note {
+    min-width: 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.syscall-panel-body {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow: auto;
+}
+.syscall-detail-body {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+.syscall-empty-error {
+    color: var(--severity-critical);
+}
+.syscall-muted {
+    color: var(--text-muted);
+}
+.syscall-detail-name {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+    font-family: var(--font-mono);
+}
+.syscall-detail-sc {
+    min-width: 0;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+}
+.syscall-detail-state {
+    padding: 1px 6px;
+    font-size: 10px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--text-primary);
+    border: 1px solid var(--border-accent);
+    border-radius: var(--radius);
+}
+.syscall-detail-note {
+    margin: 6px 0;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.syscall-facts {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    gap: 2px 12px;
+    margin: 0 0 8px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+}
+.syscall-facts dt {
+    color: var(--text-muted);
+}
+.syscall-facts dd {
+    margin: 0;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+}
+.syscall-owner {
+    font-weight: 600;
+}
+.syscall-owner-private {
+    color: var(--syscall-patched);
+}
+.syscall-owner-unresolved {
+    color: var(--syscall-diverged);
+}
+.syscall-finding {
+    margin: 0 0 10px;
+    padding: 6px 8px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-left: 3px solid var(--syscall-diverged);
+    border-radius: var(--radius);
+}
+.syscall-finding-intact {
+    border-left-color: var(--syscall-intact);
+}
+.syscall-finding-hooked {
+    border-left-color: var(--syscall-hooked);
+}
+.syscall-finding-patched {
+    border-left-color: var(--syscall-patched);
+}
+.syscall-finding-unreadable {
+    border-left-color: var(--syscall-unreadable);
+}
+.syscall-finding-help {
+    margin-bottom: 6px;
+    font-size: 11.5px;
+}
+.syscall-number-differs {
+    color: var(--syscall-patched);
+}
+.syscall-known-hook {
+    margin: 6px 0 0;
+    padding-top: 6px;
+    border-top: 1px dashed var(--border-primary);
+    font-size: 11.5px;
+    color: var(--text-primary);
+}
+.syscall-section {
+    margin: 0 0 10px;
+}
+.syscall-section-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: .1em;
+    color: var(--text-muted);
+}
+.syscall-stub-line {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin-bottom: 2px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+}
+.syscall-stub-label {
+    flex: 0 0 52px;
+    color: var(--text-muted);
+}
+.syscall-bytes {
+    min-width: 0;
+    letter-spacing: .06em;
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
+}
+/* A byte that differs is marked by more than its colour: heavier, and underlined */
+.syscall-bytes-diff {
+    padding: 0 1px;
+    font-weight: 700;
+    color: var(--text-primary);
+    text-decoration: underline;
+    background: rgba(var(--severity-medium-rgb), 0.25);
+}
+.syscall-stub-note {
+    margin-top: 2px;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.syscall-signature {
+    margin: 0;
+    padding: 6px 8px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-primary);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+}
+.syscall-links {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin-top: 4px;
+}
+.syscall-links a.btn {
+    text-decoration: none;
+}
+.syscall-link {
+    padding: 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--accent-cyan);
+    text-align: left;
+    background: none;
+    border: 0;
+    cursor: pointer;
+}
+.syscall-link:hover {
+    text-decoration: underline;
+}
+.syscall-deviations .view-table tr.selected td {
+    background: rgba(var(--accent-cyan-rgb), 0.12);
+}
+.syscall-deviations .syscall-bytes {
+    letter-spacing: 0;
+}
+/* the bytes of a row give way to the jump target and the score, the whole of them is in the title */
+.syscall-deviations .view-table-clip {
+    max-width: 9em;
+}
+.syscall-flag {
+    padding: 0 4px;
+    font-size: 10px;
+    color: var(--syscall-patched);
+    border: 1px solid var(--syscall-patched);
+    border-radius: var(--radius);
+}
+.syscall-known {
+    color: var(--syscall-hooked);
+    cursor: help;
+}
+.syscall-hooks .syscall-notice {
+    margin-bottom: 6px;
+}
+.syscall-hook-capture {
+    margin-top: 8px;
+    padding: 6px 8px;
+    background: rgba(var(--severity-medium-rgb), 0.08);
+    border-left: 3px solid var(--severity-medium);
+    border-radius: var(--radius);
+}
+.syscall-hook-warning {
+    margin: 0 0 6px;
+    font-size: 11.5px;
+    color: var(--text-secondary);
+}
+.syscall-hook-warning strong {
+    color: var(--text-primary);
+}
+.syscall-hook-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+.syscall-hook-actions .btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+/* The rule draft: shown as text; applying it (this VM, now) and downloading it (the repo, for good) are two blocks */
+.syscall-draft {
+    flex: 0 1 auto;
+    max-height: 60%;
+    margin-top: 8px;
+    overflow-y: auto;
+}
+.syscall-draft[hidden] {
+    display: none;
+}
+.syscall-draft-card {
+    padding-top: 8px;
+    border-top: 1px solid var(--border-primary);
+}
+.syscall-draft-name {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+}
+.syscall-draft-meta {
+    margin-bottom: 4px;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.syscall-draft-text {
+    max-height: 200px;
+    margin: 0 0 6px;
+    padding: 6px 8px;
+    overflow: auto;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-primary);
+    white-space: pre;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+}
+.syscall-draft-hint {
+    margin: 0 0 6px;
+    font-size: 11.5px;
+    color: var(--text-secondary);
+}
+.syscall-draft-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.syscall-draft-action {
+    padding: 6px 8px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-left-width: 3px;
+    border-radius: var(--radius);
+}
+.syscall-draft-action p {
+    margin: 0 0 6px;
+    font-size: 11.5px;
+    color: var(--text-secondary);
+}
+.syscall-draft-action-title {
+    margin-bottom: 2px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: .1em;
+    color: var(--text-primary);
+}
+.syscall-draft-vm {
+    border-left-color: var(--severity-medium);
+}
+.syscall-draft-repo {
+    border-left-color: var(--accent-green);
+}
+.syscall-draft-action a.btn {
+    display: inline-block;
+    text-decoration: none;
+}
+.syscall-draft-result {
+    margin-top: 6px;
+    padding: 4px 8px;
+    font-size: 11.5px;
+    color: var(--text-secondary);
+    border-left: 3px solid var(--border-accent);
+    overflow-wrap: anywhere;
+}
+.syscall-draft-result-ok {
+    border-left-color: var(--accent-green);
+}
+.syscall-draft-result-info {
+    border-left-color: var(--severity-info);
+}
+.syscall-draft-result-warn {
+    border-left-color: var(--severity-medium);
+}
+.syscall-draft-result-error {
+    border-left-color: var(--severity-critical);
+    color: var(--severity-critical);
 }

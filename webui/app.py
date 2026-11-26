@@ -13,6 +13,7 @@ import base64
 import bisect
 import json
 import logging
+import logging.handlers
 import os
 import glob
 import platform
@@ -30,7 +31,7 @@ import sys
 import uuid
 import weakref
 from pathlib import Path
-from flask import Flask, render_template, jsonify, request, send_from_directory, g
+from flask import Flask, render_template, jsonify, request, send_from_directory, g, has_request_context, Response
 from werkzeug.utils import secure_filename
 from werkzeug.exceptions import RequestEntityTooLarge
 import requests
@@ -38,12 +39,23 @@ import requests
 # Tool-agnostic scoring layer for live-memory findings. Scanners are plugged in
 # as normalizers there, so the verdict logic does not depend on any one tool.
 import memory_evidence
+# Syscall baseline (NTSleuth) and the measurement of a process against it, for the SYSCALLS tab.
+import syscall_baseline
+import syscall_rules
+import syscall_scan
+# The curated Win32 to Nt table: what turns a stub the sample carries into a proven bypass.
+import win32_to_nt
+# The import graph of the System32 binaries and the questions the SYSCALLS tab asks of it.
+import binary_graph
+import binary_graph_query
 import pipe_analysis
 import pipe_proxy
 # Offline analysis of exit-time minidumps (no scanner binary involved).
 import minidump_analysis
 # rizin sessions for the RIZIN tab.
 import rizin_sessions
+# The own dashboards of the Dashboard tab (saved log searches as tiles).
+import dashboards
 # Tool update checks and installs (Tool Updates section of the dashboard).
 import tool_updates
 # LOGS tab: event store, source parsers and the search language.
@@ -63,6 +75,12 @@ except ImportError as _net_import_error:
                          "pip install -r webui/requirements.txt and restart the web UI"
                          % _net_import_error)
     print("[network] " + NET_ANALYZE_ERROR)
+# FIREWALL tab: offline geo, assessment, event store, enforcement.
+import firewall
+import firewall_fetch
+import firewall_rules
+import firewall_store
+import geoip
 
 app = Flask(__name__)
 
@@ -119,7 +137,8 @@ except Exception as _exc:   # a damaged log file must not stop the web UI
 _NOT_LOGGED_PREFIXES = ("/static/", "/favicon")
 # The regular polls of the UI itself: these exact paths, and everything under /api/logs/.
 # (/api/alerts/<id> is a user action, not a poll.)
-_POLL_PATHS = frozenset(("/api/status", "/api/updates", "/api/alerts", "/api/health", "/api/rustinel"))
+_POLL_PATHS = frozenset(("/api/status", "/api/updates", "/api/alerts", "/api/health", "/api/rustinel",
+                         "/api/firewall/pending", "/api/firewall/connections", "/api/firewall/isolate"))
 _POLL_PREFIX = "/api/logs/"
 _LOG_TEXT_LIMIT = 2000
 
@@ -308,6 +327,16 @@ MEMORY_BASELINE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), 
 # The same for the network: what a clean VM does on the wire (net_baseline).
 NET_BASELINE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "net_baseline.json")
 
+# NTSleuth and the syscall baselines it extracted (ntsleuth-<build>-<view>.json), written when it is provisioned.
+NTSLEUTH_DIR = r"C:\tools\ntsleuth"
+NTSLEUTH_BASELINE_DIR = os.path.join(NTSLEUTH_DIR, "baseline")
+# Hooks seen on this host while it was considered clean; see syscall_scan.HookAllowlist.
+SYSCALL_HOOK_ALLOWLIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "syscall_hook_allowlist.json")
+# Rustinel reads its YARA rules from yara-combined (install-detection-rules.ps1) and reloads them when a file changes.
+# `tdc` is ours: the only directory a rule drafted in the SYSCALLS tab is written to. Not Aether's rules directory,
+# which the upstream clone replaces.
+YARA_RULES_DIR = r"C:\tools\detection-rules\yara-combined\tdc"
+
 
 def _decode_console(raw):
     """Decode output of a Windows console program.
@@ -480,7 +509,7 @@ def _normalize_scan(tool, result):
     elif tool and tool.lower() == "capa":  # capa reports capabilities, not a verdict
         cc = result.get("capability_count")
         verdict = "analyzed" if cc is not None else "unknown"
-    elif tool and tool.lower() == "aether":  # live-memory findings, not a file verdict
+    elif tool and tool.lower() in ("aether", "syscalls"):  # live-memory findings, not a file verdict
         # The evidence layer is authoritative: it already accounts for the host
         # baseline, persistence and corroboration.
         ev = result.get("evidence") or {}
@@ -517,10 +546,12 @@ def _normalize_scan(tool, result):
 
 
 def _record_scan(tool, filename, result, status="ok"):
-    """Append a scan to the shared history timeline (best-effort).
+    """Append a scan to the shared history timeline (best-effort); the id of the entry, or "".
 
     ``result`` is the full JSON dict returned to the client (stored verbatim
     for the "> more" expander); ``status`` is "ok", "timeout", or "error".
+    The id is what names this measurement afterwards: the syscall stage keeps it
+    so a detonation's memory block can hand its measurement to the map.
     """
     import datetime
     try:
@@ -547,8 +578,9 @@ def _record_scan(tool, filename, result, status="ok"):
             if len(history) > SCAN_HISTORY_MAX:
                 del history[SCAN_HISTORY_MAX:]
             _save_scan_history(history)
+        return entry["id"]
     except Exception:
-        pass  # history must never break a scan
+        return ""  # history must never break a scan
 
 
 # --- Scan <-> process/sample correlation (graph enrichment) ---
@@ -565,7 +597,7 @@ def _extract_sha256(hashes):
     return ""
 
 
-_PROCESS_SCAN_TOOLS = {"aether", "process dump", "exit capture", "hunt-sleeping-beacons", "beaconeye"}
+_PROCESS_SCAN_TOOLS = {"aether", "syscalls", "process dump", "exit capture", "hunt-sleeping-beacons", "beaconeye"}
 
 
 def _summarize_scan_entry(e):
@@ -800,6 +832,24 @@ def _save_submissions(submissions):
         raise
 
 
+def _sample_path_for(agent_path, pid, filename):
+    """Where the sample the agent just ran can be read, for every tool that searches the file itself.
+
+    The agent does not report where it wrote the sample: its /execute/exec answer carries status, pid and message
+    and nothing else, measured on the chamber. So: the path it gave when it gave one, else the running process's
+    image (it may still be alive right after the submit), else the agent's drop folder. None when none of them is
+    a file - a path that cannot be read is worth no more than none.
+
+    One rule for two callers. The submission record needs it for the hex, PE and FileMap links; the syscall stage
+    needs it because the file is the only source that can prove a bypass, and without a path it searched nothing.
+    """
+    candidates = [agent_path]
+    if pid:
+        candidates.append(_image_path_for_pid(pid))
+    candidates.append(os.path.join(SAMPLE_DROP_DIR, os.path.basename(str(filename or "").replace("\\", "/"))))
+    return next((c for c in candidates if c and os.path.isfile(c)), None)
+
+
 def _record_submission(filename, sha256, size, target, results):
     """Record a new submission in the history."""
     import datetime
@@ -851,16 +901,10 @@ def _record_submission(filename, sha256, size, target, results):
     if isinstance(fi, dict):
         entry["litterbox_hash"] = fi.get("litterbox_hash")
 
-    # The agent does not report where it wrote the sample. The running
-    # process knows (it may still be alive right after the submit); else the
-    # agent's drop folder. The former guess (a "vagrant" desktop folder) did
-    # not exist on any VM, so hex/PE/FileMap links to samples were dead.
-    if not entry["file_path"]:
-        candidates = []
-        if entry.get("agent_pid"):
-            candidates.append(_image_path_for_pid(entry["agent_pid"]))
-        candidates.append(os.path.join(SAMPLE_DROP_DIR, os.path.basename(filename)))
-        entry["file_path"] = next((c for c in candidates if c and os.path.isfile(c)), None)
+    # The agent does not report where it wrote the sample, so _sample_path_for looks: the running process's image
+    # (it may still be alive right after the submit), else the agent's drop folder. The former guess (a "vagrant"
+    # desktop folder) did not exist on any VM, so hex/PE/FileMap links to samples were dead.
+    entry["file_path"] = _sample_path_for(entry["file_path"], entry.get("agent_pid"), filename)
 
     with submissions_lock:
         subs = _load_submissions()
@@ -3998,6 +4042,7 @@ def api_submit():
 
     # Submit to DetonatorAgent
     agent_pid = None
+    agent_file_path = None
     exit_capture_armed_at = None
     if target in ("agent", "both"):
         # Arm dump-on-exit before the sample starts: a sample that exits within
@@ -4020,6 +4065,7 @@ def api_submit():
                 agent_data = r.json() if r.ok else {}
                 if isinstance(agent_data, dict):
                     agent_pid = agent_data.get("pid")
+                    agent_file_path = agent_data.get("file_path") or agent_data.get("path")
         except Exception as e:
             results["agent"] = {"status": 502, "error": str(e)}
 
@@ -4103,9 +4149,13 @@ def api_submit():
     memory_tools_available = (os.path.isfile(HUNT_SLEEPING_BEACONS_EXE)
                               or os.path.isfile(BEACONEYE_EXE)
                               or os.path.isfile(AETHER_EXE)
-                              or os.path.isfile(PROCESSDUMP_EXE))
+                              or os.path.isfile(PROCESSDUMP_EXE)
+                              or _syscall_stage_available())
     if agent_pid and memory_tools_available:
-        _run_memory_scans_async(agent_pid, file_sha256)
+        # The agent reports no path, so the stage would search no file at all - and the file is the only source that
+        # can prove a bypass. The same look the submission record does, done here, before the scans start.
+        _run_memory_scans_async(agent_pid, file_sha256,
+                                _sample_path_for(agent_file_path, agent_pid, filename))
         results["beacon_scan"] = {
             "triggered": True,
             "tools": [],
@@ -4116,6 +4166,8 @@ def api_submit():
             results["beacon_scan"]["tools"].append("BeaconEye")
         if os.path.isfile(AETHER_EXE):
             results["beacon_scan"]["tools"].append("Aether")
+        if _syscall_stage_available():
+            results["beacon_scan"]["tools"].append("Syscalls")
         if os.path.isfile(PROCESSDUMP_EXE):
             results["beacon_scan"]["tools"].append("Process Dump")
     else:
@@ -4260,6 +4312,7 @@ def api_detonation_results():
     hsb_result = _rs.lookup("hsb", pid, sha256)
     beaconeye_result = _rs.lookup("beaconeye", pid, sha256)
     aether_result = _rs.lookup("aether", pid, sha256)
+    syscalls_result = _rs.lookup("syscalls", pid, sha256)
     processdump_result = _rs.lookup("processdump", pid, sha256)
     exitcapture_result = _rs.lookup("exitcapture", pid, sha256)
 
@@ -4269,6 +4322,8 @@ def api_detonation_results():
         results["beaconeye"] = beaconeye_result
     if aether_result:
         results["aether"] = aether_result
+    if syscalls_result:
+        results["syscalls"] = syscalls_result
     if processdump_result:
         results["process_dump"] = processdump_result
     if exitcapture_result:
@@ -4290,6 +4345,7 @@ def api_detonation_results():
         "hsb_installed": os.path.isfile(HUNT_SLEEPING_BEACONS_EXE),
         "beaconeye_installed": os.path.isfile(BEACONEYE_EXE),
         "aether_installed": os.path.isfile(AETHER_EXE),
+        "syscall_stage_available": _syscall_stage_available(),
         "process_dump_installed": os.path.isfile(PROCESSDUMP_EXE),
     }
 
@@ -4696,6 +4752,57 @@ def _pipe_events_for(pids, sample_keys, resolve, since, until):
     return events, truncated
 
 
+def _syscall_stubs_measured(counts):
+    """How many stubs a syscall scan measured: every state but `unreadable`, which is a stub nobody read."""
+    counts = counts if isinstance(counts, dict) else {}
+    return sum(v for k, v in counts.items() if k != "unreadable" and isinstance(v, int) and not isinstance(v, bool))
+
+
+def _syscall_mark_unobserved(result):
+    """A syscall scan `result` that measured no stub is NOT OBSERVED, not CLEAN: what it did not read is not evidence
+    of being clean. A label another finding raised (a stub the sample carries) is left as it is."""
+    evidence = result.get("evidence")
+    if (isinstance(evidence, dict) and evidence.get("label") == "CLEAN"
+            and not _syscall_stubs_measured(result.get("counts"))):
+        evidence["label"] = "NOT OBSERVED"
+        evidence["note"] = f"The syscall scan measured no stub: {result.get('note') or 'nothing was read'}"
+    return result
+
+
+def _syscall_verdict_reasons(stage, evidence, reasons, only_source=False):
+    """What the syscall stage of a detonation leaves unsaid by its score, said in the verdict, the way a live scan
+    that observed nothing is: a partial measurement, a stub search that did not cover the process, and stubs that
+    diverged, which are not scored. Without it a result full of `diverged` or of unread stubs reads as a clean
+    process. A stage that measured no stub at all, as the only memory source, is NOT OBSERVED."""
+    if not stage:
+        return
+    counts = stage.get("counts") if isinstance(stage.get("counts"), dict) else {}
+    gaps = []
+    if stage.get("partial"):
+        gaps.append(str(stage.get("note") or "not every stub could be measured"))
+    stubs = stage.get("stubs") if isinstance(stage.get("stubs"), dict) else {}
+    search = stubs.get("process") if isinstance(stubs.get("process"), dict) else {}
+    if search.get("error"):
+        gaps.append(f"the search of its memory for stubs failed: {search['error']}")
+    elif search.get("partial"):
+        gaps.append(f"the search of its memory for stubs is partial: {search.get('note') or 'not all of it was read'}")
+    if gaps:
+        evidence.setdefault("partial_sources", []).append("syscalls")
+        reasons.append(f"Syscall measurement is partial ({'; '.join(gaps)[:400]}) - what it did not read is not "
+                       "evidence of being clean")
+    # an unreadable stub was not measured: a stage that read none is a stage that observed nothing
+    if not _syscall_stubs_measured(counts) and only_source and evidence.get("label") == "CLEAN":
+        evidence["label"] = "NOT OBSERVED"
+        evidence["note"] = f"The syscall stage measured no stub: {stage.get('note') or 'nothing was read'}"
+    renumbered = stage.get("renumbered") if isinstance(stage.get("renumbered"), int) else 0
+    diverged = max(0, int(counts.get("diverged") or 0) - renumbered)
+    if diverged:
+        evidence["syscalls_diverged"] = diverged
+        reasons.append(f"{diverged} syscall stub{'s' if diverged != 1 else ''} diverged: the bytes changed, and nothing "
+                       "tells a hook from a patch - there is no jump to follow, its owner could not be resolved, or it "
+                       "goes straight into ntdll or the stub's own module - not scored, and not evidence of being clean")
+
+
 def _compute_verdict(results, matching_alerts):
     """Aggregate a single verdict from EDR alerts, LitterBox findings, and beacon scans.
     Mirrors the Detonator reference UI's edr_verdict concept."""
@@ -4760,8 +4867,11 @@ def _compute_verdict(results, matching_alerts):
             network_process = f["process"]
             break
     mem_findings = memory_evidence.collect(results, process=process_name, network_process=network_process)
+    mem_findings += _syscall_stage_findings(results.get("syscalls"))
     mem_sources = [k for k in ("aether", "process_dump", "hunt_sleeping_beacons",
                                "beaconeye", "exit_capture_result") if results.get(k)]
+    if _syscall_stage_entry(results.get("syscalls")):
+        mem_sources.append("syscalls")
     if (results.get("network_beaconing") or {}).get("evidence_findings"):
         mem_sources.append("network_beaconing")
     if (results.get("named_pipes") or {}).get("evidence_findings"):
@@ -4792,6 +4902,8 @@ def _compute_verdict(results, matching_alerts):
             evidence["note"] = ("Process exited before the live scan; it was "
                                 "analyzed from its exit-time memory dump instead.")
         evidence["sources_present"] = mem_sources
+        _syscall_verdict_reasons(_syscall_stage_entry(results.get("syscalls")), evidence, reasons,
+                                 only_source=mem_sources == ["syscalls"])
 
         # Emitted even when empty, so the UI can tell "tools ran, nothing
         # scored" apart from "tools never ran".
@@ -4885,6 +4997,8 @@ def _readable_roots():
         # Memory dumps and the artifacts extracted from them
         PROCESSDUMP_DIR,
         RIZIN_UPLOAD_DIR,
+        # Secured stage-2 samples of the FIREWALL tab (read only: it is not a write target)
+        CAPTURE_DIR,
     ]
 
 
@@ -5332,8 +5446,11 @@ def _rizin_arg_text():
     return q.casefold()
 
 
-def _rizin_body():
+def _rizin_body(optional=False):
+    """The request's JSON object; with ``optional`` a request without a body counts as an empty one."""
     body = request.get_json(silent=True)
+    if body is None and optional:
+        return {}
     if not isinstance(body, dict):
         raise rizin_sessions.RizinRefused("a JSON object is expected")
     return body
@@ -5766,6 +5883,126 @@ def _rizin_comment_at(session):
     return {"offset": addr, "comment": (op["comment"] or "") if op else ""}
 
 
+def _rizin_emulation_start(session):
+    addr = _rizin_body().get("addr")
+    return session.emulation_start(None if addr is None else _rizin_address(addr))
+
+
+def _rizin_emulation_run(session):
+    body = _rizin_body()
+    addr = body.get("addr")
+    try:
+        return session.emulation_run(body.get("kind"), None if addr is None else _rizin_address(addr))
+    finally:
+        _rizin_forget(session)  # a run changes bytes, and with them the strings, imports, flags and functions
+
+
+def _rizin_emulation_register(session):
+    body = _rizin_body()
+    return session.emulation_register(body.get("name"), _rizin_address(body.get("value"), "value"))
+
+
+def _rizin_breakpoint_set(session):
+    """POST: addr. There is no disabled breakpoint to ask for: rizin 0.9.1 stops a run at one whose
+    `enabled` is false all the same, so an `on` is refused rather than answered with an enabled one."""
+    body = _rizin_body()
+    if "on" in body:
+        raise rizin_sessions.RizinRefused("there is no 'on': rizin 0.9.1 stops at a disabled breakpoint "
+                                          "too, so remove it (DELETE) instead of switching it off")
+    return session.breakpoint_set(_rizin_address(body.get("addr")))
+
+
+def _rizin_breakpoint_clear(session):
+    """DELETE: addr removes that breakpoint; a request without one (an empty object, or no body) all."""
+    addr = _rizin_body(optional=True).get("addr")
+    return session.breakpoint_clear(None if addr is None else _rizin_address(addr))
+
+
+def _rizin_waiting(body):
+    """The ``waiting`` flag of a patch request: true says the request is about the patches that wait (held
+    back over a run's bytes) at ``addr``, and not about the cache."""
+    waiting = body.get("waiting", False)
+    if not isinstance(waiting, bool):
+        raise rizin_sessions.RizinRefused("waiting is true or false")
+    return waiting
+
+
+def _rizin_patch(session):
+    """POST: addr, plus either bytes (hex digits) or kind (one of the four patch kinds), or ``waiting: true``
+    alone: write the patches that wait at addr now (only where a run's bytes lie under it again)."""
+    body = _rizin_body()
+    addr = _rizin_address(body.get("addr"))
+    data, kind = body.get("bytes"), body.get("kind")
+    try:
+        if _rizin_waiting(body):
+            if data is not None or kind is not None:
+                raise rizin_sessions.RizinRefused("a patch that waits is written as it was held back: "
+                                                  "waiting takes no bytes and no kind")
+            return session.patch_waiting(addr)
+        if (data is None) == (kind is None):
+            raise rizin_sessions.RizinRefused("a patch takes bytes or kind, not both and not neither")
+        return session.patch(addr, data) if kind is None else session.patch_op(addr, kind)
+    finally:
+        _rizin_forget(session)  # patched bytes: the strings, imports, flags and functions are stale
+
+
+def _rizin_unpatch(session):
+    """DELETE: addr takes that patch back; a request without one (an empty object, or no body) the whole
+    cache, an emulation run's bytes included (rizin has one). With ``waiting: true`` it takes the patches that
+    wait at addr out of the project instead, and then addr is required."""
+    body = _rizin_body(optional=True)
+    addr = body.get("addr")
+    try:
+        if _rizin_waiting(body):
+            if addr is None:
+                raise rizin_sessions.RizinRefused("a patch that waits is named by its addr")
+            return session.drop_waiting(_rizin_address(addr))
+        return session.unpatch(None if addr is None else _rizin_address(addr))
+    finally:
+        _rizin_forget(session)
+
+
+def _rizin_restore(session):
+    """POST (no body): replay the project's timeline of the emulation and prove the bytes it gave. A replay
+    runs the emulation and writes the cache, so the copies of the views are stale after it, whatever came of it."""
+    try:
+        return session.restore_run()
+    finally:
+        _rizin_forget(session)
+
+
+def _rizin_reanalyze(session):
+    """POST: start and end (both optional, both or neither; default the range the run wrote). A request
+    without a body at all is one without a range, as for DELETE /patch and DELETE /breakpoints."""
+    body = _rizin_body(optional=True)
+    start, end = body.get("start"), body.get("end")
+    try:
+        return session.reanalyze(None if start is None else _rizin_address(start, "start"),
+                                 None if end is None else _rizin_address(end, "end"))
+    finally:
+        # the range now holds functions, strings and flags rizin did not have: the copies are stale
+        _rizin_forget(session)
+
+
+def _rizin_call_assist(session):
+    """GET: addr (without it the session's current address) -- the call the assistant answers for."""
+    return session.call_assist(_rizin_arg_address(session))
+
+
+def _rizin_call_skip(session):
+    """POST: addr, and what to apply -- value (optional: `null` or none leaves the return register as
+    it is, decimal or `0x…`) and stack_fix (optional, default 0, a whole number of bytes)."""
+    body = _rizin_body()
+    value = body.get("value")
+    try:
+        return session.call_skip(_rizin_address(body.get("addr")),
+                                 None if value is None else _rizin_address(value, "value"),
+                                 body.get("stack_fix", 0))
+    finally:
+        # a skip can map memory and copy bytes: the strings, imports, flags and functions are stale
+        _rizin_forget(session)
+
+
 def _rizin_listable(path):
     try:
         return _readable(path) and os.path.isfile(path) and os.path.getsize(path) > 0
@@ -5811,13 +6048,220 @@ def _rizin_folder_files(folder, recursive, limit):
 
 
 def _rizin_prune_uploads(keep):
-    # The oldest uploads go; one that rizin has open stays (Windows refuses to delete it).
+    """The oldest uploads go; `keep` (a path, or several) stays: one that rizin has open (Windows refuses to
+    delete it, elsewhere nothing does), an exported copy and the note that says what was changed in it."""
+    def same(path):
+        return os.path.normcase(os.path.realpath(path))
+
+    kept = {same(path) for path in ((keep,) if isinstance(keep, str) else keep)}
     for old in _rizin_folder_files(RIZIN_UPLOAD_DIR, False, RIZIN_SCAN_MAX)[RIZIN_UPLOADS_KEEP:]:
-        if old["path"] != keep:
+        if same(old["path"]) not in kept:
             try:
                 os.remove(old["path"])
             except OSError:
                 pass
+
+
+RIZIN_NOTE_SUFFIX = ".patch.txt"
+
+
+def _rizin_patch_paddr(opened, maps, row, size):
+    """The file offset of the patch `row`, or None where its bytes are not one run of the file.
+
+    `opened` is `ol.j`, `maps` `omlj` and `size` what the file is long: **exactly one map** of `maps` may
+    touch the row's bytes, it has to be a map of the opened file (its fd), and it has to hold all of them.
+    Then byte *n* of the row is the file's byte at the map's delta + (address - from) + *n*.
+
+    Two checks that look enough are not. The offsets of the first byte and of the last: a PE with
+    SectionAlignment == FileAlignment and its raw data out of order has side-by-side maps whose first and
+    last byte are as far apart in the file as in memory while the section between them is somewhere else.
+    And the first map that holds the row: where two maps cover the same addresses rizin reads through the
+    topmost (`oml.j` and `px` answer it), which `omlj` does not say, so the row would be written where
+    rizin does not show it (both measured). With only one map over the bytes, that is the topmost.
+
+    A row in the zero-filled room past a section's data, in memory the emulation mapped, in no map, across
+    two maps, or past the end of the map or of the file is None as well."""
+    def number(value):
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+    addr, end = row["addr"], row["addr"] + row["size"]
+    touching = []
+    for m in maps:
+        if isinstance(m, dict) and number(m.get("from")) is not None and number(m.get("to")) is not None \
+                and m["from"] < end and m["to"] > addr:
+            touching.append(m)
+    fd = number(opened.get("fd"))
+    if len(touching) != 1 or fd is None:
+        return None
+    m = touching[0]
+    delta = number(m.get("delta"))
+    if number(m.get("fd")) != fd or delta is None or m["from"] > addr or end > m["to"]:
+        return None
+    paddr = delta + addr - m["from"]
+    sizes = [n for n in (number(opened.get("size")), number(size)) if n is not None]
+    return paddr if sizes and paddr + row["size"] <= min(sizes) else None
+
+
+def _rizin_note_bytes(hexdigits, shown=32):
+    """Hex for one line of the note: a long patch shows its first `shown` bytes and says how many there are."""
+    if len(hexdigits) <= 2 * shown:
+        return hexdigits
+    return f"{hexdigits[:2 * shown]}... ({len(hexdigits) // 2} bytes)"
+
+
+def _rizin_export_note(session, original_sha, copy_name, copy_sha, placed, skipped):
+    """The note beside the copy. ``placed`` is [(row, file offset, the **original's** bytes there, hex)].
+
+    A row's ``before`` is rizin's: what stood at the address when the patch was written, which is a
+    **run's** byte where the patch went over bytes an emulation run had written (measured on rizin
+    0.9.1: a file holding 73317331, a run's `wx 41 @ 1` and then a patch `wx 90 @ 1` give a second row
+    with `before: "41"`, and the copy came out 73907331 against an original 73317331). The note is
+    about the copy on disk, so the bytes it shows as replaced are the file's own -- and every row where
+    the two differ is named, because the copy has the file's bytes around that patch: a patch inside
+    code a run decrypted therefore sits in bytes that are still encrypted on disk, and nothing else
+    would say so.
+
+    The comparison decides, not the row's ``over_run`` mark: the mark rests on the session's mirror of
+    its own writes, and a note that said nothing after a restart lost that mirror would be wrong about
+    the file. A row is named where either says so.
+
+    What the three ways into the block have in common is the one thing the predicate tests: rizin's write
+    cache already held a write at that address when the patch was made -- a run's (or the console's) byte
+    that is not the file's, an **earlier hand patch** that covers the address (no run involved: the same
+    address, or one inside a longer patch -- measured: ``wx 90909090 @ 1`` then ``wx ab @ 3`` gives a row
+    at 3 with ``before: "90"``), or a run's write of the file's own byte back (the bytes replaced then
+    *are* the file's). The header says that and no more; each row's own line says which of the two it is
+    as far as the session knows (``over_run``): a run wrote there first -- the copy then holds the patch in
+    bytes still as they are on disk -- or no run is known to have, which is an earlier patch of yours.
+    """
+    over = [(row, paddr, was) for row, paddr, was in placed
+            if was != row["before"].lower() or row.get("over_run")]
+    lines = [
+        "Patched copy made by TDC (RIZIN tab). Only the patches set by hand are in it; what an emulation run",
+        "wrote is not.",
+        "",
+        f"Original:         {session.path}",
+        f"Original SHA-256: {original_sha}",
+        f"Copy:             {copy_name}",
+        f"Copy SHA-256:     {copy_sha}",
+        f"Time:             {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
+        "",
+        f"Patches in the copy ({len(placed)}): address, offset in the file, the file's bytes -> the copy's",
+    ]
+    lines += [f"  {row['addr']:#x}  file {paddr:#x}  {_rizin_note_bytes(was)} -> {_rizin_note_bytes(row['after'])}"
+              for row, paddr, was in placed]
+    if over:
+        lines += ["", f"rizin's write cache already held a write at the address of these patches when they were made ({len(over)}):",
+                  "a write by an emulation run (or the console), or an earlier patch of yours that covers it. Each",
+                  "line gives what rizin says the patch replaced and what the file holds there; the two are the same",
+                  "where that write was the file's own byte. The copy has the file's own bytes everywhere else, so such",
+                  "a patch sits in bytes as they are on disk -- still encrypted, where a run had decrypted them:"]
+        lines += [f"  {row['addr']:#x}  file {paddr:#x}  the patch replaced {_rizin_note_bytes(row['before'])}; "
+                  f"in the file they are {_rizin_note_bytes(was)}; "
+                  + ("a run wrote there first" if row.get("over_run") else "no run is known to have written there")
+                  for row, paddr, was in over]
+    if skipped:
+        lines += ["", f"Patches that could not be placed in the file, so the copy does not have them ({len(skipped)}):",
+                  "(there is no byte of the file at such an address: memory the emulation created, a section's "
+                  "zero-filled room past its data, or a patch that runs out of the file or across two maps)"]
+        lines += [f"  {row['addr']:#x}  {_rizin_note_bytes(row['before'])} -> {_rizin_note_bytes(row['after'])}"
+                  for row in skipped]
+    return "\n".join(lines) + "\n"
+
+
+def _rizin_export(session):
+    """POST: the patched copy -- the original with the hand-made patches at their file offsets, built here
+    (rizin writes no file, and the original is only ever read) -- and a note beside it.
+
+    {path, name, sha256 (of the copy), patched (bytes written), skipped (addresses of the patches that have
+    no place in the file), note (the note's text)}. The copy is `<digest>_<stem>.patched<suffix>` in
+    RIZIN_UPLOAD_DIR (the digest is the original's, as for an upload) and the note `<that>.patch.txt`; a
+    second export of the same file replaces both together, so the note always describes the copy beside it.
+
+    The bytes the note shows as the ones a patch replaced are read from the **original**, not taken from
+    rizin's cache: see _rizin_export_note.
+    """
+    mine = [row for row in session.patches_made() if row["mine"]]
+    if not mine:
+        raise rizin_sessions.RizinRefused(
+            "no patches to export: only patches set by hand go into the copy, and what an emulation run wrote "
+            "does not")
+    opened, maps = session.json("ol.j"), session.json("omlj")
+    if not isinstance(opened, dict) or not isinstance(maps, list):
+        raise ValueError("ol.j or omlj did not answer what it should")
+    placed, skipped = [], []
+    for row in mine:
+        paddr = _rizin_patch_paddr(opened, maps, row, session.size)
+        if paddr is None:
+            skipped.append(row)
+        else:
+            placed.append((row, paddr))
+    if not placed:
+        addrs = ", ".join(f"{a:#x}" for a in sorted({row["addr"] for row in skipped}))
+        raise rizin_sessions.RizinRefused(f"none of the patches could be placed in the file: {addrs}")
+
+    source = session.path
+    # the name the upload route gives a file: the digest first, so that two samples of one name (in two
+    # folders) do not replace each other's copy and note. The suffix is made apart from the stem, because
+    # secure_filename drops a name that has no ASCII in it down to the suffix ("пример.exe" -> "exe")
+    stem, ext = os.path.splitext(os.path.basename(source))
+    stem, ext = secure_filename(stem) or "sample", secure_filename(ext.lstrip("."))[:15]
+    name = f"{session.sha256[:16]}_{stem[:80]}.patched{'.' + ext if ext else ''}"
+    dest = os.path.join(RIZIN_UPLOAD_DIR, name)
+    note_dest = dest + RIZIN_NOTE_SUFFIX
+    if os.path.normcase(os.path.realpath(dest)) == os.path.normcase(os.path.realpath(source)):
+        raise rizin_sessions.RizinRefused("the copy would be written over the original: rename the original")
+    os.makedirs(RIZIN_UPLOAD_DIR, exist_ok=True)
+    tmps = []
+    try:
+        fd, copy_tmp = tempfile.mkstemp(dir=RIZIN_UPLOAD_DIR, prefix=".export-")
+        tmps.append(copy_tmp)
+        original_sha = hashlib.sha256()
+        with os.fdopen(fd, "wb") as out, open(source, "rb") as src:
+            for chunk in iter(lambda: src.read(1024 * 1024), b""):
+                original_sha.update(chunk)
+                out.write(chunk)
+        if original_sha.hexdigest() != session.sha256:
+            raise rizin_sessions.RizinRefused("the original changed on disk since it was opened: open it again")
+        with open(copy_tmp, "r+b") as out:
+            # the file's own bytes at every offset first, from the untouched copy: a row's `before` is
+            # what rizin had at the address, which is a run's byte where the patch went over one, and
+            # reading after the writes would give an earlier patch's bytes where two overlap
+            for i, (row, paddr) in enumerate(placed):
+                out.seek(paddr)
+                placed[i] = (row, paddr, out.read(row["size"]).hex())
+            for row, paddr, _was in placed:  # in the order they were written: a later patch wins
+                out.seek(paddr)
+                out.write(bytes.fromhex(row["after"]))
+        copy_sha = hashlib.sha256()
+        with open(copy_tmp, "rb") as out:
+            for chunk in iter(lambda: out.read(1024 * 1024), b""):
+                copy_sha.update(chunk)
+        note = _rizin_export_note(session, original_sha.hexdigest(), name, copy_sha.hexdigest(), placed, skipped)
+        fd, note_tmp = tempfile.mkstemp(dir=RIZIN_UPLOAD_DIR, prefix=".export-")
+        tmps.append(note_tmp)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as out:
+            out.write(note)
+        os.replace(copy_tmp, dest)
+        try:
+            os.replace(note_tmp, note_dest)
+        except OSError:
+            # a copy with the old note beside it would say what was not changed in it
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            raise
+    finally:
+        for tmp in tmps:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    _rizin_prune_uploads(keep=(dest, note_dest, source))
+    return {"path": dest, "name": name, "sha256": copy_sha.hexdigest(),
+            "patched": sum(row["size"] for row, *_ in placed),
+            "skipped": sorted({row["addr"] for row in skipped}), "note": note}
 
 
 @app.route("/api/rizin/status")
@@ -6022,6 +6466,96 @@ def api_rizin_comment(sid):
 def api_rizin_comment_at(sid):
     """The comment at addr ('' without one), for the right-click menu's Comment… field."""
     return _rizin_call(sid, _rizin_comment_at)
+
+
+@app.route("/api/rizin/<sid>/emulation/start", methods=["POST"])
+def api_rizin_emulation_start(sid):
+    return _rizin_call(sid, _rizin_emulation_start)
+
+
+@app.route("/api/rizin/<sid>/emulation")
+def api_rizin_emulation(sid):
+    return _rizin_call(sid, lambda session: session.emulation_state())
+
+
+@app.route("/api/rizin/<sid>/emulation/stop", methods=["POST"])
+def api_rizin_emulation_stop(sid):
+    return _rizin_call(sid, lambda session: session.emulation_stop())
+
+
+@app.route("/api/rizin/<sid>/emulation/run", methods=["POST"])
+def api_rizin_emulation_run(sid):
+    return _rizin_call(sid, _rizin_emulation_run)
+
+
+@app.route("/api/rizin/<sid>/emulation/register", methods=["POST"])
+def api_rizin_emulation_register(sid):
+    return _rizin_call(sid, _rizin_emulation_register)
+
+
+@app.route("/api/rizin/<sid>/breakpoints")
+def api_rizin_breakpoints(sid):
+    """The breakpoints rizin holds, lowest address first; they need no running emulation."""
+    return _rizin_call(sid, lambda session: session.breakpoints())
+
+
+@app.route("/api/rizin/<sid>/breakpoints", methods=["POST"])
+def api_rizin_breakpoint_set(sid):
+    return _rizin_call(sid, _rizin_breakpoint_set)
+
+
+@app.route("/api/rizin/<sid>/breakpoints", methods=["DELETE"])
+def api_rizin_breakpoint_clear(sid):
+    return _rizin_call(sid, _rizin_breakpoint_clear)
+
+
+@app.route("/api/rizin/<sid>/patches")
+def api_rizin_patches(sid):
+    """What rizin's write cache holds, lowest address first (`mine` tells a patch from a run's bytes), and the
+    patches held back over a run's bytes, which are in the project and not in the cache."""
+    return _rizin_call(sid, lambda session: session.patches())
+
+
+@app.route("/api/rizin/<sid>/patch", methods=["POST"])
+def api_rizin_patch(sid):
+    return _rizin_call(sid, _rizin_patch)
+
+
+@app.route("/api/rizin/<sid>/patch", methods=["DELETE"])
+def api_rizin_unpatch(sid):
+    return _rizin_call(sid, _rizin_unpatch)
+
+
+@app.route("/api/rizin/<sid>/restore", methods=["POST"])
+def api_rizin_restore(sid):
+    """Replay the timeline of the emulation the project keeps, check it gave the same bytes, then write the
+    patches that were held back."""
+    return _rizin_call(sid, _rizin_restore)
+
+
+@app.route("/api/rizin/<sid>/export", methods=["POST"])
+def api_rizin_export(sid):
+    """Build the patched copy (the hand-made patches at their file offsets) and the note beside it."""
+    return _rizin_call(sid, _rizin_export)
+
+
+@app.route("/api/rizin/<sid>/reanalyze", methods=["POST"])
+def api_rizin_reanalyze(sid):
+    """Analyse the range an emulation run wrote again, so FUNCTIONS and STRINGS see what it decrypted."""
+    return _rizin_call(sid, _rizin_reanalyze)
+
+
+@app.route("/api/rizin/<sid>/call")
+def api_rizin_call_assist(sid):
+    """What a SKIP of the call at addr can answer: the API behind it, a value and the stack correction."""
+    return _rizin_call(sid, _rizin_call_assist)
+
+
+@app.route("/api/rizin/<sid>/call", methods=["POST"])
+def api_rizin_call_skip(sid):
+    """Skip that call and apply the answer: the value in the return register, the stack correction, a
+    memory API's buffer and a copying one's copy."""
+    return _rizin_call(sid, _rizin_call_skip)
 
 
 # --- ThreatCheck / DefenderCheck Integration ---
@@ -7408,7 +7942,44 @@ def _sweep_entry(per_pid, pid, image):
     return entry
 
 
-def _run_sweep(use_aether, use_processdump, capture_baseline):
+def _sweep_syscalls(names, per_pid, errors, stats):
+    """The syscall scan of every process in `names` (pid -> image) that has a baseline and can be opened; the
+    others are counted. The findings go into `per_pid` like those of the other tools."""
+    scanned = skipped = 0
+    allowlist, build = _get_hook_allowlist(), _current_os_build()
+    baselines = {}
+    for pid, image in sorted(names.items()):
+        view = _syscall_view_for_pid(pid)
+        if view not in SYSCALL_BASELINE_VIEWS:
+            skipped += 1
+            continue
+        if view not in baselines:
+            baselines[view], why = _syscall_baseline_for(view, extract=False)
+            if baselines[view] is None:
+                errors.append(f"Syscall sweep of the {view} processes: {why}")
+        baseline = baselines[view]
+        if baseline is None:
+            skipped += 1
+            continue
+        try:
+            measured = _syscall_read_process(
+                pid, view, build,
+                lambda reader: syscall_scan.measure(baseline, reader, view, build, ("ntdll.dll",), allowlist))
+        except Exception:
+            skipped += 1
+            continue
+        # a process none of whose stubs could be read was not scanned, whatever else the sweep says of it
+        if not _syscall_stubs_measured(measured.get("counts")):
+            skipped += 1
+            continue
+        scanned += 1
+        entry = _sweep_entry(per_pid, pid, image)
+        entry["findings"] += memory_evidence.collect({"syscall_scan": measured}, process=entry["identity"])
+    stats["syscall_processes"] = scanned
+    stats["syscall_skipped"] = skipped
+
+
+def _run_sweep(use_aether, use_processdump, capture_baseline, use_syscalls=False):
     started = time.time()
     names = _running_process_names()
     per_pid, errors, stats = {}, [], {}
@@ -7451,6 +8022,9 @@ def _run_sweep(use_aether, use_processdump, capture_baseline):
                 entry = _sweep_entry(per_pid, pid, image)
                 entry["findings"] += memory_evidence.from_process_dump(
                     {"dumps": dumps}, process=entry["identity"])
+
+    if use_syscalls and _syscall_baseline_present():
+        _sweep_syscalls(names, per_pid, errors, stats)
 
     captured = 0
     pipe_captured = None
@@ -7517,17 +8091,21 @@ def _run_sweep(use_aether, use_processdump, capture_baseline):
 def api_memory_sweep_start():
     """Start a background sweep of every process.
 
-    Body: {"aether": true, "processdump": false, "baseline": false}
+    Body: {"aether": true, "processdump": false, "syscalls": false, "baseline": false}
     With "baseline": true the findings are recorded as the host baseline
-    instead of being scored - run that on a clean box.
+    instead of being scored - run that on a clean box. The syscall scan is
+    opt-in: a body without "syscalls" leaves it out, so neither SWEEP nor a
+    recorded baseline changes until a clean VM is known to sweep clean.
     """
     data = request.get_json(force=True) if request.is_json else request.form
     truthy = lambda v, d: d if v is None else str(v).lower() in ("1", "true", "yes")
     use_aether = truthy(data.get("aether"), True)
     use_pd = truthy(data.get("processdump"), False)
+    use_syscalls = truthy(data.get("syscalls"), False)
     capture_baseline = truthy(data.get("baseline"), False)
 
-    if not (use_aether and os.path.isfile(AETHER_EXE)) and not (use_pd and os.path.isfile(PROCESSDUMP_EXE)):
+    if (not (use_aether and os.path.isfile(AETHER_EXE)) and not (use_pd and os.path.isfile(PROCESSDUMP_EXE))
+            and not (use_syscalls and _syscall_baseline_present())):
         return jsonify({"error": "No selected sweep tool is installed"}), 400
 
     with _sweep_lock:
@@ -7537,13 +8115,13 @@ def api_memory_sweep_start():
         _sweep_state.clear()
         _sweep_state.update({
             "running": True, "started": time.time(),
-            "options": {"aether": use_aether, "processdump": use_pd,
+            "options": {"aether": use_aether, "processdump": use_pd, "syscalls": use_syscalls,
                         "baseline": capture_baseline},
         })
 
     def _job():
         try:
-            result = _run_sweep(use_aether, use_pd, capture_baseline)
+            result = _run_sweep(use_aether, use_pd, capture_baseline, use_syscalls)
             with _sweep_lock:
                 _sweep_state.update({"running": False, "result": result})
         except Exception as e:
@@ -8059,6 +8637,7 @@ def api_memory_evidence():
             "hunt_sleeping_beacons": _beacon_results_cache.lookup("hsb", pid),
             "beaconeye": _beacon_results_cache.lookup("beaconeye", pid),
             "exit_capture_result": _beacon_results_cache.lookup("exitcapture", pid),
+            "syscalls": _syscall_stage_entry(_beacon_results_cache.lookup("syscalls", pid)),
         }
     cached = {k: v for k, v in cached.items() if v}
     net = _network_beaconing_for_pid(pid)
@@ -8078,12 +8657,1545 @@ def api_memory_evidence():
             break
     process_name = process_name or _image_name_for_pid(pid)
     findings = memory_evidence.collect(cached, process=process_name)
+    findings += _syscall_stage_findings(cached.get("syscalls"))
     return jsonify({
         "pid": pid,
         "process": process_name,
         "sources": sorted(cached.keys()),
         "evidence": memory_evidence.score(findings, baseline=_memory_baseline),
     })
+
+
+# --- Syscall map: baseline, measurement, stubs outside ntdll ---
+
+SYSCALL_VIEWS = ("arm64", "x64", "x86")
+# NTSleuth extracts a baseline for these two; an x86 process has none
+SYSCALL_BASELINE_VIEWS = ("arm64", "x64")
+SYSCALL_MODULES = ("ntdll.dll", "win32u.dll")
+# The longest a request waits for a process to be read (seconds), and how long a reader that is
+# stuck in one call gets to come back after that
+SYSCALL_SCAN_TIMEOUT = 120
+SYSCALL_SCAN_GRACE = 10
+SYSCALL_EXTRACT_TIMEOUT = 300
+# A failed extraction of a build and view is not tried again for this long (seconds)
+SYSCALL_EXTRACT_RETRY = 600
+SYSCALL_PAGE_MAX = 500
+SYSCALL_FILE_MAX = 32 * 1024 * 1024     # a file searched for stubs is read whole, and the search holds the GIL
+SYMBOL_SERVER = ("msdl.microsoft.com", 443)
+SYMBOL_SERVER_WAIT = 3.0
+# _process_machine's names for the machine of an image -> the view of its ntdll; ARM64EC code sees the x64 one
+# the most bytes of a stub a scan reads, of any view (syscall_baseline.READ_LEN)
+SYSCALL_READ_HEX_MAX = max(syscall_baseline.READ_LEN.values())
+_SYSCALL_MACHINE_VIEW = {"x64": "x64", "ARM64": "arm64", "ARM64EC": "x64", "x86": "x86"}
+_SYSCALL_PARAMETERS_NOTE = ("The parameter table is incomplete: this baseline was extracted without the symbol "
+                            "server. The measurement is not affected, numbers, RVAs and stub bytes come from "
+                            "the disassembly.")
+
+_syscall_baselines = {}                  # file path -> (stamp, Baseline)
+_syscall_baselines_lock = threading.Lock()
+_hook_allowlist = None
+_hook_allowlist_lock = threading.Lock()
+
+
+def _new_syscall_extract_state():
+    # running: (build, view) being extracted; failed: (build, view) -> (when, why); thread: the latest one;
+    # indistinguishable: the failed ones whose reason is that the x64 extraction was the arm64 view
+    return {"running": set(), "failed": {}, "indistinguishable": set(), "thread": None}
+
+
+_syscall_extract_state = _new_syscall_extract_state()
+_syscall_extract_lock = threading.Lock()
+# NTSleuth writes to one output folder: one run at a time
+_syscall_extract_serial = threading.Lock()
+
+_syscall_scans = 0
+_syscall_scans_lock = threading.Lock()
+
+
+def _get_hook_allowlist():
+    """The one hook allowlist of this process. A second instance would write its sets over the first's: each
+    commits what it holds in memory."""
+    global _hook_allowlist
+    with _hook_allowlist_lock:
+        if _hook_allowlist is None:
+            _hook_allowlist = syscall_scan.HookAllowlist(SYSCALL_HOOK_ALLOWLIST_FILE)
+        return _hook_allowlist
+
+
+def _syscall_view_for_pid(pid):
+    """'arm64', 'x64' or 'x86': the ntdll a process runs against, or None if unknown. From the image's PE header
+    (_process_machine), which tells an x64 process under emulation from a native one."""
+    return _SYSCALL_MACHINE_VIEW.get(_process_machine(pid))
+
+
+def _syscall_default_view():
+    return "arm64" if platform.machine().upper() in ("ARM64", "AARCH64") else "x64"
+
+
+def _current_os_build():
+    r"""`<build>.<revision>` of the running system, the form baseline files are named in, or None."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion") as key:
+            number = winreg.QueryValueEx(key, "CurrentBuildNumber")[0]
+            revision = winreg.QueryValueEx(key, "UBR")[0]
+    except (ImportError, OSError):
+        return None
+    return f"{number}.{revision}"
+
+
+def _symbol_server_reachable():
+    """Whether the Microsoft symbol server answers a connection; the chamber is usually cut off from it."""
+    import socket
+    try:
+        socket.create_connection(SYMBOL_SERVER, timeout=SYMBOL_SERVER_WAIT).close()
+        return True
+    except OSError:
+        return False
+
+
+def _ntsleuth_exe(view):
+    return os.path.join(NTSLEUTH_DIR, f"ntsleuth-{view}.exe")
+
+
+def _ntsleuth_args(view, symbols=None):
+    """The command line that extracts the baseline of `view`. Without the symbol server, `--no-symbols`:
+    NTSleuth would wait on downloads that never come. `symbols` None asks the server."""
+    if symbols is None:
+        symbols = _symbol_server_reachable()
+    args = [_ntsleuth_exe(view), "--auto-params", "--format", "json"]
+    return args if symbols else args + ["--no-symbols"]
+
+
+class _ViewNotDistinguishable(RuntimeError):
+    """The x64 extraction is the arm64 one: ntsleuth-x64.exe did not see the x64 view of ntdll.dll."""
+
+
+def _same_view_baseline(parsed, build, other_view):
+    """The path of the baseline of `other_view` and `build` if it exists, loads and has the fingerprint of `parsed`,
+    else None. With no such baseline (an x64 host, a native-only one, an unreadable file) there is nothing to be
+    identical to."""
+    path = syscall_baseline.find_baseline(NTSLEUTH_BASELINE_DIR, build, other_view)
+    if path is None:
+        return None
+    try:
+        # without the shape check: an x64 lookalike has the arm64 shape, which is what is being looked for
+        other = syscall_baseline.load_baseline(path, check_shape=False)
+    except syscall_baseline.BaselineError:
+        return None
+    return path if syscall_baseline.view_fingerprint(other) == syscall_baseline.view_fingerprint(parsed) else None
+
+
+def _refuse_arm64_lookalike(parsed, build):
+    """Raises _ViewNotDistinguishable if `parsed`, an x64 extraction, is the arm64 view: it has the fingerprint of
+    the arm64 baseline of `build`, or, whether or not that file exists, the stubs of the arm64 view. Stored, it would
+    be the arm64 baseline under another name: every emulated x64 sample would be measured against the wrong
+    reference."""
+    if syscall_baseline.shape_share(parsed, "arm64") >= syscall_baseline.SHAPE_SHARE:
+        raise _ViewNotDistinguishable(
+            f"the x64 view is not distinguishable on this host: ntsleuth-x64.exe extracted ARM64 stubs (SVC) for "
+            f"build {build}, so it did not see the x64 ntdll.dll. No x64 baseline is stored; measuring emulated x64 "
+            f"samples against the ARM64 stubs would be wrong")
+    if _same_view_baseline(parsed, build, "arm64"):
+        raise _ViewNotDistinguishable(
+            f"the x64 view is not distinguishable on this host: ntsleuth-x64.exe extracted the same RVAs and stub "
+            f"bytes as the arm64 baseline of build {build}, so it did not see the x64 ntdll.dll. No x64 baseline "
+            f"is stored; measuring emulated x64 samples against the ARM64 stubs would be wrong")
+
+
+def _drop_x64_lookalike(parsed, build):
+    """The other order: `parsed`, an arm64 extraction about to be stored, equals an x64 baseline already there. The
+    x64 one is the wrong one, whichever came first: ntsleuth-arm64.exe gives the arm64 view by construction on an
+    ARM64 host, it is the emulated x64 binary that may not have seen its own. So the arm64 baseline stays and the x64
+    one goes, and the x64 view is recorded as not distinguishable, as the other order does."""
+    path = _same_view_baseline(parsed, build, "x64")
+    if path is None:
+        return
+    removed = True
+    try:
+        os.remove(path)
+    except OSError:
+        removed = False
+    why = (f"the x64 view is not distinguishable on this host: the x64 baseline of build {build} had the same RVAs "
+           f"and stub bytes as the arm64 one, so ntsleuth-x64.exe had not seen the x64 ntdll.dll. "
+           + ("It was removed; emulated x64 samples are not measured" if removed else
+              f"It could not be removed: delete {os.path.basename(path)} by hand. It is not used meanwhile, its stubs "
+              f"do not have the x64 shape, so emulated x64 samples are not measured"))
+    with _syscall_extract_lock:
+        _syscall_extract_state["failed"][(build, "x64")] = (time.time(), why)
+        _syscall_extract_state["indistinguishable"].add((build, "x64"))
+
+
+def _extract_baseline(view, symbols, build):
+    """Extract the baseline of `view` with NTSleuth and store it as the one of `build`, the build the caller is
+    keyed by, where the web UI reads it. True when it did; False when NTSleuth is not installed for that view.
+    Raises RuntimeError with the reason when the run fails: nothing is stored then."""
+    exe = _ntsleuth_exe(view)
+    if not os.path.isfile(exe):
+        return False
+    # NTSleuth writes output/syscalls.json beside where it runs; a file left by an earlier run must not pass
+    output = os.path.join(NTSLEUTH_DIR, "output", "syscalls.json")
+    try:
+        os.remove(output)
+    except OSError:
+        pass
+    try:
+        proc = _run_cmd(_ntsleuth_args(view, symbols), timeout=SYSCALL_EXTRACT_TIMEOUT, cwd=NTSLEUTH_DIR)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"NTSleuth timed out ({SYSCALL_EXTRACT_TIMEOUT}s)") from None
+    if proc.returncode != 0:
+        tail = ((proc.stderr or proc.stdout or "").strip().splitlines() or [""])[-1][:300]
+        raise RuntimeError(f"NTSleuth exited with {proc.returncode}: {tail}")
+    try:
+        with open(output, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"NTSleuth wrote no usable JSON: {exc}") from None
+    entries = payload.get("syscalls") if isinstance(payload, dict) else payload
+    document = {"symbols": bool(symbols), "syscalls": entries}
+    try:
+        parsed = syscall_baseline.parse_baseline(document, build, view)
+    except syscall_baseline.BaselineError as exc:
+        raise RuntimeError(str(exc)) from None
+    if not parsed.syscalls:
+        raise RuntimeError("NTSleuth's output holds no usable syscall")
+    if view == "x64":
+        _refuse_arm64_lookalike(parsed, build)
+    try:
+        syscall_baseline.check_view_shape(parsed)
+    except syscall_baseline.BaselineError as exc:
+        raise RuntimeError(f"NTSleuth's output is not stored: {exc}") from None
+    os.makedirs(NTSLEUTH_BASELINE_DIR, exist_ok=True)
+    target = os.path.join(NTSLEUTH_BASELINE_DIR, f"ntsleuth-{build}-{view}.json")
+    with open(target + ".tmp", "w", encoding="utf-8") as fh:
+        json.dump(document, fh)
+    os.replace(target + ".tmp", target)
+    if view == "arm64":
+        _drop_x64_lookalike(parsed, build)
+    return True
+
+
+def _syscall_extract_job(build, view):
+    key = (build, view)
+    why = None
+    same_view = False
+    try:
+        with _syscall_extract_serial:
+            if not _extract_baseline(view, _symbol_server_reachable(), build):
+                why = f"NTSleuth is not installed for the {view} view ({_ntsleuth_exe(view)})"
+    except Exception as exc:
+        why = str(exc) or type(exc).__name__
+        same_view = isinstance(exc, _ViewNotDistinguishable)
+    with _syscall_extract_lock:
+        _syscall_extract_state["running"].discard(key)
+        _syscall_extract_state["indistinguishable"].discard(key)
+        if why is None:
+            _syscall_extract_state["failed"].pop(key, None)
+        else:
+            _syscall_extract_state["failed"][key] = (time.time(), why)
+            if same_view:
+                _syscall_extract_state["indistinguishable"].add(key)
+
+
+def _start_baseline_extraction(build, view):
+    """Extract the baseline of `build` and `view` in a thread of its own, as a request must not wait for NTSleuth.
+    False when one is running for that pair already, or failed too recently to try again: any number of requests
+    that find the baseline missing start one run between them. Nothing starts while tools are being updated: the
+    update replaces the NTSleuth binary, and a GET, which the maintenance gate lets through, may not run it."""
+    key = (build, view)
+    if _updating_tools():
+        return False
+    with _syscall_extract_lock:
+        state = _syscall_extract_state
+        failed = state["failed"].get(key)
+        if key in state["running"] or (failed and time.time() - failed[0] < SYSCALL_EXTRACT_RETRY):
+            return False
+        state["running"].add(key)
+        state["thread"] = threading.Thread(target=_syscall_extract_job, args=(build, view),
+                                           name="syscall-baseline", daemon=True)
+        state["thread"].start()
+    return True
+
+
+def _forget_extraction_failure(build, view):
+    """A usable baseline of `build` and `view` is there: an earlier failure to extract it is refuted, whoever wrote
+    the file (the installer writes it without the web UI). Kept, it would contradict the baseline in the status,
+    hold back a retry and name a reason that no longer holds."""
+    with _syscall_extract_lock:
+        _syscall_extract_state["failed"].pop((build, view), None)
+        _syscall_extract_state["indistinguishable"].discard((build, view))
+
+
+def _load_syscall_baseline(path):
+    """The baseline in `path`, read again only when the file changed. One that loads clears the failure record of
+    its build and view."""
+    try:
+        info = os.stat(path)
+    except OSError as exc:
+        raise syscall_baseline.BaselineError(f"cannot read baseline {path}: {exc}") from exc
+    stamp = (info.st_mtime_ns, info.st_size)
+    with _syscall_baselines_lock:
+        hit = _syscall_baselines.get(path)
+        if not hit or hit[0] != stamp:
+            # a file that cannot be loaded is remembered too, or every request would parse it again
+            try:
+                hit = (stamp, syscall_baseline.load_baseline(path))
+            except syscall_baseline.BaselineError as exc:
+                hit = (stamp, exc)
+            _syscall_baselines[path] = hit
+        loaded = hit[1]
+    if isinstance(loaded, syscall_baseline.BaselineError):
+        raise syscall_baseline.BaselineError(str(loaded))
+    _forget_extraction_failure(loaded.build, loaded.view)
+    return loaded
+
+
+def _syscall_extracting():
+    """Whether NTSleuth is being run for a baseline. A tool update must wait for it: it replaces the binary."""
+    with _syscall_extract_lock:
+        return bool(_syscall_extract_state["running"])
+
+
+def _updating_tools():
+    manager = _update_manager
+    return manager is not None and bool(manager.maintenance)
+
+
+def _syscall_extraction_note(build, view):
+    if _updating_tools():
+        return " Tool updates are running: no extraction is started while NTSleuth is being updated."
+    with _syscall_extract_lock:
+        if (build, view) in _syscall_extract_state["running"]:
+            return " It is being extracted in the background, try again in a few seconds."
+        failed = _syscall_extract_state["failed"].get((build, view))
+        same_view = (build, view) in _syscall_extract_state["indistinguishable"]
+    if failed and same_view:
+        return f" {failed[1][:1].upper()}{failed[1][1:]}."
+    return f" The last extraction failed: {failed[1]}." if failed else ""
+
+
+def _syscall_baseline_for(view, extract=True):
+    """`(baseline, None)` for `view` on this system's build, or `(None, why)`. A baseline of another build is no
+    baseline: its RVAs are about other bytes. When there is none for this build, one is extracted in the
+    background, unless `extract` is False: a detonation does not start NTSleuth."""
+    if view not in SYSCALL_BASELINE_VIEWS:
+        return None, f"there is no syscall baseline for the {view or 'unknown'} view"
+    build = _current_os_build()
+    if not build:
+        return None, "no syscall baseline can be chosen: the build of this system cannot be determined"
+    path = syscall_baseline.find_baseline(NTSLEUTH_BASELINE_DIR, build, view)
+    if path is None:
+        if extract:
+            _start_baseline_extraction(build, view)
+        return None, (f"no syscall baseline for build {build}, view {view}."
+                      + _syscall_extraction_note(build, view))
+    try:
+        return _load_syscall_baseline(path), None
+    except syscall_baseline.BaselineError as exc:
+        return None, (f"the syscall baseline is unusable: {exc}. It is not extracted again by itself: delete "
+                      f"{os.path.basename(path)} in {NTSLEUTH_BASELINE_DIR} to have it extracted anew.")
+
+
+def _get_syscall_baseline(view):
+    """The baseline of `view` for this system's build, or None."""
+    return _syscall_baseline_for(view)[0]
+
+
+class _SyscallRouteError(Exception):
+    def __init__(self, message, status=400):
+        super().__init__(message)
+        self.status = status
+
+
+@app.errorhandler(_SyscallRouteError)
+def _syscall_route_error(exc):
+    return jsonify({"error": str(exc)}), exc.status
+
+
+def _syscall_view_param(raw):
+    """The view of a request: one of SYSCALL_VIEWS, this host's own when none is given."""
+    if raw in (None, ""):
+        return _syscall_default_view()
+    if raw not in SYSCALL_VIEWS:
+        raise _SyscallRouteError("view must be one of " + ", ".join(SYSCALL_VIEWS))
+    return raw
+
+
+def _syscall_int_param(raw, name, default, low, high):
+    if raw in (None, ""):
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise _SyscallRouteError(f"{name} must be an integer") from None
+    return max(low, min(value, high))
+
+
+def _syscall_flag_param(raw, name):
+    """A request flag: 1 or true, 0 or false; absent is false. Anything else is refused, not guessed at."""
+    if raw in (None, "", "0", "false"):
+        return False
+    if raw in ("1", "true"):
+        return True
+    raise _SyscallRouteError(f"{name} must be 0 or 1")
+
+
+def _syscall_body():
+    data = request.get_json(silent=True) if request.is_json else request.form
+    return data if hasattr(data, "get") else {}
+
+
+def _syscall_pid(raw):
+    try:
+        pid = int(raw)
+    except (TypeError, ValueError):
+        pid = 0
+    if isinstance(raw, bool) or not 0 < pid < 2 ** 32:
+        raise _SyscallRouteError("pid must be a positive integer")
+    return pid
+
+
+def _syscall_modules(raw):
+    """The modules to measure, ntdll alone unless the request names more (a list, or names separated by commas)."""
+    if raw in (None, "", []):
+        return ("ntdll.dll",)
+    names = raw.split(",") if isinstance(raw, str) else raw
+    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        raise _SyscallRouteError("modules must be a list of module names")
+    modules = tuple(dict.fromkeys(n.strip().lower() for n in names))
+    if not modules or not set(modules) <= set(SYSCALL_MODULES):
+        raise _SyscallRouteError("modules must be among " + ", ".join(SYSCALL_MODULES))
+    return modules
+
+
+def _syscall_target(pid):
+    """`(view, baseline)` for the process `pid`, or a refusal naming what is missing."""
+    view = _syscall_view_for_pid(pid)
+    if view is None:
+        raise _SyscallRouteError(f"cannot choose a syscall baseline: the architecture of process {pid} is "
+                                 "unknown (it is gone, or its image cannot be read)")
+    baseline, why = _syscall_baseline_for(view)
+    if baseline is None:
+        raise _SyscallRouteError(why)
+    return view, baseline
+
+
+def _syscall_identity(pid):
+    """What findings of a process are keyed by: its image path, as for the other memory scanners."""
+    return _image_path_for_pid(pid) or _image_name_for_pid(pid)
+
+
+class _SyscallTimeout(Exception):
+    pass
+
+
+class _DeadlineReader(syscall_scan.ProcessReader):
+    """`reader` until `deadline` (time.monotonic), then a process that reads nothing. A read cannot be cancelled
+    from outside, so the scan stops by finding nothing more to read, and `expired` says that it did."""
+
+    def __init__(self, reader, deadline):
+        self._reader, self._deadline, self.expired = reader, deadline, False
+
+    def _live(self):
+        if time.monotonic() >= self._deadline:
+            self.expired = True
+        return not self.expired
+
+    def view(self):
+        return self._reader.view()
+
+    def build(self):
+        return self._reader.build()
+
+    def modules(self):
+        return self._reader.modules() if self._live() else None
+
+    def modules_whole(self):
+        return self._reader.modules_whole() if self._live() else None
+
+    def read(self, addr, size):
+        return self._reader.read(addr, size) if self._live() else None
+
+    def region(self, addr):
+        return self._reader.region(addr) if self._live() else None
+
+
+def _open_syscall_reader(pid, view, build):
+    return syscall_scan.Win32Reader(pid, view, build)
+
+
+def _syscall_scan_running():
+    """Whether a syscall scan is reading a process. Also one whose request has given up waiting: its thread
+    holds the process open until its reader returns."""
+    with _syscall_scans_lock:
+        return _syscall_scans > 0
+
+
+def _syscall_read_process(pid, view, build, work):
+    """`work(reader)` on a thread of its own, for the process `pid`, within SYSCALL_SCAN_TIMEOUT.
+
+    `measure` and the stub search have no clock, so the limit is kept here: the request waits for the thread
+    for that long, and a reader that is past its deadline reads nothing, which ends the work. Raises
+    _SyscallRouteError for a refusal, a process that cannot be opened, or a scan that ran out of time."""
+    global _syscall_scans
+    box = {}
+    deadline = time.monotonic() + SYSCALL_SCAN_TIMEOUT
+
+    def job():
+        global _syscall_scans
+        try:
+            with _open_syscall_reader(pid, view, build) as reader:
+                guard = box["guard"] = _DeadlineReader(reader, deadline)
+                box["result"] = work(guard)
+        except Exception as exc:
+            box["error"] = exc
+        finally:
+            with _syscall_scans_lock:
+                _syscall_scans -= 1
+
+    with _syscall_scans_lock:
+        _syscall_scans += 1
+    try:
+        thread = threading.Thread(target=job, name="syscall-scan", daemon=True)
+        thread.start()
+    except BaseException:
+        with _syscall_scans_lock:
+            _syscall_scans -= 1
+        raise
+    thread.join(SYSCALL_SCAN_TIMEOUT + SYSCALL_SCAN_GRACE)
+    error = box.get("error")
+    if isinstance(error, syscall_scan.ScanRefused):
+        raise _SyscallRouteError(error.reason)
+    if isinstance(error, OSError):
+        raise _SyscallRouteError(f"cannot read process {pid}: {error}")
+    if error is not None:
+        raise error
+    if thread.is_alive() or "result" not in box or box["guard"].expired:
+        raise _SyscallRouteError(f"the scan of process {pid} timed out ({SYSCALL_SCAN_TIMEOUT}s)", 504)
+    return box["result"]
+
+
+def _syscall_measure(pid, modules, allowlist=None):
+    """`(measurement, view, build, process)` of the stubs of `modules` in the process `pid`."""
+    view, baseline = _syscall_target(pid)
+    build = _current_os_build()
+    measured = _syscall_read_process(
+        pid, view, build,
+        lambda reader: syscall_scan.measure(baseline, reader, view, build, modules, allowlist))
+    return measured, view, build
+
+
+def _syscall_measurements():
+    """The syscall scans the history kept, newest first, as the list that names one.
+
+    The history is where a measurement outlives both its process and a restart of the web UI: the stage's own cache
+    is in memory and keyed by pid. Only what the control needs to name a measurement goes in - never the result,
+    which carries every deviation of some 2,000 stubs.
+    """
+    out = []
+    for entry in _load_scan_history():
+        if not isinstance(entry, dict) or (entry.get("tool") or "") != "Syscalls":
+            continue
+        result = entry.get("result")
+        if not isinstance(result, dict) or not isinstance(result.get("counts"), dict):
+            continue
+        process = str(result.get("process") or "")
+        out.append({
+            "id": entry.get("id") or "",
+            "at": entry.get("timestamp") or "",
+            "pid": result.get("pid"),
+            "process": os.path.basename(process.replace("\\", "/")) or (entry.get("filename") or ""),
+            "build": result.get("build") or "",
+            "view": result.get("view") or "",
+            "counts": result.get("counts"),
+            "partial": bool(result.get("partial")),
+        })
+    return out
+
+
+@app.route("/api/syscalls/measurements")
+def api_syscalls_measurements():
+    """The syscall scans the history kept, to put one on the map. The list names them; it does not carry them."""
+    return jsonify({"measurements": _syscall_measurements()})
+
+
+@app.route("/api/syscalls/measurement")
+def api_syscalls_measurement():
+    """One measurement the history kept, shaped like a scan so the map needs no second way to read it.
+
+    `states` is rebuilt from the deviations against the baseline of the measurement's own build and view, and only
+    when the count adds up (syscall_scan.states_from_deviations). Where it cannot be, `states` is null and `problem`
+    says why, while the figures and deviations the scan recorded still travel: they are its own either way. `live`
+    is false and `measured_at` says when, because nothing here may read as a scan of now.
+    """
+    wanted = (request.args.get("id") or "").strip()
+    if not wanted or len(wanted) > 64 or not re.fullmatch(r"[A-Za-z0-9_-]+", wanted):
+        return jsonify({"error": "Provide the id of a measurement"}), 400
+    entry = next((e for e in _load_scan_history()
+                  if isinstance(e, dict) and (e.get("tool") or "") == "Syscalls" and e.get("id") == wanted), None)
+    if entry is None:
+        return jsonify({"error": f"no syscall measurement {wanted} in the scan history"}), 404
+    result = entry.get("result") if isinstance(entry.get("result"), dict) else {}
+    view, build = result.get("view") or "", result.get("build") or ""
+    modules = tuple(m for m in (result.get("modules") or ("ntdll.dll",)) if isinstance(m, str))
+    states, problem = None, None
+    baseline = None
+    if view in SYSCALL_BASELINE_VIEWS and build:
+        path = syscall_baseline.find_baseline(NTSLEUTH_BASELINE_DIR, build, view)
+        if path is None:
+            problem = (f"this system has no syscall baseline for build {build}, view {view}: the stubs of another "
+                       "build are numbered differently, so its map cannot be drawn here")
+        else:
+            try:
+                baseline = _load_syscall_baseline(path)
+            except syscall_baseline.BaselineError as exc:
+                problem = f"the syscall baseline of build {build} ({view}) is unusable: {exc}"
+    else:
+        problem = f"the measurement names no usable build and view (build {build or '?'}, view {view or '?'})"
+    if baseline is not None:
+        states, problem = syscall_scan.states_from_deviations(
+            baseline, modules, result.get("deviations"), result.get("counts") or {})
+        states = states or None
+    return jsonify({**{k: v for k, v in result.items() if k != "states"},
+                    "id": entry.get("id") or "", "measured_at": entry.get("timestamp") or "",
+                    "live": False, "states": states, "problem": problem})
+
+
+def _syscall_stage_enabled():
+    """False when the detonation's syscall stage is switched off for the whole web UI: TDC_NO_SYSCALL_STAGE=1."""
+    return os.environ.get("TDC_NO_SYSCALL_STAGE") != "1"
+
+
+def _syscall_baseline_present():
+    """Whether a baseline of this system's build exists for some view. Measuring needs the baseline file alone:
+    NTSleuth, the binary, is needed only to make one."""
+    build = _current_os_build()
+    return bool(build) and any(syscall_baseline.find_baseline(NTSLEUTH_BASELINE_DIR, build, view)
+                               for view in SYSCALL_BASELINE_VIEWS)
+
+
+def _syscall_stage_available():
+    """Whether a detonation has a syscall stage to run: it is not switched off and there is a baseline to measure by."""
+    return _syscall_stage_enabled() and _syscall_baseline_present()
+
+
+def _syscall_stage_file(path, baseline):
+    """`(hits, info)`: the stubs the file at `path` carries and what is known of the search. A file that cannot be
+    searched is a note in `info`. The names the file holds (imports and exports) are passed raw and expanded through
+    the Win32 to Nt table: only the expanded set can prove a bypass, and only for a syscall a curated row leads to.
+    The file speaks for the sample alone; its process memory, searched beside it, speaks for everything loaded there
+    and proves only when the binary graph holds every loaded module (_syscall_search_process)."""
+    if not isinstance(path, str) or not path:
+        return [], {"skipped": "the path of the sample is not known"}
+    real = _readable_path(path)
+    if real is None:
+        return [], {"skipped": "the sample is outside the folders the web UI reads"}
+    try:
+        if os.path.getsize(real) > SYSCALL_FILE_MAX:
+            return [], {"skipped": f"the sample is larger than {SYSCALL_FILE_MAX // (1024 * 1024)} MB"}
+        with open(real, "rb") as fh:
+            content = fh.read()
+    except OSError as exc:
+        return [], {"skipped": f"the sample cannot be read: {exc.strerror or exc}"}
+    hits, imports, doors_note = _syscall_search_file(content, baseline)
+    return hits, {"path": real, "size": len(content), "imports_read": imports is not None,
+                  "doors_complete": not doors_note, "doors_note": doors_note}
+
+
+def _syscall_stage(pid, path):
+    """The syscall scan of a detonated process: its stubs measured against the baseline, the stubs it carries
+    outside ntdll, and the stubs the sample file carries. Raises _SyscallRouteError for what it cannot do."""
+    view = _syscall_view_for_pid(pid)
+    if view is None:
+        raise _SyscallRouteError(f"the architecture of process {pid} is unknown (it is gone, or its image cannot "
+                                 "be read)")
+    baseline, why = _syscall_baseline_for(view, extract=False)
+    if baseline is None:
+        raise _SyscallRouteError(why)
+    build = _current_os_build()
+    identity = _syscall_identity(pid)
+    modules = _syscall_modules(None)
+    measured = _syscall_read_process(
+        pid, view, build,
+        lambda reader: syscall_scan.measure(baseline, reader, view, build, modules, _get_hook_allowlist()))
+    # the process first, while it is as the detonation left it. Its private memory is not the sample's alone: a stub
+    # there proves a bypass only against the doors of every loaded module, and stays a hint while one is unknown
+    try:
+        image_path = _image_path_for_pid(pid)
+        imports = _pe_import_names_of_file(image_path)
+        found, doors_note = _syscall_search_process(pid, view, build, baseline, image_path, imports)
+        # StubScan's own attributes are lost to list() and json.dumps: they become keys here
+        in_process = {"hits": list(found), "partial": found.partial, "imports_read": imports is not None,
+                      "doors_complete": not doors_note, "doors_note": doors_note,
+                      "regions_searched": found.regions_searched, "note": found.note}
+    except Exception as exc:
+        in_process = {"hits": [], "error": str(exc)}
+    file_hits, in_file = _syscall_stage_file(path, baseline)
+    in_file["hits"] = list(file_hits)
+    findings = memory_evidence.collect({"syscall_scan": measured}, process=identity)
+    # the file's copies decide a finding's answer whatever their place in the list (the weakest claim among them,
+    # Ruling 72): the file speaks for the sample itself, the process for everything loaded beside it
+    findings += memory_evidence.from_direct_stubs(in_file["hits"] + in_process["hits"], identity)
+    return _syscall_mark_unobserved({
+        **{k: v for k, v in measured.items() if k != "states"},
+        "tool": "Syscalls", "pid": pid, "process": identity, "modules": list(modules),
+        "stubs": {"process": in_process, "file": in_file},
+        "evidence_findings": findings,
+        "evidence": memory_evidence.score(findings, baseline=_memory_baseline)})
+
+
+def _run_syscall_stage(pid, path, notes=None):
+    """The syscall stage of a detonation, or None when it skips itself, the reason appended to `notes`.
+
+    It never raises and starts no extraction: switched off, without a baseline of this build and view (one being
+    extracted is not one yet), for a process that is gone or cannot be read, or for a scan that runs out of time,
+    a detonation goes on without it. NTSleuth itself is not needed: only the baseline it once made. `path` is the
+    sample's file, searched for stubs as well."""
+    def skip(why):
+        if notes is not None:
+            notes.append(why)
+        return None
+
+    if not _syscall_stage_enabled():
+        return skip("the syscall stage is switched off (TDC_NO_SYSCALL_STAGE)")
+    try:
+        return _syscall_stage(pid, path)
+    except _SyscallRouteError as exc:
+        return skip(str(exc))
+    except Exception as exc:
+        return skip(f"the syscall scan failed: {exc}")
+
+
+def _syscall_stage_entry(entry):
+    """`entry`, a stored result of the stage, when the scan ran; None for one that skipped or failed."""
+    return entry if isinstance(entry, dict) and "evidence_findings" in entry else None
+
+
+def _syscall_stage_findings(entry):
+    """The findings of a stored result of the stage."""
+    entry = _syscall_stage_entry(entry)
+    return list(entry["evidence_findings"] or []) if entry else []
+
+
+@app.route("/api/syscalls/status")
+def api_syscalls_status():
+    """Whether NTSleuth is installed, which baselines exist and whether one is being extracted."""
+    build = _current_os_build()
+    executables = {view: os.path.isfile(_ntsleuth_exe(view)) for view in SYSCALL_BASELINE_VIEWS}
+    try:
+        names = sorted(os.listdir(NTSLEUTH_BASELINE_DIR))
+    except OSError:
+        names = []
+    baselines = []
+    for name in names:
+        parsed = syscall_baseline.parse_baseline_name(name)
+        if parsed is None:
+            continue
+        entry = {"file": name, "build": parsed[0], "view": parsed[1], "current": parsed[0] == build}
+        try:
+            loaded = _load_syscall_baseline(os.path.join(NTSLEUTH_BASELINE_DIR, name))
+        except syscall_baseline.BaselineError as exc:
+            entry.update(symbols=None, error=str(exc),
+                         note="This file is unusable and is not replaced automatically: delete it to have the "
+                              "baseline extracted again.")
+        else:
+            entry.update(symbols=loaded.symbols, syscalls=len(loaded.syscalls))
+            if not loaded.symbols:
+                entry["note"] = _SYSCALL_PARAMETERS_NOTE
+        baselines.append(entry)
+    with _syscall_extract_lock:
+        running = sorted(_syscall_extract_state["running"])
+        failed = sorted((k, v) for k, v in _syscall_extract_state["failed"].items())
+        same_view = set(_syscall_extract_state["indistinguishable"])
+    return jsonify({
+        "installed": any(executables.values()),
+        "path": NTSLEUTH_DIR,
+        "executables": executables,
+        "build": build,
+        "machine": platform.machine(),
+        "default_view": _syscall_default_view(),
+        "baselines": baselines,
+        "extraction": {
+            "running": [{"build": b, "view": v} for b, v in running],
+            # indistinguishable: not a failed run but the x64 binary seeing the arm64 view, so no x64 baseline
+            "failed": [{"build": b, "view": v, "reason": why, "indistinguishable": (b, v) in same_view}
+                       for (b, v), (_, why) in failed],
+        },
+    })
+
+
+@app.route("/api/syscalls/baseline")
+def api_syscalls_baseline():
+    """The syscall catalog of a view, filtered and in pages. Params: view, query, module, offset, limit, lean.
+
+    With `lean=1` each item is its name, module and number: what a map of all of them draws, without the
+    parameters and stub bytes, which `/api/syscalls/<name>` gives for one syscall."""
+    view = _syscall_view_param(request.args.get("view"))
+    lean = _syscall_flag_param(request.args.get("lean"), "lean")
+    baseline, why = _syscall_baseline_for(view)
+    if baseline is None:
+        return jsonify({"error": why, "view": view}), 503
+    page = syscall_baseline.catalog(
+        baseline, query=(request.args.get("query") or "")[:100], module=(request.args.get("module") or "")[:64],
+        offset=_syscall_int_param(request.args.get("offset"), "offset", 0, 0, 10 ** 9),
+        limit=_syscall_int_param(request.args.get("limit"), "limit", 200, 0, SYSCALL_PAGE_MAX), lean=lean)
+    page.update(build=baseline.build, view=baseline.view, symbols=baseline.symbols,
+                skipped=len(baseline.skipped), shadowed=len(baseline.shadowed))
+    return jsonify(page)
+
+
+@app.route("/api/syscalls/<name>")
+def api_syscalls_lookup(name):
+    """One syscall with its parameters and stub, found under its Nt or its Zw name (the baseline holds one of the two;
+    a hit and the graph name it by its Nt name). Param: view."""
+    view = _syscall_view_param(request.args.get("view"))
+    baseline, why = _syscall_baseline_for(view)
+    if baseline is None:
+        return jsonify({"error": why, "view": view}), 503
+    sc = syscall_baseline.find(baseline, name)
+    if sc is None:
+        return jsonify({"error": f"unknown syscall {name[:100]}", "view": view}), 404
+    return jsonify({**syscall_baseline.describe(sc), "build": baseline.build, "view": baseline.view,
+                    "prefix_len": syscall_baseline.stub_prefix_len(sc, baseline.view)})
+
+
+@app.route("/api/syscalls/scan", methods=["POST"])
+def api_syscalls_scan():
+    """Measure the syscall stubs of a process against the baseline. Params: pid, modules (ntdll.dll, win32u.dll).
+
+    The measurement, scored in the evidence model. A scan that takes longer than SYSCALL_SCAN_TIMEOUT is a 504."""
+    data = _syscall_body()
+    pid = _syscall_pid(data.get("pid"))
+    modules = _syscall_modules(data.get("modules"))
+    measured, view, build = _syscall_measure(pid, modules, _get_hook_allowlist())
+    process = _syscall_identity(pid)
+    findings = memory_evidence.collect({"syscall_scan": measured}, process=process)
+    result = _syscall_mark_unobserved({**measured, "tool": "Syscalls", "pid": pid, "process": process,
+                                       "modules": list(modules),
+                                       "evidence": memory_evidence.score(findings, baseline=_memory_baseline)})
+    # the history keeps what a timeline row expands to, not the state of every one of some 2,000 stubs
+    _record_scan("Syscalls", f"PID {pid}", {k: v for k, v in result.items() if k != "states"})
+    return jsonify(result)
+
+
+def _syscall_expanded_imports(imports):
+    """The keywords of a stub search for the import table `imports`: the table expanded through the curated Win32
+    to Nt table, and the syscalls that table leads to. Without an import table, or without the curated table, both
+    are None and every hit stays a hint."""
+    if imports is None:
+        return {"expanded_imports": None, "covered": None}
+    try:
+        table = win32_to_nt.load_table()
+    except win32_to_nt.TableError as exc:
+        print(f"[syscalls] the Win32 to Nt table is unusable, every stub stays a hint: {exc}")
+        return {"expanded_imports": None, "covered": None}
+    return {"expanded_imports": table.expand(imports), "covered": table.covered}
+
+
+def _syscall_image_record(path):
+    """The record of the process image at `path`, read as binary_graph reads a System32 binary (imports by ordinal and
+    a table cut short kept as such); None when it cannot be read or is larger than SYSCALL_FILE_MAX."""
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        if os.path.getsize(path) > SYSCALL_FILE_MAX:
+            return None
+        return binary_graph.extract_binary(path)
+    except (OSError, binary_graph.ExtractError):
+        return None
+
+
+def _syscall_module_identity(listed):
+    return None if listed is None else sorted((str(m.get("path")), m.get("base")) for m in listed)
+
+
+def _syscall_imported_by(hit, doors):
+    name = hit.get("syscall")
+    if not isinstance(name, str):
+        return False
+    return name in doors or (name.startswith("Nt") and "Zw" + name[2:] in doors)
+
+
+def _syscall_search_process(pid, view, build, baseline, image_path, imports):
+    """`(found, doors_note)`: the stub search of the process `pid`, and why it could not prove, "" when it could.
+
+    A stub in private memory is judged against the union of the doors every loaded module imports
+    (binary_graph_query.doors_of_process), never against the image's table alone: the memory is not the image's
+    alone. The union needs the binary graph of this system, which is taken as it is and never built from here, and
+    is taken from the module list of the reader that searches, before the search and again after it, as
+    `modules_whole`: a list the reader thinned (a module whose information or name it could not read) is no list,
+    and neither is an empty one.
+
+    The denominator covers every module loaded at any point of the search, so it is the union over both lists: a
+    module loaded only for a while still had its doors in the address space, and may be the stub's author. A module
+    of either list the cache does not cover makes the union incomplete, and a list that cannot be had after the
+    search does too. Both calls are needed; one would miss what came or went while the search ran."""
+    graph, _ = _binary_graph_for(start_build=False)
+    table, why = None, ""
+    if graph is None:
+        why = "there is no binary graph of this system to read the imports of the loaded modules from"
+    else:
+        try:
+            table = win32_to_nt.load_table()
+        except win32_to_nt.TableError as exc:
+            why = f"the Win32 to Nt table is unusable: {exc}"
+    image = _syscall_image_record(image_path) if table is not None else None
+
+    def work(reader):
+        doors, note = None, why
+        listed = reader.modules_whole() if table is not None else None
+        if table is not None:
+            doors, note = binary_graph_query.doors_of_process(graph, listed, table, view=view,
+                                                              image_path=image_path, image=image)
+        keywords = {"expanded_imports": doors, "covered": table.covered} if doors is not None else {}
+        found = syscall_scan.find_stubs_in_process(reader, baseline, imports, **keywords)
+        if doors is None:
+            return found, note
+        after = reader.modules_whole()
+        if _syscall_module_identity(after) == _syscall_module_identity(listed):
+            return found, note
+        # the first list was found complete and its doors applied during the search, so over both lists the
+        # question left is the second one's; listed + after says the rule, and changes no answer beside after alone
+        if not after:
+            # an empty list is no list: nothing is known of what loaded while the search ran
+            doors, note = None, "the modules of the process could not be listed again after the search"
+        else:
+            doors, note = binary_graph_query.doors_of_process(graph, listed + after, table, view=view,
+                                                              image_path=image_path, image=image)
+            if doors is None:
+                note = f"the modules of the process changed during the search: {note}"
+        # only ever weaker: a proof becomes a hint, or the door a module loaded meanwhile brought
+        for hit in found:
+            if hit.get("import_present") is False:
+                hit["import_present"] = None if doors is None else _syscall_imported_by(hit, doors)
+        return found, note
+
+    return _syscall_read_process(pid, view, build, work)
+
+
+def _pe_import_names_of_file(path):
+    """The import table of the PE at `path` (a process image), None when it cannot be read or is too large."""
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        if os.path.getsize(path) > SYSCALL_FILE_MAX:
+            return None
+        with open(path, "rb") as fh:
+            return _pe_import_names(fh.read())
+    except OSError:
+        return None
+
+
+def _syscall_search_file(content, baseline):
+    """`(hits, imports, doors_note)`: the stub search of a file's bytes, judged against its import table run through
+    the Win32 to Nt table, that table (None when the file is no PE that can be read), and why no absence could be
+    claimed, "" when one could.
+
+    The file is read by binary_graph's reader (_pe_sample_record), as process mode reads its image: a directory
+    pefile refused leaves the table unread (None), and a record cut short keeps its True but claims no absence.
+
+    An import by ordinal is named through the binary graph (binary_graph_query.name_ordinal_imports), never built
+    from here. One it cannot name may be a door: the hits keep their True, and no stub becomes a proof.
+
+    A stub that is the body of an export under its own Nt or Zw name is the documented path itself, a copy of ntdll,
+    and is imported (True): one that starts at the export's address or less than one stub's read length after it.
+    Nothing else in the export table counts: the author of a sample writes it, so a door name or the Nt name pointing
+    anywhere but at the stub would buy off the proof for one line.
+
+    A view the file's machine does not match claims no absence and reads no export: the export table describes the
+    native view only (an ARM64X ntdll names its ARM64 stubs, not its x64 ones)."""
+    info, why = _pe_sample_record(content)
+    imports = _record_import_names(info) if info is not None else None
+    # the reader's reason says what happened: no PE at all, or which of its directories pefile refused
+    doors_note = "" if info is not None else f"the file cannot be read as a PE: {why}"
+    named = set()
+    if info is not None:
+        if any(f.startswith("#") for functions in info.imports.values() for f in functions):
+            graph, _ = _binary_graph_for(start_build=False)
+            named, doors_note = binary_graph_query.name_ordinal_imports(graph, info.imports, view=baseline.view)
+        if named:
+            imports = imports | named
+        if info.partial:
+            cut = "a table (import, delay-load or export) of the file was cut short when it was read"
+            doors_note = f"{cut}; {doors_note}" if doors_note else cut
+    # Ruling 70: the export table pefile reads describes the code of the file's own machine. On an ARM64X image
+    # (Machine ARM64) the x64 stubs lie elsewhere, so a stub found in a view the machine does not match cannot be
+    # matched against it: the denominator is unreadable, no absence is claimed. A True of the imports still stands
+    foreign = info is not None and info.machine != baseline.view
+    if foreign:
+        other = (f"the file's machine is {info.machine} and the view searched is {baseline.view}: its export table "
+                 f"describes the file's native view (as on an ARM64X image), so a stub found in another view cannot "
+                 f"be matched against it")
+        doors_note = f"{other}; {doors_note}" if doors_note else other
+    keywords = _syscall_expanded_imports(imports)
+    # what could not be named, or was lost when a table was cut short, may be the door: nothing is claimed absent
+    if (named is None or foreign or (info is not None and info.partial)) and keywords["covered"] is not None:
+        keywords["covered"] = frozenset()
+    hits = syscall_scan.find_stubs_in_bytes(content, baseline, imports, **keywords)
+    exported = _pe_export_offsets(content) if imports is not None and not foreign else {}
+    # Ruling 71: the stub is the body of the export, so inside it, not only at its first byte (arm64 ntdll has a
+    # second SVC 16 bytes into NtUnmapViewOfSection). The bound is one stub's read length of the view: with none, any
+    # stub after an export would match it, and the rescue would buy off every proof behind a single Nt export
+    span = syscall_baseline.READ_LEN.get(baseline.view, 0)
+    for hit in hits:
+        name, at = hit.get("syscall"), hit.get("offset")
+        hit["own_export"] = False
+        if hit.get("import_present") is True or not isinstance(name, str) or not name.startswith("Nt"):
+            continue
+        if not isinstance(at, int):
+            continue
+        starts = (exported.get(alias) for alias in (name, "Zw" + name[2:]))
+        if any(isinstance(start, int) and 0 <= at - start < span for start in starts):
+            hit["import_present"] = True
+            hit["own_export"] = True
+    return hits, imports, doors_note
+
+
+def _pe_export_offsets(data):
+    """Each name a PE exports with the file offset its address resolves to; {} when there is none or the table cannot
+    be read. A forwarded export, or one outside the file, has no offset and is left out."""
+    try:
+        import pefile
+        pe = pefile.PE(data=data, fast_load=True)
+        try:
+            pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_EXPORT"]])
+            out = {}
+            for sym in getattr(getattr(pe, "DIRECTORY_ENTRY_EXPORT", None), "symbols", None) or []:
+                if not sym.name or sym.forwarder or not sym.address:
+                    continue
+                try:
+                    out[sym.name.decode("ascii", "replace")] = pe.get_offset_from_rva(sym.address)
+                except Exception:
+                    continue
+            return out
+        finally:
+            pe.close()
+    except Exception:
+        return {}
+
+
+def _pe_sample_record(data):
+    """`(record, why)`: a sample's bytes read by binary_graph's reader, the one process mode reads its image and the
+    loaded modules with, or `(None, the reason)` when it yields no record. A declared import, delay-load or export
+    directory pefile refused yields none, so an unread table never reads as one that imports nothing; one cut short
+    yields a record marked partial."""
+    try:
+        return binary_graph.extract_bytes(data, "sample"), ""
+    except binary_graph.ExtractError as exc:
+        return None, str(exc)
+
+
+def _record_import_names(info):
+    """The names `info` imports, delay-loaded ones included; its imports by ordinal ("#<n>") are left to the graph.
+    Expanded through the Win32 to Nt table the set can say that a function is not imported, so a function the sample
+    delay-loads has to be in it: it is a path the sample has."""
+    return {f for functions in info.imports.values() for f in functions if not f.startswith("#")}
+
+
+def _pe_import_names(data):
+    """The names a PE imports (_record_import_names), None when `data` yields no record (_pe_sample_record)."""
+    info, _ = _pe_sample_record(data)
+    return None if info is None else _record_import_names(info)
+
+
+@app.route("/api/syscalls/stubs", methods=["POST"])
+def api_syscalls_stubs():
+    """Search for syscall stubs outside ntdll: in a running process (pid) or in a file (path, with view).
+
+    Each hit names the syscall of its number. For a file `import_present` is tri-state: False for a syscall a curated
+    Win32 to Nt row leads to and the file's imports and exports, expanded through that table, do not hold (a proven
+    bypass); True for one they hold; None where no row leads to the syscall, the file is no PE that can be read, a
+    table of it was cut short, or it imports by an ordinal the binary graph cannot name (see
+    syscall_scan.find_stubs_in_bytes). For a process it is judged against the doors every loaded module imports
+    (_syscall_search_process): False only when the binary graph of this system holds every loaded module and none of
+    them, the image included, imports a door to the syscall; True when one does, or the image imports the function;
+    None otherwise. `doors_complete` says whether that union could be built, and `doors_note` why not."""
+    data = _syscall_body()
+    pid_given, path_given = data.get("pid") not in (None, ""), data.get("path") not in (None, "")
+    if pid_given == path_given:
+        raise _SyscallRouteError("give a pid or a path")
+    if pid_given:
+        pid = _syscall_pid(data.get("pid"))
+        view, baseline = _syscall_target(pid)
+        build = _current_os_build()
+        # the raw table of the image can say that the function is imported as well, without the binary graph too
+        image_path = _image_path_for_pid(pid)
+        imports = _pe_import_names_of_file(image_path)
+        found, doors_note = _syscall_search_process(pid, view, build, baseline, image_path, imports)
+        process = _syscall_identity(pid)
+        result = {"mode": "process", "pid": pid, "process": process, "imports_read": imports is not None,
+                  "doors_complete": not doors_note, "doors_note": doors_note,
+                  "partial": found.partial, "regions_searched": found.regions_searched, "note": found.note}
+    else:
+        if data.get("view") in (None, ""):
+            raise _SyscallRouteError("a path needs the view to search it for: arm64, x64 or x86")
+        view = _syscall_view_param(data.get("view"))
+        real = _readable_path(data.get("path"))
+        if real is None:
+            raise _SyscallRouteError("Access denied: path outside allowed directories", 403)
+        if not os.path.isfile(real):
+            raise _SyscallRouteError("the file does not exist")
+        if os.path.getsize(real) > SYSCALL_FILE_MAX:
+            raise _SyscallRouteError(f"the file is larger than {SYSCALL_FILE_MAX // (1024 * 1024)} MB")
+        baseline, why = _syscall_baseline_for(view)
+        if baseline is None:
+            raise _SyscallRouteError(why)
+        try:
+            with open(real, "rb") as fh:
+                content = fh.read()
+        except OSError as exc:
+            raise _SyscallRouteError(f"the file cannot be read: {exc.strerror or exc}")
+        found, imports, doors_note = _syscall_search_file(content, baseline)
+        process = os.path.basename(real)
+        result = {"mode": "file", "path": real, "size": len(content), "process": process,
+                  "imports_read": imports is not None, "doors_complete": not doors_note, "doors_note": doors_note,
+                  "partial": False, "note": ""}
+    hits = list(found)
+    findings = memory_evidence.from_direct_stubs(hits, process)
+    result.update(tool="Syscalls", view=baseline.view, build=baseline.build, hits=hits,
+                  evidence=memory_evidence.score(findings, baseline=_memory_baseline))
+    return jsonify(result)
+
+
+def _hook_scope():
+    """`(build, view)` from the query, or `(None, None)`: one of them alone is a mistake, not a wildcard."""
+    build, view = request.args.get("build"), request.args.get("view")
+    if build is None and view is None:
+        return None, None
+    if not build or not view:
+        raise _SyscallRouteError("build and view are given together, or neither")
+    return build, _syscall_view_param(view)
+
+
+@app.route("/api/syscalls/hook-baseline", methods=["GET"])
+def api_syscalls_hook_baseline():
+    """The hooks known on this host, as (syscall, owner) pairs per build and view. Params: build and view,
+    together, to list one set."""
+    build, view = _hook_scope()
+    allowlist = _get_hook_allowlist()
+    return jsonify({"entries": allowlist.entries(build, view), "problem": allowlist.problem,
+                    "path": SYSCALL_HOOK_ALLOWLIST_FILE})
+
+
+@app.route("/api/syscalls/hook-baseline", methods=["POST"])
+def api_syscalls_hook_baseline_capture():
+    """Record the hooks found in a process as known on this host. Params: pid.
+
+    Only on a host known to be clean: whatever hooks the process holds now stops counting as evidence. A patch
+    is never recorded, only a jump into a module."""
+    pid = _syscall_pid(_syscall_body().get("pid"))
+    measured, view, build = _syscall_measure(pid, ("ntdll.dll",))
+    allowlist = _get_hook_allowlist()
+    try:
+        added = allowlist.add_from(measured)
+    except OSError as exc:
+        return jsonify({"error": f"cannot write the hook allowlist: {exc}"}), 500
+    return jsonify({"pid": pid, "build": build, "view": view, "added": added,
+                    "entries": len(allowlist.entries(build, view)), "partial": measured["partial"]})
+
+
+@app.route("/api/syscalls/hook-baseline", methods=["DELETE"])
+def api_syscalls_hook_baseline_clear():
+    """Forget the known hooks: those of one build and view (params build and view, together), or all."""
+    build, view = _hook_scope()
+    allowlist = _get_hook_allowlist()
+    try:
+        allowlist.clear(build, view)
+    except OSError as exc:
+        return jsonify({"error": f"cannot write the hook allowlist: {exc}"}), 500
+    return jsonify({"ok": True, "entries": len(allowlist.entries())})
+
+
+def _draft_error(exc):
+    """A refusal of the rule module, as a route error. Its messages name what is wrong, never what the request held."""
+    return _SyscallRouteError(str(exc))
+
+
+@app.route("/api/syscalls/rule", methods=["POST"])
+def api_syscalls_rule():
+    """Draft a detection rule from what the tab observed, and write nothing.
+
+    Params: `hit` (a stub found outside ntdll, as /api/syscalls/stubs lists it; it may carry `sample`), with `build`
+    (default: this system's), `view` (this one or the hit's own, never guessed) and `source`: a YARA rule. Or
+    `deviation` (a stub measured in ntdll) with `view`: an entry for syscall_signatures.json, to be added by hand.
+    A rule is applied, or downloaded, as a second step."""
+    data = _syscall_body()
+    hit, deviation = data.get("hit"), data.get("deviation")
+    if (hit is None) == (deviation is None):
+        raise _SyscallRouteError("give a hit (a stub found outside ntdll) or a deviation (a stub measured in ntdll)")
+    subject = hit if hit is not None else deviation
+    if not isinstance(subject, dict):
+        raise _SyscallRouteError("the hit or deviation must be an object")
+    view = data.get("view") if data.get("view") not in (None, "") else subject.get("view")
+    if hit is not None and data.get("view") not in (None, "") and subject.get("view") not in (None, data.get("view")):
+        raise _SyscallRouteError("the view of the request and the view of the hit differ")
+    if view in (None, ""):
+        raise _SyscallRouteError("give the view the rule is for: arm64, x64 or x86")
+    if not isinstance(view, str) or view not in SYSCALL_VIEWS:
+        raise _SyscallRouteError("view must be one of " + ", ".join(SYSCALL_VIEWS))
+    build = data.get("build") if data.get("build") not in (None, "") else _current_os_build()
+    if build is not None and not isinstance(build, str):
+        raise _SyscallRouteError("build must be a string like 26220.5770")
+    try:
+        if hit is not None:
+            if not build:
+                raise _SyscallRouteError("the build of this system is unknown: give the build the rule is for")
+            return jsonify(syscall_rules.draft_yara(hit, build, view, data.get("source") or "direct_syscall_stub"))
+        if (deviation.get("state") == syscall_baseline.STATE_HOOKED and build
+                and _get_hook_allowlist().knows(str(deviation.get("name")), deviation.get("target_owner"), build, view)):
+            deviation = {**deviation, "allowlisted": True}
+        entry = syscall_rules.draft_signature(deviation, view)
+    except ValueError as exc:
+        raise _draft_error(exc) from None
+    # the catalog names forms longer than the compared prefix (ADRP; LDR; BR, MOVZ/MOVK; BR): it is asked about
+    # every byte the scan read, where the deviation has them, and about the prefix otherwise
+    read = deviation.get("read")
+    if not (isinstance(read, str) and 0 < len(read) <= 2 * SYSCALL_READ_HEX_MAX and len(read) % 2 == 0
+            and re.fullmatch(r"[0-9a-fA-F]+", read)):
+        read = deviation["actual"]
+    covered = syscall_rules.matching(read, view)
+    return jsonify({"kind": "signature", "entry": entry, "text": json.dumps(entry, indent=2),
+                    "target": "webui/syscall_signatures.json",
+                    "covered_by": [{"family": c["family"], "pattern": c["pattern"], "match": c["match"]}
+                                   for c in covered]})
+
+
+@app.route("/api/syscalls/rule/apply", methods=["POST"])
+def api_syscalls_rule_apply():
+    """Write a drafted YARA rule where Rustinel reads its rules; it should take effect within about two seconds
+    (not verified on a VM).
+
+    The body is the draft as /api/syscalls/rule returned it. Only a rule of exactly that form is written, one file
+    named after the rule, into YARA_RULES_DIR and nowhere else. A rule of that name already there is a 409."""
+    draft = _syscall_body()
+    try:
+        name, _ = syscall_rules.check_draft(draft)
+    except ValueError as exc:
+        raise _draft_error(exc) from None
+    if not _path_within(os.path.join(YARA_RULES_DIR, name + ".yar"), [YARA_RULES_DIR]):
+        return jsonify({"error": "Access denied: write not allowed to this path", "allowed": [YARA_RULES_DIR]}), 403
+    try:
+        result = syscall_rules.apply_draft(draft, YARA_RULES_DIR)
+    except ValueError as exc:
+        raise _draft_error(exc) from None
+    except syscall_rules.RulesFull as exc:
+        return jsonify({"error": f"{exc} (the cap keeps a flood of rules out of {YARA_RULES_DIR})"}), 507
+    except OSError as exc:
+        return jsonify({"error": f"cannot write the rule into {YARA_RULES_DIR}: {exc.strerror or exc}"}), 500
+    if result["status"] == "exists":
+        return jsonify({**result, "error": "a rule of this name is already there: it is the same stub, build and "
+                                           "view, and was left alone"}), 409
+    return jsonify(result)
+
+
+@app.route("/api/syscalls/rule/download", methods=["GET"])
+def api_syscalls_rule_download():
+    """A drafted YARA rule as a file, to be committed under rules/yara/: the copy written by /apply is lost with
+    this VM. Params: `name` and `text`, as the draft route returned them (checked, then handed back as they are)."""
+    try:
+        name, text = syscall_rules.check_draft({"name": request.args.get("name"), "text": request.args.get("text")})
+    except ValueError as exc:
+        raise _draft_error(exc) from None
+    return Response(text, mimetype="text/plain",
+                    headers={"Content-Disposition": f'attachment; filename="{name}.yar"'})
+
+
+# --- SYSCALLS tab: the import graph of the System32 binaries ---
+
+# binary_graph.py reads every PE of System32: minutes, and a few hundred MB, so it runs as a process of its own and
+# the web UI only ever holds the finished cache. build-binary-graph.ps1 waits as long for the same build.
+BINARY_GRAPH_BUILD_TIMEOUT = 1800
+# A failed build of a build and architecture is not tried again for this long (seconds)
+BINARY_GRAPH_BUILD_RETRY = 600
+# and not at all after this many failures in a row: a build reads all of System32 for minutes, CPU taken from the
+# sample under analysis, and a failure that persists (a disk fault, a bug of our encoder) is not cured by trying again
+BINARY_GRAPH_BUILD_ATTEMPTS = 3
+BINARY_GRAPH_PARAM_MAX = 512
+_binary_graph_log = logging.getLogger("tdc.binary_graph")
+
+
+def _new_binary_graph_build_state():
+    # running: (build, arch) being built; failed: (build, arch) -> (when, why); built: (build, arch) -> the stamp of
+    # the cache the last build that ended well left behind, to tell a rebuild that did not help; attempts:
+    # (build, arch) -> failures in a row, cleared only by a usable cache; thread: the latest one
+    return {"running": set(), "failed": {}, "built": {}, "attempts": {}, "thread": None}
+
+
+_binary_graph_build_state = _new_binary_graph_build_state()
+_binary_graph_build_lock = threading.Lock()
+# binary_graph.py writes one cache per build and architecture into one directory: one build at a time
+_binary_graph_build_serial = threading.Lock()
+# The one graph this process holds, loaded once and kept: "path", "stamp" (mtime and size of the file it was read
+# from) and "graph", the Graph or the CacheMismatch the file gave. A changed file is read once more; nothing else is.
+_binary_graph_held = {}
+_binary_graph_held_lock = threading.Lock()
+
+
+def _build_binary_graph(build, arch):
+    """Build the cache of `build` and `arch` into NTSLEUTH_BASELINE_DIR with binary_graph.py. Raises RuntimeError with
+    the reason when it fails; binary_graph.py then leaves an earlier cache as it was. A cache the web UI still holds
+    open on Windows makes its os.replace fail with PermissionError, which it reports as a non-zero exit: that is a
+    failure here like any other, named, never a silent end."""
+    args = [sys.executable, os.path.join(APP_DIR, "binary_graph.py"), "--out", NTSLEUTH_BASELINE_DIR,
+            "--build", build, "--arch", arch]
+    try:
+        # below normal priority: the build must not take the CPU from a sample being observed
+        proc = _run_cmd(args, timeout=BINARY_GRAPH_BUILD_TIMEOUT, cwd=APP_DIR,
+                        creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
+                        | getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"binary_graph.py timed out ({BINARY_GRAPH_BUILD_TIMEOUT}s)") from None
+    except OSError as exc:
+        raise RuntimeError(f"binary_graph.py could not be started ({exc.__class__.__name__})") from None
+    if proc.returncode != 0:
+        tail = ((proc.stderr or proc.stdout or "").strip().splitlines() or [""])[-1][:300]
+        raise RuntimeError(f"binary_graph.py exited with {proc.returncode}: {tail}")
+
+
+def _binary_graph_stat(path):
+    """`(mtime_ns, size)` of `path`, None when it cannot be read."""
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return info.st_mtime_ns, info.st_size
+
+
+def _record_binary_graph_failure(key, why):
+    """Record a failed build of `key` and count it. Called with _binary_graph_build_lock held."""
+    state = _binary_graph_build_state
+    state["failed"][key] = (time.time(), why)
+    state["attempts"][key] = state["attempts"].get(key, 0) + 1
+
+
+def _binary_graph_build_job(build, arch):
+    key = (build, arch)
+    why = None
+    try:
+        with _binary_graph_build_serial:
+            _build_binary_graph(build, arch)
+    except Exception as exc:
+        why = str(exc) or type(exc).__name__
+        _binary_graph_log.warning("the binary graph of build %s (%s) was not built: %s", build, arch, why)
+    path = binary_graph.find_cache(NTSLEUTH_BASELINE_DIR, build, arch) if why is None else None
+    stamp = _binary_graph_stat(path) if path else None
+    with _binary_graph_build_lock:
+        state = _binary_graph_build_state
+        state["running"].discard(key)
+        state["built"].pop(key, None)
+        if why is not None:
+            _record_binary_graph_failure(key, why)
+        elif stamp is None:
+            # it said it wrote the cache and there is none: without a count, the next request would build again
+            _record_binary_graph_failure(key, "binary_graph.py ended well but left no cache")
+        else:
+            state["failed"].pop(key, None)
+            state["built"][key] = stamp
+
+
+def _start_binary_graph_build(build, arch):
+    """Build the graph of `build` and `arch` in a thread of its own. False when one is running already, one failed
+    too recently to try again, BINARY_GRAPH_BUILD_ATTEMPTS failed in a row, or tools are being updated: an update
+    that swaps files in System32 or the web UI's Python under a build is the opposite of help."""
+    key = (build, arch)
+    if _updating_tools():
+        return False
+    with _binary_graph_build_lock:
+        state = _binary_graph_build_state
+        failed = state["failed"].get(key)
+        if (state["running"] or state["attempts"].get(key, 0) >= BINARY_GRAPH_BUILD_ATTEMPTS
+                or (failed and time.time() - failed[0] < BINARY_GRAPH_BUILD_RETRY)):
+            return False
+        state["running"].add(key)
+        state["thread"] = threading.Thread(target=_binary_graph_build_job, args=(build, arch),
+                                           name="binary-graph", daemon=True)
+        state["thread"].start()
+    return True
+
+
+def _binary_graph_building():
+    """Whether a binary graph is being built. A tool update must wait for it."""
+    with _binary_graph_build_lock:
+        return bool(_binary_graph_build_state["running"])
+
+
+def _forget_binary_graph_failure(build, arch):
+    """A usable cache of `build` and `arch` is there: an earlier failure to build it is refuted, whoever wrote the
+    file (build-binary-graph.ps1 writes it without the web UI), and so is the count of attempts. Kept, it would
+    contradict the graph being served and hold back the next build for nothing."""
+    with _binary_graph_build_lock:
+        for field in ("failed", "built", "attempts"):
+            _binary_graph_build_state[field].pop((build, arch), None)
+
+
+def _rebuild_did_not_help(build, arch, stamp, reason):
+    """The cache that does not load is the very file the last build left: record that as a failure, so the throttle
+    holds the next rebuild back instead of building on every request."""
+    key = (build, arch)
+    with _binary_graph_build_lock:
+        state = _binary_graph_build_state
+        if stamp is not None and state["built"].get(key) == stamp:
+            state["built"].pop(key)
+            _record_binary_graph_failure(key, f"the cache the build wrote does not load either ({reason})")
+
+
+def _utc(seconds):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(seconds))
+
+
+def _binary_graph_refusal(error, build=None, arch=None):
+    """The body of a 404 without a graph: `cache` null, `building`, and `failed` (`reason`, `at`, `attempts` and
+    `retry_at`, UTC, null once no attempt is left) or null. `error` gets a sentence on which of them it is."""
+    with _binary_graph_build_lock:
+        building = (build, arch) in _binary_graph_build_state["running"]
+        failed = _binary_graph_build_state["failed"].get((build, arch))
+        attempts = _binary_graph_build_state["attempts"].get((build, arch), 0)
+    record = None
+    if building:
+        error += " It is being built in the background; that takes a minute or two."
+    elif failed:
+        at, why = failed
+        retry = at + BINARY_GRAPH_BUILD_RETRY if attempts < BINARY_GRAPH_BUILD_ATTEMPTS else None
+        record = {"reason": why, "at": _utc(at), "attempts": attempts, "retry_at": _utc(retry) if retry else None}
+        if retry is None:
+            error += (f" Building it failed {attempts} attempts in a row, the last at {_utc(at)}: {why}. It is not "
+                      f"built again by itself: rebuild it by hand with scripts\\build-binary-graph.ps1 -Force, and "
+                      f"the tab takes the new graph without a restart.")
+        else:
+            error += f" The last build failed at {_utc(at)}: {why}."
+            error += (f" It is tried again from {_utc(retry)} on." if retry > time.time() else
+                      " It is tried again on the next request.")
+    elif build and _updating_tools():
+        error += " Tool updates are running: no graph is built while they are."
+    return {"error": error, "cache": None, "building": building, "failed": record}
+
+
+def _binary_graph_for(start_build=True):
+    """`(graph, None)` for this system's build and architecture, or `(None, refusal)`: the JSON body of a 404, with
+    `cache` null, that says why. A cache of another build or architecture is no graph: there is exactly one per
+    system, and the architecture is the registry's (binary_graph.host_arch), never `platform.machine()`, which an
+    emulated x64 Python on ARM64 answers with AMD64. A cache that is missing or does not load is built in the
+    background, as build-binary-graph.ps1 does at provisioning; a failed build is not tried again for
+    BINARY_GRAPH_BUILD_RETRY seconds, and a build that ended well but left a cache that still does not load counts as
+    failed. With `start_build` False nothing is built: a syscall scan takes the graph that is there, and does not start
+    minutes of reading System32 under a sample being observed."""
+    build = _current_os_build()
+    if not build:
+        return None, _binary_graph_refusal("No binary graph can be chosen: the build of this system cannot be "
+                                           "determined.")
+    arch = binary_graph.host_arch()
+    path = binary_graph.find_cache(NTSLEUTH_BASELINE_DIR, build, arch)
+    stamp = _binary_graph_stat(path) if path else None
+    if stamp is None:
+        with _binary_graph_held_lock:
+            _binary_graph_held.clear()          # its file is gone: no reason to keep 40-90 MB of it
+        if start_build:
+            _start_binary_graph_build(build, arch)
+        return None, _binary_graph_refusal(f"There is no binary graph for build {build} ({arch}) yet.", build, arch)
+    with _binary_graph_held_lock:
+        if _binary_graph_held.get("path") != path or _binary_graph_held.get("stamp") != stamp:
+            _binary_graph_held.clear()          # the old graph goes before the new one is read, not after
+            try:
+                loaded = binary_graph.load_graph(path, build, arch)
+            except binary_graph.CacheMismatch as exc:
+                loaded = exc
+            # a file that cannot be opened right now (a scanner holding it without read sharing) is not a broken
+            # one: it is not held, and is read again on the next request rather than rebuilt
+            if not (isinstance(loaded, binary_graph.CacheMismatch) and loaded.reason == "unreadable"):
+                _binary_graph_held.update(path=path, stamp=stamp, graph=loaded)
+        else:
+            loaded = _binary_graph_held["graph"]
+    if isinstance(loaded, binary_graph.CacheMismatch) and loaded.reason == "unreadable":
+        return None, _binary_graph_refusal(f"The binary graph {os.path.basename(path)} cannot be opened right now; "
+                                           f"it is read again on the next request.", build, arch)
+    if isinstance(loaded, binary_graph.CacheMismatch):
+        _rebuild_did_not_help(build, arch, stamp, loaded.reason)
+        if start_build:
+            _start_binary_graph_build(build, arch)
+        return None, _binary_graph_refusal(
+            f"The binary graph {os.path.basename(path)} cannot be used ({loaded.reason}: {loaded}).", build, arch)
+    _forget_binary_graph_failure(build, arch)
+    return loaded, None
+
+
+def _binary_graph_param(name):
+    value = request.args.get(name) or ""
+    if len(value) > BINARY_GRAPH_PARAM_MAX:
+        raise _SyscallRouteError(f"{name} is longer than {BINARY_GRAPH_PARAM_MAX} characters")
+    return value
+
+
+def _binary_graph_stamp(graph):
+    return {"build": graph.build, "arch": graph.arch, "created": graph.created,
+            "cache": binary_graph.cache_name(graph.build, graph.arch)}
+
+
+def _binary_graph_context(graph, query):
+    """What query `query` reads besides its parameters. The path to a syscall reads the curated Win32 to Nt table and
+    the syscall baseline, each None where it cannot be had (the answer then says so); the list behind a figure reads the
+    table only. No baseline is extracted for a question about the graph."""
+    if query not in ("path-to-syscall", "metric"):
+        return binary_graph_query.Context(graph)
+    table = _curated_table()
+    baseline = _syscall_baseline_for(graph.arch, extract=False)[0] if query == "path-to-syscall" else None
+    return binary_graph_query.Context(graph, table, baseline)
+
+
+def _curated_table():
+    """The curated Win32 to Nt table, or None where it cannot be read: what reads it says so, it never reads it as empty."""
+    try:
+        return win32_to_nt.load_table()
+    except win32_to_nt.TableError as exc:
+        print(f"[binary graph] the Win32 to Nt table is unusable, no path can reach a syscall and no row of it is listed: {exc}")
+        return None
+
+
+@app.route("/api/binary-graph/query")
+def api_binary_graph_query():
+    """One query over the import graph. Params: `q` (a name of binary_graph_query.QUERIES) and what it reads of
+    `module`, `function`, `syscall`, `other` and `metric`."""
+    run = binary_graph_query.QUERIES.get(request.args.get("q") or "")
+    if run is None:
+        return jsonify({"error": "q must be one of " + ", ".join(binary_graph_query.QUERIES)}), 400
+    params = {name: _binary_graph_param(name) for name in ("module", "function", "syscall", "other", "metric")}
+    try:
+        binary_graph_query.check_parameters(request.args.get("q"), params)
+    except (binary_graph_query.MissingParameter, binary_graph_query.BadParameter) as exc:
+        return jsonify({"error": str(exc)}), 400
+    graph, refusal = _binary_graph_for()
+    if graph is None:
+        return jsonify(refusal), 404
+    try:
+        answer = run(_binary_graph_context(graph, request.args.get("q")), params)
+    except binary_graph_query.MissingParameter as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({**binary_graph_query.answer_json(answer), **_binary_graph_stamp(graph)})
+
+
+@app.route("/api/binary-graph/metrics")
+def api_binary_graph_metrics():
+    """The figures of the whole stock (binary_graph_query.metrics), with the stamp of the graph; the list behind each is
+    the query `metric`. `curated_transitions` is null where the Win32 to Nt table cannot be read."""
+    graph, refusal = _binary_graph_for()
+    if graph is None:
+        return jsonify(refusal), 404
+    return jsonify({**binary_graph_query.metrics(graph, _curated_table()), **_binary_graph_stamp(graph)})
+
+
+@app.route("/api/binary-graph/node")
+def api_binary_graph_node():
+    """What the import graph knows of one name. Param: `name`. `404` when it is neither a binary nor an api set."""
+    name = _binary_graph_param("name").strip()
+    if not name:
+        return jsonify({"error": "the parameter name is required"}), 400
+    graph, refusal = _binary_graph_for()
+    if graph is None:
+        return jsonify(refusal), 404
+    detail = binary_graph_query.node_detail(graph, name)
+    if detail["is"] == "none":
+        return jsonify({"error": f"{detail['name']} is neither a binary nor an api set in the binary graph of this "
+                                 f"system.", "in_degree": detail["in_degree"], **_binary_graph_stamp(graph)}), 404
+    return jsonify({**detail, **_binary_graph_stamp(graph)})
 
 
 # --- Memory dumping: Process Dump ---
@@ -8359,11 +10471,13 @@ def _parse_beaconeye_output(output):
     return findings
 
 
-def _run_memory_scans_async(pid, sha256):
+def _run_memory_scans_async(pid, sha256, path=None):
     """Run every live-memory tool against a detonated process, in background.
 
-    Order matters: the read-only scanners go first so their view of the process
-    is undisturbed, and Process Dump runs last because it writes files.
+    Order matters. The syscall stage goes first, before the wait for a beacon to settle: it is the only tool that
+    needs the process to still be there and it is the fastest, and behind that wait a sample living a few seconds
+    was always gone. The other read-only scanners follow, and Process Dump runs last because it writes files.
+    `path` is the sample's file, which the syscall stage searches as well - the only source that can prove a bypass.
     """
     def _scan():
         try:
@@ -8373,6 +10487,29 @@ def _run_memory_scans_async(pid, sha256):
 
     def _scan_all():
         import time as _time
+
+        # Syscalls first, before the wait below. Measured on the chamber: injectsim.exe lives 4.2 s and
+        # shortlived.exe 6.7 s, so behind a five-second wait plus the beacon hunters plus Aether's three samples the
+        # stage reached neither and skipped with "the architecture of process N is unknown (it is gone)". The stage
+        # itself takes under two seconds (a scan of 0.12-0.41 s, a stub search of 1.3-1.5 s) and it only reads, so
+        # among the read-only scanners its place is free and first is the only one where it can still measure. The
+        # wait is for the beacon hunters, which need a beacon that has entered its sleep; the stage needs the
+        # opposite, a process that is still there. Process Dump stays last: it writes files.
+        if _syscall_stage_enabled():
+            try:
+                notes = []
+                syscall_result = _run_syscall_stage(pid, path, notes)
+                if syscall_result:
+                    # recorded first: the id it gets back is how the memory block names this measurement to the map
+                    history_id = _record_scan("Syscalls", f"PID {pid}", syscall_result)
+                    _beacon_results_cache.put("syscalls", {**syscall_result, "history_id": history_id},
+                                              pid=pid, sha256=sha256)
+                else:
+                    _beacon_results_cache.put("syscalls", {"tool": "Syscalls", "skipped": "; ".join(notes) or "skipped"},
+                                              pid=pid, sha256=sha256)
+            except Exception as e:
+                _beacon_results_cache.put("syscalls", {"tool": "Syscalls", "error": str(e)}, pid=pid, sha256=sha256)
+
         # Wait a few seconds for the beacon to initialize and enter sleep
         _time.sleep(5)
 
@@ -8476,6 +10613,7 @@ SUSPICIOUS_IMPORTS = {
         "GetModuleHandle", "GetModuleHandleA",
     ],
 }
+binary_graph_query.set_categories(SUSPICIOUS_IMPORTS)
 
 # Known packer/protector section names
 PACKER_SECTIONS = {
@@ -10916,8 +13054,14 @@ def _close_all_rizin():
         manager.shutdown()
 
 
+ISOLATED_UPDATE_MESSAGE = ("Isolated mode is on: tool updates need the network and would run into TDC's own "
+                           "block. Leave ISOLATED in the FIREWALL tab first.")
+
+
 def _update_preconditions():
     """Why an update must not start now, or None. Runs without the manager lock."""
+    if _fw_settings.isolated:
+        return ISOLATED_UPDATE_MESSAGE
     resp = _probe_http(f"{DETONATOR_AGENT_API}/api/lock/status")
     if resp is not None:
         try:
@@ -10937,6 +13081,12 @@ def _update_preconditions():
         return "A process dump is running."
     if _scans_running() > 0:
         return "A scan is running. Wait until it finishes."
+    if _syscall_scan_running():
+        return "A syscall scan is running. Wait until it finishes."
+    if _syscall_extracting():
+        return "A syscall baseline is being extracted. Wait until it finishes."
+    if _binary_graph_building():
+        return "A binary graph is being built. Wait until it finishes."
     return None
 
 
@@ -10964,7 +13114,9 @@ def api_updates():
 
 @app.route("/api/updates/check", methods=["POST"])
 def api_updates_check():
-    """Start an update check in the background (202; 409 while busy)."""
+    """Start an update check in the background (202; 409 while busy or while ISOLATED is on)."""
+    if _fw_settings.isolated:
+        return jsonify({"error": ISOLATED_UPDATE_MESSAGE}), 409
     status, body = _get_update_manager().start_check()
     return jsonify(body), status
 
@@ -11020,7 +13172,9 @@ def _update_check_loop(hours, sleep=time.sleep, rounds=None):
         done += 1
         try:
             manager = _get_update_manager()
-            if manager.snapshot()["mode"] == "idle":
+            if _fw_settings.isolated:
+                log.info("Daily tool update check skipped: Isolated mode is on")
+            elif manager.snapshot()["mode"] == "idle":
                 manager.start_check()
         except Exception as exc:
             log.warning("Daily tool update check failed: %s", exc)
@@ -11266,6 +13420,2175 @@ def api_logs_sources():
     return _json_response(_logs.sources())
 
 
+# --- FIREWALL tab: readers, decisions, guarded fetch, capture store and routes ---------------
+# firewall_store keeps the events, firewall judges them, firewall_rules acts, firewall_fetch fetches; this
+# block is the wiring. The collector thread (tick + sweep) never waits for a fetch: a fetch runs on _fw_executor.
+CAPTURE_DIR = r"C:\tdc\samples"
+CAPTURES_FILE = os.path.join(APP_DIR, "captures.json")
+PENDING_FILE = os.path.join(APP_DIR, "pending.json")
+FIREWALL_STATE_FILE = os.path.join(APP_DIR, "firewall_state.json")
+MAX_CAPTURES = 500
+FETCH_MAX_BYTES = 64 * 1024 * 1024     # the three limits of the spec; firewall_fetch holds the fetch to them
+FETCH_TIMEOUT = 30
+FETCH_MAX_REDIRECTS = 3
+FETCH_DEFAULT_UA = firewall_fetch.DEFAULT_USER_AGENT
+FIREWALL_DECIDE_SECONDS = 30
+FIREWALL_FINDING_WINDOW_S = 1800       # the connections a sweep looks at for a download (the first sweep: all)
+FIREWALL_FINDING_FRESH_S = 3600        # an older finding is marked but no longer asked about
+FIREWALL_WINDOW_GRACE_S = 60           # a detonation window stays open this long after its process ended
+FIREWALL_RULES_TTL_S = 60              # every enforcement route forgets it, so only a change made outside TDC waits
+FIREWALL_MARK_LIMIT = 5000
+FETCH_CLOSE_ATTEMPTS = 3               # tries to take the per-fetch allow rule away again
+FETCH_CLOSE_PAUSE = 0.2
+FETCH_PATH_WAIT_S = 120                # how long a fetch waits for another one's rule write or removal
+FIREWALL_FETCH_SWEEP_S = 60            # how often the sweep looks for a per-fetch rule no fetch is using
+# What ISOLATED does not close, for the banner of the tab. Two things: Windows' own outbound Allow rules, which
+# DefaultOutboundAction Block does not stop (ISOLATED switches the local ones off; what is still enabled is read
+# back into ``allowed_out``), and TDC's fetcher, the venv's python.exe: a rule naming that program lets out
+# whatever can run it, so it is written per fetch, for one address, and taken away when the fetch ends
+# (firewall_rules.allow_fetch); what is left is that window.
+FIREWALL_ISOLATED_RESIDUAL = (
+    "ISOLATED sets the default outbound action to Block, which stops only what no rule allows, so it also switches "
+    "off Windows' own outbound Allow rules (Core Networking's DNS among them) and switches exactly those on again "
+    "when it is left. A rule a group policy sets cannot be switched off from here: what is still enabled is read "
+    "back and named. Loopback stays open. TDC's own fetch is let out one address at a time, only while it runs: "
+    "the fetcher is a Python interpreter, so a sample able to run it could reach that one address during those "
+    "seconds. Part B's proxy closes this.")
+
+_fw_store = firewall_store.FirewallStore()
+_fw_settings = firewall_store.Settings(FIREWALL_STATE_FILE)
+_fw_pending = firewall_store.PendingStore(PENDING_FILE)
+_fw_runner = firewall_rules.run_powershell        # run(args) -> (rc, out, err); tests swap it
+_fw_startup = None                                # what startup_state said at start (None before it ran)
+_FW_START_ID = base64.b32encode(os.urandom(5)).decode("ascii").lower()   # names this server start for the toast
+_fw_downloads = {}                                # (pid, dst_ip, dst_port) -> epoch of a download finding
+_fw_scan_state = {"done": False}
+_fw_decision_lock = threading.Lock()              # a decision and its firewall effect are one step
+_fw_rules_lock = threading.Lock()
+_fw_rules_cache = None                            # (epoch, rules | None, error | None)
+_fw_windows_lock = threading.Lock()
+_fw_windows_cache = (0.0, {})
+_fw_window_alive = {}                             # submission id -> last time its process was seen running
+_fw_ioc_cache = (0.0, (frozenset(), frozenset()))
+_captures_lock = threading.Lock()
+_fw_executor = None                               # runs the fetches; created on first use, tests inject one
+
+
+def _fw_int(value):
+    try:
+        return None if isinstance(value, bool) else int(str(value).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _fw_iso(epoch):
+    if isinstance(epoch, bool) or not isinstance(epoch, (int, float)) or not math.isfinite(epoch):
+        return None
+    return datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc).isoformat(
+        timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _fw_json(payload, status=200):
+    """``_json_response`` with every long string cut the way the LOGS routes do it."""
+    return _json_response(_cap_log_value(payload)[0], status)
+
+
+def _fw_error(message, status):
+    return _fw_json({"error": message}, status)
+
+
+def _firewall_decide_seconds():
+    """TDC_FIREWALL_DECIDE_SECONDS: seconds an open decision waits before TDC acts (default 30).
+
+    0 means fetch at once without asking. Junk, nan, inf and negative numbers count as the default; the
+    value is held to an hour."""
+    try:
+        seconds = float(os.environ.get("TDC_FIREWALL_DECIDE_SECONDS", FIREWALL_DECIDE_SECONDS))
+    except ValueError:
+        return float(FIREWALL_DECIDE_SECONDS)
+    if not math.isfinite(seconds) or seconds < 0:
+        return float(FIREWALL_DECIDE_SECONDS)
+    return min(seconds, 3600.0)
+
+
+def _fw_fetcher_paths():
+    """Every program TDC's own fetch can run as: the one that is never blocked, and the one ISOLATED lets out.
+
+    On Windows a venv's ``python.exe`` is a launcher that starts the base interpreter (``sys._base_executable``)
+    as a child, and that child owns the socket. A rule or a guard naming only one of the two would therefore
+    have a blind spot - the fetch in ISOLATED would be blocked by TDC's own default action, with nothing saying
+    why - so both are used wherever the fetcher is an identity. They are the same path outside a venv, and on a
+    venv whose launcher *is* the interpreter; the duplicate is dropped.
+    """
+    paths = [sys.executable]
+    base = getattr(sys, "_base_executable", None)
+    if isinstance(base, str) and base.strip() and not any(
+            base.strip().lower().replace("/", "\\") == p.strip().lower().replace("/", "\\") for p in paths):
+        paths.append(base)
+    return tuple(paths)
+
+
+# ---- detonation windows ---------------------------------------------------------------------
+
+
+def _process_started_at(pid):
+    """Creation time (epoch) of the running process ``pid``; None when there is none (and off Windows)."""
+    if os.name != "nt":
+        return None
+    import ctypes
+    from ctypes import wintypes
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    handle = kernel32.OpenProcess(0x1000, False, int(pid))      # PROCESS_QUERY_LIMITED_INFORMATION
+    if not handle:
+        return None
+    try:
+        created, exited, kernel, user = (wintypes.FILETIME() for _ in range(4))
+        code = wintypes.DWORD()
+        if not kernel32.GetProcessTimes(handle, ctypes.byref(created), ctypes.byref(exited),
+                                        ctypes.byref(kernel), ctypes.byref(user)):
+            return None
+        if not kernel32.GetExitCodeProcess(handle, ctypes.byref(code)) or code.value != 259:   # STILL_ACTIVE
+            return None
+        return ((created.dwHighDateTime << 32) | created.dwLowDateTime) / 1e7 - 11644473600
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _firewall_open_windows(now=None):
+    """``{pid: submission id}`` of the detonation windows that are open now.
+
+    A window is open while the submission's process runs, and ``FIREWALL_WINDOW_GRACE_S`` after it was last seen
+    running (a dropper that ends within a second of its submission counts for that long, too). It is *not* every
+    submission ever recorded: the BITS test of ``download_findings`` takes these PIDs as "a submission is
+    active", and a six-hour-old one would make every BITS job of the day a detonation.
+    """
+    global _fw_windows_cache
+    now = time.time() if now is None else now
+    with _fw_windows_lock:
+        stamp, cached = _fw_windows_cache
+        if 0 <= now - stamp < 1.0:
+            return dict(cached)
+        try:
+            with submissions_lock:
+                subs = _load_submissions()
+        except Exception:
+            subs = []
+        newest = {}
+        for sub in sorted((s for s in subs if isinstance(s, dict)), key=lambda s: _to_epoch(s.get("timestamp")) or 0):
+            try:
+                pid = int(sub.get("agent_pid"))
+            except (TypeError, ValueError):
+                continue
+            start = _to_epoch(sub.get("timestamp"))
+            if start is not None and 0 <= now - start <= _AGENT_PID_WINDOW and pid > 0:
+                newest[pid] = (start, str(sub.get("id") or pid))
+        open_windows = {}
+        for pid, (start, sub_id) in newest.items():
+            try:
+                began = _process_started_at(pid)
+            except Exception:
+                began = None
+            if began is not None and began <= start + 30:        # the process the submission started, not a later one
+                _fw_window_alive[sub_id] = now
+            last = _fw_window_alive.get(sub_id, start)
+            if now - last <= FIREWALL_WINDOW_GRACE_S:
+                open_windows[pid] = sub_id
+        for sub_id in set(_fw_window_alive) - {v[1] for v in newest.values()}:
+            del _fw_window_alive[sub_id]
+        _fw_windows_cache = (now, dict(open_windows))
+        return open_windows
+
+
+# ---- readers (Windows) ----------------------------------------------------------------------
+
+
+def _fw_newest_record_id(log):
+    """The newest EventRecordID of a log (0 when it is empty): what a reader reports when no event came back."""
+    raw, proc = _wevtutil_query(log, None, count=1, newest_first=True, timeout=30)
+    if proc.returncode != 0 and not proc.stdout:
+        msg = _decode_console(proc.stderr).strip()
+        raise RuntimeError(msg.splitlines()[0] if msg else f"wevtutil failed ({proc.returncode})")
+    ids = [int(m) for m in _RECORD_ID.findall(raw or "")]
+    return max(ids) if ids else 0
+
+
+def _fw_read_record_log(log, event_filter, since, parse):
+    """``(events, newest record id of the log)`` of an event log read by EventRecordID.
+
+    When events came back the id is the newest of them (a cut-off read must not skip the rest). When none did it
+    is the newest id of the *log*, so that the collector sees a cleared log: its ids start again below its cursor.
+    """
+    if not _IS_WINDOWS:
+        raise RuntimeError(_WINDOWS_ONLY_HINT)
+    if since is None:
+        query = f"*[System[{event_filter} and TimeCreated[timediff(@SystemTime) <= 86400000]]]"
+        newest_first = True
+    else:
+        query = f"*[System[{event_filter} and EventRecordID>{int(since)}]]"
+        newest_first = False
+    raw, proc = _wevtutil_query(log, query, count=LOG_READ_LIMIT, newest_first=newest_first, timeout=60)
+    if proc.returncode != 0 and not proc.stdout:
+        msg = _decode_console(proc.stderr).strip()
+        raise RuntimeError(msg.splitlines()[0] if msg else f"wevtutil failed ({proc.returncode})")
+    ids = [int(m) for m in _RECORD_ID.findall(raw or "")]
+    return parse(raw or ""), (max(ids) if ids else _fw_newest_record_id(log))
+
+
+def _fw_read_powershell(since=None):
+    return _fw_read_record_log(POWERSHELL_LOG, _PS_EVENT_IDS, since, log_store.parse_powershell_events)
+
+
+def _fw_parse_bits(raw):
+    """BITS client EID 59/60 as ``{timestamp, event_id, record_id, data}``.
+
+    No top-level ``pid``: the event's own ProcessID is the BITS service, not the process that asked."""
+    out = []
+    for chunk in log_store._event_chunks(raw):
+        ev = log_store._xml_event(chunk)
+        if ev is None or ev["record_id"] is None:
+            continue
+        data = dict(ev["data"])
+        data["url"] = next((v for k, v in ev["data"].items() if k.lower() == "url"), "")
+        out.append({"timestamp": _fw_iso(ev["epoch"]), "event_id": ev["event_id"],
+                    "record_id": ev["record_id"], "data": data})
+    return sorted(out, key=lambda e: e["record_id"])
+
+
+def _fw_read_bits(since=None):
+    return _fw_read_record_log("Microsoft-Windows-Bits-Client/Operational", "(EventID=59 or EventID=60)", since,
+                               _fw_parse_bits)
+
+
+class _FirewallLogReader:
+    """The Windows Firewall log by byte offset; the answer always carries an int offset (or the reader raises)."""
+
+    def __init__(self):
+        self.fields = None
+
+    def __call__(self, since=None):
+        text, new_offset, hint = _read_firewall_log(since)
+        if new_offset is None:
+            raise RuntimeError(hint or "the firewall log cannot be read")
+        found = log_store.firewall_fields(text)
+        if found:
+            self.fields = found
+        return log_store.parse_firewall_log(text, None, self.fields), int(new_offset)
+
+
+def _firewall_readers():
+    return {"connections": _read_sysmon_for_logs, "dns": _read_sysmon_for_logs,
+            "processes": _read_sysmon_for_logs, "powershell": _fw_read_powershell,
+            "firewall": _FirewallLogReader(), "bits": _fw_read_bits}
+
+
+# ---- the context and the rules --------------------------------------------------------------
+
+
+# One debug line per PowerShell call of firewall_rules (its op, who asked, the wait for firewall_rules' lock, how long
+# it ran), and one per wait for the rule cache's lock where that lock is held across a call: a press whose seconds
+# vary is waiting for work it did not start, and these lines say whose. Only names TDC chose itself go in (the op,
+# the route's rule, the thread's name), never a parameter or anything Windows answered, with one exception: the way
+# a read answered (via=fast or via=cmdlet) and, on a fallback, its reason, quoted with %r so it stays one line.
+_fw_call_logger = _log_logger.getChild("firewall_calls")
+
+
+def _fw_caller():
+    """The route that asked (method and its rule, not the requested path), or ``thread`` outside a request."""
+    try:
+        if has_request_context() and request.url_rule is not None:
+            return f"{request.method} {request.url_rule.rule}"
+    except Exception:
+        pass
+    return "thread"
+
+
+def _fw_ms(value):
+    return "-" if value is None else f"{value:.1f}"
+
+
+def _fw_log_call(record):
+    if not _fw_call_logger.isEnabledFor(logging.DEBUG):
+        return
+    way = ""
+    if record.get("via") in firewall_rules.WAYS:
+        way = f" via={record['via']}"
+        if record.get("fallback"):
+            way += f" fallback={str(record['fallback'])!r}"
+    _fw_call_logger.debug("firewall call op=%r caller=%r thread=%r lock=%s wait_ms=%s run_ms=%s rc=%s%s",
+                          record["op"], _fw_caller(), record["thread"], record["lock"] or "-",
+                          _fw_ms(record["wait_ms"]), _fw_ms(record["run_ms"]),
+                          "-" if record["rc"] is None else record["rc"], way)
+
+
+firewall_rules.CALL_OBSERVER = _fw_log_call
+FIREWALL_CALL_LOG_BYTES = 1024 * 1024
+FIREWALL_CALL_LOG_KEEP = 3
+
+
+def _fw_keep_call_log():
+    """Write the lines of _fw_call_logger to ``firewall-calls.log`` beside the access log (rotated, a few MB at
+    most), and nowhere else. Only the server itself does this (``__main__``); an import, a test above all, does not."""
+    try:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        handler = logging.handlers.RotatingFileHandler(os.path.join(LOG_DIR, "firewall-calls.log"),
+                                                       maxBytes=FIREWALL_CALL_LOG_BYTES,
+                                                       backupCount=FIREWALL_CALL_LOG_KEEP, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s %(message)s"))
+        _fw_call_logger.addHandler(handler)
+        _fw_call_logger.setLevel(logging.DEBUG)
+        _fw_call_logger.propagate = False
+    except Exception as e:      # a log that cannot be kept must not stop the web UI
+        _log_logger.warning("firewall: the call log cannot be written: %s", e)
+
+
+def _fw_take_rules_lock():
+    """Take _fw_rules_lock; returns how long that waited in ms (it can be held across another thread's ``List``)."""
+    started = time.perf_counter()
+    _fw_rules_lock.acquire()
+    return (time.perf_counter() - started) * 1000.0
+
+
+def _fw_log_rules_wait(waited):
+    if not _fw_call_logger.isEnabledFor(logging.DEBUG):
+        return
+    try:
+        _fw_call_logger.debug("firewall wait lock=rules-cache caller=%r thread=%r wait_ms=%s", _fw_caller(),
+                              threading.current_thread().name, _fw_ms(waited))
+    except Exception:
+        pass
+
+
+def _fw_rules(force=False):
+    """``(rules, error)`` of the TDC firewall rules; one PowerShell call per ``FIREWALL_RULES_TTL_S``.
+
+    The cache's lock is held across that call. Its wait is logged only when a call follows, because a cache hit
+    waits for nothing worth a line."""
+    global _fw_rules_cache
+    waited = _fw_take_rules_lock()
+    try:
+        cached = _fw_rules_cache
+        if not force and cached is not None and 0 <= time.time() - cached[0] < FIREWALL_RULES_TTL_S:
+            return cached[1], cached[2]
+        _fw_log_rules_wait(waited)
+        started = time.monotonic()
+        try:
+            found, error = firewall_rules.rules(_fw_runner), None
+        except Exception as e:
+            found, error = None, str(e).splitlines()[0][:300] if str(e) else type(e).__name__
+        _fw_rules_cache = (time.time(), found, error)
+        if found is not None:
+            _fw_saw_cut(any(r.get("name") == firewall_rules.CUT_RULE and r.get("cuts") for r in found), started)
+        return found, error
+    finally:
+        _fw_rules_lock.release()
+
+
+def _fw_forget_rules():
+    """Something may have changed in the firewall: the rules and the profiles are read again next time."""
+    global _fw_rules_cache
+    _fw_log_rules_wait(_fw_take_rules_lock())
+    try:
+        _fw_rules_cache = None
+    finally:
+        _fw_rules_lock.release()
+    _fw_forget_profiles()
+
+
+# Which firewall profiles are off, for the state GET /isolate shows every LIVE tick. Reading it is a PowerShell
+# call and it changes about as often as somebody opens the firewall settings, so it is cached (an error, and any
+# read while ISOLATED is on, for less time: see _fw_isolate_fact_ttl); an enforcement route forgets it. The enforcement
+# routes themselves never use the cache: they read the profiles fresh (_fw_firewall_off_message) and store what
+# they found.
+FIREWALL_PROFILES_TTL_S = 60
+# How far Sysmon's time of a connection and Windows' start time of a process may disagree (kill's PID-reuse test):
+# both read the same clock, so only Sysmon's millisecond precision, which cuts the time down
+FIREWALL_KILL_CLOCK_SLACK_S = 0.001
+FIREWALL_PROFILES_ERROR_TTL_S = 10
+_fw_profiles_cache = None                         # (stamp, off, error, blocking) or None
+_fw_profiles_lock = threading.Lock()
+
+
+def _fw_forget_profiles():
+    global _fw_profiles_cache, _fw_allowed_cache
+    with _fw_profiles_lock:
+        _fw_profiles_cache = None
+        _fw_allowed_cache = None
+
+
+def _fw_read_profiles():
+    """``(off, error)`` read now, and kept for _fw_profiles_off. ``off`` is None when they could not be read.
+
+    The same read gives the profiles whose default outbound action in force is Block (``blocking``), kept beside
+    them for _fw_outbound_blocking."""
+    global _fw_profiles_cache
+    try:
+        states = firewall_rules.profile_states(_fw_runner)
+        off, error = [s["name"] for s in states if not s["enabled"]], None
+        blocking = [s["name"] for s in states if s["outbound"] == "Block"]
+    except Exception as e:
+        off, error, blocking = None, _fw_reason(e), None
+    with _fw_profiles_lock:
+        _fw_profiles_cache = (time.monotonic(), off, error, blocking)
+    return off, error
+
+
+def _fw_keep_profiles(off):
+    """Keep ``off`` (the profiles that are off, as an enforcement route just read them back) for _fw_profiles_off.
+    The default action is not in that answer, so it is kept as unknown and read when it is asked for."""
+    global _fw_profiles_cache
+    with _fw_profiles_lock:
+        _fw_profiles_cache = (time.monotonic(), list(off), None, None)
+
+
+def _fw_fresh_profiles():
+    """The cached ``(stamp, off, error, blocking)`` while it is fresh, else None."""
+    with _fw_profiles_lock:
+        cached = _fw_profiles_cache
+    if cached is not None and time.monotonic() - cached[0] < _fw_isolate_fact_ttl(cached[2]):
+        return cached
+    return None
+
+
+def _fw_isolate_fact_ttl(error):
+    """How long a read of the profiles or of the Allow list holds. While TDC isolates (the marker stands) as short
+    as an error: ``verified`` rests on both, and a minute-old fact is the green badge lying. A rule does nothing on
+    a profile whose firewall is off, so a profile switched off after the cut must show within a poll or two; and in
+    stage ``isolated`` the cut rule is gone, so Block plus an empty Allow list is the only thing holding the egress,
+    and a rule switched on again from outside must show as soon. Being isolated is a deliberate, attended state, so
+    a call every 10 s there is the right price; otherwise these change about as often as someone opens the
+    firewall settings."""
+    if error or _fw_settings.isolated:
+        return FIREWALL_PROFILES_ERROR_TTL_S
+    return FIREWALL_PROFILES_TTL_S
+
+
+def _fw_profiles_off():
+    """``(off, error)`` from the cache while it is fresh, else read now. No lock is held across the PowerShell call."""
+    cached = _fw_fresh_profiles()
+    if cached is not None:
+        return cached[1], cached[2]
+    return _fw_read_profiles()
+
+
+def _fw_outbound_blocking():
+    """The profiles whose default outbound action in force is Block, from the same cached read as _fw_profiles_off
+    (read now when the cache does not hold it); None when the profiles cannot be read."""
+    cached = _fw_fresh_profiles()
+    if cached is None or (cached[3] is None and cached[2] is None):
+        _fw_read_profiles()
+        cached = _fw_fresh_profiles() or (0.0, None, None, None)
+    return cached[3]
+
+
+# What still lets traffic out while ISOLATED is on (Windows' own outbound Allow rules that are enabled), for the
+# band: read back by isolate itself, then cached like the profiles (for as short a time while ISOLATED is on, which
+# is the only time it is read: see _fw_isolate_fact_ttl) and forgotten with them. Not read while
+# ISOLATED is off: then everything is let out anyway.
+_fw_allowed_cache = None                          # (stamp, rules | None, error | None) or None
+
+
+def _fw_keep_allowed_out(found, error):
+    global _fw_allowed_cache
+    with _fw_profiles_lock:
+        _fw_allowed_cache = (time.monotonic(), found, error)
+
+
+def _fw_allowed_out():
+    """``(rules, error)`` of what ISOLATED does not close; ``(None, None)`` while ISOLATED is off, and in stage ``cut``,
+    where it is not read on purpose: the catch-all rule closes whatever they allow, and ``converge`` reads them."""
+    if not _fw_settings.isolated or _fw_settings.stage == "cut":
+        return None, None
+    with _fw_profiles_lock:
+        cached = _fw_allowed_cache
+    if cached is not None:
+        stamp, found, error = cached
+        if time.monotonic() - stamp < _fw_isolate_fact_ttl(error):
+            return found, error
+    try:
+        found, error = firewall_rules.allowed_out(_fw_runner), None
+    except Exception as e:
+        found, error = None, _fw_reason(e)
+    _fw_keep_allowed_out(found, error)
+    return found, error
+
+
+def _fw_rule_keys(found):
+    """``{key: rule_id}`` of the rules that stand. Several rules can share a key (tcp and udp): any one id will do."""
+    keys = {}
+    for rule in found or ():
+        if rule.get("blocking") and rule.get("key"):
+            keys.setdefault(rule["key"], rule["rule_id"])
+    return keys
+
+
+def _fw_ioc_sets():
+    """``(ips, domains)`` of Rustinel's IOC lists, normalised; read again after a minute."""
+    global _fw_ioc_cache
+    stamp, cached = _fw_ioc_cache
+    if time.time() - stamp < 60:
+        return cached
+    base = os.path.join(RUSTINEL_INSTALL_DIR, "rules", "ioc")
+
+    def lines(name):
+        try:
+            with open(os.path.join(base, name), "r", encoding="utf-8", errors="replace") as f:
+                return [l.strip() for l in f if l.strip() and not l.lstrip().startswith("#")]
+        except OSError:
+            return []
+    ips = set()
+    for text in lines("ips.txt"):
+        try:
+            addr = _ipaddress.ip_address(text.split()[0])
+            ips.add(str(addr.ipv4_mapped if addr.version == 6 and addr.ipv4_mapped else addr))
+        except ValueError:
+            continue
+    domains = {text.split()[0].lower().rstrip(".") for text in lines("domains.txt")}
+    _fw_ioc_cache = (time.time(), (frozenset(ips), frozenset(domains)))
+    return _fw_ioc_cache[1]
+
+
+def _fw_url_host(url):
+    try:
+        return (_urlparse(url).hostname or "").lower()
+    except ValueError:
+        return ""
+
+
+def _firewall_context(now=None):
+    """The ``firewall.Context`` of this moment, and the error that kept the rules from it (or None)."""
+    now = time.time() if now is None else now
+    with store_lock:
+        alerts = list(events_store.get("alerts") or [])
+    found, error = _fw_rules()
+    pending = {firewall.rule_key(i["finding"].get("image") or "", i["finding"].get("dst_ip") or "", None)
+               for i in _fw_pending.open() if isinstance(i.get("finding"), dict)}
+    targets = set()
+    for item in _fw_pending.open() + _fw_pending.history(200):
+        finding = item.get("finding") or {}
+        targets.update(v for v in (finding.get("dst_ip"), _fw_url_host(finding.get("url") or "")) if v)
+    for cap in _capture_store():
+        targets.update(v for v in (cap.get("dst_ip"), _fw_url_host(cap.get("url") or "")) if v)
+    ips, domains = _fw_ioc_sets()
+    ctx = firewall.Context(
+        dns=_fw_store.dns(), alerts=alerts, submission_pids=set(_firewall_open_windows(now)),
+        ioc_ips=set(ips), ioc_domains=set(domains), processes=_fw_store.processes(),
+        rules=_fw_rule_keys(found), pending=pending, fetch_targets=targets,
+        downloads=set(_fw_downloads))      # one C-level pass: the collector thread adds to it meanwhile
+    return ctx, error
+
+
+def _fw_classified(since=None, until=None):
+    """``(flows, rules_error)``: the connections of a window, bundled, tagged and placed, with captures attached."""
+    events = _fw_store.events(since, until)
+    ctx, error = _firewall_context()
+    flows = firewall.classify(events, _fw_store.firewall_events(since, until), ctx)
+    by_endpoint = {}
+    for cap in _capture_store():
+        by_endpoint.setdefault((str(cap.get("image") or "").lower(), cap.get("dst_ip"), cap.get("dst_port")),
+                               []).append(cap["id"])
+    for flow in flows:
+        flow["capture_ids"] = by_endpoint.get((flow["image"].lower(), flow["dst_ip"], flow["dst_port"]), [])
+    return flows, error
+
+
+# ---- the capture store ----------------------------------------------------------------------
+
+
+def _capture_store():
+    """The recorded captures, oldest first (``captures.json``); a damaged file reads as empty."""
+    with _captures_lock:
+        try:
+            with open(CAPTURES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            return []
+    return [c for c in data if isinstance(c, dict) and isinstance(c.get("id"), str)] if isinstance(data, list) else []
+
+
+def _record_capture(meta):
+    """Add ``meta`` to ``captures.json`` (500 entries at most, the oldest entry goes first; its file stays) and
+    return it with its ``id``. Written like ``submissions.json``: beside the file, flushed, then put in its place."""
+    entry = dict(meta, id=hashlib.sha256(f"{meta.get('sha256')}{meta.get('url')}{time.time()}{os.urandom(4).hex()}"
+                                         .encode()).hexdigest()[:12])
+    with _captures_lock:
+        try:
+            with open(CAPTURES_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = []
+        data = [c for c in data if isinstance(c, dict)] if isinstance(data, list) else []
+        data = (data + [entry])[-MAX_CAPTURES:]
+        tmp = CAPTURES_FILE + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+                f.flush()
+                os.fsync(f.fileno())
+            for attempt in range(1, _REPLACE_ATTEMPTS + 1):
+                try:
+                    os.replace(tmp, CAPTURES_FILE)
+                    break
+                except PermissionError:
+                    if attempt == _REPLACE_ATTEMPTS:
+                        raise
+                    time.sleep(_REPLACE_PAUSE)
+        except BaseException:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
+    return entry
+
+
+def _ensure_capture_dir(run=None):
+    """Create ``CAPTURE_DIR``, empty its staging folder and exclude it from Defender (idempotent; only logs).
+
+    Without the exclusion Defender eats the stage-2 file before anyone looks at it. install-webui.ps1 does the
+    same at provisioning; doing it here as well is what makes the feature work on a VM that only got a deploy.
+    ``.incoming`` is emptied because a fetch that was killed leaves a partial body in a folder that Defender
+    ignores and ``/api/file/download`` can read."""
+    try:
+        os.makedirs(CAPTURE_DIR, exist_ok=True)
+    except OSError as e:
+        _log_logger.warning("cannot create %s: %s", CAPTURE_DIR, e)
+        return False
+    left = firewall_fetch.clear_staging(CAPTURE_DIR)
+    if left:
+        _log_logger.info("firewall: removed %d unfinished download(s) from %s", left,
+                         os.path.join(CAPTURE_DIR, firewall_fetch.STAGING))
+    if os.name != "nt" and run is None:
+        return True
+    quoted = CAPTURE_DIR.replace("'", "''")      # our own constant, not malware text
+    try:
+        rc, _, err = (run or firewall_rules.run_powershell)(
+            [firewall_rules.POWERSHELL, "-NoProfile", "-NonInteractive", "-Command",
+             f"Add-MpPreference -ExclusionPath '{quoted}' -ErrorAction Stop"])
+        if rc != 0:
+            _log_logger.warning("Defender exclusion for %s failed (%s): %s", CAPTURE_DIR, rc, (err or "").strip()[:200])
+            return False
+    except Exception as e:
+        _log_logger.warning("Defender exclusion for %s failed: %s", CAPTURE_DIR, e)
+        return False
+    return True
+
+
+# ---- what TDC did by itself, in LOGS --------------------------------------------------------
+
+
+def _fw_log_action(method, by, status, finding=None, **fields):
+    """Write one ``access`` event for something the FIREWALL tab did by itself, so LOGS can find it.
+
+    A route becomes an ``access`` event through ``_log_request``; the block the detector places, the decision a
+    deadline takes and the fetch that follows pass through no route at all, and the spec names all three among
+    the actions that have to be traceable ("nothing happens silently"). The unattended contact with a C2 is the
+    one action an analyst most needs to find again, so it is an event with the endpoint, the URL, the
+    User-Agent that was sent and the outcome. ``by`` is ``detector``, ``analyst`` or ``deadline``.
+    """
+    finding = finding if isinstance(finding, dict) else {}
+    path = "/internal/firewall/" + method.lower()
+    event = {"method": method, "path": path, "query": "", "status": int(status), "duration_ms": 0.0,
+             "remote_addr": "", "user_agent": "", "client": "tdc", "poll": False, "by": by,
+             "image": str(finding.get("image") or "")[:_LOG_TEXT_LIMIT],
+             "dst_ip": finding.get("dst_ip"), "dst_port": finding.get("dst_port"),
+             "url": str(finding.get("url") or "")[:_LOG_TEXT_LIMIT], "finding_id": finding.get("id")}
+    event.update({k: (v[:_LOG_TEXT_LIMIT] if isinstance(v, str) else v) for k, v in fields.items()})
+    detail = " ".join(str(v) for v in (event.get("outcome"), event["dst_ip"], event["url"]) if v)
+    try:
+        _logs.add("access", _log_now(), f"{method} {path} ({event['status']}) {by}: {detail}".strip(), event)
+    except Exception:       # an event that cannot be stored must not stop the action
+        _log_logger.debug("firewall: action not written to the log", exc_info=True)
+
+
+# ---- the guarded fetch ----------------------------------------------------------------------
+# The mechanism - one address, one deadline, one size - is ``firewall_fetch``. What is here is the policy
+# around it: which addresses this lab allows, the loader's own User-Agent, the way out of ISOLATED for the
+# seconds a fetch takes, and the record that is kept of it.
+
+_UA_PATTERNS = (
+    re.compile(r"-UserAgent\s+['\"]([^'\"\r\n]{1,300})['\"]", re.I),
+    re.compile(r"User-?Agent['\"]?\s*[,=:]\s*['\"]([^'\"\r\n]{1,300})['\"]", re.I),
+    re.compile(r"(?:^|\s)(?:-A|--user-agent)\s+['\"]([^'\"\r\n]{1,300})['\"]", re.I),
+)
+
+_fw_fetch_paths = {}                     # the allow rules of a fetch (a tuple of names) -> its shared state
+_fw_fetch_open = {}                      # rule name -> why it is still standing, for one that would not go
+_fw_fetch_swept = 0.0                    # when the per-fetch rules were last swept for forgotten ones
+_fw_fetch_sweeping = False               # that sweep is running: it removes every per-fetch rule, so wait
+# Guards the two maps above and tells a fetch when another one's rule write or removal is done. Only the
+# bookkeeping happens under it: a PowerShell call never does, or a collector tick would wait behind it.
+_fw_fetch_cond = threading.Condition()
+
+
+def _fw_reason(exc):
+    """The first line of an exception, short enough for a field."""
+    return (str(exc).splitlines() or [type(exc).__name__])[0][:300] or type(exc).__name__
+
+
+def _fw_still_open(names):
+    """Why a caller should worry, when a per-fetch allow rule would not go away; None when all of them went."""
+    if not names:
+        return None
+    return ("the way out of ISOLATED could not be closed again: " + ", ".join(names) +
+            " still allows TDC's fetcher out to that address")
+
+
+def _loader_user_agent(finding):
+    """The User-Agent the loader's own script or command line names for this URL, or None."""
+    url = finding.get("url") or ""
+    texts = [ev.get("message") for ev in _fw_store.powershell()] + [ev.get("commandline") for ev in _fw_store.process_events()]
+    for text in texts:
+        if not isinstance(text, str) or url not in text:
+            continue
+        for pattern in _UA_PATTERNS:
+            for match in pattern.finditer(text):
+                agent = firewall_fetch.clean_header_text(match.group(1))
+                if agent:
+                    return agent
+    return None
+
+
+def _fw_fetch_lan():
+    """``TDC_FIREWALL_FETCH_LAN=1``: TDC may fetch from private addresses (a lab whose stage 2 sits on the LAN)."""
+    return (os.environ.get("TDC_FIREWALL_FETCH_LAN") or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _fw_refuse_address(ip):
+    """Why TDC will not connect to ``ip``, or None (``firewall_fetch.refuse_address`` with this lab's setting)."""
+    return firewall_fetch.refuse_address(ip, allow_lan=_fw_fetch_lan())
+
+
+def _submission_for(finding):
+    """The id of the submission whose process, or an ancestor of it, ran the loader; None if none did."""
+    procs = _fw_store.processes()
+    chain, pid = [], finding.get("origin_pid") if finding.get("origin_pid") is not None else finding.get("pid")
+    while isinstance(pid, int) and pid not in chain and len(chain) < 32:
+        chain.append(pid)
+        pid = _fw_int((procs.get(pid) or {}).get("parent_pid"))
+    wanted = {str(p) for p in chain}
+    try:
+        with submissions_lock:
+            subs = _load_submissions()
+    except Exception:
+        return None
+    for sub in reversed([s for s in subs if isinstance(s, dict)]):
+        if str(sub.get("agent_pid")) in wanted:
+            return sub.get("id")
+    return None
+
+
+def _fw_remember_open(name, problem, by, key=None):
+    """Remember an allow rule that would not go away: the sweep retries it, LOGS and the tab show it.
+
+    One event per hole, not one per retry, and the time it was first seen is kept. ``key`` is the rule set the
+    fetch held it under, so a retry can claim the same set and no fetch is surprised by a removal.
+    """
+    with _fw_fetch_cond:
+        before = _fw_fetch_open.get(name) or {}
+        first = not before
+        _fw_fetch_open[name] = {"rule_id": name, "problem": problem,
+                                "key": list(key or before.get("key") or (name,)),
+                                "since": before.get("since") or _fw_iso(time.time())}
+    if first:
+        _log_logger.warning("firewall: the per-fetch allow rule %s could not be removed (%s); TDC's fetcher "
+                            "stays allowed out to that address until it goes", name, problem)
+        _fw_log_action("ALLOW", by, 500, None, outcome="still open", rule_id=name, problem=problem)
+    else:        # one warning and one event per hole, not one per retry
+        _log_logger.debug("firewall: %s still stands (%s)", name, problem)
+
+
+def _fw_forget_open(name):
+    with _fw_fetch_cond:
+        _fw_fetch_open.pop(name, None)
+
+
+def _fw_claim_fetch_path(names, timeout=None):
+    """Take a share of the allow rules ``names``: ``(writer, problem, held)``.
+
+    ``writer`` is True for the one call that has to write them; everybody else waits until it has and then gets
+    **its** problem, so two fetches sharing a rule tell the same story about it. A set of names that is being
+    removed, and a full sweep, are waited out, so no removal can take away a rule a new fetch just made. The
+    waiting happens on the condition and never on a PowerShell call, which is why the collector thread is only
+    ever behind the bookkeeping. Waiting longer than ``FETCH_PATH_WAIT_S`` gives up. Against a sweep or a
+    removal of these rules ``held`` is then False, nothing was claimed and there is nothing to give back; against
+    another fetch's write the call takes a share anyway (``held`` True), which has to be given back like any other.
+    """
+    deadline = time.monotonic() + (FETCH_PATH_WAIT_S if timeout is None else timeout)
+    with _fw_fetch_cond:
+        while True:
+            state = _fw_fetch_paths.get(names)
+            if state is None and not _fw_fetch_sweeping:
+                _fw_fetch_paths[names] = {"holders": 1, "busy": True, "problem": None}
+                return True, None, True
+            if state is not None and not state["busy"]:
+                state["holders"] += 1
+                return False, state["problem"], True
+            left = deadline - time.monotonic()
+            if left <= 0:
+                if state is None:            # a sweep is removing every per-fetch rule; it owns them
+                    return False, "a sweep of the per-fetch allow rules is still running", False
+                if state["holders"] == 0:    # busy with no holder: they are being removed, and the entry goes too
+                    return False, "the allow rules of this endpoint are still being removed", False
+                state["holders"] += 1
+                return False, (state["problem"] or
+                               "another fetch to this endpoint is still writing its allow rule"), True
+            _fw_fetch_cond.wait(left)
+
+
+def _fw_wrote_fetch_path(names, problem):
+    """The writer is done: let everyone waiting for these rules through, with what it found."""
+    with _fw_fetch_cond:
+        state = _fw_fetch_paths.get(names)
+        if state is not None:
+            state["busy"], state["problem"] = False, problem
+        _fw_fetch_cond.notify_all()
+
+
+def _fw_open_fetch_path(ip, port):
+    """While ISOLATED, let TDC's own fetch out to this one endpoint for as long as this fetch lasts.
+
+    ``(names, problem)``: the allow rules of this fetch - one per program the fetch may run as - and what is
+    wrong with them, or None. ISOLATED shuts the default way out, so without a rule the fetch cannot
+    happen; a standing allow rule for the fetcher would be much wider, because the fetcher is a Python
+    interpreter (``firewall_rules.allow_fetch`` spells out the residual). A rule that cannot be written is not
+    fatal: the fetch is tried and the problem is recorded with its result, for every fetch that shares it.
+    """
+    if not _fw_settings.isolated:
+        return (), None
+    programs = _fw_fetcher_paths()
+    try:
+        names = tuple(firewall_rules.fetch_rule_name(ip, port, program) for program in programs)
+    except Exception as e:
+        return (), _fw_reason(e)
+    writer, problem, held = _fw_claim_fetch_path(names)
+    if not held:
+        return (), problem          # nothing was claimed, so this fetch holds nothing to give back
+    if not writer:
+        return names, problem
+    problem = None
+    try:
+        for program, name in zip(programs, names):
+            done = firewall_rules.allow_fetch(_fw_runner, fetcher=program, ip=ip, port=port)
+            problem = problem or done["problem"]
+            _fw_forget_open(name)                # it stands again, so it is no longer a hole left open
+    except Exception as e:
+        problem = _fw_reason(e)
+    finally:
+        _fw_forget_rules()
+        _fw_wrote_fetch_path(names, problem)
+    return names, problem
+
+
+def _fw_close_fetch_path(names, by="fetch"):
+    """Give up this fetch's share of the allow rules: ``(stuck, still_held)``.
+
+    ``stuck`` are the rules that would not go - retried here, then remembered for the sweep, for LOGS and for
+    the tab, because a way out of ISOLATED that nobody sees is worse than one they do. ``still_held`` says
+    another fetch is using them, so they stand on purpose and this fetch left nothing open. The removal runs
+    without the lock; while it does, the names stay claimed (``busy``), so a new fetch waits instead of
+    watching its rule disappear.
+    """
+    if not names:
+        return [], False
+    with _fw_fetch_cond:
+        state = _fw_fetch_paths.get(names)
+        if state is None:                        # nobody holds them any more (ISOLATED was left, say)
+            return [], False
+        state["holders"] = max(0, state["holders"] - 1)
+        if state["holders"] > 0:
+            return [], True
+        state["busy"] = True
+    try:
+        return _fw_remove_fetch_rules(names, by=by), False
+    finally:
+        with _fw_fetch_cond:
+            _fw_fetch_paths.pop(names, None)
+            _fw_fetch_cond.notify_all()
+
+
+def _fw_remove_fetch_rules(names, attempts=None, sleep=time.sleep, by="fetch"):
+    """Remove per-fetch allow rules, trying ``attempts`` times (``FETCH_CLOSE_ATTEMPTS``); what still stands.
+
+    PowerShell runs without the fetch-path lock; only the bookkeeping takes it. What will not go is remembered
+    (``_fw_remember_open``) so that the next sweep tries again; what goes is forgotten there.
+    """
+    attempts = FETCH_CLOSE_ATTEMPTS if attempts is None else max(1, int(attempts))
+    stuck = []
+    try:
+        for name in names:
+            problem = None
+            for attempt in range(1, attempts + 1):
+                try:
+                    firewall_rules.deny_fetch(_fw_runner, name)
+                    problem = None
+                    break
+                except Exception as e:
+                    problem = _fw_reason(e)
+                    if attempt < attempts:
+                        sleep(FETCH_CLOSE_PAUSE)
+            if problem is None:
+                _fw_forget_open(name)
+            else:
+                stuck.append(name)
+                _fw_remember_open(name, problem, by, key=tuple(names))
+    finally:
+        _fw_forget_rules()
+    return stuck
+
+
+def _fw_retry_fetch_paths(now=None):
+    """Try again to close the ways out that would not close, and sweep for forgotten ones; what is left.
+
+    Runs at every sweep, in the collector thread. Nothing else would close them: the fetch they belonged to is
+    over, and while one stands TDC's fetcher is allowed out to that address. Every decision is taken under the
+    lock and every PowerShell call outside it, so a tick is never behind a rule write.
+
+    The full sweep removes *every* per-fetch rule - including one a crash left behind, which only it can find,
+    because the names of those are gone with the process. It therefore runs only while ISOLATED is on and no
+    fetch is in flight, at most every ``FIREWALL_FETCH_SWEEP_S``, and a fetch starting meanwhile waits for it.
+    """
+    global _fw_fetch_swept, _fw_fetch_sweeping
+    now = time.time() if now is None else now
+    with _fw_fetch_cond:
+        in_flight = {name for names in _fw_fetch_paths for name in names}
+        stuck = {tuple((_fw_fetch_open[name].get("key") or [name])) for name in _fw_fetch_open
+                 if name not in in_flight}
+        sweep = (bool(_fw_settings.isolated) and not _fw_fetch_paths
+                 and now - _fw_fetch_swept >= FIREWALL_FETCH_SWEEP_S and not _fw_fetch_sweeping)
+        if sweep:
+            _fw_fetch_swept, _fw_fetch_sweeping = now, True
+    for names in sorted(stuck):
+        # Claiming the set a fetch would use keeps a new fetch from watching its rule disappear. A rule a crash
+        # left behind has no such set (its names died with the process), so for that one the window stays: a
+        # fetch to the very same endpoint, starting in the same moment, can lose its rule and fail once.
+        writer, _, held = _fw_claim_fetch_path(names, timeout=0)
+        if not held:
+            continue                         # a sweep has them; it removes every per-fetch rule anyway
+        if writer:
+            _fw_close_fetch_path(names, by="sweep")
+        else:
+            _fw_close_fetch_path(names)      # a fetch holds these rules: it only gives the share back
+    if sweep:
+        try:
+            removed, left = firewall_rules.forget_fetch_rules(_fw_runner)
+            for name in removed:
+                _fw_forget_open(name)
+            if removed:
+                _log_logger.warning("firewall: removed %d per-fetch allow rule(s) no fetch was using: %s",
+                                    len(removed), ", ".join(removed))
+            for rule in left:
+                _fw_remember_open(rule["rule_id"], rule["problem"], "sweep")
+        except Exception as e:
+            _log_logger.warning("firewall: the per-fetch allow rules could not be checked: %s", e)
+        finally:
+            _fw_forget_rules()
+            with _fw_fetch_cond:
+                _fw_fetch_sweeping = False
+                _fw_fetch_cond.notify_all()
+    with _fw_fetch_cond:
+        return sorted(_fw_fetch_open)
+
+
+def _fw_fetch_failed(finding, message, by, agent, problem, closed=None, trouble=None):
+    """Record a fetch that stored nothing in LOGS and answer with its reason."""
+    _fw_log_action("FETCH", by, 500, finding, outcome="failed", error=message[:300],
+                   user_agent=agent or firewall_fetch.DEFAULT_USER_AGENT, allow_problem=problem,
+                   allow_closed=closed, close_problem=trouble)
+    return {"error": message}
+
+
+def _fetch_capture(pending, by="tdc"):
+    """Fetch the file of a download finding, check it and store it; it is never executed and never reported.
+
+    ``pending`` is the finding (``url``, ``dst_ip``, ``dst_port``, ``image``, ``pid``). The limits and the
+    pinning to the observed address are ``firewall_fetch``; what this adds is the lab's address policy, the
+    loader's User-Agent, the way out of ISOLATED for the time of the fetch, the geo and submission of the
+    capture, the record in ``captures.json`` and the entry in LOGS. Returns the capture record, or
+    ``{"error": ...}`` (with no ``sha256``) when nothing was stored.
+
+    ``FETCH_TIMEOUT`` is the budget for all of it, the address checks and the firewall rule included, so the
+    HTTP exchange gets what those left over. ``allow_closed`` is True when this fetch's way out is gone again,
+    False while it still stands (``close_problem`` says why: it would not go, or another fetch is using it) and
+    None when there was nothing to close, because ISOLATED is off.
+    """
+    finding = pending if isinstance(pending, dict) else {}
+    started = time.monotonic()
+    ip, port = finding.get("dst_ip"), finding.get("dst_port")
+    agent = firewall_fetch.clean_header_text(_loader_user_agent(finding))
+    rules, problem, out, error = (), None, None, None
+    try:
+        # checked here as well as inside fetch(): what TDC will not fetch must not even get a firewall rule
+        refusal = _fw_refuse_address(ip) if isinstance(ip, str) else "no address"
+        if refusal:
+            raise firewall_fetch.FetchError("refused: " + refusal)
+        firewall_fetch.target_of(finding.get("url"), ip, port)
+        rules, problem = _fw_open_fetch_path(ip, port)
+        out = firewall_fetch.fetch(finding.get("url"), ip, port, capture_dir=CAPTURE_DIR, user_agent=agent,
+                                   timeout=FETCH_TIMEOUT - (time.monotonic() - started),
+                                   max_bytes=FETCH_MAX_BYTES, max_redirects=FETCH_MAX_REDIRECTS,
+                                   refuse=_fw_refuse_address)
+    except firewall_fetch.FetchError as e:
+        error = str(e)
+    except Exception as e:
+        _log_logger.warning("fetch failed: %s: %s", type(e).__name__, e)
+        error = f"fetch failed: {type(e).__name__}"
+    stuck, held = _fw_close_fetch_path(rules)     # whatever happened, this fetch's share is given back
+    closed = None if not rules else not (stuck or held)
+    trouble = _fw_still_open(stuck) or ("another fetch is still using these rules" if held else None)
+    if error is not None:
+        return _fw_fetch_failed(finding, error, by, agent, problem, closed, trouble)
+    meta = {"sha256": out["sha256"], "size": out["size"], "url": finding.get("url"), "dst_ip": ip,
+            "dst_port": port, "geo": firewall.geo_info(ip), "pid": finding.get("pid"),
+            "image": finding.get("image"), "fetched_at": _fw_iso(time.time()), "origin": "fetch",
+            "content_type": out["content_type"], "magic": out["magic"],
+            "submission_id": _submission_for(finding), "executed": False, "path": out["path"],
+            "status": out["status"], "redirects": out["redirects"], "user_agent": out["user_agent"],
+            "user_agent_source": "loader" if agent else "default", "finding_id": finding.get("id"),
+            "source": finding.get("source"), "allow_rules": list(rules), "allow_problem": problem,
+            "allow_closed": closed, "close_problem": trouble}
+    entry = _record_capture(meta)
+    _fw_log_action("FETCH", by, 200, finding, outcome="stored", capture_id=entry["id"], sha256=entry["sha256"],
+                   size=entry["size"], magic=entry["magic"], user_agent=entry["user_agent"],
+                   http_status=out["status"], redirects=out["redirects"], allow_problem=problem,
+                   allow_closed=closed, close_problem=trouble)
+    return entry
+
+
+# ---- decisions ------------------------------------------------------------------------------
+
+
+def _fw_block_key(finding):
+    return firewall.rule_key(finding.get("image") or "", finding.get("dst_ip") or "", None)
+
+
+def _fw_ensure_block(finding):
+    """Make sure the loader is blocked from the endpoint (program-scoped, so TDC's own fetch is not); say what stands.
+
+    ``{rule_id, verified, problem}``, or ``{error}``. Nothing is claimed that was not read back: the rules are read
+    fresh, never from the cache, because a rule removed outside TDC (the hatch, wf.msc, the sample) must not make a
+    confirmed block."""
+    try:
+        found, _ = _fw_rules(force=True)
+        rule_id = _fw_rule_keys(found).get(_fw_block_key(finding))
+        if rule_id:
+            return {"rule_id": rule_id, "verified": True, "problem": None}
+        done = firewall_rules.block(_fw_runner, image=finding.get("image"), ip=finding.get("dst_ip"),
+                                    fetcher=_fw_fetcher_paths())
+        _fw_forget_rules()
+        return {"rule_id": done["rule_id"], "verified": done["verified"], "problem": done["problem"]}
+    except Exception as e:
+        _fw_forget_rules()
+        return {"error": (str(e).splitlines() or [type(e).__name__])[0][:300]}
+
+
+def _fw_other_holds(item_id, finding):
+    """Whether another decision keeps this endpoint blocked: an open one, or one that was taken as block."""
+    key = _fw_block_key(finding)
+    for other in _fw_pending.open() + _fw_pending.history(1000):
+        if other["id"] == item_id or not isinstance(other.get("finding"), dict):
+            continue
+        if _fw_block_key(other["finding"]) == key and (other["action"] in (None, "block", "block_fetch")):
+            return True
+    return False
+
+
+def _fw_release(item_id, finding):
+    """ZULASSEN: remove every rule of the endpoint's key, unless another decision still holds it."""
+    if _fw_other_holds(item_id, finding):
+        return {"unblocked": False, "reason": "another decision for the same endpoint keeps it blocked"}
+    key = _fw_block_key(finding)
+    try:
+        found, _ = _fw_rules(force=True)
+        ids = [r["rule_id"] for r in found or () if r.get("kind") == "block" and r.get("key") == key]
+        for rule_id in ids:
+            firewall_rules.unblock(_fw_runner, rule_id)
+        _fw_forget_rules()
+        return {"unblocked": True, "rule_ids": ids}
+    except Exception as e:
+        _fw_forget_rules()
+        return {"unblocked": False, "error": (str(e).splitlines() or [type(e).__name__])[0][:300]}
+
+
+def _fw_address_wide_block(finding, force=False):
+    """Whether a block for every program stands on the endpoint: it would cut TDC's own fetch off as well.
+
+    ``force`` reads the rules fresh: what enforces (a decision's refusal, the deadline) passes it; only the poll
+    path's ``can_fetch`` takes the cache."""
+    found, _ = _fw_rules(force=force)
+    return _fw_address_wide_in(found, finding)
+
+
+def _fw_address_wide_in(found, finding):
+    """Whether the rule list ``found`` holds a block for every program on the finding's endpoint."""
+    keys = _fw_rule_keys(found)
+    ip = finding.get("dst_ip") or ""
+    return any(firewall.rule_key("", ip, port) in keys for port in (None, finding.get("dst_port")))
+
+
+# Why TDC's fetch cannot go (what a settled decision's note keeps), and what to do about it (only for the live refusal
+# of a decision that is still open: advice written into the record of a settled one would be stale)
+_FW_NO_FETCH_CUT = ("The cut stands: one Block rule for every program beats every Allow rule, so no exception lets "
+                    "TDC's own fetch out.")
+_FW_NO_FETCH_WIDE = "A block for every program stands on that endpoint, so TDC's own fetch would be cut off."
+_FW_ADVICE_CUT = "Leave the cut first to secure a sample, or choose block only."
+_FW_ADVICE_WIDE = "Remove it, or choose block only."
+
+
+class _FwFetchRefused(Exception):
+    """``block_fetch`` cannot work now: the cut stands, so no Allow exception for the fetch gets through."""
+
+
+def _fw_fetch_refusal(finding):
+    """Why TDC's own fetch of this finding cannot get out right now, as a sentence; None when nothing says so.
+
+    The cut (stage ``cut``/``cut_policy``, a press under way, or a cut rule a crash left behind) comes first: a
+    Block rule for every program beats every Allow rule, the per-fetch exception included. Then a block for
+    every program on the endpoint. What enforces reads the rules fresh; an unreadable list refuses nothing here
+    (the poll's ``can_fetch`` is None then, and says it does not know). The reason only: the live refusal adds the
+    advice (``_fw_refusal_text``)."""
+    if _fw_cut_may_stand():
+        return _FW_NO_FETCH_CUT
+    found, _ = _fw_rules(force=True)
+    if any(r.get("name") == firewall_rules.CUT_RULE for r in found or ()):
+        return _FW_NO_FETCH_CUT
+    if _fw_address_wide_in(found, finding):
+        return _FW_NO_FETCH_WIDE
+    return None
+
+
+def _fw_refusal_text(reason):
+    """The 409 of a decision that is still open: the reason and what to do about it."""
+    return f"{reason} {_FW_ADVICE_CUT if reason == _FW_NO_FETCH_CUT else _FW_ADVICE_WIDE}"
+
+
+def _fw_decide(item_id, action, by, note=None):
+    """Take the decision ``action`` for an open item. ``(item, won)``; ``KeyError`` for an unknown id.
+
+    The decision and its effect on the firewall are one step under a lock. Only the call that wins (``won``)
+    acts, and a fetch is started outside the lock on the executor. What was decided and what it did to the
+    firewall goes to LOGS, because a deadline's decision passes through no route. ``note`` is why a decision is
+    not the one that was wanted (the deadline's block where the fetch could not go), kept in its result.
+
+    ``block_fetch`` while a cut may stand raises ``_FwFetchRefused`` and settles nothing. The routes check first;
+    this catches a press that landed before this check (``_fw_pressing`` is raised under another lock, so one
+    that lands after it is not caught here: ``_fw_fetch_item`` looks again when the fetch starts, and says the
+    cut is why when it stands then)."""
+    with _fw_decision_lock:
+        before = _fw_pending.get(item_id)
+        if before is None:
+            raise KeyError(item_id)
+        if action == "block_fetch" and before["action"] is None and _fw_cut_may_stand():
+            raise _FwFetchRefused(_FW_NO_FETCH_CUT)
+        item, won = _fw_pending.settle(item_id, action, dict(before.get("result") or {}, by=by,
+                                                              **({"note": note} if note else {})))
+        if not won:
+            return item, False
+        effect = {}
+        if action == "allow":
+            effect.update(_fw_release(item_id, item["finding"]))
+        else:
+            effect["block"] = _fw_ensure_block(item["finding"])
+        item = _fw_pending.set_result(item_id, effect) or item
+    done = effect.get("block") or effect
+    _fw_log_action("DECIDE", by, 500 if done.get("error") else 200, item["finding"], action=action,
+                   outcome=action, decision=item_id, rule_id=done.get("rule_id"),
+                   verified=done.get("verified"), unblocked=effect.get("unblocked"), note=note,
+                   problem=done.get("problem") or done.get("error") or effect.get("reason"))
+    if action == "block_fetch":
+        _fw_start_fetch(item_id, by)
+    return _fw_pending.get(item_id) or item, True
+
+
+def _fw_start_fetch(item_id, by="tdc"):
+    global _fw_executor
+    if _fw_executor is None:
+        from concurrent.futures import ThreadPoolExecutor
+        _fw_executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="firewall-fetch")
+    _fw_executor.submit(_fw_fetch_item, item_id, by)
+
+
+def _fw_fetch_item(item_id, by="tdc"):
+    """Fetch for a decided item and add the outcome to it. A pruned item is no error: the capture is kept."""
+    try:
+        item = _fw_pending.get(item_id)
+        if item is None:
+            return
+        # a press can land between the decision and this job: say the cut is why, not a timeout of a fetch it cut off
+        out = {"error": _FW_NO_FETCH_CUT} if _fw_cut_may_stand() else _fetch_capture(item["finding"], by)
+        summary = ({"error": out["error"]} if out.get("error") else
+                   {"capture_id": out["id"], "sha256": out["sha256"], "size": out["size"], "magic": out["magic"]})
+        if _fw_pending.set_result(item_id, {"fetch": summary}) is None:
+            _log_logger.info("firewall: item %s left the history before its fetch finished", item_id)
+    except Exception:
+        _log_logger.exception("firewall: fetch for %s failed", item_id)
+
+
+def _fw_open_decision(finding, now):
+    """A new open decision for ``finding``: the loader is blocked first, then the analyst is asked."""
+    if _fw_pending.get(finding["id"]) is not None:
+        return
+    with _fw_decision_lock:
+        if _fw_pending.get(finding["id"]) is not None:
+            return
+        block = _fw_ensure_block(finding)
+        item = _fw_pending.add(finding, now + _firewall_decide_seconds())
+        _fw_pending.set_result(item["id"], {"block": block})
+    _fw_log_action("BLOCK", "detector", 500 if block.get("error") else 200, finding,
+                   outcome="blocked" if block.get("verified") else "not verified", decision=item["id"],
+                   rule_id=block.get("rule_id"), verified=block.get("verified"),
+                   problem=block.get("problem") or block.get("error"),
+                   deadline=_fw_iso(item["deadline"]))
+
+
+def _fw_descends_from_webui(pid):
+    """Whether ``pid`` is a process the web UI itself started (its tool updater): TDC's own, whatever its image."""
+    procs = _fw_store.processes()
+    seen = set()
+    while isinstance(pid, int) and pid not in seen and len(seen) < 32:
+        if pid == os.getpid():
+            return True
+        seen.add(pid)
+        pid = _fw_int((procs.get(pid) or {}).get("parent_pid"))
+    return False
+
+
+def _fw_scan_downloads(now):
+    """Find downloads in the recent connections and scripts, mark them, and open a decision where the policy says so.
+
+    The tag is never suppressed: every finding is remembered for ``Context.downloads``. Policy (``ask_mode``):
+    ``detonation`` takes findings in a detonation window, ``all`` any finding of a process that is not TDC's own,
+    ``off`` none. A URL on an update host or from a process the web UI started is marked and never asked about."""
+    since = None if not _fw_scan_state["done"] else now - FIREWALL_FINDING_WINDOW_S
+    events = _fw_store.events(since)
+    if not events:
+        return
+    flows = firewall.bundle(events)
+    dns = _fw_store.dns()
+    for flow in flows:
+        flow["dst_hostname"] = flow["dst_hostname"] or dns.get(flow["dst_ip"])
+    windows = set(_firewall_open_windows(now))
+    findings = firewall_store.download_findings(_fw_store.powershell(), _fw_store.process_events(), _fw_store.bits(),
+                                                flows, windows, now=now)
+    _fw_scan_state["done"] = True
+    mode = _fw_settings.ask_mode
+    for finding in findings:
+        _fw_downloads[(finding["pid"], finding["dst_ip"], finding["dst_port"])] = now
+        if mode == "off":
+            continue
+        if mode == "detonation" and not finding["in_detonation"]:
+            continue
+        # The self list is a list of paths, and a sample chooses its own: C:\Program Files\Git\ ships curl.exe,
+        # and any file named git.exe counts. Inside a detonation the ancestry from a submission says whose
+        # process it really is, so only a finding outside one is left to TDC's own programs.
+        if finding["self"] and not finding["in_detonation"]:
+            continue
+        if firewall.is_update_host(_fw_url_host(finding["url"])):
+            continue
+        origin = finding.get("origin_pid") if finding.get("origin_pid") is not None else finding["pid"]
+        if _fw_descends_from_webui(origin):
+            continue
+        observed = firewall.epoch_of(finding.get("observed_at"))
+        if observed is not None and now - observed > FIREWALL_FINDING_FRESH_S:
+            continue
+        _fw_open_decision(finding, now)
+    if len(_fw_downloads) > FIREWALL_MARK_LIMIT:
+        for key in sorted(_fw_downloads, key=_fw_downloads.get)[:len(_fw_downloads) - FIREWALL_MARK_LIMIT]:
+            del _fw_downloads[key]
+
+
+def _fw_decide_at_deadline(item):
+    """The unattended default: block and fetch, or only block, with the reason in the decision when the fetch cannot go.
+
+    Where TDC's own fetch would be cut off (the cut stands, or a block for every program stands on the endpoint)
+    the default is a plain block, no capture is written and the result says ``could not secure``: a sample that
+    was not secured is never reported as one.
+
+    A write of the block waits behind a running convergence (``firewall_rules`` holds its lock across all of it,
+    tens of seconds), and this runs in the collector's thread, so a deadline can hold up a tick. It is the only
+    part of a cut-stage deadline that waits, and a deadline shortly after a press nearly always meets the
+    convergence that follows the press: this is the common case in the cut, not a corner. It is left as it is.
+    Raising the cancel flag from here would stop the analyst's cut midway, and a block the sweep gave up on would
+    be a deadline that did nothing. What stands meanwhile is honest: the decision is settled as ``block`` and its
+    result still holds the ``block`` written when the decision was opened (the same per-program rule key), which
+    the tab keeps showing until this write replaces it; a write that fails is recorded as the failure it is."""
+    reason = _fw_fetch_refusal(item["finding"])
+    if reason is None:
+        try:
+            _fw_decide(item["id"], "block_fetch", "deadline")
+            return
+        except _FwFetchRefused as e:                    # a press landed after the check: it is the cut now
+            reason = str(e)
+    _fw_decide(item["id"], "block", "deadline", note=f"TDC could not secure the file: {reason}")
+
+
+def _firewall_sweep(now=None):
+    """One pass after a collector tick, in the collector's thread: look for new downloads, close a way out of
+    ISOLATED that a fetch left open, then act on the open decisions whose deadline has passed (block and fetch,
+    TDC's unattended default). Nothing here waits for the network: a fetch is handed to the executor. With
+    ``ask_mode`` off nothing is blocked and nothing is fetched."""
+    now = time.time() if now is None else now
+    try:
+        _fw_scan_downloads(now)
+    except Exception:
+        _log_logger.exception("firewall: scan for downloads failed")
+    try:
+        _fw_retry_fetch_paths(now)      # a way out of ISOLATED that would not close is tried again every round
+    except Exception:
+        _log_logger.exception("firewall: the per-fetch allow rules could not be closed")
+    if _fw_settings.ask_mode == "off":
+        return
+    for item in _fw_pending.expired(now):
+        try:
+            _fw_decide_at_deadline(item)
+        except KeyError:
+            continue
+        except Exception:
+            _log_logger.exception("firewall: default action for %s failed", item.get("id"))
+
+
+def _fw_prepare():
+    """The first step of the collector thread: everything at start-up that has to wait for Windows.
+
+    It runs there and not at import, so that a PowerShell which hangs cannot hold up the web UI: Flask already
+    serves while this works, and ``/api/firewall/isolate`` answers ``startup: null`` until it is done. The
+    per-fetch allow rules of a run that was interrupted are removed here, because they are a way out of
+    ISOLATED that nothing would otherwise close."""
+    global _fw_startup
+    _ensure_capture_dir()
+    try:
+        firewall_fetch.own_addresses(refresh=True)      # a fetch must not pay for this lookup itself
+    except Exception as exc:
+        _log_logger.warning("firewall: this VM's own addresses could not be read: %s", exc)
+    try:
+        _fw_startup = firewall_rules.startup_state(_fw_runner, _fw_settings)
+    except Exception as exc:
+        _log_logger.warning("firewall start-up state unreadable: %s", exc)
+    try:
+        removed, stuck = firewall_rules.forget_fetch_rules(_fw_runner)
+        if removed:
+            _log_logger.warning("firewall: removed %d per-fetch allow rule(s) left by an earlier run: %s",
+                                len(removed), ", ".join(removed))
+        for rule in stuck:          # a way out a crash left behind that will not go: say so, do not hide it
+            _fw_remember_open(rule["rule_id"], rule["problem"], "startup")
+    except Exception as exc:
+        _log_logger.warning("firewall: the per-fetch allow rules could not be checked: %s", exc)
+    _fw_forget_rules()
+
+
+def _firewall_loop(collector, rounds=None, sleep=time.sleep):
+    try:
+        _fw_prepare()
+    except Exception:
+        _log_logger.exception("firewall start-up step failed")
+    done = 0
+    while rounds is None or done < rounds:
+        done += 1
+        try:
+            collector.tick()
+        except Exception:
+            _log_logger.exception("firewall collector tick failed")
+        try:
+            _firewall_sweep()
+        except Exception:
+            _log_logger.exception("firewall sweep failed")
+        sleep(collector.interval())
+
+
+def _start_firewall():
+    """Start-up of the FIREWALL tab: load the geo data once and start the collector thread, which does the rest
+    (the capture directory, its Defender exclusion, the state a previous run left) as its first step."""
+    try:
+        geoip.load()               # without data the tab runs on: geo is only scope and nulls
+    except Exception:
+        _log_logger.exception("geoip.load failed")
+    collector = firewall_store.FirewallCollector(_fw_store, _fw_settings, _firewall_readers(),
+                                                 lambda: bool(_firewall_open_windows()))
+    thread = threading.Thread(target=_firewall_loop, args=(collector,), name="firewall-collector", daemon=True)
+    thread.start()
+    return thread
+
+
+# ISOLATED has two stages (see firewall_rules.isolate): the press cuts with one catch-all Block rule and answers, and
+# the thorough part (firewall_rules.converge, tens of seconds) runs afterwards in one background worker. There is
+# never more than one: a press while it runs asks it for one more round (``_fw_converge_again``) instead. Never two
+# rule runs at once either, because converge holds firewall_rules' own lock for its whole run; so a press and a leave
+# raise the cancel flag **before** they call in, converge sees it at its next step and lets go of the lock after the
+# one call it is in, instead of after all of them. The flag is an Event per round, so a press that restarts the work
+# never lowers the flag a leave raised for the round still running. The worker writes nothing to a request, catches
+# everything, and leaves what it found in ``_fw_converge_note`` for GET /isolate: a worker that dies quietly would be
+# a surface that says nothing.
+_fw_converge_lock = threading.Lock()
+_fw_converge_event = threading.Event()            # the cancel flag of the current round
+_fw_converge_running = False                      # a worker is started and has not finished
+_fw_converge_again = False                        # a press came while it ran: one more round
+_fw_converge_note = None                          # the note of the last round, or why it failed; None when all went
+_fw_converge_gen = 0                              # counts the presses, so a round's result never outranks a later cut
+_fw_cut_verified = None                           # the cut rule read back by the press (or by converge in cut_policy)
+_fw_leaving = 0                                   # leaves under way: every round stops at its next step meanwhile
+_fw_pressing = 0                                  # presses under way: a cut rule may stand before the stage says so
+# The newest read of the cut rule, whoever made it (the press, converge, the rule list of a poll, _fw_cut_stands):
+# ``(monotonic time of the read, stands)``: when a List or a Get started; when the press or converge returned, because
+# their read-back is their last step (a List that began during the press saw no rule and must not outrank it).
+# ``stands`` is True, False or None (not readable). ``verified`` in the cut stages rests on it as well as on the
+# press's read-back, so that a rule removed or disabled from outside after
+# the press (wf.msc, the hatch, a sample with admin rights) stops reading as closed within the isolate TTL.
+_fw_cut_seen = None
+_fw_cut_unseen_at = float("-inf")                # reads that started before this are not kept
+_fw_cut_seen_lock = threading.Lock()
+
+
+def _fw_saw_cut(stands, started):
+    """Keep a read of the cut rule that started at ``started`` (monotonic), unless a read that started later is kept
+    or the reads were forgotten after it started (_fw_unsee_cut)."""
+    global _fw_cut_seen
+    with _fw_cut_seen_lock:
+        if started < _fw_cut_unseen_at:
+            return
+        if _fw_cut_seen is None or started >= _fw_cut_seen[0]:
+            _fw_cut_seen = (started, stands)
+
+
+def _fw_unsee_cut():
+    """Forget every read of the cut rule, and any still under way: the next ``verified`` in a cut stage reads it again."""
+    global _fw_cut_seen, _fw_cut_unseen_at
+    with _fw_cut_seen_lock:
+        _fw_cut_seen = None
+        _fw_cut_unseen_at = time.monotonic()
+
+
+def _fw_cut_stands():
+    """Whether the cut rule stands as the catch-all, from the newest read of it while that is younger than the isolate
+    TTL; otherwise read now (one ``Get``, no lock: never behind a convergence). False when it cannot be read.
+
+    The rule list the tab's polls read anyway is one of those reads, so a poll costs a ``Get`` only when the list is
+    older than the TTL; the price of not reading at all would be a green band over a rule that is gone."""
+    with _fw_cut_seen_lock:
+        seen = _fw_cut_seen
+    now = time.monotonic()
+    if seen is not None and 0 <= now - seen[0] < _fw_isolate_fact_ttl(None):
+        return seen[1] is True
+    stands = firewall_rules.cut_stands(_fw_runner)
+    _fw_saw_cut(stands, now)
+    return stands is True
+
+
+def _fw_converge_thread(target):
+    threading.Thread(target=target, name="firewall-converge", daemon=True).start()
+
+
+_fw_converge_spawn = _fw_converge_thread          # spawn(target); tests run the worker themselves
+
+
+def _fw_converge_worker():
+    """The background half of ISOLATED: ``converge`` until no press asks for another round."""
+    global _fw_converge_running, _fw_converge_again, _fw_converge_note, _fw_cut_verified
+    finished = False
+    try:
+        while True:
+            with _fw_converge_lock:
+                event, gen, _fw_converge_again = _fw_converge_event, _fw_converge_gen, False
+            result = None
+            try:
+                result = firewall_rules.converge(_fw_runner, settings=_fw_settings,
+                                                 cancelled=lambda: event.is_set() or _fw_leaving > 0)
+                note = result.get("note")
+            except Exception as e:
+                _log_logger.exception("firewall: the convergence of ISOLATED failed")
+                note = (f"The thorough part of ISOLATED failed ({_fw_reason(e)}); whether the cut rule still stands "
+                        "was not read back.")
+            try:
+                _fw_forget_rules()
+            except Exception:
+                _log_logger.exception("firewall: the caches could not be forgotten after the convergence")
+            with _fw_converge_lock:
+                _fw_converge_note = note
+                if gen == _fw_converge_gen:            # no later press cut again meanwhile
+                    if result is None:
+                        _fw_cut_verified = None        # unknown: the failure may have been in removing the rule
+                    elif result["stage"] == "isolated" and _fw_settings.stage != "isolated":
+                        _fw_cut_verified = None        # the rule is gone but the stage was not saved: nothing to verify
+                    elif result["stage"] == "cut_policy" and not result["cancelled"] and not result["refused"]:
+                        _fw_cut_verified = bool(result["verified"])    # converge read the rule back itself
+                        # its read-back is its last step, so the round's end is about when it read
+                        _fw_saw_cut(_fw_cut_verified, time.monotonic())
+                    # every other answer read nothing back (cancelled, refused, a step failed): the press's stands
+                if not _fw_converge_again:
+                    _fw_converge_running = False
+                    finished = True
+                    return
+    except BaseException:
+        _log_logger.exception("firewall: the convergence worker of ISOLATED stopped unexpectedly")
+        raise
+    finally:
+        if not finished:                               # something above the catches failed: never stay "converging"
+            with _fw_converge_lock:
+                _fw_converge_running = False
+                _fw_converge_note = _fw_converge_note or "The thorough part of ISOLATED stopped unexpectedly."
+
+
+def _fw_converge_start(verified):
+    """After a press: keep what it read back (``verified``; None keeps what is known) and have one worker converge.
+    True when one works."""
+    global _fw_converge_event, _fw_converge_running, _fw_converge_again, _fw_converge_note, _fw_converge_gen
+    global _fw_cut_verified
+    with _fw_converge_lock:
+        if _fw_converge_event.is_set():                # it belonged to the round a cancel stopped
+            _fw_converge_event = threading.Event()
+        if verified is not None:
+            _fw_converge_gen += 1
+            _fw_cut_verified = bool(verified)
+        _fw_converge_note = None
+        if _fw_converge_running:
+            _fw_converge_again = True
+            return True
+        try:
+            _fw_converge_spawn(_fw_converge_worker)
+        except Exception as e:
+            _fw_converge_note = f"The thorough part of ISOLATED could not be started ({_fw_reason(e)}); the cut stands."
+            return False
+        _fw_converge_running = True
+        return True
+
+
+def _fw_converge_cancel(leaving=False):
+    """Stop the running round at its next step (and no further round); call it **before** calling firewall_rules.
+    True when a worker was running."""
+    global _fw_converge_again, _fw_leaving, _fw_pressing
+    with _fw_converge_lock:
+        _fw_converge_again = False
+        _fw_converge_event.set()
+        if leaving:
+            _fw_leaving += 1
+        else:
+            _fw_pressing += 1
+        return _fw_converge_running
+
+
+def _fw_left():
+    """After a leave, whether it worked or not: a failed one may have put the default action back to Allow before it
+    stopped, and it read nothing back about the cut rule, so the press's read-back no longer says anything."""
+    global _fw_leaving, _fw_cut_verified
+    with _fw_converge_lock:
+        _fw_leaving -= 1
+        _fw_cut_verified = None
+    _fw_unsee_cut()
+
+
+def _fw_pressed():
+    global _fw_pressing
+    with _fw_converge_lock:
+        _fw_pressing -= 1
+
+
+# ---- routes ---------------------------------------------------------------------------------
+
+
+def _fw_time_arg(name):
+    """A ``since``/``until`` query value (ISO-8601 or epoch seconds) as the store takes it; ``ValueError`` if unreadable."""
+    value = (request.args.get(name) or "").strip()
+    if not value:
+        return None
+    try:
+        return float(value)
+    except ValueError:
+        if firewall.epoch_of(value) is None:
+            raise ValueError(f"{name} must be an ISO-8601 time or epoch seconds")
+        return value
+
+
+def _fw_flow_view(flow):
+    out = dict(flow)
+    out["first_seen"], out["last_seen"] = _fw_iso(flow["first_seen"]), _fw_iso(flow["last_seen"])
+    return out
+
+
+def _fw_item_view(item, now):
+    out = dict(item)
+    out["remaining"] = max(0.0, item["deadline"] - now) if item["action"] is None else 0.0
+    for key in ("deadline", "created_at", "resolved_at"):
+        out[key] = _fw_iso(item.get(key))
+    return out
+
+
+@app.route("/api/firewall/connections")
+def api_firewall_connections():
+    """Bundled flows with tags and geo. Params: since, until (ISO-8601 or epoch), process, tag, state, max (1-5000, 500)."""
+    try:
+        since, until = _fw_time_arg("since"), _fw_time_arg("until")
+    except ValueError as e:
+        return _fw_error(str(e), 400)
+    state = request.args.get("state")
+    if state not in (None, "", "allowed", "blocked", "pending"):
+        return _fw_error("state must be allowed, blocked or pending", 400)
+    limit = max(1, min(request.args.get("max", 500, type=int) or 500, 5000))
+    flows, rules_error = _fw_classified(since, until)
+    process, tag = (request.args.get("process") or "").strip().lower(), (request.args.get("tag") or "").strip()
+    flows = [f for f in flows
+             if (not process or process in f["image"].lower()) and (not tag or tag in f["tags"])
+             and (not state or f["state"] == state)]
+    rank = {s: i for i, s in enumerate(firewall.SEVERITIES)}
+    flows.sort(key=lambda f: (-rank.get(f["severity"], 0), -f["last_seen"]))
+    return _fw_json({"connections": [_fw_flow_view(f) for f in flows[:limit]], "count": len(flows),
+                     "truncated": len(flows) > limit, "rules_error": rules_error,
+                     "isolated": bool(_fw_settings.isolated), "ask_mode": _fw_settings.ask_mode,
+                     "sources": _fw_store.stats()})
+
+
+@app.route("/api/firewall/summary")
+def api_firewall_summary():
+    """Totals and tops of the same window as /connections (since, until), plus open decisions and captures.
+
+    A display: the rules come from the cache (``_fw_classified``), never forced. It reads no list of its own, but it
+    waits on the cache's lock behind any read that is under way, which is why a forced read in ``/rules`` slowed it."""
+    try:
+        since, until = _fw_time_arg("since"), _fw_time_arg("until")
+    except ValueError as e:
+        return _fw_error(str(e), 400)
+    flows, rules_error = _fw_classified(since, until)
+    summary = firewall.summarize(flows)
+    summary.update({"open_decisions": len(_fw_pending.open()), "captures_total": len(_capture_store()),
+                    "rules_error": rules_error, "isolated": bool(_fw_settings.isolated),
+                    "ask_mode": _fw_settings.ask_mode, "geo_available": geoip.available(),
+                    "bytes_note": "Sysmon has no byte counts; the tab counts connections and firewall records."})
+    return _fw_json(summary)
+
+
+@app.route("/api/firewall/geo")
+def api_firewall_geo():
+    """One offline lookup: ?ip= gives ``{ip, geo}`` (``geo`` as in /connections)."""
+    ip = (request.args.get("ip") or "").strip()
+    try:
+        ip = str(_ipaddress.ip_address(ip))
+    except ValueError:
+        return _fw_error("ip must be an IPv4 or IPv6 address", 400)
+    return _fw_json({"ip": ip, "geo": firewall.geo_info(ip), "available": geoip.available()})
+
+
+@app.route("/api/firewall/rules")
+def api_firewall_rules():
+    """The ``TDC-FW-*`` rules that stand, each with its own ``rule_id``, ``protocol`` and ``blocking`` verdict.
+
+    A display, so it takes the rule cache (``FIREWALL_RULES_TTL_S``) and does not force a read: every path that changes
+    a rule forgets the cache itself (block, unblock, the isolate press, the leave, the fetch's rules), so the list can
+    show no stale picture of anything TDC did, only lag a change made outside TDC by up to the TTL. What enforces reads
+    with ``force=True`` and never goes through this route. The forced read cost a PowerShell call every 30 s, and
+    ``/summary``, fired with it, queued behind that call on the cache's lock."""
+    found, error = _fw_rules()
+    if error:
+        return _fw_error(error, 500)
+    return _fw_json({"rules": found})
+
+
+def _fw_body(allowed, required=()):
+    """The JSON body as a dict that has exactly keys of ``allowed`` (all of ``required``), else ``(None, message)``."""
+    data = request.get_json(silent=True)
+    if not isinstance(data, dict):
+        return None, "send a JSON object"
+    extra = sorted(set(data) - set(allowed))
+    if extra:
+        return None, "unknown field: " + ", ".join(k[:40] for k in extra)
+    missing = [k for k in required if k not in data]
+    return (None, "missing field: " + ", ".join(missing)) if missing else (data, None)
+
+
+def _fw_firewall_off_message():
+    """The reason enforcement is impossible (a profile is off or unreadable), or None."""
+    off, error = _fw_read_profiles()
+    if error is not None:
+        return error or "the Windows Firewall cannot be read"
+    if not off:
+        return None
+    return (f"Windows Firewall is switched off for: {', '.join(off)}. A rule or a default action would be "
+            "accepted and do nothing, so nothing is enforced.")
+
+
+@app.route("/api/firewall/block", methods=["POST"])
+def api_firewall_block():
+    """Block outbound traffic. Body: ``{scope, image, ip, port, protocol}``.
+
+    ``endpoint``: this program to ``ip`` (needs ``image`` and ``ip``; ``port`` needs ``protocol``). ``endpoint_all``:
+    every program to ``ip``, a decision of its own, because it includes TDC's fetcher. ``process``: ``image`` anywhere."""
+    data, problem = _fw_body(("scope", "image", "ip", "port", "protocol"), ("scope",))
+    if problem:
+        return _fw_error(problem, 400)
+    scope, image, ip, port, protocol = (data.get(k) for k in ("scope", "image", "ip", "port", "protocol"))
+    if scope not in ("endpoint", "endpoint_all", "process"):
+        return _fw_error("scope must be endpoint, endpoint_all or process", 400)
+    if not all(v is None or isinstance(v, str) for v in (image, ip, protocol)) \
+            or not (port is None or (isinstance(port, int) and not isinstance(port, bool))):
+        return _fw_error("image, ip and protocol are text, port is a number", 400)
+    if scope == "process":
+        if not image or ip or port is not None:
+            return _fw_error("scope process takes an image and nothing else", 400)
+        args = {"image": image}
+    elif scope == "endpoint":
+        if not image or not ip:
+            return _fw_error("scope endpoint takes an image and an ip", 400)
+        args = {"image": image, "ip": ip, "port": port, "protocol": protocol}
+    else:
+        if image or not ip:
+            return _fw_error("scope endpoint_all takes an ip and no image", 400)
+        args = {"ip": ip, "port": port, "protocol": protocol}
+    off = _fw_firewall_off_message()
+    if off:
+        return _fw_error(off, 409)
+    try:
+        done = firewall_rules.block(_fw_runner, fetcher=_fw_fetcher_paths(), **args)
+    except firewall_rules.RuleError as e:
+        return _fw_error(str(e), 409)
+    finally:
+        _fw_forget_rules()
+    done["scope"] = scope
+    if not done["verified"]:
+        return _fw_json(dict(done, error=done["problem"] or "the rule could not be verified"), 409)
+    return _fw_json(done)
+
+
+@app.route("/api/firewall/unblock", methods=["POST"])
+def api_firewall_unblock():
+    """Remove a block. Body: ``{rule_id}``; every rule that shares its key goes too (tcp and udp of one endpoint)."""
+    data, problem = _fw_body(("rule_id",), ("rule_id",))
+    if problem:
+        return _fw_error(problem, 400)
+    rule_id = data["rule_id"]
+    if not isinstance(rule_id, str):
+        return _fw_error("rule_id is text", 400)
+    ids = [rule_id]
+    found, _ = _fw_rules(force=True)
+    mine = next((r for r in found or () if r["rule_id"] == rule_id), None)
+    if mine and mine.get("key"):
+        ids = [rule_id] + [r["rule_id"] for r in found if r.get("key") == mine["key"] and r["kind"] == "block"
+                           and r["rule_id"] != rule_id]
+    try:
+        for each in ids:
+            firewall_rules.unblock(_fw_runner, each)
+    except firewall_rules.RuleError as e:
+        return _fw_error(str(e), 400 if "not a TDC block rule" in str(e) else 500)
+    finally:
+        _fw_forget_rules()
+    return _fw_json({"removed": ids})
+
+
+def _fw_cut_rule_listed():
+    """Whether the rule list in the cache (never read for this) names the cut rule; None when nothing is cached."""
+    with _fw_rules_lock:
+        cached = _fw_rules_cache
+    found = cached[1] if cached else None
+    if found is None:
+        return None
+    return any(r.get("name") == firewall_rules.CUT_RULE for r in found)
+
+
+def _fw_cut_may_stand():
+    """True while TDC's own cut rule may stand: a press is under way (its ``Cut`` can be written before the stage
+    is saved, and the cached rule list predates it), or the marker is there and the thorough stage is not reached.
+
+    The marker is the authority, not the stage: start-up can save stage ``open`` beside a marker while the cut rule
+    holds (a profile was off), and that is no state in which a fetch gets out."""
+    return _fw_pressing > 0 or (bool(_fw_settings.isolated) and _fw_settings.stage != "isolated")
+
+
+def _fw_state_can_fetch():
+    """``can_fetch`` of the state, for any address: False while the cut may stand or the rule list names the cut rule,
+    True only when the list was read and names none, and None when it is not known (nothing read yet, or unreadable):
+    a cut rule a crash left behind can stand with no marker, and an unread list must not be taken for its absence.
+    The list is never read for this, so the state costs no call for it; the polls of the tab fill it."""
+    if _fw_cut_may_stand():
+        return False
+    listed = _fw_cut_rule_listed()
+    return None if listed is None else not listed
+
+
+def _fw_isolate_verified(allowed, off):
+    """``verified`` of the state: whether what closes the egress in this stage was read back. None while not isolated.
+
+    In **every** stage it needs every firewall profile read and on (``off == []``): a rule does nothing on a profile
+    whose firewall is off, so a rule read back as written is not in force there. ``cut()`` refuses while a profile is
+    off, so in the cut stages this is a profile switched off after the cut, the case that must not read as closed.
+    In ``cut`` and ``cut_policy`` it is the catch-all rule as the press read it back (or ``converge`` in
+    ``cut_policy``), **and** the newest read of that rule younger than the isolate TTL still finding it in the
+    catch-all shape (_fw_cut_stands: the rule list a poll read, or one ``Get``): the press's read-back is one moment,
+    and a rule removed or disabled from outside afterwards must stop reading as closed, all the more in
+    ``cut_policy``, where the rule is the only thing holding the egress for as long as the stage lasts. Nothing about
+    the Allow list: a Block rule beats every Allow rule. In ``isolated`` the rule
+    is gone, so it is the default action Block in force on every profile, all of them on, **and** the Allow list as
+    read now empty: either changed from outside (a group policy refresh, a rule switched on again) makes it False,
+    and TDC writes nothing by itself about that (it changes enforcement on a press only)."""
+    if not _fw_settings.isolated:
+        return None
+    if off != []:                                  # a profile off, or the profiles unreadable: nothing confirmed in force
+        return False
+    stage = _fw_settings.stage
+    if stage == "isolated":
+        # the cut rule is gone here, so the default action is the one thing that holds the egress: Block in force
+        # on all three profiles, read now, and nothing let out beside it
+        blocking = _fw_outbound_blocking()
+        return (allowed == [] and blocking is not None
+                and sorted(blocking) == sorted(firewall_rules.PROFILE_NAMES))
+    if stage in ("cut", "cut_policy"):
+        return _fw_cut_verified is True and _fw_cut_stands()
+    return False                                   # a marker with stage open: nothing in force was read back
+
+
+def _fw_isolate_state():
+    # A way out that a fetch could not close again: the analyst has to be able to see it. Read without the
+    # lock, because the sweep can hold that across a PowerShell call and this route must not wait for it:
+    # list(dict.values()) is one atomic step, so the snapshot is never a half-changed dict.
+    open_paths = [dict(entry) for entry in list(_fw_fetch_open.values())]
+    in_flight = sum(state.get("holders", 0) for state in list(_fw_fetch_paths.values()))
+    isolated = bool(_fw_settings.isolated)
+    out = {"isolated": isolated, "outbound_before": _fw_settings.outbound_before,
+           "isolated_since": _fw_iso(_fw_settings.isolated_since), "ask_mode": _fw_settings.ask_mode,
+           "settings_error": _fw_settings.load_error, "startup": _fw_startup,
+           "stage": _fw_settings.stage if isolated else "open", "converging": bool(_fw_converge_running),
+           "converge_note": _fw_converge_note,
+           "can_fetch": _fw_state_can_fetch(),
+           "profiles_off": None, "profiles_error": None, "residual": FIREWALL_ISOLATED_RESIDUAL,
+           "allowed_out": None, "allowed_out_error": None,
+           "allow_disabled": len(_fw_settings.allow_disabled or ()),
+           "fetch_paths_open": open_paths, "fetches_in_flight": in_flight}
+    # Everything above is in memory and as fresh as the request; only the profiles and, while ISOLATED is on,
+    # what it does not close cost PowerShell (both cached)
+    out["profiles_off"], out["profiles_error"] = _fw_profiles_off()
+    out["allowed_out"], out["allowed_out_error"] = _fw_allowed_out()
+    out["verified"] = _fw_isolate_verified(out["allowed_out"], out["profiles_off"])
+    return out
+
+
+@app.route("/api/firewall/isolate", methods=["GET", "POST"])
+def api_firewall_isolate():
+    """GET: the state (isolated, the remembered outbound action, which firewall profiles are off, the start-up
+    note, ``residual``: what ISOLATED does not close, ``allowed_out``: Windows' own outbound Allow rules that are
+    still enabled while ISOLATED is on, read back (``null`` with no ``allowed_out_error`` while it is off and in stage
+    ``cut``, where they are not read on purpose because the catch-all rule closes whatever they allow; ``null`` with
+    ``allowed_out_error`` when they could not be read), ``allow_disabled``: how many of them ISOLATED holds switched off, and
+    ``fetch_paths_open``: a way out of a finished fetch that would not close again — all for the banner).
+    POST ``{on: bool}``: switch ISOLATED; 409 when the Windows Firewall is off (it would accept the change and do nothing).
+
+    ISOLATED on has two stages. The press writes one catch-all outbound Block rule, reads it back and answers
+    (``stage`` ``cut``, ``converging`` true, ``verified``: that rule read back); the thorough part runs afterwards in
+    one background worker (Windows' own Allow rules switched off, the default Block, then the rule dropped: ``stage``
+    ``isolated``, or kept where something still lets traffic out: ``cut_policy``). GET adds ``stage``,
+    ``converging`` (the worker runs), ``converge_note`` (what its last round said, or why it failed), ``verified``
+    (see _fw_isolate_verified) and ``can_fetch``: **always false in** ``cut`` **and** ``cut_policy``, because no
+    per-fetch Allow exception gets through a catch-all Block rule, so TDC cannot secure a sample there. Leaving stops
+    the worker at its next step and works from any stage."""
+    if request.method == "GET":
+        return _fw_json(_fw_isolate_state())
+    data, problem = _fw_body(("on",), ("on",))
+    if problem or not isinstance(data["on"], bool):
+        return _fw_error(problem or "on must be true or false", 400)
+    on = data["on"]
+    # The flag goes up before the call: converge holds firewall_rules' lock, and only sees the flag between its steps
+    # (and between the chunks of switching Windows' Allow rules off)
+    stopped = _fw_converge_cancel(leaving=not on)
+    # No separate profile check first: isolate reads the profiles itself, in its first call, and refuses with
+    # ProfileOffError (nothing changed) while one is off. Every PowerShell call costs seconds.
+    done = None
+    read_at = None
+    try:
+        done = firewall_rules.isolate(_fw_runner, on, settings=_fw_settings)
+        # its read-back of the cut rule is the last thing isolate() did: stamped when it returned, so a poll's List
+        # that began during the press, before Cut wrote, never outranks it
+        read_at = time.monotonic()
+    except firewall_rules.ProfileOffError as e:
+        return _fw_error(str(e), 409)
+    except firewall_rules.RuleError as e:
+        if on:
+            _fw_unsee_cut()     # cut() can fail after it wrote: what the cut rule is now is not known
+        return _fw_error(str(e), 500)
+    finally:
+        try:
+            _fw_forget_rules()
+            if on and done is not None:
+                _fw_saw_cut(bool(done["verified"]), read_at)    # the press's Cut read the rule back
+                # only the press's own read-back counts as verified; converge's answer is never laid over it
+                _fw_converge_start(done["verified"])
+            elif on and stopped and _fw_settings.isolated:
+                _fw_converge_start(None)       # a refused press stopped the round of an isolation that stays on
+        finally:
+            # each counter comes down whatever the lines above did, or can_fetch (a press) and every convergence (a
+            # leave) would stay held until a restart
+            if on:
+                _fw_pressed()              # after the start: the stage the press saved now says what holds
+            else:
+                _fw_left()
+    if done.get("profiles_off") is not None:
+        _fw_keep_profiles(done["profiles_off"])                                      # just read back
+    if on:
+        done = dict(done, converging=bool(_fw_converge_running))
+    return _fw_json(dict(done, state=_fw_isolate_state()))
+
+
+def _fw_can_fetch(finding):
+    """Whether TDC's own fetch could reach the finding's endpoint: False while the cut may stand (stages ``cut`` and
+    ``cut_policy``, or a marker in any stage but ``isolated``: no per-fetch Allow exception gets through a catch-all
+    Block rule), False while the rule list names the cut rule (a crash can leave one without a marker), False while a
+    block for every program stands there (``block_fetch`` is refused then, and the deadline only blocks), None when
+    the rules cannot be read."""
+    if _fw_cut_may_stand():
+        return False
+    found, _ = _fw_rules()
+    if found is None:
+        return None
+    if any(r.get("name") == firewall_rules.CUT_RULE for r in found):
+        return False
+    return not _fw_address_wide_block(finding)
+
+
+@app.route("/api/firewall/pending")
+def api_firewall_pending():
+    """Open decisions with their remaining seconds and ``can_fetch`` (see ``_fw_can_fetch``), the decisions
+    of the last 24 h (``history``), ``isolated``, and ``startup``: what the firewall was like when this server
+    started (``{id, announce, note}``, ``null`` until it was read) - the poll every tab runs, so a restart into
+    ISOLATED or into a shut egress is told on whatever tab the analyst is on, once per ``id``."""
+    now = time.time()
+    startup = None
+    if isinstance(_fw_startup, dict):
+        startup = {"id": _FW_START_ID, "announce": bool(_fw_startup.get("announce")), "note": _fw_startup.get("note")}
+    return _fw_json({"pending": [dict(_fw_item_view(i, now), can_fetch=_fw_can_fetch(i["finding"])) for i in _fw_pending.open()],
+                     "history": [_fw_item_view(i, now) for i in _fw_pending.history(100)],
+                     "ask_mode": _fw_settings.ask_mode, "decide_seconds": _firewall_decide_seconds(),
+                     "isolated": bool(_fw_settings.isolated), "startup": startup,
+                     "server_time": _fw_iso(now)})
+
+
+@app.route("/api/firewall/decide", methods=["POST"])
+def api_firewall_decide():
+    """Decide an open item. Body: exactly ``{id, action}``, action ``allow``, ``block`` or ``block_fetch``.
+
+    There is no URL here and there never will be: a URL would let malware in the guest use TDC as its proxy.
+    An id works once; a second answer gets the decision that was taken, with 200."""
+    data, problem = _fw_body(("id", "action"), ("id", "action"))
+    if problem:
+        return _fw_error(problem, 400)
+    item_id, action = data["id"], data["action"]
+    if not isinstance(item_id, str) or action not in firewall_store.DECISIONS:
+        return _fw_error("id is text and action is one of " + ", ".join(firewall_store.DECISIONS), 400)
+    item = _fw_pending.get(item_id)
+    if item is None:
+        return _fw_error("No such decision; it may be older than 24 hours.", 404)
+    if item["action"] is None and action == "block_fetch":
+        reason = _fw_fetch_refusal(item["finding"])
+        if reason:
+            return _fw_error(_fw_refusal_text(reason), 409)
+    try:
+        item, won = _fw_decide(item_id, action, "analyst")
+    except KeyError:
+        return _fw_error("No such decision; it may be older than 24 hours.", 404)
+    except _FwFetchRefused as e:
+        return _fw_error(_fw_refusal_text(str(e)), 409)
+    return _fw_json({"id": item_id, "action": item["action"], "won": won, "item": _fw_item_view(item, time.time())})
+
+
+@app.route("/api/firewall/ask", methods=["POST"])
+def api_firewall_ask():
+    """Set the ASK switch. Body: ``{mode: "detonation" | "all" | "off"}`` (kept on the server)."""
+    data, problem = _fw_body(("mode",), ("mode",))
+    if problem or data["mode"] not in firewall_store.ASK_MODES:
+        return _fw_error(problem or "mode must be one of " + ", ".join(firewall_store.ASK_MODES), 400)
+    try:
+        _fw_settings.set(ask_mode=data["mode"])
+    except OSError as e:
+        return _fw_error(f"The setting could not be saved: {e}", 500)
+    return _fw_json({"ask_mode": _fw_settings.ask_mode})
+
+
+@app.route("/api/firewall/enable", methods=["POST"])
+def api_firewall_enable():
+    """Switch the Windows Firewall on for Domain, Private and Public. Body: ``{}``.
+
+    TDC never does this by itself: it changes what the malware sees, so it is the analyst's call (the UI asks
+    first). Answers ``{enabled, profiles_off, state}`` (``state`` as GET /isolate); 500 when a profile stays off."""
+    data, problem = _fw_body(())
+    if problem:
+        return _fw_error(problem, 400)
+    try:
+        firewall_rules.enable_firewall(_fw_runner)
+    except firewall_rules.RuleError as e:
+        _fw_forget_rules()
+        state = _fw_isolate_state()
+        return _fw_json({"error": _fw_reason(e), "enabled": False, "profiles_off": state["profiles_off"],
+                         "state": state}, 500)
+    _fw_forget_rules()
+    state = _fw_isolate_state()
+    return _fw_json({"enabled": True, "profiles_off": state["profiles_off"], "state": state})
+
+
+@app.route("/api/firewall/kill", methods=["POST"])
+def api_firewall_kill():
+    """End a process with ``taskkill /PID <pid> /F``. Body: ``{pid}``.
+
+    Only a process the tab shows, and only the one that made its connections: the process holding ``pid`` now
+    must have started no later than (``FIREWALL_KILL_CLOCK_SLACK_S``) a connection the collector saw under that
+    pid, or Windows has given the pid to another process since. The image and TDC's own check come from those
+    connections alone. 409 otherwise (also for a pid ``firewall_rules.kill`` refuses), 500 when taskkill fails."""
+    data, problem = _fw_body(("pid",), ("pid",))
+    if problem:
+        return _fw_error(problem, 400)
+    pid = data["pid"]
+    if isinstance(pid, bool) or not isinstance(pid, int):
+        return _fw_error("pid is a number", 400)
+    flows, _ = _fw_classified(None, None)
+    named = [f for f in flows if f["pid"] == pid]
+    if not named:
+        return _fw_error(f"PID {pid} is not a process with connections in this tab.", 409)
+    started = _process_started_at(pid)
+    if started is None:
+        return _fw_error(f"PID {pid} is not running, or its start time cannot be read, so it is not killed.", 409)
+    # A connection the running process can have made: not before it started (the same test as the detonation
+    # windows use against a reused submission PID)
+    mine = [f for f in named if f["last_seen"] >= started - FIREWALL_KILL_CLOCK_SLACK_S]
+    if not mine:
+        return _fw_error(f"PID {pid} now belongs to a process that started after its connections were seen: "
+                         "Windows has given the PID to another process, which is not killed.", 409)
+    if any(f["self"] for f in mine):
+        return _fw_error(f"PID {pid} is one of TDC's own processes; it is not killed from here.", 409)
+    try:
+        firewall_rules.kill(_fw_runner, pid)
+    except firewall_rules.RuleError as e:
+        return _fw_error(_fw_reason(e), 409 if "may be killed" in str(e) else 500)
+    return _fw_json({"pid": pid, "killed": True, "image": mine[0]["image"]})
+
+
+@app.route("/api/firewall/captures")
+def api_firewall_captures():
+    """The secured samples, newest first."""
+    return _fw_json({"captures": list(reversed(_capture_store()))})
+
+
+@app.route("/api/firewall/capture/<capture_id>")
+def api_firewall_capture(capture_id):
+    """One capture with its metadata, and whether its file is still there."""
+    cap = next((c for c in _capture_store() if c["id"] == capture_id), None)
+    if cap is None:
+        return _fw_error("Capture not found.", 404)
+    path = cap.get("path")
+    return _fw_json(dict(cap, exists=isinstance(path, str) and os.path.isfile(path)))
+
+
+# --- Own dashboards (Dashboard tab) -------------------------------------
+# A tile is a saved log search; nothing is computed here. The browser fetches
+# every tile's numbers from /api/logs/search, one tile after the other.
+DASHBOARDS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dashboards.json")
+_default_dashboard_store = dashboards.DashboardStore(DASHBOARDS_FILE)
+_dashboards = _default_dashboard_store
+
+# What a body may carry; anything else is named in a 400 so a typo is visible.
+_DASHBOARD_FIELDS = frozenset(("name",))
+_PANEL_FIELDS = frozenset(("name", "query", "form", "earliest", "latest"))
+_PANEL_PATCH_FIELDS = frozenset(("name", "form", "move"))
+DASHBOARD_SAVE_ERROR = "The dashboards could not be saved; see the web UI log."
+
+
+def set_dashboard_store(store):
+    """Use ``store`` for the own dashboards (tests); ``None`` goes back to the default one."""
+    global _dashboards
+    _dashboards = store if store is not None else _default_dashboard_store
+
+
+def _dashboard_body(allowed):
+    """``(body, None)`` for a JSON object that only carries ``allowed`` fields,
+    else ``(None, answer)`` with the 400 that says what was wrong."""
+    body = request.get_json(silent=True)
+    if not isinstance(body, dict):
+        return None, (jsonify({"error": "JSON object body required"}), 400)
+    unknown = sorted(set(body) - allowed)
+    if unknown:
+        return None, (jsonify({"error": f"unknown field(s): {', '.join(unknown)}"}), 400)
+    return body, None
+
+
+def _dashboard_answer(key, work, status=200):
+    """Run one write on the store and answer in the house style: the reason with
+    400 for a refused value or a reached limit, 404 for a dashboard or tile that
+    is gone (another browser tab deleted it), 500 for a write that failed."""
+    try:
+        value = work()
+    except dashboards.Invalid as e:         # LimitReached is one of these
+        return jsonify({"error": str(e)}), 400
+    except dashboards.NotFound as e:
+        return jsonify({"error": str(e)}), 404
+    except Exception:
+        # Everything else - a failed write, or a bug in the store - answers the
+        # documented message; the log entry stays neutral about which it was, the
+        # traceback says it.
+        _log_logger.exception("a dashboard write failed (%s)", getattr(_dashboards, "path", "?"))
+        return jsonify({"error": DASHBOARD_SAVE_ERROR}), 500
+    return jsonify({key: value} if key else {"deleted": True}), status
+
+
+@app.route("/api/dashboards", methods=["GET", "POST"])
+def api_dashboards():
+    """The own dashboards with their tiles, or add one. POST body: {"name"}."""
+    if request.method == "GET":
+        return jsonify({"dashboards": _dashboards.all()})
+    body, error = _dashboard_body(_DASHBOARD_FIELDS)
+    if error:
+        return error
+    return _dashboard_answer("dashboard", lambda: _dashboards.add(body.get("name")), 201)
+
+
+@app.route("/api/dashboards/<did>", methods=["PATCH", "DELETE"])
+def api_dashboard(did):
+    """Rename a dashboard (body: {"name"}) or delete it with all its tiles."""
+    if request.method == "DELETE":
+        return _dashboard_answer(None, lambda: _dashboards.remove(did))
+    body, error = _dashboard_body(_DASHBOARD_FIELDS)
+    if error:
+        return error
+    return _dashboard_answer("dashboard", lambda: _dashboards.rename(did, body.get("name")))
+
+
+@app.route("/api/dashboards/<did>/panels", methods=["POST"])
+def api_dashboard_panels(did):
+    """Save a search as a tile. Body: {"name", "query", "form", "earliest", "latest"}."""
+    body, error = _dashboard_body(_PANEL_FIELDS)
+    if error:
+        return error
+    return _dashboard_answer("panel", lambda: _dashboards.add_panel(
+        did, body.get("name"), body.get("query"), body.get("form"),
+        body.get("earliest", ""), body.get("latest", "")), 201)
+
+
+@app.route("/api/dashboards/<did>/panels/<pid>", methods=["PATCH", "DELETE"])
+def api_dashboard_panel(did, pid):
+    """Change a tile (body: {"name", "form", "move"}, ``move``: "up"/"down") or delete it."""
+    if request.method == "DELETE":
+        return _dashboard_answer(None, lambda: _dashboards.remove_panel(did, pid))
+    body, error = _dashboard_body(_PANEL_PATCH_FIELDS)
+    if error:
+        return error
+    return _dashboard_answer("panel", lambda: _dashboards.update_panel(
+        did, pid, name=body.get("name"), form=body.get("form"), move=body.get("move")))
+
+
+# --- The offline wiki -------------------------------------------------------
+# `make docs` (or `.\make.ps1 docs`) builds docs/ into one self-contained file
+# beside this app; the three deploy paths carry it up when it is there. It is
+# generated, so it may be missing: the help asks here and shows either the link
+# or the way to build it. Flask serves the file itself as a static file, so
+# nothing reads 15 MB into memory here.
+WIKI_FILE = os.path.join(APP_DIR, "static", "wiki.html")
+
+
+@app.route("/api/wiki")
+def api_wiki():
+    """The offline wiki: {"present", "built"} - its mtime in UTC, or null."""
+    try:
+        if not os.path.isfile(WIKI_FILE):
+            return jsonify({"present": False, "built": None})
+        # The aware form, not utcfromtimestamp, which Python 3.12 deprecates
+        built = datetime.datetime.fromtimestamp(os.path.getmtime(WIKI_FILE),
+                                                datetime.timezone.utc)
+    except OSError:
+        # Unreadable directory, a path that is no longer there: the help says
+        # how to build one rather than linking a file nobody can serve.
+        return jsonify({"present": False, "built": None})
+    return jsonify({"present": True, "built": built.strftime("%Y-%m-%dT%H:%M:%SZ")})
+
+
 # --- Main ---
 # Start background alert loader (works with both direct run and import by dev_server)
 # When Flask reloader is active, only start in the child process to avoid duplicate threads
@@ -11279,6 +15602,7 @@ if not _background_disabled and (_is_reloader_child or not _reloader_active):
     loader.start()
     _start_update_check_thread()
     _start_log_collector_thread()
+    _start_firewall()
 
 if __name__ == "__main__":
     print(f"[*] Detonation Chamber UI starting on http://0.0.0.0:{WEBUI_PORT}")
@@ -11286,6 +15610,7 @@ if __name__ == "__main__":
     print(f"    Detonator API:   {DETONATOR_API}")
     print(f"    Agent API:       {DETONATOR_AGENT_API}")
     print(f"    LitterBox:       {LITTERBOX_API}")
+    _fw_keep_call_log()
 
     # 0.0.0.0 keeps the UI reachable from the host over the VM network; set
     # WEBUI_HOST=127.0.0.1 to restrict it to the VM itself.

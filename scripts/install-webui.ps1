@@ -99,5 +99,11 @@ New-NetFirewallRule -DisplayName "Detonation Chamber UI" -Direction Inbound -Loc
 Add-MpPreference -ExclusionPath "C:\WINDOWS\TEMP\scan_uploads" -ErrorAction SilentlyContinue
 Add-MpPreference -ExclusionPath "$env:TEMP\scan_uploads" -ErrorAction SilentlyContinue
 
+# The FIREWALL tab saves the stage-2 files it fetches here. Without the exclusion Defender eats them before
+# anyone looks. It is a TDC directory, not the detonation path, so the EDR tests stay meaningful. The web UI
+# makes the directory and the same exclusion at its own start-up as well, for a VM that only got a deploy.
+New-Item -ItemType Directory -Path "C:\tdc\samples" -Force | Out-Null
+Add-MpPreference -ExclusionPath "C:\tdc\samples" -ErrorAction SilentlyContinue
+
 Write-Host "[+] Web UI installed at $webuiDir" -ForegroundColor Green
 Write-Host "    URL: http://localhost:9000" -ForegroundColor Gray
