@@ -73,7 +73,7 @@ Daran scheitert die Arbeit, auch wenn sie technisch funktioniert:
   erreichbar. Port 9000 und WinRM müssen durchgehend stehen.
 - Die VM bleibt nach einem abgebrochenen Lauf ohne Netz oder mit einer
   fremden CA im Truststore zurück. Aufräumen muss garantiert sein — wie es
-  `_exit_capture_watch` (`webui/app.py:6340`) mit `finally` schon macht —
+  `_exit_capture_watch` (`webui/app.py:6919`) mit `finally` schon macht —
   plus Aufräumen von Resten beim nächsten Start.
 - Es entsteht ein zweites Scoring neben `memory_evidence`.
 - Die Fingerprint-Datenbank liegt nur in der VM und ist beim nächsten
@@ -168,7 +168,7 @@ Ein neues Feld im Submit-Tab, neben `Target` und `EDR Mode`:
 Bei `online` ändert sich am bestehenden Ablauf **nichts** außer einer
 zusätzlichen passiven Auswertung dessen, was Sysmon schon liefert.
 
-*Nebenbei:* `#submit-edr` (`webui/templates/index.html:1225`) wird im
+*Nebenbei:* `#submit-edr` (`webui/templates/index.html:1574`) wird im
 Frontend nirgends gelesen — ein toter Steuerknopf. Beim Einbauen des
 Modus-Feldes mit aufräumen.
 
@@ -177,7 +177,7 @@ Modus-Feldes mit aufräumen.
 `/api/submit` ist synchron und kehrt zurück, sobald der Agent den Start
 quittiert hat; TDC kennt heute kein Signal „Detonation vorbei". Die zwei
 Vorbilder im Code widersprechen sich: Exit Capture nimmt ein festes Fenster
-(`EXIT_CAPTURE_WINDOW = 120`, `webui/app.py:6164`), `pipe_proxy` hat
+(`EXIT_CAPTURE_WINDOW = 120`, `webui/app.py:6769`), `pipe_proxy` hat
 Start/Stop über die API, `max_duration` und einen Reaper.
 
 Für Netzwerk reicht ein festes Fenster von 120 s **nicht**: ein Beacon mit
@@ -264,7 +264,7 @@ Die Trennung passiert danach, auf drei Wegen:
    `_compute_verdict` es für Alerts schon tut. Nur markierte Events zählen
    fürs Verdict, der Rest steht in den Notizen.
 2. **Netzwerk-Baseline**, nach dem Muster von `_memory_baseline`
-   (`webui/app.py:6151`) und `/api/memory/sweep`: eine Aufnahme auf der
+   (`webui/app.py:6744`) und `/api/memory/sweep`: eine Aufnahme auf der
    sauberen VM, die festhält, welche Namen, Ziele und Muster dort ohnehin
    auftreten. Was in der Baseline steht, wird unterdrückt und gezählt — nicht
    gelöscht.
@@ -287,7 +287,7 @@ Der Fake-Server kennt Quell-Adresse und -Port der Verbindung. Direkt beim
 Accept liefert `GetExtendedTcpTable` (ctypes, Muster aus
 `webui/pipe_backends.py`) die PID. Fällt das Zeitfenster zu knapp aus, wird
 über Zeit, Port und Ziel gegen Sysmon EID 3 korreliert
-(`_sysmon_network_events`, `webui/app.py:4417`).
+(`_sysmon_network_events`, `webui/app.py:4497`).
 
 Der Prozessbaum kommt aus dem, was TDC schon hat (Sysmon, Graph-Tab). Ein
 eigener ETW-Tracer wird **nicht** gebaut.
@@ -309,7 +309,7 @@ Telemetrie daneben mitläuft.
 
 **Die Beacon-Config als Eingabe.** BeaconEye zieht heute schon die
 Beacon-Konfiguration aus dem Prozessspeicher, inklusive `C2Server`; TDC
-benutzt sie nur als Beweisstück (`webui/memory_evidence.py:546`). Der Listener
+benutzt sie nur als Beweisstück (`from_beaconeye`, `webui/memory_evidence.py:913`). Der Listener
 liest sie mit und vergleicht erwartete gegen beobachtete Werte: erwarteter
 Host, erwartetes Sleep, erwarteter Jitter gegen das, was tatsächlich auf der
 Leitung passiert. Eine Abweichung ist selbst ein Befund.
@@ -359,12 +359,18 @@ Dazu eine neue Evidence-Art:
 |---|---|---|---|
 | `payload_staging` | 4.0 | strukturell | Ein nachgeladenes ausführbares Objekt, als Datei belegt — nicht bloß eine URL |
 
+> **Nachtrag (26.11.):** Diese Art ist **schon gebaut**, in Phase 1
+> (`webui/memory_evidence.py:239`, Gewicht 4.0, strukturell,
+> `corroborate: False`), weil ein im Mitschnitt gefundener Download sie
+> ebenso braucht wie eine echt abgeholte Stufe. Phase 3 fügt sie nicht hinzu,
+> sondern speist sie aus der gesicherten Stage.
+
 ### Analyse, Events und Regeln
 
 Dieselben Event-Typen, wie sie sich aus den Protokollen ergeben: `dns`,
 `conn`, `conn_failed`, `tls`, `http`, `udp`, `raw`, `ftp`, `smtp`,
 `websocket`, `download`, `upload`, `decoded`, `beacon`, `retry`, `fanout`.
-Die Feldnamen richten sich am bestehenden Alert-Schema (`webui/app.py:1046`)
+Die Feldnamen richten sich am bestehenden Alert-Schema (`parse_rustinel_alert`, `webui/app.py:971`)
 aus. Jeder Lauf schreibt `events.json` mit allen Feldern — das ist das
 Material, aus dem man Regeln schreibt.
 
@@ -399,10 +405,10 @@ Startregelsatz dazu.
 ### Einhängen in das Evidence-Modell
 
 `webui/memory_evidence.py` ist schon tool-agnostisch und hat mit
-`c2_beaconing` (`:121`) und `beacon_config` (`:126`) genau die passenden
+`c2_beaconing` (`:142`) und `beacon_config` (`:146`) genau die passenden
 Arten. Netzwerk-Befunde kommen als neue `KINDS` dazu und werden über
 `evidence_findings` eingespeist — demselben Weg, den `network_beaconing` und
-`named_pipes` in `_compute_verdict` (`webui/app.py:4729`) schon nehmen.
+`named_pipes` in `_compute_verdict` (`webui/app.py:4806`) schon nehmen.
 
 Vorgeschlagene neue Arten (Gewichte sind Vorschläge und wollen an echten
 Läufen kalibriert werden):
@@ -418,6 +424,18 @@ Läufen kalibriert werden):
 | `tls_ja3_known` | 2.5 | strukturell | JA3/JA4 trifft einen katalogisierten Client |
 | `dga_pattern` | 2.0 | behavioral | Namen mit DGA-Charakter, NXDOMAIN-Salven |
 
+> **Nachtrag (26.11.):** Alle acht sind in Phase 1 gebaut, mit **genau diesen
+> Gewichten und Klassen** — keine wurde verschoben. Dazugekommen ist, was die
+> Tabelle nicht vorsah: `corroborate` je Art (`exfil_upload`,
+> `credential_in_transit`, `dga_pattern` stehen allein; die übrigen brauchen
+> eine zweite Quelle) und `supersedes` bei `c2_checkin`.
+>
+> **Die Kalibrierung ist damit aber nicht erledigt, sondern offen.** Phase 1
+> hat nur Mitschnitte gelesen; echte Läufe, an denen die Tabelle kalibriert
+> werden wollte, gibt es erst ab Phase 2. Dass die Zahlen im Code stehen,
+> heißt nur, dass der Vorschlag umgesetzt wurde — nicht, dass er geprüft ist.
+> Wer Phase 2 abschließt, soll sie an den ersten echten Läufen nachmessen.
+
 **Doppelzählung muss verhindert werden, sonst bricht „ein Verdict" leise.**
 `_network_beaconing_for_pid` liefert heute schon `c2_beaconing` (3.0) aus
 Sysmon EID 3. Im abgeschotteten Modus sind **wir** der Grund, warum die
@@ -432,6 +450,10 @@ Zwei Festlegungen:
   und denselben Endpunkt. Die Beobachtung aus Sysmon bleibt als Bestätigung
   stehen, zählt aber nicht zweimal. Das braucht eine
   Verdrängungsbeziehung zwischen Arten, die `memory_evidence` heute nicht hat.
+  > **Nachtrag (26.11.):** gebaut. `KINDS` trägt jetzt ein `supersedes`-Feld
+  > (`c2_checkin` verdrängt `c2_beaconing`), und die Entscheidung fällt pro
+  > zusammenhängender Gruppe über die ganze Befundmenge statt gierig — gierig
+  > war nicht monoton und hing von der Reihenfolge ab.
 - **Confidence je Modus:** Im abgeschotteten Modus belegen `exfil_upload` und
   `credential_in_transit`, dass das Sample es **versucht** hat — unser eigener
   Server hat die Daten angenommen, kein echtes C2. Sie bekommen dort einen
@@ -445,7 +467,7 @@ in Phase 3 nachgepatcht.
 ### Fingerprint
 
 Pro Lauf ein JSON-Objekt in `webui/network_fingerprints.json` (newest-first,
-begrenzt, atomar geschrieben — wie `submissions.json`, `webui/app.py:757`):
+begrenzt, atomar geschrieben — wie `submissions.json`, `_record_submission` (`webui/app.py:853`) und `_save_submissions` (`:808`)):
 
 - JA3 und JA4 des Clients, TLS-Versionen, Cipher-Reihenfolge
 - Beacon-Intervall und Jitter, gemessen statt behauptet
@@ -471,7 +493,7 @@ Passwort.
 `synced_folder` (`Vagrantfile:53`, `Vagrantfile.utm:151`), es gibt also keinen
 host-sichtbaren Pfad: der Gast kann nichts auf den Host legen. Die Sicherung
 muss daher vom Host **geholt** werden, über die bestehende HTTP-Schnittstelle
-(`WEBUI_URL`, `Makefile:52`):
+(`WEBUI_URL`, `Makefile:56`):
 
 - `make submit FILE=…` holt nach dem Lauf automatisch ab und legt die Datei
   host-seitig ab. Für den CLI-Weg ist damit nichts zu vergessen.
@@ -504,7 +526,7 @@ C:\dumps\network\<zeit>_<sha256-prefix>\
 ```
 
 Gekürzt wie die anderen Sammlungen (`NETWORK_KEEP`, Muster
-`_exit_capture_prune`, `webui/app.py:6291`).
+`_exit_capture_prune`, `webui/app.py:6896`).
 
 ## UI
 
@@ -513,7 +535,7 @@ NETWORK-Tab**.
 
 ### Panel im Submit-Tab
 
-In `renderDetonationPanels()` (`webui/static/js/app.js:8471`) ein Eintrag
+In `renderDetonationPanels()` (`webui/static/js/app.js:9715`) ein Eintrag
 `Network` im `tabs`-Array, und im Ergebnisbereich ein kompaktes Panel neben
 `LIVE MEMORY`: was beantwortet wurde, was der C2-Listener getan hat, was
 **nicht** beantwortet wurde (die festen IP-Adressen), und der
@@ -538,14 +560,14 @@ Kette der Läufe, die daraus entstanden sind.
 ### Tracing
 
 `HTTP REQUESTS`, `CONNECTIONS` und `DNS REQUESTS`
-(`webui/templates/index.html:384-394`) ziehen aus derselben Quelle, statt
+(`webui/templates/index.html:407-409`) ziehen aus derselben Quelle, statt
 weiter auf `0` zu stehen. Die Heuristik, die heute Netzwerk-Events nach Port
-80/443 filtert (`webui/static/js/app.js:4178`), wird durch echte HTTP-Events
+80/443 filtert (`renderRtraceEventTable`, `webui/static/js/app.js:5421`), wird durch echte HTTP-Events
 ersetzt, wo es welche gibt.
 
 ### Pflichten beim neuen Tab
 
-Aus `docs/superpowers/plans/2026-11-22-syscalls.md:1002`: Tab-Button und
+Aus `docs/superpowers/plans/2026-11-22-syscalls.md:1086` (Task 11, „Tab und Karte“): Tab-Button und
 `tab-content` mit `data-info`, Eintrag in `#help-usage` an derselben Position,
 neue Routen in `#help-api`, `?v=`-Versionen hochzählen, Farben nur über
 `themeColor()`, Werte in `style.css :root` **und**
@@ -555,8 +577,8 @@ einmal in der API-Tabelle, neue Dateien in alle drei Deploy-Pfade
 (`scripts/deploy-utm.py:39`, `Makefile` `deploy`, `make.ps1` `'deploy'`).
 
 Diese Tests brechen garantiert und müssen mit:
-`tests/test_theme.py:3037` (Tab-Zahlen), `tests/test_docs.py:54`, `:62`,
-`:72`, `tests/test_frontend.py:147`.
+`tests/test_theme.py:3136` (Tab-Zahlen), `tests/test_docs.py:116`, `:128`,
+`:138`, `tests/test_frontend.py:148`.
 
 ## Herkunft: NetLens ist Vorbild, nicht Quelle
 
@@ -576,7 +598,7 @@ Was dennoch unproblematisch ist, weil es nicht NetLens gehört:
 - **Die Event-Typen** (`dns`, `conn`, `tls`, `http`, `ftp`, `smtp`, …) folgen
   aus den Protokollen selbst, nicht aus NetLens. Die Feldnamen werden aus
   TDCs eigenen Daten abgeleitet und am bestehenden Alert-Schema
-  (`webui/app.py:1046`) ausgerichtet, nicht an NetLens' Schema.
+  (`parse_rustinel_alert`, `webui/app.py:971`) ausgerichtet, nicht an NetLens' Schema.
 - **`198.18.0.0/15`** ist RFC 2544, kein fremdes Werk.
 - **Der Ansatz** — Namen fälschen, Protokolle beantworten, TLS terminieren,
   Verhalten über Zeit bewerten — ist Allgemeingut der Malware-Analyse
@@ -627,6 +649,13 @@ lebendig und erlaubt, fremde pcaps auszuwerten.
 - Die Aufteilung in Module. Vorschlag: `webui/net_capture.py` (Diverter,
   Server, Session), `webui/net_analyze.py` (Flows, Parser, Dekodierung),
   `webui/net_rules.py` (Regel-Engine), `webui/net_fingerprint.py`.
+  > **Nachtrag (26.11.):** Phase 1 hat feiner geteilt als vorgeschlagen.
+  > `net_analyze.py` ist nur die Orchestrierung; Flows, Parser und
+  > Dekodierung liegen je für sich (`net_flows`, `net_events`, `net_dns`,
+  > `net_http`, `net_tls`, `net_mail_ftp`, `net_raw`, `net_decode`), dazu
+  > `net_behavior`, `net_evidence` und `net_baseline`. `net_rules.py` heißt
+  > wie vorgeschlagen. `net_capture.py` (Phase 2) und `net_fingerprint.py`
+  > (Phase 4) gibt es noch nicht.
 - Die Liste der vorab gebundenen Ports und die glaubwürdigen Antworten.
 - Die Gewichte der neuen Evidence-Arten — die Tabelle oben ist ein
   Startpunkt, kalibriert wird an echten Läufen.
@@ -670,7 +699,7 @@ Ohne dass danach gefragt wurde, als Vorschlag erkennbar:
   VMs verfügbar sind — damit die Logik host-seitig testbar bleibt.
 - Die Passthrough-Allowlist ist ein freies Feld in der UI, nicht eine
   server-seitig vorgenehmigte Liste. Die UI hat kein Login, darf aber schon
-  heute Malware starten (`webui/app.py:53`: „lab tool on an isolated
+  heute Malware starten (`webui/app.py:88`: „lab tool on an isolated
   network"); eine strengere Regel nur für die Allowlist wäre inkonsistent.
 - Der tote `#submit-edr`-Knopf wird beim Einbauen des Modus-Feldes aufgeräumt.
 
