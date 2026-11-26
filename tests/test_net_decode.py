@@ -104,6 +104,10 @@ Regressions covered:
     neither flagged nor masked; a CDATA value is read, and the first element
     inside a secret named in the singular is looked into (not inside a
     plural such as ``<keys>``) (Ruling 78 follow-up)
+  * an unclosed CDATA section was read to its 4096-character bound again for
+    every secret tag after it: ``<pwd><![CDATA[`` repeated took 5.8 s per MB of
+    masking, 50 s for a 191 KB capture; the end of a CDATA is searched for once
+    per stretch of text (``_CdataEnds``) (round-2 review, Important)
 """
 
 import base64
@@ -1406,3 +1410,35 @@ def test_a_plural_secret_is_not_read_through_an_element():
                  "<credentials><site>bank.example</site></credentials>"):
         assert not net_decode._is_credential("body_text", "", _Text(text)), text
         assert net_decode.mask_credentials(text) == text
+
+
+def test_unclosed_cdata_sections_are_searched_once_not_once_per_tag(monkeypatch):
+    made = []
+    real = net_decode._CdataEnds
+
+    class Counted(real):
+        def __init__(self, text):
+            super().__init__(text)
+            made.append(self)
+    monkeypatch.setattr(net_decode, "_CdataEnds", Counted)
+    calls = {"n": 0}
+    for name in ("_XML_TEXT", "_XML_CDATA", "_XML_CHILD"):
+        pattern = getattr(net_decode, name)
+
+        class Proxy:
+            def __init__(self, pattern):
+                self.pattern = pattern
+
+            def match(self, *args):
+                calls["n"] += 1
+                return self.pattern.match(*args)
+        monkeypatch.setattr(net_decode, name, Proxy(pattern))
+    unit = "<pwd><![CDATA["
+    text = unit * 20000
+    masked = net_decode.mask_credentials(text, lines=True)
+    assert masked == text                       # nothing closed, nothing masked
+    scanned = sum(m.scanned for m in made)
+    assert scanned <= 2 * len(text), scanned    # was ~4096 characters per tag
+    assert calls["n"] <= 4 * 20000 * 2, calls   # a few matches per tag, flag and mask
+    closed = "<pwd><![CDATA[Val-9]]>" * 2000
+    assert "Val-9" not in net_decode.mask_credentials(closed)

@@ -749,7 +749,9 @@ _SECRET_PERCENT = re.compile(
 # ``<author>`` and ``<authority>`` are no secrets.
 _XML_TAG = re.compile(r"<([A-Za-z_][\w.:-]{0,64})(?:\s[^<>]{0,256})?>")
 _XML_CHILD = re.compile(r"\s{0,64}<([A-Za-z_][\w.:-]{0,64})(?:\s[^<>]{0,256})?>")
-_XML_TEXT = re.compile(r"([^<]*[^<\s][^<]*)|\s{0,64}<!\[CDATA\[((?:(?!\]\]>)[\s\S]){1,4096})\]\]>")
+_XML_TEXT = re.compile(r"[^<]*[^<\s][^<]*")
+_XML_CDATA = re.compile(r"\s{0,64}<!\[CDATA\[")
+_CDATA_MAX = 4096                   # characters of a CDATA value read
 _XML_WRAPPERS = frozenset(("value", "val", "v", "string", "str", "data", "text"))
 _XML_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z0-9]+")
 # a word of a tag name that ends in one of these is a secret (``apikey``,
@@ -818,6 +820,27 @@ def _xml_secret_name(name):
     return False, False
 
 
+class _CdataEnds:
+    """The next ``]]>`` at or after a position, each stretch of the text searched
+    once. A CDATA section that is never closed was read to its 4096-character
+    bound again for every tag after it: ``<pwd><![CDATA[`` repeated was 50 s of
+    masking for a 191 KB capture. ``scanned`` counts the characters searched."""
+
+    def __init__(self, text):
+        self.text = text
+        self.start = 0          # the search from here found ``found`` (-1: none to the end)
+        self.found = None
+        self.scanned = 0
+
+    def at(self, pos):
+        if self.found is not None and self.start <= pos and (self.found == -1 or pos <= self.found):
+            return self.found
+        self.start = pos
+        self.found = self.text.find("]]>", pos)
+        self.scanned += (len(self.text) if self.found == -1 else self.found) - pos
+        return self.found
+
+
 def _xml_secret_spans(text):
     """``(start, end)`` of the value of each XML element whose name says secret.
 
@@ -831,6 +854,7 @@ def _xml_secret_spans(text):
     if "<" not in text:
         return spans
     done = 0
+    ends = _CdataEnds(text)
     for tag in _XML_TAG.finditer(text):
         if tag.start() < done:
             continue
@@ -841,9 +865,15 @@ def _xml_secret_spans(text):
         while True:
             value = _XML_TEXT.match(text, pos)
             if value:
-                group = 1 if value.group(1) is not None else 2
-                spans.append((value.start(group), value.end(group)))
-                done = value.end(group)
+                spans.append((value.start(), value.end()))
+                done = value.end()
+                break
+            cdata = _XML_CDATA.match(text, pos)
+            if cdata:
+                end = ends.at(cdata.end())
+                if end > cdata.end() and end - cdata.end() <= _CDATA_MAX:
+                    spans.append((cdata.end(), end))
+                    done = end
                 break
             child = _XML_CHILD.match(text, pos)
             if child is None or depth == 2:
