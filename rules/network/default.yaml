@@ -1,0 +1,357 @@
+# Starter rules for network events (see webui/net_rules.py for the language).
+#
+# Written from how malware behaves on the wire, not taken from another rule set.
+# Each rule is a worked example; copy one and change it rather than starting blank.
+#
+# How to read and extend a rule
+#   event     the event type(s) the rule looks at (dns tls http download upload decoded
+#             ftp smtp beacon retry fanout ...). The fields that exist per type are the
+#             FIELDS table in webui/net_rules.py; a field the type does not have is
+#             refused when the file loads, and the events of a report show real values
+#             (GET /api/network/report?id=<id>, or the NETWORK tab of an imported pcap).
+#   match     field: value is equality (case-insensitive, a list means "any of");
+#             field|op: value with op in re contains startswith endswith in gte lte gt lt
+#             count_gte has_all; any / all / not combine conditions.
+#   behavior  one plain sentence for the report: what the sample DID, not how the rule works.
+#   kind      optional. Points the hit at an evidence art; the art, not the rule, decides
+#             the weight. A rule without kind only annotates.
+#   role      stage | c2 | exfil | recon, so the report can group findings.
+#
+# Things that decide whether a rule can fire
+#   * A regex sees only the first 2048 characters of a field; on a longer field with no
+#     match in that head the answer is "undecided" (listed under `unevaluated`), not "no".
+#     So: regexes for paths, hosts, user agents; contains/startswith/endswith for bodies,
+#     long URLs and decoded text.
+#   * known_good (below) hides these event types from every rule that does not set
+#     include_known_good: true: dns conn conn_failed tls http udp raw ftp smtp websocket
+#     beacon retry. It never hides download, upload or decoded. The name on an event is
+#     the sample's own Host header, SNI or lookup, so a rule on a download does not rely
+#     on it: a PE fetched "from" a Windows Update host still fires net.exe_download.
+#   * A correlation rule (requires) says the same process did all of it. It does not check
+#     the order in time.
+
+lists:
+  # Names a Windows machine talks to on its own. Events whose destination is listed (or
+  # sits below a "*." entry) are invisible to rules; the beacon rule would otherwise report
+  # the OS's own polling as command-and-control. Keep this to what really occurs on every
+  # machine: each name added here is also a name a sample can put in its Host header.
+  known_good:
+    # connectivity checks
+    - www.msftconnecttest.com
+    - ipv6.msftconnecttest.com
+    - dns.msftncsi.com
+    - www.msftncsi.com
+    # Windows Update, Defender updates, Delivery Optimization, SmartScreen
+    - '*.windowsupdate.com'
+    - '*.update.microsoft.com'
+    - '*.mp.microsoft.com'                # Store, delivery.mp, dsp.mp (traffic shaping, Delivery Optimization)
+    - '*.storequality.microsoft.com'
+    - checkappexec.microsoft.com          # app reputation check before a program starts
+    - go.microsoft.com
+    - definitionupdates.microsoft.com
+    - wdcp.microsoft.com
+    - wdcpalt.microsoft.com
+    - '*.smartscreen.microsoft.com'
+    - smartscreen-prod.microsoft.com
+    # certificate revocation lists and OCSP
+    - crl.microsoft.com
+    - mscrl.microsoft.com
+    - www.microsoft.com
+    - ocsp.msocsp.com
+    - ocsp.digicert.com
+    - crl3.digicert.com
+    - crl4.digicert.com
+    - cacerts.digicert.com
+    - ocsp.sectigo.com
+    - crl.sectigo.com
+    - ocsp.usertrust.com
+    - crl.usertrust.com
+    - ocsp.globalsign.com
+    - ocsp.pki.goog
+    - crl.pki.goog
+    - '*.o.lencr.org'
+    # time synchronisation
+    - time.windows.com
+    # telemetry, accounts, push notifications
+    - settings-win.data.microsoft.com
+    - vortex-win.data.microsoft.com
+    - '*.events.data.microsoft.com'
+    - watson.telemetry.microsoft.com
+    - activity.windows.com
+    - login.live.com
+    - login.microsoftonline.com
+    - '*.wns.windows.com'
+    # Edge, which ships with Windows
+    - edge.microsoft.com
+    - msedge.api.cdp.microsoft.com
+    - config.edge.skype.com
+    - ntp.msn.com
+    # content the shell fetches on its own timers (lock screen, widgets, weather, tiles)
+    - arc.msn.com
+    - assets.msn.com
+    - fd.api.iris.microsoft.com
+    - ris.api.iris.microsoft.com
+    - tile-service.weather.microsoft.com
+    # lookups the resolver and the network stack make without being asked
+    - wpad
+    - isatap
+    - '*.in-addr.arpa'
+    - '*.ip6.arpa'
+
+  # Services that tell a caller its own public address. Malware asks to learn where it
+  # runs (geo-fencing, victim report). The two DNS-based ones answer a lookup with the
+  # caller's address.
+  ip_lookup_services:
+    - api.ipify.org
+    - api64.ipify.org
+    - ipinfo.io
+    - ifconfig.me
+    - ifconfig.co
+    - ifconfig.io
+    - icanhazip.com
+    - ipv4.icanhazip.com
+    - checkip.amazonaws.com
+    - checkip.dyndns.org
+    - checkip.dyndns.com
+    - ip-api.com
+    - ipapi.co
+    - ipwho.is
+    - ipwhois.app
+    - ipecho.net
+    - ident.me
+    - myexternalip.com
+    - wtfismyip.com
+    - api.myip.com
+    - bot.whatismyipaddress.com
+    - get.geojs.io
+    - geoplugin.net
+    - www.geoplugin.net
+    - freegeoip.app
+    - api.ip.sb
+    - api.seeip.org
+    - myip.opendns.com
+    - o-o.myaddr.l.google.com
+
+  # File endings that an executable pretends to have when it is served as something else.
+  harmless_endings:
+    - .jpg
+    - .jpeg
+    - .png
+    - .gif
+    - .ico
+    - .bmp
+    - .txt
+    - .css
+    - .js
+    - .html
+    - .htm
+    - .pdf
+    - .doc
+    - .docx
+    - .mp3
+    - .mp4
+
+rules:
+  # --- staging ---------------------------------------------------------------------------
+
+  - id: net.exe_download
+    name: Executable downloaded over HTTP
+    description: >-
+      A response body that starts like a Windows (MZ) or Linux (ELF) executable, in clear
+      text. Installers and updaters usually use HTTPS, so on a sandbox that only runs the
+      sample this is a loader fetching its next stage. Defender definition updates from
+      download.windowsupdate.com have at times been served this way; the rule still fires on them
+      because the host name of a download is not evidence.
+    event: download
+    match:
+      kind: [pe, elf]
+    severity: high
+    role: stage
+    behavior: The sample downloaded an executable file over unencrypted HTTP.
+    attack: T1105
+    kind: payload_staging
+
+  - id: net.disguised_exe_download
+    name: Executable served as an image, text or document
+    description: >-
+      An executable whose URL ends like a picture, a text file or a document, or that the
+      server labelled image/*, text/*, audio/* or video/*. Done to get past filters that
+      judge a download by its name.
+    event: download
+    match:
+      kind: [pe, elf]
+      any:
+        - path|endswith: $harmless_endings
+        - content_type|startswith: [image/, text/, audio/, video/]
+    severity: high
+    role: stage
+    behavior: >-
+      The sample downloaded an executable that was named or labelled as a picture,
+      text file or document.
+    attack: [T1105, T1036]
+
+  - id: net.exe_in_encoded_field
+    name: Executable hidden in an encoded field
+    description: >-
+      A base64, hex or escaped value in a query, header, body or response that decodes to a
+      Windows, Linux or macOS executable. net_decode reports a value only when the result
+      is a known file type or readable text, so this is not a decoded hash or a session id.
+    event: decoded
+    match:
+      kind: [pe, elf, macho]
+    severity: high
+    role: stage
+    behavior: >-
+      The sample sent or received an executable file encoded inside an ordinary HTTP
+      field.
+    attack: [T1105, T1027]
+
+  # --- command and control -----------------------------------------------------------------
+
+  - id: net.gate_post
+    name: POST to a bot gate page
+    description: >-
+      A POST to a PHP page named like the receiving end of a panel: gate.php, bot.php,
+      tasks.php, cmd.php, command.php or fre.php (LokiBot), in any directory. Bots and stealers report to such a
+      page and fetch their orders from it. Ordinary web forms rarely use these names.
+    event: http
+    match:
+      method: POST
+      path|re: '(?i)(^|/)(gate|bot|tasks?|cmd|command|fre)\.php$'
+    severity: high
+    role: c2
+    behavior: >-
+      The sample sent a POST request to a PHP gate page, the way bots and stealers report
+      to their control panel.
+    attack: [T1071.001, T1041]
+    family: Zeus, Pony, LokiBot and other panel-based bots
+
+  - id: net.index_post_without_browser_headers
+    name: POST to index.php without browser headers
+    description: >-
+      Several stealers and loaders (AZORult, Amadey and others) report to a bare index.php
+      (or index.php/route), which ordinary sites use too. What tells them apart is the
+      request: a browser that submits a form sends Origin or Referer, and these clients do
+      not. A script or a command-line tool that posts to an index.php fires this as well; a
+      sample that adds a Referer header does not.
+    event: http
+    match:
+      method: POST
+      path|re: '(?i)(^|/)index\.php(/.*)?$'
+      not:
+        header_order|in: [Origin, Referer]
+    severity: medium
+    role: c2
+    behavior: >-
+      The sample sent a POST request to index.php with none of the headers a browser adds
+      when it submits a form.
+    attack: [T1071.001, T1041]
+
+  - id: net.periodic_checkin
+    name: Regular contact with one host
+    description: >-
+      A beacon event from net_behavior: a series of requests or connections to one name that
+      keeps a rhythm (at least four check-ins, tight spacing). The interval is measured. The
+      operating system's own polling is hidden through known_good; an application that
+      polls on a timer and is not on that list fires too, and the baseline is what tells
+      them apart.
+    event: beacon
+    match:
+      interval|gt: 0
+    severity: medium
+    role: c2
+    behavior: The sample contacted the same host again and again at regular intervals.
+    attack: T1071
+    kind: c2_checkin
+
+  - id: net.chain_exe_then_beacon
+    name: Executable downloaded, then regular contact
+    description: >-
+      The same process fetched an executable over HTTP (or carried one in an encoded field)
+      and checks in at regular intervals. The order is not checked, only that one process
+      did both. A loader that fetched its payload and phones home looks like this.
+    requires:
+      - [net.exe_download, net.exe_in_encoded_field]
+      - [net.periodic_checkin]
+    severity: critical
+    role: c2
+    behavior: >-
+      The same process transferred an executable file in HTTP traffic (received it, sent
+      it, or carried it encoded in a field) and also contacts a host at regular intervals.
+    attack: [T1105, T1071]
+
+  - id: net.nxdomain_burst
+    name: Burst of names that do not exist
+    description: >-
+      Ten or more different names answered NXDOMAIN within one minute. A domain generation
+      algorithm tries names until one is registered. A few failed lookups (a typo) stay
+      below this, and names a machine asks for on its own (reverse lookups under
+      in-addr.arpa, wpad and isatap, single-label host names, .local and .lan) are not
+      counted into the burst: net_behavior leaves them out, because a rule compares the
+      elements of a list as "any of" and cannot say "most of these are infrastructure".
+    event: fanout
+    match:
+      nxdomain: true
+      hosts|gte: 10
+    severity: medium
+    role: c2
+    behavior: >-
+      The sample looked up many different names that do not exist in a short time, as a
+      domain generation algorithm does when it searches for a live command server.
+    attack: T1568.002
+    kind: dga_pattern
+
+  # --- reconnaissance -----------------------------------------------------------------------
+
+  - id: net.ip_lookup
+    name: Public address lookup
+    description: >-
+      A DNS lookup, an HTTP request or a TLS connection to a service whose only purpose is to
+      return the caller's address or location. Run once at start-up it is how malware learns
+      where it is; installers and some legitimate tools do this too, so the weight is low.
+    event: [dns, http, tls]
+    match:
+      dest|in: $ip_lookup_services
+    severity: low
+    role: recon
+    behavior: The sample asked an online service for its own public address.
+    attack: T1016
+    kind: recon_service
+
+  # --- credentials sent in the clear ----------------------------------------------------------
+
+  - id: net.ftp_cleartext_credentials
+    name: FTP login in clear text
+    description: >-
+      A user name and password sent over an FTP control connection that was not upgraded to
+      TLS. Stealers upload what they collect to an FTP server with an account built into the
+      sample. An anonymous login (user anonymous or ftp) does not count: its "password" is an
+      e-mail address given as a courtesy. The password itself is never shown: the event keeps
+      it as a Secret.
+    event: ftp
+    match:
+      password_captured: true
+      not:
+        user: [anonymous, ftp]
+    severity: high
+    role: exfil
+    behavior: >-
+      The sample logged in to an FTP server with a named account and a password sent
+      in clear text.
+    attack: T1048.003
+    kind: credential_in_transit
+
+  - id: net.smtp_cleartext_credentials
+    name: SMTP login in clear text
+    description: >-
+      An AUTH exchange (PLAIN or LOGIN) on a mail connection that was not upgraded with
+      STARTTLS. Stealers mail their harvest through an account built into the sample. The
+      password itself is never shown: the event keeps it as a Secret.
+    event: smtp
+    match:
+      password_captured: true
+    severity: high
+    role: exfil
+    behavior: The sample logged in to a mail server with a password sent in clear text.
+    attack: T1048.003
+    kind: credential_in_transit

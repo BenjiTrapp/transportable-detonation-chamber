@@ -177,6 +177,30 @@ the other tables. Screenshots:
   alerts every 5 s, the dashboard every 10 s), and not while their tab is
   hidden.
 
+## Network analysis
+
+The NETWORK tab turns a packet capture (pcap or pcapng) into a report: import
+one, or open a stored report. The import takes a mode - *online* when the real
+internet answered the sample, *isolated* when the chamber's own server did, so
+an upload or a login there is an attempt and not a success - and optionally the
+SHA256 of the detonated sample, whose detonation results then carry the newest
+such report as `network` and score its findings in the verdict.
+
+- **OVERVIEW** says what the rules in `rules/network/default.yaml` and the
+  evidence model (source `network`, apart from live memory) found, and what
+  could *not* be decided: a rule that timed out, a spent regex or hash budget,
+  a capture cut by a cap, a step that failed. That is not the same as nothing
+  found, and a verdict built on such a capture is marked INCOMPLETE. Findings
+  the baseline knows and findings another finding absorbed are listed apart;
+  EVENTS BY TYPE has a CHART / TABLE switch.
+- **CONNECTIONS, DNS, HTTP, TLS, FILES and IOCs** list the events, sortable.
+  Files are shown by hash and kind only and are never opened or run.
+- **Capture baseline** learns what a clean machine does on the wire from a
+  capture of the clean VM, analysed without the baseline.
+
+The Submit tab draws a Network panel from the report a run's results carry. The
+routes are under [Network](api.md#network).
+
 ## ETW Browser
 
 The ETW tab provides a multi-channel Windows Event Log viewer with automatic threat classification:

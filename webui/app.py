@@ -22,15 +22,18 @@ import stat
 import tempfile
 import time
 import hashlib
+import itertools
 import math
 import struct
 import threading
 import subprocess
 import sys
+import uuid
 import weakref
 from pathlib import Path
 from flask import Flask, render_template, jsonify, request, send_from_directory, g, has_request_context, Response
 from werkzeug.utils import secure_filename
+from werkzeug.exceptions import RequestEntityTooLarge
 import requests
 
 # Tool-agnostic scoring layer for live-memory findings. Scanners are plugged in
@@ -58,6 +61,20 @@ import tool_updates
 # LOGS tab: event store, source parsers and the search language.
 import log_search
 import log_store
+# NETWORK analysis: a pcap to a report, and the baseline of the clean VM.
+# net_analyze needs dpkt, PyYAML and cryptography, and a deploy to an existing
+# VM does not run pip: without them the rest of the UI must still start, and
+# the routes that analyze a capture say what is missing (503).
+import net_baseline
+try:
+    import net_analyze
+    NET_ANALYZE_ERROR = None
+except ImportError as _net_import_error:
+    net_analyze = None
+    NET_ANALYZE_ERROR = ("network analysis is not available (%s); install its packages with "
+                         "pip install -r webui/requirements.txt and restart the web UI"
+                         % _net_import_error)
+    print("[network] " + NET_ANALYZE_ERROR)
 # FIREWALL tab: offline geo, assessment, event store, enforcement.
 import firewall
 import firewall_fetch
@@ -307,6 +324,8 @@ SCAN_HISTORY_MAX = 200
 # is considered clean, then subtracted from later scans - the memory-side
 # counterpart to Process Dump's clean-hash database.
 MEMORY_BASELINE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory_baseline.json")
+# The same for the network: what a clean VM does on the wire (net_baseline).
+NET_BASELINE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "net_baseline.json")
 
 # NTSleuth and the syscall baselines it extracted (ntsleuth-<build>-<view>.json), written when it is provisioned.
 NTSLEUTH_DIR = r"C:\tools\ntsleuth"
@@ -4310,6 +4329,11 @@ def api_detonation_results():
     if exitcapture_result:
         results["exit_capture_result"] = exitcapture_result
 
+    # --- The network report imported for this sample (stored masked, sent without its events) ---
+    network_report = _net_report_for_sample(sha256)
+    if network_report is not None:
+        results["network"] = _net_poll_copy(network_report)
+
     # --- Network beaconing from Sysmon EID 3 (survives process exit) ---
     if pid:
         results["network_beaconing"] = _network_beaconing_for_pid(pid)
@@ -4832,7 +4856,17 @@ def _compute_verdict(results, matching_alerts):
     if not process_name:
         process_name = (results.get("file_info") or {}).get("name") or ""
 
-    mem_findings = memory_evidence.collect(results, process=process_name)
+    # The capture's findings carry no process: they are the sample's, so they go
+    # to its process - the one named above, else the image Sysmon saw for this
+    # very PID (network_beaconing is the root PID's own connections; the named
+    # pipes cover the whole subtree, so a child's image could come from there)
+    network_process = process_name
+    block = results.get("network_beaconing")
+    for f in (block.get("evidence_findings") or []) if isinstance(block, dict) and not network_process else []:
+        if isinstance(f, dict) and f.get("process"):
+            network_process = f["process"]
+            break
+    mem_findings = memory_evidence.collect(results, process=process_name, network_process=network_process)
     mem_findings += _syscall_stage_findings(results.get("syscalls"))
     mem_sources = [k for k in ("aether", "process_dump", "hunt_sleeping_beacons",
                                "beaconeye", "exit_capture_result") if results.get(k)]
@@ -4842,6 +4876,10 @@ def _compute_verdict(results, matching_alerts):
         mem_sources.append("network_beaconing")
     if (results.get("named_pipes") or {}).get("evidence_findings"):
         mem_sources.append("named_pipes")
+    # The network report of the sample: a source as soon as there is one, so a
+    # capture that found nothing still says it was looked at
+    if isinstance(results.get("network"), dict):
+        mem_sources.append("network")
     if mem_sources:
         evidence = memory_evidence.score(mem_findings, baseline=_memory_baseline)
 
@@ -4898,7 +4936,18 @@ def _compute_verdict(results, matching_alerts):
         label = "SUSPICIOUS"
     else:
         label = "CLEAN"
-    return {"label": label, "score": score, "reasons": reasons}
+    verdict = {"label": label, "score": score, "reasons": reasons}
+    # A capture cut by a cap or a budget may hold the C2 in what was not
+    # analysed: the verdict says so, and a CLEAN is then no "nothing found".
+    incomplete = memory_evidence.network_incomplete(results.get("network"))
+    if incomplete:
+        verdict["incomplete"] = True
+        verdict["incomplete_reasons"] = incomplete
+        reasons.append("Network capture only partly analysed (" + "; ".join(incomplete)
+                       + ") - what was cut is not in this verdict")
+        if isinstance(results.get("memory_evidence"), dict):
+            results["memory_evidence"]["incomplete"] = incomplete
+    return verdict
 
 
 def _add_hash_to_ioc(sha256_hash, filename=""):
@@ -6651,6 +6700,16 @@ class _ResultStore:
             self._index.pop(key, None)
         return doc["meta"], doc["value"]
 
+    def keys(self, prefix=""):
+        """Keys of every stored entry that start with `prefix`."""
+        with self._lock:
+            names = list(self._mem) + list(self._index)
+        return sorted({k for k in names if k.startswith(prefix)})
+
+    def has(self, key):
+        with self._lock:
+            return key in self._mem or key in self._index
+
     def lookup(self, tool, pid=None, sha256=None, max_pid_age=6 * 3600):
         """Newest matching result, or None.
 
@@ -6683,6 +6742,18 @@ _beacon_cache_lock = threading.Lock()
 
 # Per-host baseline of benign memory findings, shared by every scanner.
 _memory_baseline = memory_evidence.MemoryBaseline(MEMORY_BASELINE_FILE)
+
+# Network reports, one entry per imported capture (a restart keeps them), and the
+# network baseline. Both are module objects so the tests can point them elsewhere.
+# Every report has two entries: "netreport_<id>" (the report) and "netsummary_<id>"
+# (what the list shows), and one imported for a detonated sample a third,
+# "netsample_<sha256>" (the id of the newest report of that sample); the limit
+# therefore holds three times the reports kept.
+NET_REPORTS_KEEP = 100
+_net_reports = _ResultStore(
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "net_results"),
+    limit=3 * NET_REPORTS_KEEP)
+_net_baseline = net_baseline.NetBaseline(NET_BASELINE_FILE)
 
 
 # --- Exit capture (dump-on-exit via Windows Silent Process Exit) -----------
@@ -8237,6 +8308,314 @@ def api_memory_baseline_clear():
     """Forget the host baseline (every finding counts as evidence again)."""
     _memory_baseline.clear()
     return jsonify({"ok": True, "baseline": _memory_baseline.stats()})
+
+
+# --- Network analysis: pcap import, stored reports, baseline ---------------
+#
+# A capture is only ever read by net_analyze (which parses bytes, never opens or
+# runs anything in them). The upload is stored under a name the server makes up,
+# so nothing of the client's file name reaches a path.
+
+NET_UPLOADS_KEEP = 20
+NET_UPLOAD_MAX = 256 * 1024 * 1024
+_NET_FORM_ALLOWANCE = 1024 * 1024    # the other form fields and the multipart framing
+_NET_REPORT_ID = re.compile(r"[0-9a-f]{32}")
+_NET_SAMPLE_SHA256 = re.compile(r"[0-9a-f]{64}")
+_NET_MODES = ("online", "isolated")
+_NET_PROCESS_MAX = 260
+_net_sample_lock = threading.Lock()
+_net_sequence = itertools.count()
+
+
+def _net_rules_candidates():
+    """Where the default network rules may be: the deployed copy next to the app first,
+    then the repository, then the Vagrant share. (The parent of the app directory is
+    C:\\ on the VM and must not shadow the deployed copy.)"""
+    app_dir = os.path.dirname(os.path.abspath(__file__))
+    return [os.path.join(base, "rules", "network", "default.yaml")
+            for base in (app_dir, os.path.dirname(app_dir), r"C:\vagrant")]
+
+
+def _net_rules_file():
+    """The default network rules file. When none exists the first candidate is returned,
+    and net_analyze lists the unreadable file in the report's `errors`."""
+    candidates = _net_rules_candidates()
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return candidates[0]
+
+
+def _net_upload_dir():
+    return os.path.join(tempfile.gettempdir(), "net_uploads")
+
+
+def _save_net_upload(file, report_id):
+    """Store an uploaded capture as <report id>.pcap, at most NET_UPLOAD_MAX bytes.
+
+    Returns the path, or None when the upload is larger than that (nothing stays).
+    Older uploads are pruned like those of _save_scan_upload.
+    """
+    base = _net_upload_dir()
+    os.makedirs(base, exist_ok=True)
+    try:
+        old = sorted((os.path.join(base, n) for n in os.listdir(base)),
+                     key=os.path.getmtime, reverse=True)
+        for path in [p for p in old if os.path.isfile(p)][NET_UPLOADS_KEEP:]:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+    except OSError:
+        pass
+    path = os.path.join(base, report_id + ".pcap")
+    size = 0
+    try:
+        with open(path, "wb") as out:
+            while True:
+                chunk = file.stream.read(1024 * 1024)
+                if not chunk:
+                    break
+                size += len(chunk)
+                if size > NET_UPLOAD_MAX:
+                    raise OverflowError
+                out.write(chunk)
+    except OverflowError:
+        os.remove(path)
+        return None
+    return path
+
+
+def _net_mode(data):
+    mode = (data.get("mode") or "online").strip().lower()
+    return mode if mode in _NET_MODES else None
+
+
+def _net_too_large():
+    return jsonify({"error": "the capture is larger than %d MB"
+                    % (NET_UPLOAD_MAX // (1024 * 1024))}), 413
+
+
+def _net_analyze_upload(baseline, with_sample=False):
+    """Analyze the uploaded capture of this request against `baseline` (or None).
+
+    Returns (report, error response). The response is a ready (json, status)
+    when the request is wrong; the report comes from net_analyze unchanged (it is
+    already masked and JSON-safe) with `id` and `filename` added. With
+    `with_sample` the optional form field `sha256` (the detonated sample the
+    capture belongs to) is checked before anything is stored and kept as
+    `sample_sha256` (lower case, or None).
+
+    Without net_analyze (its packages missing, see NET_ANALYZE_ERROR) the
+    error is a 503 that names the fix.
+
+    The size is settled before the body is parsed: reading request.form parses
+    (and spools) the whole multipart body, so a Content-Length over the limit is
+    refused first, and a body without one (chunked) is bounded by the request's
+    max_content_length, which Werkzeug enforces while it reads.
+    """
+    if net_analyze is None:
+        return None, (jsonify({"error": NET_ANALYZE_ERROR}), 503)
+    limit = NET_UPLOAD_MAX + _NET_FORM_ALLOWANCE
+    if (request.content_length or 0) > limit:
+        return None, _net_too_large()
+    request.max_content_length = limit
+    try:
+        data = request.form
+        upload = request.files.get("file")
+    except RequestEntityTooLarge:
+        return None, _net_too_large()
+    if upload is None:
+        return None, (jsonify({"error": "no pcap file uploaded (field 'file')"}), 400)
+    mode = _net_mode(data)
+    if mode is None:
+        return None, (jsonify({"error": "mode must be one of %s"
+                               % ", ".join(_NET_MODES)}), 400)
+    sample = None
+    if with_sample:
+        sample = (data.get("sha256") or "").strip().lower() or None
+        if sample is not None and not _NET_SAMPLE_SHA256.fullmatch(sample):
+            return None, (jsonify({"error": "sha256 must be the 64 hex digits of the sample's SHA256"}), 400)
+    process = (data.get("process") or "")[:_NET_PROCESS_MAX]
+    report_id = uuid.uuid4().hex
+    path = _save_net_upload(upload, report_id)
+    if path is None:
+        return None, _net_too_large()
+    # masked before secure_filename drops the '=' that the mask looks for
+    filename = secure_filename(net_analyze.mask_report(upload.filename or "")) or "capture.pcap"
+    try:
+        report = net_analyze.analyze_pcap(path, rules=_net_rules_file(), baseline=baseline,
+                                          process=process, mode=mode)
+    except Exception as e:
+        return None, (jsonify({"error": "the capture could not be analyzed (%s)"
+                               % type(e).__name__}), 500)
+    if not report.get("format"):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        # the note is "<what is wrong>; <the capture holds nothing>": the first part is the reason
+        reason = (report.get("note") or "").split(";")[0].strip()
+        if not reason.lower().startswith("not a pcap"):
+            reason = "not a pcap or pcapng file (%s)" % reason if reason else \
+                "not a pcap or pcapng file"
+        return None, (jsonify({"error": reason}), 400)
+    report["id"] = report_id
+    report["filename"] = filename
+    if with_sample:
+        report["sample_sha256"] = sample
+    return report, None
+
+
+def _net_summary(report):
+    """What the reports list shows of a report: counts and the verdict, not the events."""
+    findings = report.get("evidence_findings") or []
+    verdict, score = None, None
+    try:
+        scored = memory_evidence.score(findings)
+        verdict, score = scored.get("label"), scored.get("score")
+    except Exception:
+        pass
+    return {
+        "events": len(report.get("events") or []),
+        "event_summary": report.get("event_summary") or {},
+        "rule_hits": len(report.get("rule_hits") or []),
+        "findings": len(findings),
+        "iocs": len(report.get("iocs") or []),
+        "files": len(report.get("files") or []),
+        "suppressed_count": report.get("suppressed_count", 0),
+        "observed": bool(report.get("observed")),
+        "truncated": bool(report.get("truncated")),
+        "errors": len(report.get("errors") or []),
+        "verdict": verdict,
+        "score": score,
+        # what the analysis could not read: the verdict of a cut capture is a lower bound
+        "incomplete": memory_evidence.network_incomplete(report),
+    }
+
+
+@app.route("/api/network/import", methods=["POST"])
+def api_network_import():
+    """Analyze an uploaded pcap and keep the report.
+    Params: `file`, `mode` (online|isolated), `process`, `sha256` (optional: the detonated sample)"""
+    report, error = _net_analyze_upload(_net_baseline, with_sample=True)
+    if error:
+        return error
+    report["timestamp"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    summary = {"id": report["id"], "filename": report["filename"],
+               "timestamp": report["timestamp"], "mode": report.get("mode"),
+               "sample_sha256": report["sample_sha256"],
+               "seq": next(_net_sequence), "summary": _net_summary(report)}
+    _net_reports.put("netreport", report, sha256=report["id"])
+    _net_reports.put("netsummary", summary, sha256=report["id"])
+    # after the report: a poll that finds the index finds the report too
+    if report["sample_sha256"]:
+        with _net_sample_lock:
+            ids = _net_sample_ids(_net_reports.lookup("netsample", sha256=report["sample_sha256"]))
+            ids = [report["id"]] + [i for i in ids if i != report["id"]]
+            _net_reports.put("netsample", {"ids": ids[:NET_REPORTS_KEEP]},
+                             sha256=report["sample_sha256"])
+    return jsonify(report)
+
+
+def _net_sample_ids(entry):
+    """The report ids of a "netsample_<sha256>" entry, newest first (an entry of the
+    first version held one `id`); anything that is no report id is dropped."""
+    if not isinstance(entry, dict):
+        return []
+    ids = entry.get("ids") if isinstance(entry.get("ids"), list) else [entry.get("id")]
+    return [i for i in ids if isinstance(i, str) and _NET_REPORT_ID.fullmatch(i)]
+
+
+def _net_report_for_sample(sha256):
+    """The newest network report still stored that was imported for this sample,
+    as stored, or None.
+
+    /api/detonation/results is polled every 5 s: "netsample_<sha256>" lists the
+    sample's report ids newest first, so this is a key lookup and a membership
+    test per id until one is still kept (an evicted newest report falls back to
+    the next), never a scan over the reports.
+    """
+    sample = (sha256 or "").strip().lower()
+    if not _NET_SAMPLE_SHA256.fullmatch(sample):
+        return None
+    for report_id in _net_sample_ids(_net_reports.lookup("netsample", sha256=sample)):
+        if _net_reports.has("netreport_" + report_id):
+            report = _net_reports.lookup("netreport", sha256=report_id)
+            if report is not None:
+                return report
+    return None
+
+
+def _net_poll_copy(report):
+    """What the detonation results carry of a report: everything but its events
+    (and the behaviour events among them), with their number. The results are
+    polled every 5 s; whoever needs the events fetches them once from
+    /api/network/report."""
+    copy = {k: v for k, v in report.items() if k not in ("events", "behavior")}
+    copy["event_count"] = len(report.get("events") or [])
+    return copy
+
+
+@app.route("/api/network/report", methods=["GET"])
+def api_network_report():
+    """A stored network report. Params: `id`"""
+    report_id = request.args.get("id", "")
+    if not _NET_REPORT_ID.fullmatch(report_id):
+        return jsonify({"error": "invalid report id"}), 400
+    report = _net_reports.lookup("netreport", sha256=report_id)
+    if report is None:
+        return jsonify({"error": "no such report"}), 404
+    return jsonify(report)
+
+
+@app.route("/api/network/reports", methods=["GET"])
+def api_network_reports():
+    """Stored network reports, newest first: id, filename, timestamp, mode and a summary"""
+    rows = []
+    for key in _net_reports.keys("netsummary_"):
+        report_id = key[len("netsummary_"):]
+        summary = _net_reports.lookup("netsummary", sha256=report_id)
+        if summary is not None and _net_reports.has("netreport_" + report_id):
+            rows.append(summary)
+    rows.sort(key=lambda r: (r.get("timestamp", ""), r.get("seq", 0)), reverse=True)
+    for r in rows:
+        r.pop("seq", None)
+    return jsonify({"reports": rows})
+
+
+@app.route("/api/network/baseline", methods=["GET"])
+def api_network_baseline():
+    """What the network baseline of this VM holds"""
+    stats = _net_baseline.stats()
+    stats["count"] = _net_baseline.count
+    return jsonify(stats)
+
+
+@app.route("/api/network/baseline/capture", methods=["POST"])
+def api_network_baseline_capture():
+    """Record what a capture of the clean VM holds as the network baseline. Params: `file`"""
+    # the capture is analyzed without the baseline: all of it is learned
+    report, error = _net_analyze_upload(None)
+    if error:
+        return error
+    events = report.get("events") or []
+    before = _net_baseline.count
+    added = _net_baseline.add(events)
+    learned = []
+    seen = set()
+    for e in events:
+        if not isinstance(e, dict):
+            continue
+        item = (e.get("type"), e.get("dest"), e.get("port"))
+        if item not in seen and len(learned) < 200:
+            seen.add(item)
+            learned.append({"type": item[0], "dest": item[1], "port": item[2]})
+    return jsonify(net_analyze.mask_report({
+        "added": added, "count": _net_baseline.count, "previous_count": before,
+        "events_seen": len(events), "learned": learned, "baseline": _net_baseline.stats(),
+        "truncated": bool(report.get("truncated")), "errors": report.get("errors") or [],
+        "note": report.get("note") or ""}))
 
 
 @app.route("/api/memory/evidence", methods=["POST"])

@@ -2,7 +2,11 @@
 
 Regressions covered: the README documented a /api/fibratus proxy that did not
 exist, missed 17 routes and had no MCP section; the in-app help described
-layouts and tabs that were gone; screenshots showed an old UI.
+layouts and tabs that were gone; screenshots showed an old UI; the README did
+not say that NetLens gave the idea of the network analysis (the spec's
+"Herkunft"), nor that nothing of it is used; the network rules pointed their
+authors at an events.json nothing writes; the Vagrant deploy uploaded the
+directory rules/network, which WinRM nests inside an existing one.
 """
 
 import ast
@@ -54,6 +58,16 @@ def test_api_page_documents_every_route_and_nothing_else():
     # one row per method and route - a route with two methods has two rows
     twice = sorted(r for r in set(rows) if rows.count(r) > 1)
     assert twice == [], "the API reference has more than one row for %s" % twice
+
+
+def test_api_page_documents_each_network_route_exactly_once():
+    # The API reference moved from the README into the pages of API_PAGES (main's
+    # restructure); the network routes are held there, one row each, like the rest.
+    lines = "\n".join(_doc(name) for name in API_PAGES).splitlines()
+    for route in sorted(r for r in ROUTES if r.startswith("/api/network/")):
+        rows = [line for line in lines if re.match(r"\|\s*[A-Z /]+\s*\|\s*`" + re.escape(route) + "`", line)]
+        assert len(rows) == 1, (route, rows)
+    assert len([r for r in ROUTES if r.startswith("/api/network/")]) == 5
 
 
 def test_help_modal_only_mentions_existing_routes():
@@ -128,6 +142,9 @@ def test_every_deploy_path_uploads_the_web_ui_modules():
     utm = open(os.path.join(ROOT, "scripts", "deploy-utm.py"), encoding="utf-8").read()
     modules = set(re.findall(r'"webui/([\w.]+\.(?:py|json|ps1))"', utm))
     assert {"app.py", "pipe_proxy.py", "pipe_backends.py", "pipe_signatures.json"} <= modules
+    # the network analysis: every net_*.py on disk (app.py imports them) and its rules
+    on_disk = {n for n in os.listdir(os.path.join(ROOT, "webui")) if re.match(r"net_\w+\.py$", n)}
+    assert len(on_disk) >= 13 and on_disk <= modules, on_disk - modules
     # Every module app.py imports from webui/ (the FIREWALL tab brought five), and the script firewall_rules.py runs
     local = {f[:-3] for f in os.listdir(os.path.join(ROOT, "webui")) if f.endswith(".py")}
     imported = set(re.findall(r"^import (\w+)", APP, re.M)) & local
@@ -147,6 +164,14 @@ def test_every_deploy_path_uploads_the_web_ui_modules():
         assert f'"webui/{name}": r"C:\\DetonationChamberUI\\{win}"' in utm, name
         assert f"webui/{name} C:\\\\DetonationChamberUI\\\\" + win.replace("\\", "\\\\") in vagrant, name
         assert f"'webui\\{win}' -Destination 'C:\\DetonationChamberUI\\{win}'" in hyperv, name
+    for rule in sorted(n for n in os.listdir(os.path.join(ROOT, "rules", "network"))):
+        win = "rules\\network\\" + rule
+        assert f'"rules/network/{rule}": r"C:\\DetonationChamberUI\\{win}"' in utm, rule
+        assert f"'{win}' -Destination 'C:\\DetonationChamberUI\\{win}'" in hyperv, rule
+        # the file itself: WinRM nests an uploaded directory in an existing one (...\\network\\network)
+        assert ("vagrant upload rules/network/%s C:\\\\DetonationChamberUI\\\\rules\\\\network\\\\%s"
+                % (rule, rule)) in vagrant, rule
+    assert "vagrant upload rules/network " not in make
 
 
 def test_every_deploy_path_ships_the_data_directories_and_the_way_out_of_isolated():
@@ -477,6 +502,43 @@ def test_help_lists_every_pipe_interception_route():
         r'<td class="api-\w+">(\w+)</td><td><code>(/api/pipes/intercept[^<]*)</code>', HELP)}
     assert routes <= rows, routes - rows
     assert '<td class="api-delete">DELETE</td>' in HELP
+
+
+def test_readme_credits_netlens_with_the_idea_and_nothing_else():
+    lines = [line for line in README.splitlines() if "NetLens" in line]
+    assert len(lines) == 1, lines
+    assert "github.com/FzRsLLaSheR/NetLens" in lines[0] and "idea" in lines[0]
+    assert "no code, rule, fixture" in lines[0]
+
+
+def test_the_network_rules_point_their_authors_at_what_exists():
+    with open(os.path.join(ROOT, "rules", "network", "default.yaml"), encoding="utf-8") as fh:
+        rules = fh.read()
+    assert "events.json" not in rules
+    assert "/api/network/report" in rules
+
+
+def test_restart_paths_only_stop_the_web_ui_python_processes():
+    """Regressions covered: the web-UI restart (deploy-utm.py RESTART_PS, `make restart` on Vagrant,
+    make.ps1 restart) ran `Get-Process -Name python* | Stop-Process -Force`, which also killed LitterBox
+    (venv python.exe launcher and its base-interpreter child, both running litterbox.py); a detonation
+    right after a restart then failed with LitterBox upload 502. Every restart path must select the
+    processes by an `app.py` command line and never stop python by name alone."""
+    utm = open(os.path.join(ROOT, "scripts", "deploy-utm.py"), encoding="utf-8").read()
+    make = open(os.path.join(ROOT, "Makefile"), encoding="utf-8").read()
+    ps1 = open(os.path.join(ROOT, "make.ps1"), encoding="utf-8").read()
+    paths = {
+        "deploy-utm.py": utm[utm.index("RESTART_PS = ("):utm.index("LOGS_PS = (")],
+        "Makefile": make[make.index("\nrestart:"):make.index("\n.PHONY: deploy-restart")],
+        "make.ps1": ps1[ps1.index("'restart' {"):ps1.index("Start-ScheduledTask", ps1.index("'restart' {"))],
+    }
+    for name, text in paths.items():
+        flat = re.sub(r'"\s*\n\s*"', "", text)
+        assert not re.search(r"Get-Process\s+-Name\s+['\"]?python", flat, re.I), name
+        assert not re.search(r"Stop-Process\s+-Name", flat, re.I), name
+        assert "Win32_Process" in flat and "Terminate" in flat, name
+        assert "CommandLine LIKE ''% app.py%''" in flat, name
+        assert "litterbox" not in flat.lower(), name
 
 
 def test_help_lists_every_firewall_route():

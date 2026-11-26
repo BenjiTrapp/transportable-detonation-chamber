@@ -3147,13 +3147,13 @@ def test_info_texts_cover_every_tab():
         return lambda e: name in e["attrs"].get("class", "").split()
 
     headers = find(elements.root, with_class("content-header"))
-    assert len(headers) == 14, "a tab head is missing or the pattern is out of date"
+    assert len(headers) == 15, "a tab head is missing or the pattern is out of date"
     rows = find(elements.root, with_class("rtrace-header")) + find(elements.root, with_class("graph-toolbar"))
     assert len(rows) == 2, "the head rows of Tracing and Graph"
     assert [h["children"][0]["text"] if h["children"] else "" for h in headers if not has_info(h)] == []
     assert all(has_info(row) for row in rows), "Tracing or Graph without (i)"
     tabs = find(elements.root, with_class("tab-content"))
-    assert len(tabs) == 16 and all(has_info(tab) for tab in tabs)
+    assert len(tabs) == 17 and all(has_info(tab) for tab in tabs)
     texts = INFO_ATTR.findall(html) + INFO_ATTR.findall(_read(APP_JS))
     assert len(texts) >= 30
     for text in texts:
@@ -3917,10 +3917,18 @@ def test_inline_file_map_ignores_a_stale_load():
     assert r["elf"] == ["strip of F.so", None, "tree of F.so"], "E's late file map replaced F's tree"
 
 
-RTRACE_EVENT_FUNCTIONS = ["renderRtraceEventTable", "initRtraceEventSort", "sortRtraceEvents", "updateRtraceEventSortHeads",
+RTRACE_EVENT_FUNCTIONS = ["renderRtraceEventTable", "showRtraceEventTable", "rtraceState", "networkReportOf",
+                          "rtraceReportEvents", "rtraceFetchReportEvents", "networkJson",
+                          "rtraceNetworkEvents", "rtraceNetworkRows", "rtraceNetworkDetail", "rtraceNetworkSortValue",
+                          "networkText", "networkTime", "networkHeader", "networkDetail", "networkFlags", "networkEmpty",
+                          "networkCut", "formatSize", "sortNumberValue", "compareSortValues", "renderRtraceVerdictView",
+                          "initRtraceEventSort", "sortRtraceEvents", "updateRtraceEventSortHeads",
                           "rtraceEventAction", "rtraceEventSortValue", "sortItemsBy", "sortKey", "compareSortKeys",
                           "getActionBadgeClass", "getEventDetails", "formatRelativeTime", "formatTime", "escapeHtml", "jsArg",
                           "cssToken", "severitySortValue", "sortTimeValue", "alertSeverity"]
+RTRACE_EVENT_CONSTS = ("ALERT_SEVERITIES", "RTRACE_EVENT_SORT_ID", "RTRACE_DETAIL_TABS", "RTRACE_NETWORK_TYPES",
+                       "NETWORK_ROWS_MAX", "networkState", "rtraceNetworkFetched", "RTRACE_NETWORK_FETCHED_MAX",
+                       "RTRACE_NETWORK_RETRY_MS")
 
 
 @needs_node
@@ -3945,12 +3953,12 @@ def test_tracing_event_grid_sorts_by_its_column_heads():
         const heads = () => [...document.querySelectorAll('.rtrace-event-table-header .rtrace-col')];
         const head = name => heads().find(h => h.textContent.trim() === name);
         const aria = () => heads().map(h => h.getAttribute('aria-sort'));
-        renderRtraceEventTable();
+        showRtraceEventTable();
         const r = { initial: ids(), heads: heads().map(h => [h.getAttribute('role'), h.getAttribute('tabindex')]) };
         click(head('PID')); r.pidAsc = [ids(), aria()];
         click(head('PID')); r.pidDesc = [ids(), aria()];
         events.push(ev('e5', '2026-11-09T13:00:00Z', 500, 'epsilon', 'low', 'C:\\e'));
-        renderRtraceEventTable();
+        showRtraceEventTable();
         r.polled = ids();
         click(head('Rule / Engine')); r.rule = ids();
         click(head('Time')); r.time = ids();
@@ -3962,14 +3970,14 @@ def test_tracing_event_grid_sorts_by_its_column_heads():
         // Values from the events stay text (a PID or a time that is no number or no time)
         events.push({ id: 'e6', timestamp: '<b>bold</b>', pid: '<img src=x onerror=alert(1)>', rule_name: 'x',
                       severity: 'low', engine: 'sigma', raw: {} });
-        renderRtraceEventTable();
+        showRtraceEventTable();
         const body = document.getElementById('rtrace-event-table-body');
         r.hostile = [body.querySelectorAll('img').length + body.querySelectorAll('b').length,
                      body.querySelectorAll('.ev-pid').map(c => c.textContent).filter(t => t.includes('<')).length,
                      body.querySelectorAll('.ev-time').map(c => c.textContent).filter(t => t === '<b>bold</b>').length];
         console.log(JSON.stringify(r));
     """.replace("MARKUP", json.dumps(_tab_markup("tracing"))),
-        SORT_DOM + _controls_prelude() + "\n" + "\n".join(_const_source(c) for c in ("ALERT_SEVERITIES", "RTRACE_EVENT_SORT_ID")))
+        SORT_DOM + _controls_prelude() + "\n" + "\n".join(_const_source(c) for c in RTRACE_EVENT_CONSTS))
     none = [None] * 7
     assert r["initial"] == ["e3", "e4", "e1", "e2"]
     assert r["heads"] == [["columnheader", "0"]] * 7, "a head cannot be reached with the keyboard"
@@ -3983,6 +3991,35 @@ def test_tracing_event_grid_sorts_by_its_column_heads():
     assert r["hostile"] == [0, 1, 1], "an event's PID or time reached the markup"
     # The heads are wired once at start-up (initRtraceTabs runs in DOMContentLoaded)
     assert re.search(r"^\s*initRtraceEventSort\(\);", _function_source("initRtraceTabs"), re.M)
+
+
+@needs_node
+def test_a_click_on_a_redrawn_sub_tab_switches_the_rows():
+    """The Tracing sub-tab bar is drawn again with every count (Task 16), so its
+    buttons are new each time: one listener on the bar (not one per button)
+    keeps them working, and the rows of a network sub-tab come from the
+    detonation's network report."""
+    report = {"events": [{"type": "tls", "ts": 5, "dest": "203.0.113.5", "port": 443, "sni": "cdn.top"},
+                         {"type": "dns", "ts": 1, "dest": "evil.top", "query_type": "A", "answers": ["203.0.113.5"]}]}
+    r = _run_node(["initRtraceTabs", "showRtraceDetailTabs", "renderRtraceDetailTabs"] + RTRACE_EVENT_FUNCTIONS, r"""
+        document.body.innerHTML = MARKUP;
+        globalThis.state = { processes: { '7': { pid: 7, alerts: [], children: [], activity: {} } },
+                             rtraceSelectedPid: '7', rtraceActiveDetailTab: 'live', detonationNetwork: REPORT };
+        initRtraceTabs();
+        const bar = document.getElementById('rtrace-detail-tabs');
+        const body = document.getElementById('rtrace-event-table-body');
+        const tab = name => bar.querySelectorAll('.rtrace-tab').find(b => b.dataset.rtab === name);
+        showRtraceDetailTabs();
+        click(tab('tls'));
+        const r = { tab: state.rtraceActiveDetailTab, tls: body.textContent.includes('cdn.top') };
+        showRtraceDetailTabs();
+        click(tab('dns'));
+        r.dns = [state.rtraceActiveDetailTab, body.textContent.includes('evil.top'),
+                 bar.querySelectorAll('.rtrace-tab').filter(b => b.classList.contains('active')).map(b => b.dataset.rtab)];
+        console.log(JSON.stringify(r));
+    """.replace("MARKUP", json.dumps(_tab_markup("tracing"))).replace("REPORT", json.dumps(report)),
+        SORT_DOM + _controls_prelude() + "\n" + "\n".join(_const_source(c) for c in RTRACE_EVENT_CONSTS))
+    assert r == {"tab": "tls", "tls": True, "dns": ["dns", True, ["dns"]]}
 
 
 def test_card_controls_of_task_8_are_styled_in_both_themes():

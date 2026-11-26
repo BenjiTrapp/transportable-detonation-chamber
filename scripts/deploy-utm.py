@@ -39,6 +39,19 @@ WIKI_FILE = "webui/static/wiki.html"
 FILES = {
     "webui/app.py": r"C:\DetonationChamberUI\app.py",
     "webui/memory_evidence.py": r"C:\DetonationChamberUI\memory_evidence.py",
+    "webui/net_analyze.py": r"C:\DetonationChamberUI\net_analyze.py",
+    "webui/net_baseline.py": r"C:\DetonationChamberUI\net_baseline.py",
+    "webui/net_behavior.py": r"C:\DetonationChamberUI\net_behavior.py",
+    "webui/net_decode.py": r"C:\DetonationChamberUI\net_decode.py",
+    "webui/net_dns.py": r"C:\DetonationChamberUI\net_dns.py",
+    "webui/net_events.py": r"C:\DetonationChamberUI\net_events.py",
+    "webui/net_evidence.py": r"C:\DetonationChamberUI\net_evidence.py",
+    "webui/net_flows.py": r"C:\DetonationChamberUI\net_flows.py",
+    "webui/net_http.py": r"C:\DetonationChamberUI\net_http.py",
+    "webui/net_mail_ftp.py": r"C:\DetonationChamberUI\net_mail_ftp.py",
+    "webui/net_raw.py": r"C:\DetonationChamberUI\net_raw.py",
+    "webui/net_rules.py": r"C:\DetonationChamberUI\net_rules.py",
+    "webui/net_tls.py": r"C:\DetonationChamberUI\net_tls.py",
     "webui/syscall_baseline.py": r"C:\DetonationChamberUI\syscall_baseline.py",
     "webui/syscall_scan.py": r"C:\DetonationChamberUI\syscall_scan.py",
     "webui/syscall_rules.py": r"C:\DetonationChamberUI\syscall_rules.py",
@@ -70,6 +83,8 @@ FILES = {
     "webui/static/css/theme-cyberpunk.css": r"C:\DetonationChamberUI\static\css\theme-cyberpunk.css",
     "webui/templates/index.html": r"C:\DetonationChamberUI\templates\index.html",
     "webui/static/icon.png": r"C:\DetonationChamberUI\static\icon.png",
+    # network analysis rules, read from <app dir>\rules\network
+    "rules/network/default.yaml": r"C:\DetonationChamberUI\rules\network\default.yaml",
     # The offline wiki, built on the host by `make docs` and git-ignored: the VM
     # has no network, so this one file is the documentation there. A fresh clone
     # has none, and the loop below skips what is not on disk.
@@ -89,6 +104,9 @@ DATA_FILES = {
     if not name.startswith(".") and os.path.isfile(os.path.join(REPO, local, name))
 }
 
+# Where the network analysis rules live on the VM, created before the copy
+RULES_REMOTE_DIR = r"C:\DetonationChamberUI\rules\network"
+
 # The install scripts the tool updates re-run, kept next to the provisioning copy
 SCRIPTS_REMOTE_DIR = r"C:\tdc\scripts"
 # (plus configure-logging.ps1, which an existing VM runs once to turn on the logs of the LOGS and FIREWALL tabs,
@@ -103,7 +121,8 @@ SCRIPT_FILES = {
 }
 
 RESTART_PS = (
-    "Get-Process -Name python* -EA SilentlyContinue | Stop-Process -Force;"
+    "Get-CimInstance Win32_Process -Filter 'Name LIKE ''python%'' AND CommandLine LIKE ''% app.py%''' "
+    "| Invoke-CimMethod -MethodName Terminate | Out-Null;"
     "Start-Sleep 2; Start-ScheduledTask -TaskName DetonationChamberUI;"
     "Start-Sleep 4; (Get-ScheduledTask -TaskName DetonationChamberUI).State"
 )
@@ -181,7 +200,7 @@ def do_deploy(sess, args):
     httpd = serve()
     print(f"[*] Host HTTP server on :{PORT}, deploying to {args.vm_ip} ...")
     try:
-        dirs = ",".join(f'"{d}"' for d in [SCRIPTS_REMOTE_DIR, *DATA_DIRS.values()])
+        dirs = ",".join(f'"{d}"' for d in [SCRIPTS_REMOTE_DIR, RULES_REMOTE_DIR, *DATA_DIRS.values()])
         ps = f'New-Item -ItemType Directory -Path {dirs} -Force | Out-Null'
         run_ps(sess, ps, label="directories")
         for local, remote in {**FILES, **DATA_FILES, **SCRIPT_FILES}.items():

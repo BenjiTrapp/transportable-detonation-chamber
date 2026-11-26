@@ -206,6 +206,19 @@ transportable-detonation-chamber/
 │   ├── firewall_rules.ps1         # One firewall verb per call, values as -File parameters
 │   ├── firewall_fetch.py          # FIREWALL tab: the guarded fetch of a stage-2 file
 │   ├── geoip.py                   # Offline IP -> country / AS lookup
+│   ├── net_analyze.py             # NETWORK tab: a pcap to one report (flows, parsers, decoding, behaviour, rules, evidence)
+│   ├── net_flows.py               # NETWORK tab: a pcap read into flows and reassembled TCP streams
+│   ├── net_events.py              # NETWORK tab: the network event schema
+│   ├── net_dns.py                 # NETWORK tab: DNS messages to dns events
+│   ├── net_http.py                # NETWORK tab: HTTP streams to http, download, upload and websocket events
+│   ├── net_tls.py                 # NETWORK tab: TLS handshakes to tls events, with JA3 and JA4
+│   ├── net_mail_ftp.py            # NETWORK tab: FTP and SMTP control streams to ftp and smtp events
+│   ├── net_raw.py                 # NETWORK tab: traffic no other parser could name, profiled into raw events
+│   ├── net_decode.py              # NETWORK tab: encoded values decoded when the result means something
+│   ├── net_behavior.py            # NETWORK tab: beacons, retries and fanout over time
+│   ├── net_rules.py               # NETWORK tab: YAML rules over network events (rules/network/default.yaml)
+│   ├── net_evidence.py            # NETWORK tab: network findings in the shared evidence model
+│   ├── net_baseline.py            # NETWORK tab: what a clean machine does on the wire
 │   ├── data/                      # Offline geo index (iptoasn.com, CC0) and country centroids; `make geoip` refreshes it
 │   ├── memory_baseline.json       # Host memory baseline (git-ignored)
 │   ├── dev_server.py              # Dev server with live-reload

@@ -320,6 +320,21 @@ deploy:
 		vagrant upload webui/static/js/app.js C:\\DetonationChamberUI\\static\\js\\app.js; \
 		vagrant upload webui/app.py C:\\DetonationChamberUI\\app.py; \
 		vagrant upload webui/memory_evidence.py C:\\DetonationChamberUI\\memory_evidence.py; \
+		vagrant upload webui/net_analyze.py C:\\DetonationChamberUI\\net_analyze.py; \
+		vagrant upload webui/net_baseline.py C:\\DetonationChamberUI\\net_baseline.py; \
+		vagrant upload webui/net_behavior.py C:\\DetonationChamberUI\\net_behavior.py; \
+		vagrant upload webui/net_decode.py C:\\DetonationChamberUI\\net_decode.py; \
+		vagrant upload webui/net_dns.py C:\\DetonationChamberUI\\net_dns.py; \
+		vagrant upload webui/net_events.py C:\\DetonationChamberUI\\net_events.py; \
+		vagrant upload webui/net_evidence.py C:\\DetonationChamberUI\\net_evidence.py; \
+		vagrant upload webui/net_flows.py C:\\DetonationChamberUI\\net_flows.py; \
+		vagrant upload webui/net_http.py C:\\DetonationChamberUI\\net_http.py; \
+		vagrant upload webui/net_mail_ftp.py C:\\DetonationChamberUI\\net_mail_ftp.py; \
+		vagrant upload webui/net_raw.py C:\\DetonationChamberUI\\net_raw.py; \
+		vagrant upload webui/net_rules.py C:\\DetonationChamberUI\\net_rules.py; \
+		vagrant upload webui/net_tls.py C:\\DetonationChamberUI\\net_tls.py; \
+		vagrant winrm -c "New-Item -ItemType Directory -Path C:\\DetonationChamberUI\\rules\\network -Force | Out-Null"; \
+		vagrant upload rules/network/default.yaml C:\\DetonationChamberUI\\rules\\network\\default.yaml; \
 		vagrant upload webui/syscall_baseline.py C:\\DetonationChamberUI\\syscall_baseline.py; \
 		vagrant upload webui/syscall_scan.py C:\\DetonationChamberUI\\syscall_scan.py; \
 		vagrant upload webui/syscall_rules.py C:\\DetonationChamberUI\\syscall_rules.py; \
@@ -368,6 +383,21 @@ deploy-app:
 	else \
 		vagrant upload webui/app.py C:\\DetonationChamberUI\\app.py; \
 		vagrant upload webui/memory_evidence.py C:\\DetonationChamberUI\\memory_evidence.py; \
+		vagrant upload webui/net_analyze.py C:\\DetonationChamberUI\\net_analyze.py; \
+		vagrant upload webui/net_baseline.py C:\\DetonationChamberUI\\net_baseline.py; \
+		vagrant upload webui/net_behavior.py C:\\DetonationChamberUI\\net_behavior.py; \
+		vagrant upload webui/net_decode.py C:\\DetonationChamberUI\\net_decode.py; \
+		vagrant upload webui/net_dns.py C:\\DetonationChamberUI\\net_dns.py; \
+		vagrant upload webui/net_events.py C:\\DetonationChamberUI\\net_events.py; \
+		vagrant upload webui/net_evidence.py C:\\DetonationChamberUI\\net_evidence.py; \
+		vagrant upload webui/net_flows.py C:\\DetonationChamberUI\\net_flows.py; \
+		vagrant upload webui/net_http.py C:\\DetonationChamberUI\\net_http.py; \
+		vagrant upload webui/net_mail_ftp.py C:\\DetonationChamberUI\\net_mail_ftp.py; \
+		vagrant upload webui/net_raw.py C:\\DetonationChamberUI\\net_raw.py; \
+		vagrant upload webui/net_rules.py C:\\DetonationChamberUI\\net_rules.py; \
+		vagrant upload webui/net_tls.py C:\\DetonationChamberUI\\net_tls.py; \
+		vagrant winrm -c "New-Item -ItemType Directory -Path C:\\DetonationChamberUI\\rules\\network -Force | Out-Null"; \
+		vagrant upload rules/network/default.yaml C:\\DetonationChamberUI\\rules\\network\\default.yaml; \
 		vagrant upload webui/syscall_baseline.py C:\\DetonationChamberUI\\syscall_baseline.py; \
 		vagrant upload webui/syscall_scan.py C:\\DetonationChamberUI\\syscall_scan.py; \
 		vagrant upload webui/syscall_rules.py C:\\DetonationChamberUI\\syscall_rules.py; \
@@ -407,7 +437,7 @@ restart:
 	if [ "$$mode" = "utm" ]; then \
 		$(UTM_DEPLOY) --action restart; \
 	else \
-		vagrant winrm -c "Get-Process -Name python* -EA SilentlyContinue | Stop-Process -Force; Start-Sleep 2; Start-ScheduledTask -TaskName DetonationChamberUI; Start-Sleep 3; Write-Host ('Web UI: ' + (Get-ScheduledTask -TaskName DetonationChamberUI).State)"; \
+		vagrant winrm -c "Get-CimInstance Win32_Process -Filter 'Name LIKE ''python%'' AND CommandLine LIKE ''% app.py%''' | Invoke-CimMethod -MethodName Terminate | Out-Null; Start-Sleep 2; Start-ScheduledTask -TaskName DetonationChamberUI; Start-Sleep 3; Write-Host ('Web UI: ' + (Get-ScheduledTask -TaskName DetonationChamberUI).State)"; \
 	fi
 
 .PHONY: deploy-restart

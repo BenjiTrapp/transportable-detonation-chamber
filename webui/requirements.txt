@@ -1,4 +1,8 @@
-flask>=3.0
+flask>=3.1
 requests>=2.31
 watchdog>=4.0
 pefile>=2023.2.7
+dpkt>=1.9.8
+cryptography>=42
+pyyaml>=6.0
+regex>=2023.12.25

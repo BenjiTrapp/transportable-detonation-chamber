@@ -13,21 +13,42 @@ Live-process memory scanners are awkward to build a verdict on:
     Hunt-Sleeping-Beacons each see part of the picture.
 
 This module keeps the scoring independent of any particular scanner. Findings
-from any source are normalized into one schema and weighted by four factors:
+from any source are normalized into one schema and weighted by five factors:
 
   evidence class   structural facts outrank behavioural hints outrank strings
   persistence      how many samples of a repeated scan contained the finding
   corroboration    whether an independent source agrees on the same process
   novelty          whether the finding also occurs in this host's clean baseline
+  observation      how much of the act was seen: an upload that our own
+                   isolated server accepted shows the attempt, not that a real
+                   C2 received anything. A finding without the field was seen
+                   in full, so the scanners above are weighed as before.
+
+Two sources can see one phenomenon. Sysmon's connection log and a capture of
+the same traffic both see a beacon loop, and the two findings together would
+cross the malicious threshold on their own. A kind may therefore name kinds it
+``supersedes``. The findings of both kinds on one process that share an
+endpoint, directly or through each other, are one phenomenon, and only one side
+of it is scored: whichever gives the higher total, chosen over the whole set at
+once so that the order findings arrive in cannot change the verdict. The other
+side stays listed with ``superseded_by`` and still counts as the independent
+second opinion that it is. Adding a finding never lowers the score, except a
+finding that shows two such phenomena to be one (what was counted twice is then
+counted once), and except past ``SUPERSEDE_MAX_ENUMERATED`` such phenomena on
+one process, where the choice is no longer searched exhaustively.
 
 Adding a scanner means adding a normalizer function; nothing else changes.
 """
 
 import hashlib
+import ipaddress
 import json
+import math
 import os
 import threading
 import time
+
+import net_behavior
 
 # --- Evidence classes -------------------------------------------------
 # Ordered by how hard the signal is to fake or to trip accidentally.
@@ -194,7 +215,110 @@ KINDS = {
         "weight": 1.0, "evidence": EVIDENCE_STRING, "corroborate": True,
         "label": "In-memory signature match",
     },
+    # Network, from a capture (net_evidence). Weights from the design spec.
+    # A capture knows no process, so every source here is "network" and a
+    # second opinion has to come from a host-side tool on the same process.
+    # A check-in is a beacon whose server answered: the same loop c2_beaconing
+    # sees in Sysmon, measured on the wire, so it absorbs that finding rather
+    # than adding to it. Like c2_beaconing it stands alone only when tight
+    # (net_evidence clears needs_corroboration then); a loose rhythm also fits
+    # a poller.
+    "c2_checkin": {
+        "weight": 4.0, "evidence": EVIDENCE_STRUCTURAL, "corroborate": True,
+        "supersedes": ("c2_beaconing",),
+        "label": "Periodic check-in answered by its server",
+    },
+    "exfil_upload": {
+        "weight": 4.0, "evidence": EVIDENCE_STRUCTURAL, "corroborate": False,
+        "label": "Data sent out (size and destination on the wire)",
+    },
+    "credential_in_transit": {
+        "weight": 4.5, "evidence": EVIDENCE_STRUCTURAL, "corroborate": False,
+        "label": "Credentials sent in clear text",
+    },
+    "payload_staging": {
+        "weight": 4.0, "evidence": EVIDENCE_STRUCTURAL, "corroborate": False,
+        "label": "Executable downloaded (a file, not only a URL)",
+    },
+    # A JA3/JA4 hash is shared by every program built on the same TLS stack.
+    "tls_ja3_known": {
+        "weight": 2.5, "evidence": EVIDENCE_STRUCTURAL, "corroborate": True,
+        "label": "TLS client fingerprint of a catalogued tool",
+    },
+    # Updaters walk mirror lists too.
+    "fallback_rotation": {
+        "weight": 3.0, "evidence": EVIDENCE_BEHAVIORAL, "corroborate": True,
+        "label": "One request rotated through fallback hosts",
+    },
+    # Software retries an offline service as well.
+    "dead_c2_retry": {
+        "weight": 2.0, "evidence": EVIDENCE_BEHAVIORAL, "corroborate": True,
+        "label": "Repeated attempts to an unreachable host",
+    },
+    # Ten different invented names failing within a minute is not something
+    # ordinary software does; the resolver's own names are not counted.
+    "dga_pattern": {
+        "weight": 2.0, "evidence": EVIDENCE_BEHAVIORAL, "corroborate": False,
+        "label": "Generated-looking names, burst of NXDOMAIN answers",
+    },
+    # Installers ask for their public address too.
+    "recon_service": {
+        "weight": 1.0, "evidence": EVIDENCE_BEHAVIORAL, "corroborate": True,
+        "label": "Public address or location lookup",
+    },
 }
+
+# The kinds a network capture produces (net_evidence), and the only ones a
+# network rule may name (net_rules checks this when a rule loads).
+NETWORK_KINDS = ("c2_checkin", "exfil_upload", "credential_in_transit", "payload_staging",
+                 "tls_ja3_known", "fallback_rotation", "dead_c2_retry", "dga_pattern",
+                 "recon_service")
+
+
+def _check_kinds(kinds=None):
+    """Every ``supersedes`` target is a kind, the relation has no cycle (two
+    kinds that supersede each other would take each other out), no kind is on
+    both sides of it (a phenomenon has two sides, the superseding kinds and
+    the superseded ones, and a chain would give it three), and every network
+    kind is a kind."""
+    kinds = KINDS if kinds is None else kinds
+    for kind, spec in kinds.items():
+        for other in spec.get("supersedes", ()):
+            if other not in kinds:
+                raise ValueError("kind %r supersedes %r, which is not a kind" % (kind, other))
+    superseded = {k for spec in kinds.values() for k in spec.get("supersedes", ())}
+    done = set()
+    for start in kinds:
+        if start in done:
+            continue
+        path, stack = [], [(start, iter(kinds[start].get("supersedes", ())))]
+        on_path = {start}
+        path.append(start)
+        while stack:
+            kind, targets = stack[-1]
+            nxt = next(targets, None)
+            if nxt is None:
+                stack.pop()
+                on_path.discard(path.pop())
+                done.add(kind)
+                continue
+            if nxt in on_path:
+                raise ValueError("kinds supersede each other in a cycle: %s"
+                                 % " -> ".join(path[path.index(nxt):] + [nxt]))
+            if nxt not in done:
+                on_path.add(nxt)
+                path.append(nxt)
+                stack.append((nxt, iter(kinds[nxt].get("supersedes", ()))))
+    for kind, spec in kinds.items():
+        if spec.get("supersedes") and kind in superseded:
+            raise ValueError("kind %r supersedes others and is superseded itself: a chain "
+                             "of supersedes has no two sides to choose between" % kind)
+    for kind in NETWORK_KINDS:
+        if kind not in kinds:
+            raise ValueError("network kind %r is not a kind" % kind)
+
+
+_check_kinds()
 
 # Aether finding type -> canonical kind
 AETHER_TYPE_MAP = {
@@ -234,9 +358,23 @@ SATURATION_CAP = 2.0
 
 # Minimum base weight for a finding to count as an independent second opinion.
 CORROBORATION_MIN_WEIGHT = 1.0
+# corroboration_scope of a finding that is about one destination only.
+CORROBORATION_SCOPE_ENDPOINT = "endpoint"
+# attribution of a capture finding whose process is the sample's by
+# assumption (a capture knows no process): it counts with that process for
+# grouping and supersede, but gets and gives a second opinion only through a
+# shared endpoint (Ruling 69)
+ATTRIBUTION_ASSUMED = "assumed"
 
 VERDICT_MALICIOUS = 6.0
 VERDICT_SUSPICIOUS = 2.0
+
+# The source of a capture's findings (net_evidence.SOURCE), and what its
+# uncorroborated findings of one process may add up to across kinds: enough
+# for SUSPICIOUS, never MALICIOUS without a second, independent signal.
+NETWORK_SOURCE = "network"
+NETWORK_UNCORROBORATED_CAP = 4.0
+assert VERDICT_SUSPICIOUS <= NETWORK_UNCORROBORATED_CAP < VERDICT_MALICIOUS
 
 
 # Version of the finding-key scheme. Baselines record it; a baseline built
@@ -704,13 +842,27 @@ def from_direct_stubs(hits, process=""):
 
 # --- Network behaviour ------------------------------------------------
 
-# A beacon needs enough check-ins to show a rhythm.
-BEACON_MIN_CONNECTIONS = 4
-# Coefficient of variation of the intervals: below this the timing is regular
-# enough to be machine-driven. Jittered C2 (20-30% jitter) stays under 0.5.
-BEACON_MAX_COV = 0.5
-# Connections closer than this are a burst (one request), not separate beacons.
-BEACON_MIN_INTERVAL_S = 0.5
+# What counts as regular is defined once, in net_behavior.periodicity; these
+# are its thresholds, named here for the callers that read them from this module.
+BEACON_MIN_CONNECTIONS = net_behavior.BEACON_MIN_CONNECTIONS
+BEACON_MAX_COV = net_behavior.BEACON_MAX_COV
+BEACON_MIN_INTERVAL_S = net_behavior.BEACON_MIN_INTERVAL_S
+
+# A rhythm that is tight and sustained is machine-driven on its own; a looser
+# or shorter one also fits update checks and telemetry. Four or five random
+# contacts pass the regularity gate about one time in ten; they can never be
+# tight, which takes six.
+BEACON_TIGHT_MAX_COV = 0.2
+BEACON_TIGHT_MIN_ON_RHYTHM = 0.7
+BEACON_TIGHT_MIN_CONNECTIONS = 6
+# Weight of a beacon that is periodic but not tight, as a share of its kind's.
+BEACON_LOOSE_FACTOR = 0.7
+
+
+def beacon_is_tight(cov, on_rhythm, connections):
+    """Is a periodic rhythm tight enough to stand without a second opinion?"""
+    return (cov <= BEACON_TIGHT_MAX_COV and on_rhythm >= BEACON_TIGHT_MIN_ON_RHYTHM
+            and connections >= BEACON_TIGHT_MIN_CONNECTIONS)
 
 
 def beaconing_from_connections(connections, process=""):
@@ -719,12 +871,12 @@ def beaconing_from_connections(connections, process=""):
     Works from any connection log - Sysmon EID 3, ETW, a pcap summary - so it
     is independent of whichever tool happens to watch the network.
 
-    Periodicity is measured robustly (median and median absolute deviation):
-    real check-in loops have outliers - a slow first connect, a retry - and a
-    mean/stdev estimate lets a single outlier hide an otherwise exact rhythm.
+    Each endpoint's timestamps are measured by ``net_behavior.periodicity``,
+    the one definition of a rhythm in this project: robust (median and median
+    absolute deviation, so a slow first connect or a retry does not hide an
+    exact rhythm), connections less than ``BEACON_MIN_INTERVAL_S`` apart are
+    one check-in, and a series with more than one time scale has no interval.
     """
-    import statistics
-
     by_endpoint = {}
     for ts, ip, port in connections:
         if not ip or ts is None:
@@ -733,23 +885,12 @@ def beaconing_from_connections(connections, process=""):
 
     out = []
     for (ip, port), times in by_endpoint.items():
-        times.sort()
-        intervals = [b - a for a, b in zip(times, times[1:]) if b - a >= BEACON_MIN_INTERVAL_S]
-        if len(intervals) + 1 < BEACON_MIN_CONNECTIONS:
+        p = net_behavior.periodicity(times, rounded=False)
+        if not p["periodic"]:
             continue
-        median = statistics.median(intervals)
-        if median <= 0:
-            continue
-        mad = statistics.median(abs(x - median) for x in intervals)
-        # 1.4826 * MAD estimates the standard deviation for normal data.
-        robust_cov = 1.4826 * mad / median
-        on_rhythm = sum(1 for x in intervals if abs(x - median) <= 0.25 * median) / len(intervals)
-        if robust_cov > BEACON_MAX_COV or on_rhythm < 0.5:
-            continue
-        # A tight, sustained rhythm is machine-driven on its own; looser timing
-        # also fits update checks and telemetry, so it needs a second opinion.
-        tight = robust_cov <= 0.2 and on_rhythm >= 0.7 and len(intervals) + 1 >= 6
-        weight = KINDS["c2_beaconing"]["weight"] * (1.0 if tight else 0.7)
+        median, robust_cov, on_rhythm = p["interval"], p["cov"], p["on_rhythm"]
+        tight = beacon_is_tight(robust_cov, on_rhythm, p["connections"])
+        weight = KINDS["c2_beaconing"]["weight"] * (1.0 if tight else BEACON_LOOSE_FACTOR)
         out.append(MemoryFinding(
             source="sysmon-network", kind="c2_beaconing", process=process,
             detail=f"{len(times)} connections to {ip}:{port}, every {median:.1f}s "
@@ -758,6 +899,7 @@ def beaconing_from_connections(connections, process=""):
             weight=round(weight, 2),
             extra={
                 "endpoint": f"{ip}:{port}",
+                "dest": ip,
                 "connections": len(times),
                 "mean_interval_s": round(median, 2),
                 "cov": round(robust_cov, 3),
@@ -955,12 +1097,213 @@ class MemoryBaseline:
 
 # --- Scoring ----------------------------------------------------------
 
+def _observation_factor(finding):
+    """The share of the act that was seen, 0..1; 1.0 when the finding does not say."""
+    value = finding.get("observation", 1.0)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or math.isnan(value):
+        return 1.0
+    return min(1.0, max(0.0, float(value)))
+
+
+def _endpoints(finding):
+    """The destinations a finding names: its dest and, for a name, its addresses."""
+    out = set()
+    for value in [finding.get("dest")] + list(finding.get("addresses") or ()):
+        if not isinstance(value, str) or not value:
+            continue
+        try:
+            out.add(str(ipaddress.ip_address(value)))
+        except ValueError:
+            out.add(value.lower().rstrip("."))
+    return out
+
+
+def _group_total(contributions):
+    """What one (process, kind) group adds once saturation has capped it."""
+    values = sorted(contributions, reverse=True)
+    if not values:
+        return 0.0
+    allowance = values[0] * SATURATION_CAP
+    running = 0.0
+    for value in values:
+        running += min(value, max(0.0, allowance - running))
+    return running
+
+
+def _total(entries, excluded):
+    groups = {}
+    for index, (group, contribution) in entries.items():
+        if index not in excluded:
+            groups.setdefault(group, []).append(contribution)
+    return round(sum(_group_total(values) for values in groups.values()), 6)
+
+
+# Components of one process whose sides are chosen together, by trying every
+# combination. Real captures have one or two per C2; past this the sides are
+# chosen per component, which is still independent of the order of findings.
+SUPERSEDE_MAX_ENUMERATED = 10
+
+
+def _components(findings, entries, proc_key):
+    """One phenomenon per component: ``[(process, superseding side, other side)]``.
+
+    Findings take part when they are scored, name an endpoint and are of a kind
+    that supersedes or is superseded. Two of them on the same process that
+    share an endpoint are in one component, whichever side they are on, so a
+    check-in to a name and one to its address and the Sysmon beacons on two
+    ports of that address are one component. Only components with both sides
+    are returned, ordered by their content, not by where the findings sat.
+    """
+    superseding = {k for k, spec in KINDS.items() if spec.get("supersedes")}
+    superseded = {k for spec in KINDS.values() for k in spec.get("supersedes", ())}
+    parent = {}
+
+    def root(i):
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    first = {}
+    for i, f in enumerate(findings):
+        if i not in entries or f.get("kind") not in superseding | superseded:
+            continue
+        ends = _endpoints(f)
+        if not ends:
+            continue
+        parent[i] = i
+        side = "a" if f.get("kind") in superseding else "b"
+        for end in ends:
+            first.setdefault((proc_key(f), end, side), []).append(i)
+    # An edge joins a superseding finding and a superseded one that share an
+    # endpoint. Two check-ins on one address are not one phenomenon by that
+    # alone (a CDN address carries many names); a beacon to it makes them one.
+    for (process, end, side), here in first.items():
+        if side != "a":
+            continue
+        for j in first.get((process, end, "b"), ()):
+            for i in here:
+                a, b = root(i), root(j)
+                if a != b:
+                    parent[max(a, b)] = min(a, b)
+    members = {}
+    for i in parent:
+        members.setdefault(root(i), []).append(i)
+    out = []
+    for group in members.values():
+        side_a = sorted(i for i in group if findings[i]["kind"] in superseding)
+        side_b = sorted(i for i in group if findings[i]["kind"] not in superseding)
+        if side_a and side_b:
+            out.append((proc_key(findings[group[0]]), side_a, side_b))
+
+    def content(i):
+        f = findings[i]
+        return (f.get("kind") or "", f.get("source") or "", f.get("key") or "", entries[i][1])
+
+    out.sort(key=lambda c: (c[0], sorted(content(i) for i in c[1] + c[2])))
+    return out
+
+
+def _supersessions(findings, entries, proc_key):
+    """``{index: index of the winner}`` for the findings supersede takes out.
+
+    ``entries`` maps the index of every scored finding (not known to the
+    baseline) to its saturation group and contribution. Each component of
+    ``_components`` is one phenomenon seen two ways (the check-ins of a C2 and
+    Sysmon's beacons to it), so only one side of it counts: of all the ways to
+    choose a side in every component of a process, the one with the highest
+    total wins; a tie goes to the superseding side. The choice is made over
+    the whole set at once, so it does not depend on the order of the findings,
+    and adding a finding can only lower the score when that finding shows two
+    components to be one phenomenon (it joins them): what was counted twice is
+    then counted once. A finding the baseline knows takes part in neither side:
+    it counts nothing, so it must not take away what another would have counted.
+
+    Both guarantees are bounded. The best total is searched over all choices
+    only up to ``SUPERSEDE_MAX_ENUMERATED`` components on one process; past
+    that the result starts from the best of three whole-set choices and is
+    improved one component at a time (see the code). It is still independent
+    of order and never below counting either view of every component whole,
+    but it is a local optimum, so there adding a finding can lower the score
+    without joining anything.
+
+    Considered and not taken: forbid only *pairs* of findings that share an
+    endpoint and take the best total over the pair-free subsets. That is
+    monotone by construction (0 drops in 1,500 random sets against 12 here),
+    but it counts two views of one C2 twice whenever they name different
+    endpoints of it: a check-in to a name and Sysmon's beacon to an address
+    the name also resolves to, through a third finding. With no process
+    attribution in a capture that is the more likely error, so components
+    were chosen. A later phase that attributes connections to processes may
+    want the pair rule instead.
+    """
+    out = {}
+    by_process = {}
+    for component in _components(findings, entries, proc_key):
+        by_process.setdefault(component[0], []).append(component)
+
+    def winner_of(side):
+        return max(side, key=lambda i: (entries[i][1], findings[i].get("key") or ""))
+
+    for process, components in sorted(by_process.items()):
+        local = {i: e for i, e in entries.items() if e[0][0] == process}
+        if len(components) <= SUPERSEDE_MAX_ENUMERATED:
+            best = None
+            for mask in range(1 << len(components)):
+                excluded = set()
+                for bit, (_p, side_a, side_b) in enumerate(components):
+                    excluded.update(side_b if not mask >> bit & 1 else side_a)
+                rank = (_total(local, excluded), -bin(mask).count("1"), -mask)
+                if best is None or rank > best[0]:
+                    best = (rank, mask)
+            choices = [not best[1] >> bit & 1 for bit in range(len(components))]
+        else:
+            # Past the cap: the best of three choices, each independent of the
+            # order of the findings: every component on its superseding side,
+            # every one on the other side, and each on its own larger side.
+            candidates = [
+                [True] * len(components),
+                [False] * len(components),
+                [_total({i: entries[i] for i in side_a}, set())
+                 >= _total({i: entries[i] for i in side_b}, set())
+                 for _p, side_a, side_b in components]]
+
+            def total_of(choice):
+                excluded = set()
+                for keep_a, (_p, side_a, side_b) in zip(choice, components):
+                    excluded.update(side_b if keep_a else side_a)
+                return _total(local, excluded)
+            choices = max(candidates, key=lambda c: (total_of(c), c.count(True)))
+            # Then flip one component at a time, in the canonical order, while
+            # that raises the total: saturation often makes a mix of sides
+            # best (two beacons fill their kind's cap, the rest count as
+            # check-ins), and none of the three candidates is a mix.
+            best_total = total_of(choices)
+            improved = True
+            while improved:
+                improved = False
+                for bit in range(len(choices)):
+                    trial = list(choices)
+                    trial[bit] = not trial[bit]
+                    value = total_of(trial)
+                    if value > best_total:
+                        choices, best_total, improved = trial, value, True
+        for keep_a, (_p, side_a, side_b) in zip(choices, components):
+            keep, drop = (side_a, side_b) if keep_a else (side_b, side_a)
+            winner = winner_of(keep)
+            for i in drop:
+                out[i] = winner
+    return out
+
+
 def score(findings, baseline=None):
     """Weigh normalized findings into a verdict.
 
     Returns a dict with the verdict, the scored findings (each carrying the
     factors that produced its confidence), and the suppressed ones, so the
-    result can be audited rather than trusted.
+    result can be audited rather than trusted. ``suppressed`` holds what the
+    baseline knows (``suppressed_count``) and what another finding absorbed
+    (``superseded_by``, ``superseded_count``).
     """
     scored, suppressed = [], []
 
@@ -979,7 +1322,26 @@ def score(findings, baseline=None):
     # Only substantial findings may corroborate another source. Otherwise a
     # trivial string hit ("kernel32.dll", weight 0.2) would vouch for anything
     # that happens to share the process.
+    # A finding with corroboration_scope "endpoint" is about one destination
+    # only (an upload to a known-good host): it neither gets nor gives a second
+    # opinion except with a finding that names the same endpoint. An OCSP
+    # request is not made suspicious by a reflective PE elsewhere in the
+    # process, nor does it vouch for one.
+    # A finding whose process is only assumed (attribution "assumed": a
+    # capture's finding given to the sample) neither gets nor gives a second
+    # opinion through the process, only through a shared endpoint. The two
+    # directions differ on purpose: it *gets* one from a finding of any
+    # process and any other source that names its endpoint (the capture
+    # cannot say which process made the connection, so Sysmon's beacon to
+    # that address in another process still vouches for it), but it *gives*
+    # one only to a finding of the same process that names its endpoint (a
+    # capture's check-in must not make an unrelated process's finding count
+    # in full).
+    def assumed(f):
+        return f.get("attribution") == ATTRIBUTION_ASSUMED
+
     sources_by_process = {}
+    scoped = []
     for f in findings:
         if f.get("base_weight", 0) < CORROBORATION_MIN_WEIGHT:
             continue
@@ -989,41 +1351,95 @@ def score(findings, baseline=None):
             continue
         if known(f):
             continue
+        if f.get("corroboration_scope") == CORROBORATION_SCOPE_ENDPOINT or assumed(f):
+            scoped.append(f)
+            continue
         sources_by_process.setdefault(proc_key(f), set()).add(f["source"])
+    eligible = [f for f in findings
+                if f.get("base_weight", 0) >= CORROBORATION_MIN_WEIGHT and not known(f)
+                and f.get("may_corroborate") is not False]
 
+    def corroborators(f):
+        if assumed(f):
+            mine = _endpoints(f)
+            return {g["source"] for g in eligible if g is not f and mine & _endpoints(g)} - {f["source"]}
+        if f.get("corroboration_scope") == CORROBORATION_SCOPE_ENDPOINT:
+            pool = [g for g in eligible if g is not f]
+        elif scoped:
+            pool = scoped
+        else:
+            return sources_by_process.get(proc_key(f), set()) - {f["source"]}
+        mine = _endpoints(f)
+        near = {g["source"] for g in pool
+                if proc_key(g) == proc_key(f) and mine & _endpoints(g)}
+        if f.get("corroboration_scope") != CORROBORATION_SCOPE_ENDPOINT:
+            near |= sources_by_process.get(proc_key(f), set())
+        return near - {f["source"]}
 
-    for f in findings:
-        item = dict(f)
-        factors = {}
-
+    # Every finding is weighed first, then supersede decides which side of
+    # each phenomenon counts, from the totals of all choices at once. The
+    # findings it takes out stay in sources_by_process above, so they still
+    # corroborate, the one that won as well as any other.
+    weighed = {}
+    for index, f in enumerate(findings):
         if known(f):
+            continue
+        factors = {"persistence": _persistence_factor(f)}
+        corroborated_by = None
+        cf = 1.0
+        if f.get("needs_corroboration"):
+            others = corroborators(f)
+            if others:
+                corroborated_by = sorted(others)
+            else:
+                cf = UNCORROBORATED
+        factors["corroboration"] = cf
+        factors["observation"] = _observation_factor(f)
+        confidence = round(min(1.0, factors["persistence"] * cf * factors["observation"]), 3)
+        contribution = round(f.get("base_weight", 1.0) * confidence, 3)
+        weighed[index] = (factors, corroborated_by, confidence, contribution)
+
+    out_by = _supersessions(
+        findings, {i: ((proc_key(findings[i]), findings[i]["kind"]), w[3])
+                   for i, w in weighed.items()}, proc_key)
+    absorbed = {}
+    for index, winner in out_by.items():
+        absorbed.setdefault(winner, []).append(
+            {"kind": findings[index].get("kind"), "source": findings[index].get("source")})
+    baseline_count = superseded_count = 0
+
+    for index, f in enumerate(findings):
+        item = dict(f)
+
+        if index not in weighed:
             item["baseline"] = "known"
             item["confidence"] = 0.0
             item["score"] = 0.0
             item["factors"] = {"baseline": BASELINE_KNOWN}
             suppressed.append(item)
+            baseline_count += 1
+            continue
+        if index in out_by:
+            winner = findings[out_by[index]]
+            item["superseded_by"] = winner["kind"]
+            item["superseded_by_key"] = winner.get("key")
+            item["confidence"] = 0.0
+            item["score"] = 0.0
+            item["factors"] = {"superseded": 0.0}
+            suppressed.append(item)
+            superseded_count += 1
             continue
         item["baseline"] = "new"
 
-        pf = _persistence_factor(f)
-        factors["persistence"] = pf
-
-        cf = 1.0
-        if f.get("needs_corroboration"):
-            others = sources_by_process.get(proc_key(f), set()) - {f["source"]}
-            if others:
-                item["corroborated_by"] = sorted(others)
-            else:
-                cf = UNCORROBORATED
-        factors["corroboration"] = cf
-
-        confidence = round(min(1.0, pf * cf), 3)
-        contribution = round(f.get("base_weight", 1.0) * confidence, 3)
-
+        factors, corroborated_by, confidence, contribution = weighed[index]
+        if corroborated_by:
+            item["corroborated_by"] = corroborated_by
         item["confidence"] = confidence
         item["raw_score"] = contribution
         item["score"] = contribution
         item["factors"] = factors
+        if index in absorbed:
+            item["absorbed"] = absorbed[index]
         scored.append(item)
 
     # Saturation: cap what one kind can contribute per process. Without this a
@@ -1050,6 +1466,29 @@ def score(findings, baseline=None):
                 "group_size": len(items),
                 "group_cap": round(allowance, 2),
             }
+
+    # A capture's findings that needed a second opinion and got none: every
+    # periodic service and telemetry POST of the machine is "the sample's" in
+    # a pcap, so together, across kinds, they may make a process SUSPICIOUS
+    # but never MALICIOUS on their own (a poller and two telemetry POSTs were
+    # 6.4). Only source "network" findings take part, so a set without them
+    # scores exactly as before.
+    pools = {}
+    for item in scored:
+        if (item.get("source") == NETWORK_SOURCE
+                and item["factors"].get("corroboration") == UNCORROBORATED and item["score"] > 0):
+            pools.setdefault(proc_key(item), []).append(item)
+    for proc, items in pools.items():
+        if sum(item["score"] for item in items) <= NETWORK_UNCORROBORATED_CAP:
+            continue
+        items.sort(key=lambda x: (-x["score"], x.get("key") or ""))
+        running = 0.0
+        for item in items:
+            capped = min(item["score"], max(0.0, NETWORK_UNCORROBORATED_CAP - running))
+            running += capped
+            item["network_cap"] = {"before": item["score"], "cap": NETWORK_UNCORROBORATED_CAP,
+                                   "group_size": len(items)}
+            item["score"] = round(capped, 3)
 
     total = round(sum(item["score"] for item in scored), 2)
 
@@ -1079,6 +1518,10 @@ def score(findings, baseline=None):
         sat = item.get("saturation")
         if sat and sat["group_size"] > 1:
             bits.append(f"{sat['rank']} of {sat['group_size']} of this kind")
+        if item.get("network_cap"):
+            bits.append(f"uncorroborated capture findings capped at {NETWORK_UNCORROBORATED_CAP:g}")
+        for other in item.get("absorbed") or ():
+            bits.append(f"absorbs {other['kind']} from {other['source']}")
         reasons.append(f"{reason} ({'; '.join(bits)})")
 
     by_evidence = {}
@@ -1092,15 +1535,77 @@ def score(findings, baseline=None):
         "thresholds": {"suspicious": VERDICT_SUSPICIOUS, "malicious": VERDICT_MALICIOUS},
         "findings": scored,
         "suppressed": suppressed,
-        "suppressed_count": len(suppressed),
+        # Read as "suppressed by the host baseline" by app.py and the UI.
+        "suppressed_count": baseline_count,
+        "superseded_count": superseded_count,
         "by_evidence": by_evidence,
         "reasons": reasons[:12],
         "sources": sorted({f["source"] for f in findings}),
     }
 
 
-def collect(results, process=""):
-    """Pull every supported scanner result out of a detonation result dict."""
+def network_incomplete(report):
+    """What a network report could not analyse, one line each; [] when nothing.
+
+    A capture cut by a cap or a budget (too many events, a flow padded with
+    junk, a spent text, hash or decoding budget, rules the regex budget could
+    not decide, a step that failed) may hold the C2 in the part that was not
+    looked at, so its findings are a lower bound, and a verdict built on them
+    must say so instead of presenting CLEAN as "nothing found". Read from the
+    report's flags, so a report stored before ``incomplete`` existed is read
+    the same way. What only the report leaves out (``report_text_cut``,
+    ``iocs_capped``) is not here: the analysis saw it.
+    """
+    if not isinstance(report, dict):
+        return []
+    out = []
+    if report.get("truncated"):
+        out.append("the capture file was cut")
+    if report.get("events_capped"):
+        out.append("more than %s parser events: the flows after them were not parsed"
+                   % report.get("max_events", "the maximum of"))
+    if report.get("flows_capped"):
+        out.append("%s flow(s) had more than %s events: the rest of each was not parsed"
+                   % (report["flows_capped"], report.get("max_events_per_flow", "the maximum of")))
+    if report.get("text_budget_spent"):
+        out.append("the analysis text budget was spent: some bodies were analysed in part")
+    if report.get("hash_budget_spent"):
+        out.append("the hash budget was spent: some files have no full hash")
+    if report.get("decoded_capped"):
+        out.append("the decoding budget was spent: some encoded values were not decoded")
+    if report.get("dns_answers_capped"):
+        out.append("some DNS answers were not kept")
+    if report.get("rule_budget_spent"):
+        out.append("the regex time budget was spent: some rules were not decided")
+    elif report.get("rule_unevaluated"):
+        out.append("%d rule(s) could not be decided for some events"
+                   % _count(report["rule_unevaluated"]))
+    if report.get("errors"):
+        out.append("%d analysis step(s) failed" % _count(report["errors"]))
+    return out
+
+
+def _count(value):
+    return len(value) if isinstance(value, (list, tuple)) else 1
+
+
+def collect(results, process="", network_process=None):
+    """Pull every supported scanner result out of a detonation result dict.
+
+    A capture knows no process, so the findings of the network report come
+    without one; they are the sample's traffic (the report was imported for
+    it), so they are attributed to ``network_process`` (default ``process``)
+    and marked ``attribution: "assumed"``. Supersede matches by process:
+    without this a capture's check-in and Sysmon's beaconing of the same loop
+    never met and counted twice. Corroboration of such a finding goes only
+    through a shared endpoint (see score). Every finding of the report without
+    a pid is assumed, also one that names a process (the import's ``process``
+    field writes it into every finding; the name is kept) and also when there
+    is no owner (its process stays ""): a name typed at import time, or none,
+    is not an attribution, and through it a check-in to one address was
+    corroborated by Sysmon's beacon to another. Only a pid keeps a finding
+    out of this.
+    """
     findings = []
     aether = results.get("aether") or {}
     if isinstance(aether, dict):
@@ -1130,6 +1635,23 @@ def collect(results, process=""):
     pipes = results.get("named_pipes") or {}
     if isinstance(pipes, dict) and pipes.get("evidence_findings"):
         findings += pipes["evidence_findings"]
+
+    # The network report imported for the sample (net_evidence, source
+    # "network"). It only holds findings of events the network baseline does
+    # not know; one marked baseline anyway stays out. Copies: the report is the
+    # stored one, and scoring must not write into it.
+    report = results.get("network") or {}
+    if isinstance(report, dict) and isinstance(report.get("evidence_findings"), list):
+        owner = _process_identity(process if network_process is None else network_process)[0]
+        for f in report["evidence_findings"]:
+            if not isinstance(f, dict) or f.get("baseline"):
+                continue
+            # A capture knows no process, whatever the report or the import
+            # named: every finding of it without a pid is the sample's by
+            # assumption, with or without an owner (Ruling 69).
+            if f.get("pid") in (None, ""):
+                f = dict(f, process=f.get("process") or owner, attribution=ATTRIBUTION_ASSUMED)
+            findings.append(dict(f))
 
     dyn = results.get("litterbox_dynamic") or {}
     if isinstance(dyn, dict):

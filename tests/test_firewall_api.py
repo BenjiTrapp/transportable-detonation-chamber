@@ -1401,7 +1401,10 @@ def test_the_provisioning_script_excludes_the_capture_directory():
 def test_the_requirements_did_not_grow():
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     lines = [l.strip() for l in open(os.path.join(root, "webui", "requirements.txt")) if l.strip()]
-    assert lines == ["flask>=3.0", "requests>=2.31", "watchdog>=4.0", "pefile>=2023.2.7"]
+    # The FIREWALL tab adds no dependency; the list is the one the network analysis
+    # (dpkt, cryptography, pyyaml, regex, flask>=3.1) brought in the merge of both.
+    assert lines == ["flask>=3.1", "requests>=2.31", "watchdog>=4.0", "pefile>=2023.2.7",
+                     "dpkt>=1.9.8", "cryptography>=42", "pyyaml>=6.0", "regex>=2023.12.25"]
 
 
 # ---- the readers -----------------------------------------------------------------------------

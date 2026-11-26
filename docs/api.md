@@ -27,7 +27,7 @@ Responses are JSON.
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | POST | `/api/submit` | Submit sample (multipart). Params: `file`, `target` (agent/litterbox/both) |
-| GET | `/api/detonation/results` | Poll results. Params: `sha256`, `pid`, `litterbox_hash`, `filename` |
+| GET | `/api/detonation/results` | Poll results. Params: `sha256`, `pid`, `litterbox_hash`, `filename`. With a network report imported for the sample: `network`, the newest one still kept, without its events (`event_count` instead; fetch them from `/api/network/report`), its findings scored in the verdict |
 
 ## Process Graph
 
@@ -112,6 +112,18 @@ own page: [API Reference — Rizin](api-rizin.md).
 | GET / POST | `/api/processdump/baseline` | Process Dump clean-hash database status / build it (`mode`: `gen`, `genquick`) |
 | GET | `/api/process/lookup` | Running PIDs by image name. Params: `name` |
 | GET | `/api/file/visualize` | File map planes + structure + import/export trees. Params: `path`, `cols`, `rows` |
+
+## Network
+
+The NETWORK tab: a packet capture turned into a report of events, rule hits and scored findings, and the network baseline of the clean VM ([Network analysis](web-ui.md#network-analysis)).
+
+| Method | Endpoint | Description |
+|--------|----------|-------------|
+| POST | `/api/network/import` | Analyze an uploaded pcap or pcapng and keep the report. Form fields: `file`, `mode` (`online` default, or `isolated`), `process`, `sha256` (optional: the SHA256 of the detonated sample the capture belongs to, 64 hex digits, else 400; `/api/detonation/results` of that sample then carries the newest such report as `network`, without its events). Returns the report (events, rule hits, findings, IOCs, files; passwords masked) with `id`, `filename`, `timestamp`, `sample_sha256`; `events_capped` / `flows_capped` / `text_budget_spent` / `decoded_capped` / `dns_answers_capped` when the capture held more events, body text, decoded values or DNS answers than one analysis reads (listed in `incomplete`, which the combined verdict carries as `incomplete` / `incomplete_reasons`), `report_text_cut` when the report keeps only part of the text the analysis read; 400 for a file that is not a pcap, 413 over 256 MB, 503 (with the `pip install` to run) when the network packages are missing |
+| GET | `/api/network/report` | A stored network report. Params: `id` (as returned by the import) |
+| GET | `/api/network/reports` | Stored network reports, newest first: `id`, `filename`, `timestamp`, `mode` and a `summary` (counts, `verdict`, `score`, and `incomplete`: what the analysis could not read, [] when nothing), not the report |
+| GET | `/api/network/baseline` | What the network baseline of this VM holds (`count`, `by_type`, the DNS `resolvers` it learned, whose answers alone a capture analysed with the baseline believes; `stale: true` when built with an older key scheme) |
+| POST | `/api/network/baseline/capture` | Record what a pcap of the clean VM holds as the network baseline (it is analyzed without the baseline). Form field: `file`. Returns `added`, `count`, what was `learned`, and `truncated` / `errors` / `note` when the capture was cut short or a step failed (it is learned anyway) |
 
 ## Syscalls
 

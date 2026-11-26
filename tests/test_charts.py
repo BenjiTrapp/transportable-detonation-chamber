@@ -7519,7 +7519,8 @@ RESULT_VIEW_FUNCTIONS = list(dict.fromkeys(VERDICT_FLOW_FUNCTIONS + [
     "renderDetonationPanels", "detHasMemoryResults", "viewDetonationResult", "_detRawButton", "renderMemoryEvidence", "evidenceClassLabel",
     "confidenceClass", "renderExitCaptureBlock", "renderNetworkBeaconingBlock", "renderNamedPipesBlock", "pipesIsGone",
     "pipesCanonical", "pipeProcLabel", "formatTime", "formatSize", "cssToken", "severitySortValue", "sortTimeValue",
-    "sortNumberValue", "pushDetailHistory", "setDetailHeader", "setDetailBody", "showDetail"]))
+    "sortNumberValue", "pushDetailHistory", "setDetailHeader", "setDetailBody", "showDetail",
+    "verdictIncompleteHtml", "verdictReasonsText", "networkText"]))
 FLOW_KINDS = ["kind:edr", "kind:memory", "kind:exit", "kind:network", "kind:pipes"]
 FLOW_KIND_SOURCES = {"exit-capture": "kind:exit", "sysmon-network": "kind:network", "sysmon-pipes": "kind:pipes"}
 

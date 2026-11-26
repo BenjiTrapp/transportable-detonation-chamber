@@ -19,7 +19,8 @@ import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 APP_JS = os.path.join(ROOT, "webui", "static", "js", "app.js")
-SOURCE = open(APP_JS, encoding="utf-8").read()
+with open(APP_JS, encoding="utf-8") as _app_js:
+    SOURCE = _app_js.read()
 
 NODE = shutil.which("node")
 needs_node = pytest.mark.skipif(NODE is None, reason="node not installed")

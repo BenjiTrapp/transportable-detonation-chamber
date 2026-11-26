@@ -19,9 +19,9 @@
             document.documentElement.dataset.theme = 'cyberpunk';
         }
     </script>
-    <link rel="stylesheet" href="/static/css/style.css?v=97">
+    <link rel="stylesheet" href="/static/css/style.css?v=98">
     <link rel="stylesheet" href="/static/css/theme-layout.css?v=13">
-    <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=38">
+    <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=39">
 </head>
 <body>
     <!-- Global loading overlay (shown on slow fetches) -->
@@ -85,6 +85,7 @@
                     <button class="tab" data-tab="tracing">Tracing</button>
                     <button class="tab" data-tab="graph">Graph</button>
                     <button class="tab" data-tab="pipes">Pipes</button>
+                    <button class="tab" data-tab="network">Network</button>
                     <button class="tab" data-tab="sysmon">Sysmon</button>
                     <button class="tab" data-tab="firewall">FIREWALL</button>
                     <button class="tab" data-tab="logs">LOGS</button>
@@ -401,15 +402,16 @@
                         <div class="rtrace-detail-content" id="rtrace-detail-content" style="display:none;">
                             <!-- Detail tabs -->
                             <div class="rtrace-detail-tabs" id="rtrace-detail-tabs">
-                                <button class="rtrace-tab active" data-rtab="verdict">Verdict</button>
-                                <button class="rtrace-tab" data-rtab="live">Live</button>
-                                <button class="rtrace-tab" data-rtab="http">HTTP Requests <span class="rtrace-tab-count">0</span></button>
-                                <button class="rtrace-tab" data-rtab="connections">Connections <span class="rtrace-tab-count">0</span></button>
-                                <button class="rtrace-tab" data-rtab="dns">DNS Requests <span class="rtrace-tab-count">0</span></button>
-                                <button class="rtrace-tab" data-rtab="files">Files <span class="rtrace-tab-count">0</span></button>
-                                <button class="rtrace-tab" data-rtab="registry">Registry <span class="rtrace-tab-count">0</span></button>
-                                <button class="rtrace-tab" data-rtab="artifacts">Artifacts <span class="rtrace-tab-count">0</span></button>
-                                <button class="rtrace-tab" data-rtab="modules">Modules <span class="rtrace-tab-count">0</span></button>
+                                <button type="button" class="rtrace-tab" data-rtab="verdict">VERDICT</button>
+                                <button type="button" class="rtrace-tab active" data-rtab="live">LIVE</button>
+                                <button type="button" class="rtrace-tab" data-rtab="http">HTTP REQUESTS <span class="rtrace-tab-count">0</span></button>
+                                <button type="button" class="rtrace-tab" data-rtab="connections">CONNECTIONS <span class="rtrace-tab-count">0</span></button>
+                                <button type="button" class="rtrace-tab" data-rtab="dns">DNS REQUESTS <span class="rtrace-tab-count">0</span></button>
+                                <button type="button" class="rtrace-tab" data-rtab="tls">TLS <span class="rtrace-tab-count">0</span></button>
+                                <button type="button" class="rtrace-tab" data-rtab="files">FILES <span class="rtrace-tab-count">0</span></button>
+                                <button type="button" class="rtrace-tab" data-rtab="registry">REGISTRY <span class="rtrace-tab-count">0</span></button>
+                                <button type="button" class="rtrace-tab" data-rtab="artifacts">ARTIFACTS <span class="rtrace-tab-count">0</span></button>
+                                <button type="button" class="rtrace-tab" data-rtab="modules">MODULES <span class="rtrace-tab-count">0</span></button>
                             </div>
                             <!-- Event Table: a grid of <div>s whose heads sort the rows
                                  (initRtraceEventSort in app.js) -->
@@ -576,6 +578,48 @@
                         </div>
                     </section>
                 </div>
+            </div>
+
+            <!-- Network Tab: the network report of a pcap (networkTabShown in app.js): the bar to import
+                 a capture and to choose a stored report, the sub-tabs, the pane renderNetworkReport draws -->
+            <div class="tab-content" id="tab-network">
+                <div class="content-header">
+                    <h2 data-info="What a capture of the sample's network traffic holds: connections, DNS, HTTP, TLS, the files that crossed the wire and the indicators, with what the rules and the evidence score made of it. A pcap or pcapng is analyzed on the VM and kept as a report.">Network</h2>
+                    <div class="header-actions">
+                        <span class="net-summary" id="net-summary" aria-live="polite"></span>
+                    </div>
+                </div>
+                <div class="net-bar">
+                    <label class="net-field"><span>Report</span>
+                        <select id="net-report-select" class="etw-select" aria-label="Stored network report" onchange="networkSelectReport(this.value)"><option value="">No report yet</option></select></label>
+                    <label class="net-field"><span>Capture (pcap, pcapng)</span>
+                        <input type="file" id="net-file" class="net-file" accept=".pcap,.pcapng,.cap" aria-label="Capture to analyze"></label>
+                    <label class="net-field"><span>Mode</span>
+                        <select id="net-mode" class="etw-select" title="online: the real internet answered. isolated: our own server answered, so an upload or a login is an attempt.">
+                            <option value="online" selected>online</option>
+                            <option value="isolated">isolated</option>
+                        </select></label>
+                    <label class="net-field"><span>Sample SHA256 (optional)</span>
+                        <input type="text" id="net-sample" class="filter-input" spellcheck="false" autocomplete="off" placeholder="the detonated sample" title="The SHA256 of the detonated sample this capture belongs to: its detonation results then carry this report, and its findings count in the verdict."></label>
+                    <button type="button" class="etw-btn" id="net-import-btn" onclick="networkImport()">Import</button>
+                    <button type="button" class="btn btn-sm" onclick="networkRefreshReports()">Refresh</button>
+                </div>
+                <div class="net-baseline" id="net-baseline">
+                    <span class="net-baseline-text" id="net-baseline-text">Baseline: loading...</span>
+                    <input type="file" id="net-baseline-file" class="net-file" accept=".pcap,.pcapng,.cap" aria-label="Capture of the clean machine">
+                    <button type="button" class="btn btn-sm" id="net-baseline-btn" onclick="networkCaptureBaseline()" title="Learn what a capture of the clean machine holds; later imports mark and suppress it">Capture baseline</button>
+                </div>
+                <div class="net-message" id="net-message" role="status" aria-live="polite" hidden></div>
+                <nav class="net-subtabs" id="net-subtabs" aria-label="Network sections">
+                    <button type="button" class="net-subtab" data-net-sub="overview" aria-pressed="true" onclick="networkSetSub('overview')">OVERVIEW</button>
+                    <button type="button" class="net-subtab" data-net-sub="connections" aria-pressed="false" onclick="networkSetSub('connections')">CONNECTIONS</button>
+                    <button type="button" class="net-subtab" data-net-sub="dns" aria-pressed="false" onclick="networkSetSub('dns')">DNS</button>
+                    <button type="button" class="net-subtab" data-net-sub="http" aria-pressed="false" onclick="networkSetSub('http')">HTTP</button>
+                    <button type="button" class="net-subtab" data-net-sub="tls" aria-pressed="false" onclick="networkSetSub('tls')">TLS</button>
+                    <button type="button" class="net-subtab" data-net-sub="files" aria-pressed="false" onclick="networkSetSub('files')">FILES</button>
+                    <button type="button" class="net-subtab" data-net-sub="iocs" aria-pressed="false" onclick="networkSetSub('iocs')">IOCs</button>
+                </nav>
+                <div class="net-report" id="net-report"><div class="net-empty">Import a capture to see its report.</div></div>
             </div>
 
             <!-- Sysmon Tab: the charts of the events the filters let through
@@ -1702,6 +1746,10 @@
                             <p>Named pipe events from Sysmon (EID 17/18) with name and PID filters; known C2 pipe names are marked. Interception: attach to an existing pipe or arm for a pipe that does not exist yet, observe or hold messages (forward, edit as hex, drop), export a session as JSON. The pipe name must be known; clients that connect while a session is starting, or that were already connected, are not intercepted.</p>
                         </div>
                         <div class="help-guide-item">
+                            <h4>Network</h4>
+                            <p>The report of a pcap or pcapng: import one (mode <em>online</em> when the real internet answered, <em>isolated</em> when our own server did, so an upload or a login is an attempt) or open a stored report. OVERVIEW says what was found, what the evidence score made of it and what could <em>not</em> be decided (rules that timed out, a spent regex or hash budget, a cut capture, steps that failed), which is not the same as nothing found; findings the baseline knows and findings another finding absorbed are listed apart. CONNECTIONS, DNS, HTTP, TLS, FILES and IOCs list the events. Files are shown by hash and kind only and are never opened or run. Capture baseline learns what a clean machine does on the wire.</p>
+                        </div>
+                        <div class="help-guide-item">
                             <h4>Sysmon</h4>
                             <p>Sysmon events with search, type and PID filters, and the Windows Event IDs each event corresponds to. EVENTS OVER TIME and the Sankey PROCESS &rarr; EVENT TYPE count the events of the filters, all but the time window, which the bars mark (it narrows the table): a click on a bar sets a time window (Shift+click widens it to another bar), on a legend row or a node an event type or image, each a chip in the filter bar.</p>
                         </div>
@@ -1779,7 +1827,7 @@
                         <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
                         <tbody>
                             <tr><td class="api-post">POST</td><td><code>/api/submit</code></td><td>Submit a sample. Params: <code>file</code>, <code>target</code> (agent/litterbox/both)</td></tr>
-                            <tr><td class="api-get">GET</td><td><code>/api/detonation/results</code></td><td>Combined verdict and results. Params: <code>sha256</code>, <code>pid</code>, <code>filename</code></td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/detonation/results</code></td><td>Combined verdict and results. Params: <code>sha256</code>, <code>pid</code>, <code>filename</code>. Carries <code>network</code> (the sample's newest network report, without its events) when one was imported for the sample</td></tr>
                             <tr><td class="api-get">GET</td><td><code>/api/process-graph</code></td><td>Process tree around a process. Params: <code>pid</code>, <code>at</code>, <code>down_depth</code>, <code>max_nodes</code></td></tr>
                         </tbody>
                     </table>
@@ -1845,6 +1893,18 @@
                             <tr><td class="api-post">POST</td><td><code>/api/pipes/intercept/&lt;sid&gt;/messages/&lt;seq&gt;</code></td><td>Forward, edit or drop a held message</td></tr>
                             <tr><td class="api-post">POST</td><td><code>/api/pipes/intercept/&lt;sid&gt;/release</code></td><td>Forward every held message</td></tr>
                             <tr><td class="api-get">GET</td><td><code>/api/pipes/intercept/&lt;sid&gt;/export</code></td><td>Session and all messages as a JSON download</td></tr>
+                        </tbody>
+                    </table>
+
+                    <h4>Network</h4>
+                    <table class="help-api-table">
+                        <thead><tr><th>Method</th><th>Endpoint</th><th>Description</th></tr></thead>
+                        <tbody>
+                            <tr><td class="api-post">POST</td><td><code>/api/network/import</code></td><td>Analyze an uploaded pcap or pcapng and keep the report. Params: <code>file</code>, <code>mode</code> (online/isolated), <code>process</code>, <code>sha256</code> (optional: the detonated sample; its detonation results then carry the newest such report as <code>network</code>)</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/network/report</code></td><td>A stored network report. Param: <code>id</code></td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/network/reports</code></td><td>Stored reports, newest first, with a summary</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/network/baseline</code></td><td>What the network baseline of this VM holds</td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/network/baseline/capture</code></td><td>Learn a capture of the clean VM as the baseline. Param: <code>file</code></td></tr>
                         </tbody>
                     </table>
 
@@ -2001,6 +2061,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
         <div id="decision-toasts" class="decision-stack" role="region" aria-label="Firewall decisions"></div>
     </div>
 
-    <script src="/static/js/app.js?v=165"></script>
+    <script src="/static/js/app.js?v=166"></script>
 </body>
 </html>
