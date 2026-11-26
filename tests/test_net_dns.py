@@ -40,6 +40,8 @@ Regressions covered:
   * one DNS-over-TCP exchange with the resolver (Windows retries a truncated
     reply over TCP/53) made it an endpoint and no resolver; connections to
     port 53 and 853 do not count (follow-up review, Important 1)
+  * with a baseline, the share rule believed a sample's own server answering
+    the only lookup; with learned resolvers only their answers count (Ruling 77)
 """
 
 import os
@@ -502,3 +504,15 @@ def test_dns_over_tcp_or_tls_to_the_resolver_keeps_it_a_resolver():
         assert len(net_dns.trusted_lookups(events + [conn])) == 2, port
     other = net_events.NetEvent("conn", 2.0, dest=RESOLVER, port=443)
     assert net_dns.trusted_lookups(events + [other]) == []
+
+
+def test_with_learned_resolvers_only_their_answers_count():
+    events = [_lookup("ocsp.digicert.com", ["203.0.113.66"], server="203.0.113.67")]
+    assert len(net_dns.trusted_lookups(events)) == 1            # the share rule alone believes it
+    assert net_dns.trusted_lookups(events, frozenset((RESOLVER,))) == []
+    events.append(_lookup("a.example", ["198.51.100.1"]))
+    assert [e["dest"] for e in net_dns.trusted_lookups(events, [RESOLVER])] == ["a.example"]
+    assert net_dns.trusted_lookups(events, frozenset()) == []
+    # a learned resolver is still no resolver where the capture sent traffic to it
+    conn = net_events.NetEvent("conn", 2.0, dest=RESOLVER, port=80)
+    assert net_dns.trusted_lookups(events + [conn], [RESOLVER]) == []

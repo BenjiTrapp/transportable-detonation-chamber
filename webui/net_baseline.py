@@ -47,7 +47,11 @@ Two further points:
     is not where the data went. Nor is a claimed answer: one reply the C2
     served about itself (``ocsp.digicert.com A <C2>``) made forty uploads to it
     known, so only the answers of the capture's resolvers count
-    (``net_dns.trusted_lookups``), never a self-answer.
+    (``net_dns.trusted_lookups``), never a self-answer. Which servers those are
+    a capture cannot always tell (a sample's own server answering its only
+    lookup passes any share rule), so the baseline also learns the resolvers
+    of the clean machine (``resolvers``, ``learned_resolvers``; key scheme 3),
+    and with a baseline only their answers count.
   * A masked value in a path hides the file after it. ``/dl;token=abc/update.bin``
     and ``/dl;token=abc/stage.exe`` were both ``/dl;token=***`` and had one
     key; a path is masked segment by segment (``net_decode.mask_credentials``
@@ -71,7 +75,7 @@ import net_dns
 
 # 1: first scheme. 2: an upload's key holds its size bucket, and a path's
 #    masked value ends at "/" (net_decode.mask_credentials path mode).
-KEY_VERSION = 2
+KEY_VERSION = 3
 INTERVAL_STEP = 1.25    # ratio between neighbouring beacon interval buckets
 SIZE_STEP = 2.0         # ratio between neighbouring upload size buckets
 
@@ -213,7 +217,7 @@ class NetBaseline:
     @staticmethod
     def _empty():
         return {"created": None, "updated": None, "key_version": KEY_VERSION, "keys": {},
-                "dests": {}}
+                "dests": {}, "resolvers": {}}
 
     def _stale(self):
         # a file without a version was not written by this module's scheme
@@ -228,6 +232,7 @@ class NetBaseline:
             if not (isinstance(data, dict) and isinstance(data.get("keys"), dict)):
                 raise ValueError("not a network baseline")
             data.setdefault("dests", {})
+            data.setdefault("resolvers", {})
             self._data = data
             if self._stale():
                 print("[net_baseline] %s uses key scheme v%s, current is v%d: ignored until "
@@ -260,7 +265,14 @@ class NetBaseline:
                 self._data = self._empty()
             keys = self._data.setdefault("keys", {})
             dests = self._data.setdefault("dests", {})
-            for event in events or ():
+            resolvers = self._data.setdefault("resolvers", {})
+            events = list(events or ())
+            # without a learned set of its own (the clean capture's share rule)
+            for lookup in net_dns.trusted_lookups(events):
+                server = net_dns._address(lookup.get("server"))
+                if server:
+                    resolvers[server] = resolvers.get(server, 0) + 1
+            for event in events:
                 key = event_key(event)
                 if key is None:
                     continue
@@ -289,6 +301,17 @@ class NetBaseline:
         """Is this event what the clean VM did (its key, or a neighbouring rhythm)?"""
         return any(self.knows(key) for key in _candidates(event))
 
+    def learned_resolvers(self):
+        """The DNS servers whose answers the clean machine's captures believed
+        (``net_dns.trusted_lookups``), or None when this baseline knows nothing
+        (stale or never captured): then a capture is judged on its own. A
+        baseline that learned keys but no resolver gives an empty set, and no
+        answer of a capture is believed."""
+        with self._lock:
+            if self._stale() or not self._data.get("keys"):
+                return None
+            return frozenset(self._data.get("resolvers") or {})
+
     def knows_dest(self, dest):
         """Did the clean VM talk to this destination at all, whatever it did there?"""
         if self._stale():
@@ -314,7 +337,8 @@ class NetBaseline:
         for entry in keys.values():
             by_type[entry.get("type", "?")] = by_type.get(entry.get("type", "?"), 0) + 1
         out = {"total": 0 if stale else len(keys), "by_type": {} if stale else by_type,
-               "created": created, "updated": updated, "key_version": KEY_VERSION}
+               "created": created, "updated": updated, "key_version": KEY_VERSION,
+               "resolvers": [] if stale else sorted(self._data.get("resolvers") or {})}
         if stale:
             out["stale"] = True
             out["stale_keys"] = len(keys)
@@ -323,12 +347,13 @@ class NetBaseline:
         return out
 
 
-def resolved_addresses(events):
+def resolved_addresses(events, resolvers=None):
     """Name -> the addresses the A/AAAA answers of a capture gave for it: the
-    answers of its resolvers only (``net_dns.trusted_lookups``), never one a
-    server gave about itself or one from where an upload went."""
+    answers of its resolvers only (``net_dns.trusted_lookups``, with the
+    baseline's ``learned_resolvers`` as ``resolvers``), never one a server
+    gave about itself or one from where an upload went."""
     table = {}
-    for e in net_dns.trusted_lookups(events):
+    for e in net_dns.trusted_lookups(events, resolvers):
         if e.get("query_type") not in (None, "A", "AAAA"):
             continue
         for answer in e.get("answers") or ():

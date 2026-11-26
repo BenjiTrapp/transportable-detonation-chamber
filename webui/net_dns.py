@@ -290,9 +290,16 @@ def _address(text):
         return None
 
 
-def trusted_lookups(events):
+def trusted_lookups(events, resolvers=None):
     """The ``dns`` events of a capture whose answers it may believe, with only
     the answers it may believe.
+
+    ``resolvers``, when given, are the resolvers a network baseline learned on
+    the clean machine (``net_baseline.NetBaseline.learned_resolvers``): then
+    only lookups those servers answered count, whatever share of the capture
+    they answered, and the share rule below is not needed. Without them, a
+    sample's own DNS server that answered the only lookup of a capture was
+    believed (forty spoofed OCSP uploads to the C2 known to the baseline).
 
     A DNS answer is the sample's to write when the sample talks to a DNS
     server of its own. An answer counts only when it came from one of the
@@ -333,8 +340,10 @@ def trusted_lookups(events):
             endpoints.add(_address(e.get("dest")))
         for address in e.get("addresses") or ():
             endpoints.add(_address(address))
+    learned = None if resolvers is None else {_address(r) or "" for r in resolvers}
     resolvers = {server for server, count in counts.items()
-                 if count >= RESOLVER_SHARE * total and server not in endpoints}
+                 if (count >= RESOLVER_SHARE * total if learned is None else server in learned)
+                 and server not in endpoints}
     out = []
     for e in lookups:
         server = _address(e.get("server")) or ""

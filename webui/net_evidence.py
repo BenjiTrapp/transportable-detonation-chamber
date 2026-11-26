@@ -429,7 +429,7 @@ def _from_hit(c, hit, events):
               family=_plain(hit.get("family")) or "", severity=_plain(hit.get("severity")) or "")
 
 
-def findings_from(events, hits, process="", observed_fully=True, *, known_good):
+def findings_from(events, hits, process="", observed_fully=True, *, known_good, resolvers=None):
     """``MemoryFinding`` objects for a capture's events and rule hits.
 
     ``events`` are network events (with the ``beacon``, ``retry`` and
@@ -464,7 +464,7 @@ def findings_from(events, hits, process="", observed_fully=True, *, known_good):
     for hit in hits or ():
         if isinstance(hit, dict):
             _from_hit(c, hit, events)
-    answers = _answers(events)
+    answers = _answers(events, resolvers)
     for finding in c.by_key.values():
         resolved = answers.get(_dest_key(finding.get("dest")))
         if resolved:
@@ -520,7 +520,7 @@ def _fold_addresses(findings):
     return out
 
 
-def _answers(events):
+def _answers(events, resolvers=None):
     """Name -> the addresses the capture's DNS answers gave for it.
 
     A check-in over HTTP names its host by the Host header and Sysmon by the
@@ -531,7 +531,7 @@ def _answers(events):
     hand the C2's finding to that name.
     """
     table = {}
-    for e in net_dns.trusted_lookups(events):
+    for e in net_dns.trusted_lookups(events, resolvers):
         if e.get("query_type") not in (None, "A", "AAAA"):
             continue
         name = _dest_key(e.get("dest"))

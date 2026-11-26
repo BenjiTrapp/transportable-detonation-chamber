@@ -460,7 +460,7 @@ def _address(text):
         return None
 
 
-def _resolutions(events):
+def _resolutions(events, resolvers=None):
     """Address -> (name, time of the first lookup that returned it).
 
     The name is None when the address was answered for more than one name, in
@@ -472,7 +472,7 @@ def _resolutions(events):
     known-good host.
     """
     table = {}
-    for e in net_dns.trusted_lookups(events):
+    for e in net_dns.trusted_lookups(events, resolvers):
         if not _usable(e.get("ts")):
             continue
         name = e.get("dest")
@@ -611,7 +611,7 @@ def _nxdomain_fanout(failures):
         window_s=NXDOMAIN_WINDOW_S, dests=list(seen)[:MAX_LISTED_DESTS])
 
 
-def analyze(events):
+def analyze(events, resolvers=None):
     """``beacon``, ``retry`` and ``fanout`` events for a capture's events.
 
     A first pass reads the ``dns`` answers. A second groups the events:
@@ -620,7 +620,7 @@ def analyze(events):
     resolved is replaced by its name. Each group is then measured once. The
     result is in time order and the input is not changed.
     """
-    resolved = _resolutions(events)
+    resolved = _resolutions(events, resolvers)
     beacons = {}
     retries = {}
     paths = {}

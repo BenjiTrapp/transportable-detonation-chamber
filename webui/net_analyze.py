@@ -691,7 +691,7 @@ def _norm(name):
     return name.lower().rstrip(".") if isinstance(name, str) else ""
 
 
-def _quiet_addresses(events, claimed, known_good):
+def _quiet_addresses(events, claimed, known_good, resolvers=None):
     """Addresses that are a known-good server, not an indicator.
 
     A claimed name (a Host header, a server name) is not corroboration: the
@@ -704,7 +704,7 @@ def _quiet_addresses(events, claimed, known_good):
     address no known-good lookup returned keeps that address as an IOC.
     """
     names = {}
-    for e in net_dns.trusted_lookups(events):
+    for e in net_dns.trusted_lookups(events, resolvers):
         if e.get("query_type") not in ("A", "AAAA"):
             continue
         for answer in e.get("answers") or ():
@@ -860,9 +860,17 @@ def analyze_pcap(path, rules=None, baseline=None, process="", mode="online"):
     errors += parse_errors
 
     decoded, source_of, decode_budget = _decode_all(base, limits, errors)
+    # With a baseline, only the answers of the resolvers it learned on the clean machine count
+    # (net_dns.trusted_lookups); without one, the capture's own share rule decides.
+    learned = None
+    if baseline is not None:
+        try:
+            learned = baseline.learned_resolvers()
+        except Exception as exc:
+            errors.append(_failure("net_baseline", exc))
 
     try:
-        behavior = list(net_behavior.analyze(base + decoded))
+        behavior = list(net_behavior.analyze(base + decoded, resolvers=learned))
     except Exception as exc:
         errors.append(_failure("net_behavior", exc))
         behavior = []
@@ -870,7 +878,7 @@ def analyze_pcap(path, rules=None, baseline=None, process="", mode="online"):
 
     known = [False] * len(events)
     if baseline is not None:
-        resolved = net_baseline.resolved_addresses(events)
+        resolved = net_baseline.resolved_addresses(events, learned)
         for i, e in enumerate(events):
             try:
                 known[i] = bool(baseline.knows_event(e)) and (
@@ -891,7 +899,8 @@ def analyze_pcap(path, rules=None, baseline=None, process="", mode="online"):
         hits = net_rules.Hits()
     try:
         findings = net_evidence.findings_from(active + answers, hits, process=process,
-                                              observed_fully=MODES[mode], known_good=ruleset)
+                                              observed_fully=MODES[mode], known_good=ruleset,
+                                              resolvers=learned)
     except Exception as exc:
         errors.append(_failure("net_evidence", exc))
         findings = []
@@ -906,7 +915,7 @@ def analyze_pcap(path, rules=None, baseline=None, process="", mode="online"):
         if is_known:
             copy["baseline"] = "known"
     iocs, iocs_capped = _iocs(copies, known_good,
-                              _quiet_addresses(events, claimed, known_good))
+                              _quiet_addresses(events, claimed, known_good, learned))
 
     note = result.note
     if not events:

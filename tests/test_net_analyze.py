@@ -91,6 +91,10 @@ Regressions covered:
     resolver: an idle hour with its baseline lost 4 suppressions and scored
     SUSPICIOUS 4.0 with thirteen check-ins on known-good servers (follow-up
     review, Important 1)
+  * a sample's own DNS server answering the only lookup of a capture was
+    believed: forty spoofed OCSP uploads to the C2 stayed known to the
+    baseline; the baseline learns the clean machine's resolvers and, with a
+    baseline, only their answers count (Ruling 77)
 """
 
 import base64
@@ -1301,3 +1305,55 @@ def test_dns_over_tcp_to_the_resolver_keeps_an_idle_hour_absorbed(tmp_path, monk
     assert r["evidence_findings"] == [] and r["suppressed_count"] >= 415
     s = memory_evidence.score(memory_evidence.collect({"network": r}, process="sample.exe"))
     assert s["label"] == "CLEAN" and s["score"] == 0
+
+
+# --- with a baseline, only the resolvers it learned (Ruling 77) -------------------------------------
+
+def test_the_baseline_learns_the_resolvers_of_the_clean_capture(tmp_path):
+    bl = _ocsp_baseline(tmp_path)
+    assert bl.learned_resolvers() == frozenset((RESOLVER,))
+    with open(bl.path) as fh:
+        data = json.load(fh)
+    assert data["key_version"] == net_baseline.KEY_VERSION == 3 and data["resolvers"] == {RESOLVER: 1}
+    assert net_baseline.NetBaseline(str(tmp_path / "none.json")).learned_resolvers() is None
+
+
+def test_a_fake_server_answering_the_only_lookup_is_not_believed_with_a_baseline(tmp_path):
+    bl = _ocsp_baseline(tmp_path)
+    cap = Capture()
+    _fake_lookup(cap, 9.0, "ocsp.digicert.com", "203.0.113.67")
+    _spoofed_uploads(cap)
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap), baseline=bl)
+    assert _uploads(r) == [(1000, None)] * 40
+    assert {(f["kind"], f["dest"]) for f in r["evidence_findings"]} == {
+        ("c2_checkin", C2), ("exfil_upload", "ocsp.digicert.com")}
+    assert C2 in [i["value"] for i in r["iocs"]]
+    # without a baseline the capture's own share rule still believes it (as before)
+    plain = net_analyze.analyze_pcap(_write(tmp_path, cap, "plain.pcap"))
+    assert C2 not in [i["value"] for i in plain["iocs"]]
+
+
+def test_a_one_lookup_capture_through_the_learned_resolver_is_judged_as_before(tmp_path):
+    bl = _ocsp_baseline(tmp_path)
+    cap = Capture()
+    cap.dns(1.0, "evil.top")
+    for i in range(12):
+        cap.web(100.0 + i * 60, "evil.top", b"POST /gate.php HTTP/1.1\r\nHost: evil.top\r\nContent-Length: 4"
+                b"\r\n\r\nping", _ok(b"ok"), lookup=False)
+    _ocsp(cap, 50.0, 640)
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap), baseline=bl)
+    assert _uploads(r) == [(640, "known")]
+    assert [(f["kind"], f["dest"]) for f in r["evidence_findings"]] == [("c2_checkin", "evil.top")]
+    assert r["evidence_findings"][0]["addresses"]          # the lookup still ties name and address
+
+
+def test_a_baseline_that_learned_no_resolver_believes_no_answer(tmp_path):
+    bl = net_baseline.NetBaseline(str(tmp_path / "nodns.json"))
+    cap = Capture()
+    _ocsp(cap, 5.0, 600, "198.51.100.9")     # learned without any lookup
+    bl.add(net_analyze.analyze_pcap(_write(tmp_path, cap, "clean.pcap"))["events"])
+    assert bl.learned_resolvers() == frozenset()
+    sample = Capture()
+    _ocsp(sample, 10.0, 640)
+    r = net_analyze.analyze_pcap(_write(tmp_path, sample), baseline=bl)
+    assert _uploads(r) == [(640, None)]
