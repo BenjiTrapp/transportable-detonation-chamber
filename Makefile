@@ -379,7 +379,7 @@ restart:
 	if [ "$$mode" = "utm" ]; then \
 		$(UTM_DEPLOY) --action restart; \
 	else \
-		vagrant winrm -c "Get-Process -Name python* -EA SilentlyContinue | Stop-Process -Force; Start-Sleep 2; Start-ScheduledTask -TaskName DetonationChamberUI; Start-Sleep 3; Write-Host ('Web UI: ' + (Get-ScheduledTask -TaskName DetonationChamberUI).State)"; \
+		vagrant winrm -c "Get-CimInstance Win32_Process -Filter 'Name LIKE ''python%'' AND CommandLine LIKE ''% app.py%''' | Invoke-CimMethod -MethodName Terminate | Out-Null; Start-Sleep 2; Start-ScheduledTask -TaskName DetonationChamberUI; Start-Sleep 3; Write-Host ('Web UI: ' + (Get-ScheduledTask -TaskName DetonationChamberUI).State)"; \
 	fi
 
 .PHONY: deploy-restart

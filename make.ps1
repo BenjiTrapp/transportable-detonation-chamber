@@ -399,7 +399,7 @@ switch ($Target) {
     'restart' {
         Write-Host "[restart] Restarting Web UI..." -ForegroundColor Cyan
         Invoke-VM {
-            Get-Process -Name python* -ErrorAction SilentlyContinue | Stop-Process -Force
+            Get-CimInstance Win32_Process -Filter 'Name LIKE ''python%'' AND CommandLine LIKE ''% app.py%''' | Invoke-CimMethod -MethodName Terminate | Out-Null
             Start-Sleep -Seconds 2
             Start-ScheduledTask -TaskName 'DetonationChamberUI'
             Start-Sleep -Seconds 3

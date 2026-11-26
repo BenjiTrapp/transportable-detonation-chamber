@@ -158,3 +158,26 @@ def test_the_network_rules_point_their_authors_at_what_exists():
         rules = fh.read()
     assert "events.json" not in rules
     assert "/api/network/report" in rules
+
+
+def test_restart_paths_only_stop_the_web_ui_python_processes():
+    """Regressions covered: the web-UI restart (deploy-utm.py RESTART_PS, `make restart` on Vagrant,
+    make.ps1 restart) ran `Get-Process -Name python* | Stop-Process -Force`, which also killed LitterBox
+    (venv python.exe launcher and its base-interpreter child, both running litterbox.py); a detonation
+    right after a restart then failed with LitterBox upload 502. Every restart path must select the
+    processes by an `app.py` command line and never stop python by name alone."""
+    utm = open(os.path.join(ROOT, "scripts", "deploy-utm.py"), encoding="utf-8").read()
+    make = open(os.path.join(ROOT, "Makefile"), encoding="utf-8").read()
+    ps1 = open(os.path.join(ROOT, "make.ps1"), encoding="utf-8").read()
+    paths = {
+        "deploy-utm.py": utm[utm.index("RESTART_PS = ("):utm.index("LOGS_PS = (")],
+        "Makefile": make[make.index("\nrestart:"):make.index("\n.PHONY: deploy-restart")],
+        "make.ps1": ps1[ps1.index("'restart' {"):ps1.index("Start-ScheduledTask", ps1.index("'restart' {"))],
+    }
+    for name, text in paths.items():
+        flat = re.sub(r'"\s*\n\s*"', "", text)
+        assert not re.search(r"Get-Process\s+-Name\s+['\"]?python", flat, re.I), name
+        assert not re.search(r"Stop-Process\s+-Name", flat, re.I), name
+        assert "Win32_Process" in flat and "Terminate" in flat, name
+        assert "CommandLine LIKE ''% app.py%''" in flat, name
+        assert "litterbox" not in flat.lower(), name

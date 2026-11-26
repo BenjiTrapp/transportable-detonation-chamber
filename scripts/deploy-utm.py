@@ -80,7 +80,8 @@ SCRIPT_FILES = {
 }
 
 RESTART_PS = (
-    "Get-Process -Name python* -EA SilentlyContinue | Stop-Process -Force;"
+    "Get-CimInstance Win32_Process -Filter 'Name LIKE ''python%'' AND CommandLine LIKE ''% app.py%''' "
+    "| Invoke-CimMethod -MethodName Terminate | Out-Null;"
     "Start-Sleep 2; Start-ScheduledTask -TaskName DetonationChamberUI;"
     "Start-Sleep 4; (Get-ScheduledTask -TaskName DetonationChamberUI).State"
 )
