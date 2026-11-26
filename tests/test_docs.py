@@ -28,20 +28,32 @@ def _norm(path):
 
 ROUTES = {_norm(p) for p in re.findall(r'@app\.route\("(/api/[^"]+)"', APP)}
 
+# The API reference is these pages together. The RIZIN tab's 37 routes were 59%
+# of docs/api.md and the site caps a page at 100,000 characters
+# (test_site.py::test_the_index_is_fetched_not_inlined), so they have a page of
+# their own. A new route belongs on the page of its tab, and on exactly one.
+API_PAGES = ("api.md", "api-rizin.md")
+
 
 def test_api_page_documents_every_route_and_nothing_else():
     """The API reference moved from the README to docs/api.md; the promise is
     the same one, against the new source: every /api/ route of webui/app.py has
-    exactly one row there, and no row names a route that does not exist."""
-    api = _doc("api.md")
-    rows = [(m.strip(), _norm(p)) for m, p in
-            re.findall(r"\|\s*([A-Z /]+?)\s*\|\s*`(/api/[^`]+)`", api)]
+    exactly one row there, and no row names a route that does not exist.
+
+    It now spans the pages of API_PAGES, and the promise is their union: one row
+    for a route, on one of them, never on both."""
+    rows = []
+    for name in API_PAGES:
+        assert os.path.isfile(os.path.join(DOCS, name)), \
+            "docs/%s is missing: the API reference is the pages of API_PAGES" % name
+        rows += [(m.strip(), _norm(p)) for m, p in
+                 re.findall(r"\|\s*([A-Z /]+?)\s*\|\s*`(/api/[^`]+)`", _doc(name))]
     documented = {p for _, p in rows}
-    assert ROUTES - documented == set(), "routes missing from the docs/api.md reference"
-    assert documented - ROUTES == set(), "docs/api.md documents routes that do not exist"
+    assert ROUTES - documented == set(), "routes missing from the API reference"
+    assert documented - ROUTES == set(), "the API reference documents routes that do not exist"
     # one row per method and route - a route with two methods has two rows
     twice = sorted(r for r in set(rows) if rows.count(r) > 1)
-    assert twice == [], "docs/api.md has more than one row for %s" % twice
+    assert twice == [], "the API reference has more than one row for %s" % twice
 
 
 def test_help_modal_only_mentions_existing_routes():
@@ -253,10 +265,11 @@ def test_rizin_page_rows_say_what_the_server_answers():
     Review, Minors 3 and 4: the other views are not without a limit (they carry their own, and a view
     over it answers 500), and FUNCTIONS does have the row cap - only no 32 MB one.
 
-    The rows now live in docs/api.md, which is where every route has to have its
-    one row (test_api_page_documents_every_route_and_nothing_else); the limits
-    the tab itself carries live in docs/rizin.md, the page about the tab."""
-    api = _doc("api.md")
+    The rows now live in docs/api-rizin.md, the API page the RIZIN tab's routes
+    moved to, which is where every route has to have its one row
+    (test_api_page_documents_every_route_and_nothing_else); the limits the tab
+    itself carries live in docs/rizin.md, the page about the tab."""
+    api = _doc("api-rizin.md")
     rizin = _doc("rizin.md")
     rows = {path: line for line in api.splitlines()
             for path in re.findall(r"`(/api/rizin/[^`]+)`", line)}
@@ -288,7 +301,7 @@ def test_the_patch_rows_say_what_a_waiting_patch_does_through_a_take_back():
     """A patch that waits is no write of rizin's cache, so DELETE /patch (`wc-*` or an address) cannot take it;
     the row that promises a taken-back patch does not come back must not leave out the one that stays."""
     def row(method, route):
-        found = [line for line in _doc("api.md").splitlines() if line.startswith(f"| {method} | `{route}` |")]
+        found = [line for line in _doc("api-rizin.md").splitlines() if line.startswith(f"| {method} | `{route}` |")]
         assert len(found) == 1, (method, route, len(found))
         return _plain(found[0])
 
@@ -317,7 +330,7 @@ def test_the_rizin_page_says_what_emulation_can_and_cannot_do():
     assert "**EMULATE**" in README and "no process" in README and "never writes the original" in README
     # the console is no longer "no writing, no debugging"
     assert "no writing, no debugging" not in _doc("configuration.md")
-    assert "no debugging |" not in _doc("api.md")
+    assert all("no debugging |" not in _doc(page) for page in API_PAGES)
 
 
 def test_the_limits_the_rizin_page_names_are_the_code():
@@ -1648,7 +1661,7 @@ def test_the_guide_says_what_a_waiting_patch_is_and_how_a_session_comes_back():
     assert "fh.seek(max(0, fh.tell() - 65536))" in inspect.getsource(rizin_sessions._read_project_meta)
 
     # the API page keeps one row each and says what a waiting entry holds
-    row = [line for line in _doc("api.md").splitlines() if line.startswith("| GET | `/api/rizin/<sid>/patches` |")]
+    row = [line for line in _doc("api-rizin.md").splitlines() if line.startswith("| GET | `/api/rizin/<sid>/patches` |")]
     assert len(row) == 1 and "waiting: [{addr, after, reason, apply_now}]" in row[0]
 
 
@@ -1658,8 +1671,8 @@ def test_the_api_page_names_only_methods_the_code_has():
     import re
     import rizin_sessions
 
-    page = _doc("api.md")
+    page = "\n".join(_doc(name) for name in API_PAGES)
     names = set(re.findall(r"`RizinSession\.(\w+)`", page)) | set(re.findall(r"`(_restore_\w+|restore_\w+)`", page))
     assert names, "the page names no method of the session any more: this test has nothing to hold"
     for name in names:
-        assert hasattr(rizin_sessions.RizinSession, name), "docs/api.md names RizinSession.%s, which is not there" % name
+        assert hasattr(rizin_sessions.RizinSession, name), "the API reference names RizinSession.%s, which is not there" % name

@@ -138,7 +138,7 @@ MAX_REANALYZE_FUNCTIONS = 256
 # (RUN_RANGE_GAP). It is a bound, not a licence: without the limits af walked 32 functions down a chain
 # of calls, the last of them 0x2d00 bytes past the range (measured), and rizin's own cap on a function
 # is 256 KB, 64 times this.
-# A function reaching more than a page past the range is still truncated; docs/api.md says so.
+# A function reaching more than a page past the range is still truncated; docs/api-rizin.md says so.
 REANALYZE_SLACK = 0x1000
 CONSOLE_LIMIT = 1024 * 1024
 # The largest answer that the lists of strings, imports and flags keep: their JSON of a big dump (izj,

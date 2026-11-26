@@ -338,6 +338,7 @@ is built from `main` on every push - one address per page, and a search.
 | [Tool updates](docs/updates.md) | How do the tools on the VM stay current? |
 | [Web UI](docs/web-ui.md) | What do the themes, the charts and every tab look like? |
 | [API](docs/api.md) | Which routes and MCP tools can I call? |
+| [API — Rizin](docs/api-rizin.md) | Which routes does the RIZIN tab serve? |
 | [Development](docs/development.md) | How do I run the tests and change the code? |
 | [Troubleshooting](docs/troubleshooting.md) | Nothing works - where do I look? |
 

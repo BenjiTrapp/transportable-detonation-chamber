@@ -17,7 +17,7 @@ unsafe inline handlers in `app.js`), charts that count other numbers than
 their tables and filters, the RIZIN tab (the console allowlist, sessions and
 views, against a stand-in for rizin; with a real rizin where one is
 installed), MCP tool output, documentation drift (the routes and the MCP
-tools against [api.md](api.md), the tab table and the pictures of the README,
+tools against [api.md](api.md) and [api-rizin.md](api-rizin.md), the tab table and the pictures of the README,
 the shape of every page of this guide and the numbers the pages quote, in
 `tests/test_docs.py`), the offline wiki itself (`tests/test_wiki.py`: the
 markdown the generator carries, the navigation, the search index, and that no
