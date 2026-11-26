@@ -752,7 +752,7 @@ _XML_CHILD = re.compile(r"\s{0,64}<([A-Za-z_][\w.:-]{0,64})(?:\s[^<>]{0,256})?>"
 _XML_TEXT = re.compile(r"[^<]*[^<\s][^<]*")
 _XML_CDATA = re.compile(r"\s{0,64}<!\[CDATA\[")
 _CDATA_MAX = 4096                   # characters of a CDATA value read
-_XML_WRAPPERS = frozenset(("value", "val", "v", "string", "str", "data", "text"))
+_XML_WRAPPERS = frozenset(("value", "val", "v", "string", "str", "data", "text", "item", "entry"))
 _XML_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z0-9]+")
 # a word of a tag name that ends in one of these is a secret (``apikey``,
 # ``accesstoken``, ``credentials``), and one that starts with one of the second
@@ -808,16 +808,14 @@ def _mask_parts(text):
 
 
 def _xml_secret_name(name):
-    """``(secret, plural)``: does an XML element's name say its text is a
-    secret, read word by word, and is that word a plural (``<keys>``,
-    ``<credentials>``: a container of named things, not a value)?"""
+    """Does an XML element's name say its text is a secret, read word by word
+    (a plural too: ``<keys>``, ``<credentials>``)?"""
     for word in _XML_WORD.findall(name.replace(":", "_")):
         word = word.lower()
-        if word.endswith(_XML_SECRET_ENDS) or word.startswith(_XML_SECRET_STARTS):
-            return True, False
-        if word.endswith("s") and word[:-1].endswith(_XML_SECRET_ENDS):
-            return True, True
-    return False, False
+        for one in (word, word[:-1] if word.endswith("s") else word):
+            if one.endswith(_XML_SECRET_ENDS) or one.startswith(_XML_SECRET_STARTS):
+                return True
+    return False
 
 
 class _CdataEnds:
@@ -845,11 +843,11 @@ def _xml_secret_spans(text):
     """``(start, end)`` of the value of each XML element whose name says secret.
 
     The value is the first text right after the tag, or the content of a
-    CDATA section there. A value wrapper (``<value>``, ``<v>``, ``<string>``...)
-    is looked into, twice at most, and so is the first element inside a
-    secret named in the singular (``<password><item>S</item>``): a password
-    holds one value however it is wrapped. Not one inside a plural
-    (``<keys><server>evil-c2.top</server>`` names a server)."""
+    CDATA section there. Only a generic value wrapper (``<value>``, ``<v>``,
+    ``<string>``, ``<item>``, ``<entry>``...) is looked into, twice at most
+    (``<password><item>S</item>``); any other element names a thing of its
+    own: ``<keys><server>evil-c2.top</server>`` and ``<key><url>http://evil-c2.top/g</url>``
+    name the C2, which the report must keep."""
     spans = []
     if "<" not in text:
         return spans
@@ -858,8 +856,7 @@ def _xml_secret_spans(text):
     for tag in _XML_TAG.finditer(text):
         if tag.start() < done:
             continue
-        secret, plural = _xml_secret_name(tag.group(1))
-        if not secret:
+        if not _xml_secret_name(tag.group(1)):
             continue
         pos, depth = tag.end(), 0
         while True:
@@ -878,7 +875,7 @@ def _xml_secret_spans(text):
             child = _XML_CHILD.match(text, pos)
             if child is None or depth == 2:
                 break
-            if not (child.group(1).lower() in _XML_WRAPPERS or (depth == 0 and not plural)):
+            if child.group(1).lower() not in _XML_WRAPPERS:
                 break
             pos, depth = child.end(), depth + 1
     return spans

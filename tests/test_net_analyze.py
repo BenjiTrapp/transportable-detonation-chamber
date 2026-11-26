@@ -101,6 +101,9 @@ Regressions covered:
     (Ruling 78)
   * a flow without payload after the cap was reached set ``events_capped``,
     so a capture that lost nothing read INCOMPLETE (follow-up review, Minor 3)
+  * ``<key><url>``, ``<auth><server>`` and ``<token><host>`` masked the C2 in
+    the report again, in a plain response and in decoded text (round-2
+    review, Minor)
 """
 
 import base64
@@ -1402,3 +1405,23 @@ def test_a_flow_without_payload_past_the_cap_is_no_cut(tmp_path, monkeypatch):
     cap.tcp(3.0, "10.7.0.3", 80, [("c", req)])          # one with payload is cut, and says so
     r = net_analyze.analyze_pcap(_write(tmp_path, cap, "more.pcap"))
     assert r["events_capped"] is True and r["flows_unparsed"] == 1
+
+
+def test_a_c2_host_inside_a_secret_element_stays_in_the_report(tmp_path):
+    shapes = (b"<key><url>http://evil-c2.top/g</url></key>", b"<auth><server>evil-c2.top</server></auth>",
+              b"<token><host>evil-c2.top</host></token>")
+    cap = Capture()
+    for i, xml in enumerate(shapes):
+        _served(cap, 10.0 + i, "p%d.example" % i, xml)
+        _served(cap, 20.0 + i, "d%d.example" % i, base64.b64encode(xml))
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    for i, xml in enumerate(shapes):
+        plain = [e for e in r["events"] if e["type"] == "http" and e["dest"] == "p%d.example" % i][0]
+        assert plain["resp_text"] == xml.decode()
+        d = [e for e in r["events"] if e["type"] == "decoded" and e["dest"] == "d%d.example" % i][0]
+        assert d["text"] == xml.decode() and d["credential"] is False
+    still = Capture()
+    _served(still, 10.0, "s.example", b"<password><item>Sec-Pw-22</item></password>")
+    _served(still, 11.0, "t.example", base64.b64encode(b"<cfg><password><![CDATA[Sec-Pw-15]]></password></cfg>"))
+    blob = json.dumps(net_analyze.analyze_pcap(_write(tmp_path, still, "still.pcap")))
+    assert "Sec-Pw-22" not in blob and "Sec-Pw-15" not in blob

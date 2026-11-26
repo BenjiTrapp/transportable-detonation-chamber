@@ -108,6 +108,9 @@ Regressions covered:
     every secret tag after it: ``<pwd><![CDATA[`` repeated took 5.8 s per MB of
     masking, 50 s for a 191 KB capture; the end of a CDATA is searched for once
     per stretch of text (``_CdataEnds``) (round-2 review, Important)
+  * the descent into the first element of a singular secret masked the C2 in
+    ``<key><url>``, ``<auth><server>``, ``<token><host>``; only generic value
+    wrappers are looked into (round-2 review, Minor)
 """
 
 import base64
@@ -1442,3 +1445,12 @@ def test_unclosed_cdata_sections_are_searched_once_not_once_per_tag(monkeypatch)
     assert calls["n"] <= 4 * 20000 * 2, calls   # a few matches per tag, flag and mask
     closed = "<pwd><![CDATA[Val-9]]>" * 2000
     assert "Val-9" not in net_decode.mask_credentials(closed)
+
+
+@pytest.mark.parametrize("text", ["<key><url>http://evil-c2.top/g</url></key>",
+                                  "<auth><server>evil-c2.top</server></auth>",
+                                  "<token><host>evil-c2.top</host></token>"])
+def test_an_element_inside_a_secret_that_names_a_host_is_not_masked(text):
+    assert not net_decode._is_credential("body_text", "", _Text(text)), text
+    for lines in (True, False):
+        assert net_decode.mask_credentials(text, lines=lines) == text, text
