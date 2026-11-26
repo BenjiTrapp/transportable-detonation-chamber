@@ -100,6 +100,10 @@ Regressions covered:
   * the flag did not say which shape made a text a credential, so a text
     flagged only by a line shape was masked in part and leaked its bare
     password line; ``credential_shapes`` names the shapes (Ruling 78)
+  * after F3, ``<password><item>S</item>`` and ``<password><![CDATA[S]]>`` were
+    neither flagged nor masked; a CDATA value is read, and the first element
+    inside a secret named in the singular is looked into (not inside a
+    plural such as ``<keys>``) (Ruling 78 follow-up)
 """
 
 import base64
@@ -1385,3 +1389,20 @@ def test_the_xml_flag_and_mask_agree_on_generated_names():
 def test_credential_shapes_name_why_a_text_is_a_credential(text, shapes):
     assert net_decode.credential_shapes(text) == shapes
     assert net_decode._is_credential("body_text", "", _Text(text)) is bool(shapes)
+
+
+@pytest.mark.parametrize("text", ["<password><item>Val-9</item></password>",
+                                  "<cfg><password><![CDATA[Val-9]]></password></cfg>",
+                                  "<token>\n <entry><value>Val-9</value></entry></token>",
+                                  "<apiKey><![CDATA[Val-9 with ]] inside]]></apiKey>"])
+def test_a_singular_secret_is_read_through_one_element_and_cdata(text):
+    assert net_decode._is_credential("body_text", "", _Text(text)), text
+    for lines in (True, False):
+        assert "Val-9" not in net_decode.mask_credentials(text, lines=lines), text
+
+
+def test_a_plural_secret_is_not_read_through_an_element():
+    for text in ("<keys><server>evil-c2.top</server></keys>",
+                 "<credentials><site>bank.example</site></credentials>"):
+        assert not net_decode._is_credential("body_text", "", _Text(text)), text
+        assert net_decode.mask_credentials(text) == text

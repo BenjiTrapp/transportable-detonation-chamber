@@ -741,16 +741,16 @@ _SECRET_PERCENT = re.compile(
     "(" + _PERCENT_KEY + r"%3[dD])((?:%(?!26|3[bB]|2[cC])[0-9A-Fa-f]{2}"
     r"|[^\s&;,\"'<>%])+)", re.I)
 # An XML element whose name says secret: ``<pwd>S</pwd>``, ``<password type="x">S``,
-# ``<password><value>S</value>``. The value is the first text right after the
-# tag, up to the next tag, closed or not (a body cut short); only a value
-# wrapper (``<value>``, ``<v>``, ``<string>``...) is looked into, not any
-# element: ``<keys><server>evil-c2.top</server>`` names a server, not a key.
-# The name is read word by word (``_xml_secret_name``), not as a substring:
-# ``<keywords>``, ``<author>`` and ``<authority>`` are no secrets.
-_XML_ELEMENT = re.compile(
-    r"(<([A-Za-z_][\w.:-]{0,64})(?:\s[^<>]{0,256})?>"
-    r"(?:\s{0,64}<(?:value|val|v|string|str|data|text)(?:\s[^<>]{0,256})?>){0,2})"
-    r"([^<]*[^<\s][^<]*)", re.I)
+# ``<password><value>S</value>``, ``<password><![CDATA[S]]>``. The value is the
+# first text right after the tag, up to the next tag, closed or not (a body cut
+# short); what is looked into is ``_xml_secret_spans``'s: not any element,
+# ``<keys><server>evil-c2.top</server>`` names a server, not a key. The name is
+# read word by word (``_xml_secret_name``), not as a substring: ``<keywords>``,
+# ``<author>`` and ``<authority>`` are no secrets.
+_XML_TAG = re.compile(r"<([A-Za-z_][\w.:-]{0,64})(?:\s[^<>]{0,256})?>")
+_XML_CHILD = re.compile(r"\s{0,64}<([A-Za-z_][\w.:-]{0,64})(?:\s[^<>]{0,256})?>")
+_XML_TEXT = re.compile(r"([^<]*[^<\s][^<]*)|\s{0,64}<!\[CDATA\[((?:(?!\]\]>)[\s\S]){1,4096})\]\]>")
+_XML_WRAPPERS = frozenset(("value", "val", "v", "string", "str", "data", "text"))
 _XML_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z0-9]+")
 # a word of a tag name that ends in one of these is a secret (``apikey``,
 # ``accesstoken``, ``credentials``), and one that starts with one of the second
@@ -806,23 +806,65 @@ def _mask_parts(text):
 
 
 def _xml_secret_name(name):
-    """Does an XML element's name say its text is a secret, read word by word?"""
+    """``(secret, plural)``: does an XML element's name say its text is a
+    secret, read word by word, and is that word a plural (``<keys>``,
+    ``<credentials>``: a container of named things, not a value)?"""
     for word in _XML_WORD.findall(name.replace(":", "_")):
         word = word.lower()
-        for one in (word, word[:-1] if word.endswith("s") else word):
-            if one.endswith(_XML_SECRET_ENDS) or one.startswith(_XML_SECRET_STARTS):
-                return True
-    return False
+        if word.endswith(_XML_SECRET_ENDS) or word.startswith(_XML_SECRET_STARTS):
+            return True, False
+        if word.endswith("s") and word[:-1].endswith(_XML_SECRET_ENDS):
+            return True, True
+    return False, False
+
+
+def _xml_secret_spans(text):
+    """``(start, end)`` of the value of each XML element whose name says secret.
+
+    The value is the first text right after the tag, or the content of a
+    CDATA section there. A value wrapper (``<value>``, ``<v>``, ``<string>``...)
+    is looked into, twice at most, and so is the first element inside a
+    secret named in the singular (``<password><item>S</item>``): a password
+    holds one value however it is wrapped. Not one inside a plural
+    (``<keys><server>evil-c2.top</server>`` names a server)."""
+    spans = []
+    if "<" not in text:
+        return spans
+    done = 0
+    for tag in _XML_TAG.finditer(text):
+        if tag.start() < done:
+            continue
+        secret, plural = _xml_secret_name(tag.group(1))
+        if not secret:
+            continue
+        pos, depth = tag.end(), 0
+        while True:
+            value = _XML_TEXT.match(text, pos)
+            if value:
+                group = 1 if value.group(1) is not None else 2
+                spans.append((value.start(group), value.end(group)))
+                done = value.end(group)
+                break
+            child = _XML_CHILD.match(text, pos)
+            if child is None or depth == 2:
+                break
+            if not (child.group(1).lower() in _XML_WRAPPERS or (depth == 0 and not plural)):
+                break
+            pos, depth = child.end(), depth + 1
+    return spans
 
 
 def _xml_secret(text):
     """Is there an XML element whose name says secret with text in it?"""
-    return "<" in text and any(_xml_secret_name(m.group(2)) for m in _XML_ELEMENT.finditer(text))
+    return bool(_xml_secret_spans(text))
 
 
 def _mask_xml(text):
-    return _XML_ELEMENT.sub(
-        lambda m: m.group(1) + MASK if _xml_secret_name(m.group(2)) else m.group(0), text)
+    out, last = [], 0
+    for start, end in _xml_secret_spans(text):
+        out.append(text[last:start] + MASK)
+        last = end
+    return "".join(out) + text[last:] if out else text
 
 
 def is_session_header(name):
