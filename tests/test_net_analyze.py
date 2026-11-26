@@ -99,6 +99,8 @@ Regressions covered:
     ``login: bob`` kept the password on the bare next line, a dump of 300
     ``name: value`` lines its bare secret line; such a text is masked whole
     (Ruling 78)
+  * a flow without payload after the cap was reached set ``events_capped``,
+    so a capture that lost nothing read INCOMPLETE (follow-up review, Minor 3)
 """
 
 import base64
@@ -1386,3 +1388,17 @@ def test_a_shape_that_says_where_the_secret_is_still_masks_in_part(tmp_path):
     r = net_analyze.analyze_pcap(_write(tmp_path, cap))
     d = [e for e in r["events"] if e["type"] == "decoded"][0]
     assert "Sec-Pw-5" not in json.dumps(r) and "<pwd>***</pwd>" in d["text"]
+
+
+def test_a_flow_without_payload_past_the_cap_is_no_cut(tmp_path, monkeypatch):
+    monkeypatch.setattr(net_analyze, "MAX_EVENTS", 5)
+    req = b"GET / HTTP/1.1\r\nHost: a.top\r\n\r\n"
+    cap = Capture()
+    cap.tcp(1.0, "10.7.0.1", 80, [("c", req * 5)])
+    cap.tcp(2.0, "10.7.0.2", 80, [])
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    assert sum(e["type"] == "conn" for e in r["events"]) == 2
+    assert r["events_capped"] is False and r["flows_unparsed"] == 0 and r["incomplete"] == []
+    cap.tcp(3.0, "10.7.0.3", 80, [("c", req)])          # one with payload is cut, and says so
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap, "more.pcap"))
+    assert r["events_capped"] is True and r["flows_unparsed"] == 1

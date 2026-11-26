@@ -392,15 +392,18 @@ def _collect(path, limits=None):
     a flow keeps at most ``MAX_EVENTS_PER_FLOW`` parser events
     (``flows_capped`` counts the flows cut so), the capture at most
     ``MAX_EVENTS`` (``events_capped``); a flow past that is not parsed, but
-    its connection event is kept, as every flow's is (``flows_unparsed``)."""
+    its connection event is kept, as every flow's is (``flows_unparsed``
+    counts those with payload: only they lost something)."""
     if limits is None:
         limits = _Limits()
     result = net_flows.read_pcap(path)
     errors, events, claimed = [], [], {}
     for index, flow in enumerate(result.flows):
         if limits.events_left <= 0:
-            limits.events_capped = True
-            limits.flows_unparsed += 1
+            # a flow without payload has nothing a parser could add: nothing was dropped
+            if _has_payload(flow):
+                limits.events_capped = True
+                limits.flows_unparsed += 1
             try:
                 events.append(connection_event(flow))
             except Exception as exc:
