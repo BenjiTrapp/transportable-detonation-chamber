@@ -1371,20 +1371,34 @@ def _workload(n):
     return out
 
 
-def test_cost_grows_linearly_with_the_number_of_events():
-    small, large = _workload(20000), _workload(80000)
+# Measured on an idle machine: _workload(80000) is analysed in 0.20 s and
+# _resolving_workload(80000) in 0.35 s, and the cost is linear - the per-event
+# cost stays flat within 1.35x over a 32x range of input (10k to 320k). The
+# ceiling below sits an order of magnitude above that. It is a guard against a
+# step that makes the analysis dramatically more expensive, not a measurement
+# of the machine, and it follows the shape this project already uses for such
+# guards (tests/test_log_search.py, tests/test_net_rules.py): an absolute bound
+# with wide headroom.
+#
+# It replaces a quotient. The earlier form divided the time for 80000 events by
+# the time for 20000 and required the result below 9. Both measurements were
+# around 40 ms, so the quotient multiplied the relative noise of two
+# measurements too short to take: locally the quotient ranged 4.5 to 5.8, and a
+# shared CI runner produced 10.07 on the same code. The quotient also measured
+# nothing the ceiling does not: removing MAX_INTERVALS - the one bound the
+# module documents as keeping the work linear - changes the time by 1.1x,
+# because the work it bounds is itself linear. That bound is pinned without a
+# clock instead, by test_the_measurement_window_is_bounded_in_the_verdict below.
+ANALYSIS_CEILING = 10.0
 
-    def best(events):
-        times = []
-        for _ in range(3):
-            t0 = time.perf_counter()
-            net_behavior.analyze(events)
-            times.append(time.perf_counter() - t0)
-        return min(times)
 
-    ratio = best(large) / best(small)
-    # 4x the events: linear is about 4, quadratic about 16.
-    assert ratio < 9, ratio
+def test_a_large_capture_is_analysed_in_bounded_time():
+    events = _workload(80000)
+    t0 = time.perf_counter()
+    net_behavior.analyze(events)
+    took = time.perf_counter() - t0
+    assert took < ANALYSIS_CEILING, took
+
 
 
 def _resolving_workload(n):
@@ -1399,19 +1413,38 @@ def _resolving_workload(n):
     return out
 
 
-def test_resolving_addresses_costs_linear_time_too():
-    small, large = _resolving_workload(20000), _resolving_workload(80000)
+def test_resolving_addresses_stays_in_bounded_time_too():
+    events = _resolving_workload(80000)
+    t0 = time.perf_counter()
+    net_behavior.analyze(events)
+    took = time.perf_counter() - t0
+    assert took < ANALYSIS_CEILING, took
 
-    def best(events):
-        times = []
-        for _ in range(3):
-            t0 = time.perf_counter()
-            net_behavior.analyze(events)
-            times.append(time.perf_counter() - t0)
-        return min(times)
 
-    ratio = best(large) / best(small)
-    assert ratio < 9, ratio
+def test_the_measurement_window_is_bounded_in_the_verdict():
+    """``_measure`` works from the first ``MAX_INTERVALS`` intervals of a group.
+
+    The module documents that bound as what keeps the work linear in the number
+    of events, and nothing verified it. A wall-clock test cannot: removing the
+    bound changes the time for 80000 events by 1.1x, because the work it bounds
+    is itself linear (``periodicity`` stays flat within 1.18x over a 256x range
+    of input). The bound is visible in the verdict instead - a group that is
+    regular inside the window and irregular after it is periodic only while the
+    bound holds - so this needs no clock and cannot flake.
+    """
+    step, inside = 30.0, net_behavior.MAX_INTERVALS + 1
+    times = [t * step for t in range(inside)]
+    # Gaps that repeat only after 523 steps, so the tail is periodic at no scale
+    after = 500
+    t = times[-1]
+    for i in range(after):
+        t += 11.0 + (i * 37) % 523
+        times.append(t)
+
+    p = net_behavior.periodicity(times)
+    assert p["periodic"] is True and p["interval"] == step
+    # every contact is still counted, only the measurement is windowed
+    assert p["connections"] == inside + after
 
 
 def test_a_huge_single_group_is_analysed_from_a_bounded_window():

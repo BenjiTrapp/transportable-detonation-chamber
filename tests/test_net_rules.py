@@ -1411,7 +1411,13 @@ def test_a_large_rule_set_over_many_events_stays_fast():
     hits = rs.evaluate(events)
     elapsed = time.time() - start
     assert len(hits) == 300
-    assert elapsed < 5.0, elapsed
+    # 1.43 s on an idle machine. The bound is wide on purpose: a shared CI
+    # runner can be several times slower, and a bound a few times above the
+    # measurement is how the quotient test in tests/test_net_behavior.py came
+    # to fail on CI while passing everywhere else. This still catches a rule
+    # engine that became an order of magnitude more expensive, which is what
+    # the test is for.
+    assert elapsed < 20.0, elapsed
 
 
 def test_a_request_that_names_two_hosts_is_never_known_good():
