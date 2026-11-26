@@ -169,10 +169,24 @@ Set-MpPreference -DisableRealtimeMonitoring $true
   `C:\Temp`, `C:\Users\Public\Downloads` and `C:\dumps`, and never to script
   or shortcut files.
 - **RIZIN console:** every command passes an allowlist on the server before
-  rizin gets it: no programs, no other files, no writing, no debugging, and
-  settings only for the disassembly and the analysis (see
-  [Console without a shell](rizin.md#console-without-a-shell)). rizin opens files
-  read-only, and names, strings and comments from a file are shown as text.
+  rizin gets it: no programs, no other files, no writing to the file, no real
+  debugging (emulation, yes), and settings only for the disassembly, the
+  analysis and the emulation (see
+  [Console without a shell](rizin.md#console-without-a-shell)). Names, strings
+  and comments from a file are shown as text.
+- **RIZIN emulation and patches:** the original sample is never written, and
+  that has two guards that do not depend on each other: the allowlist refuses
+  `wci` and `wc+`, which commit rizin's cache to the file, and rizin is never
+  started with `-w`, so even those two fail on the file's handle ("Error
+  writing change at 0x…", the file untouched, measured). ESIL runs the code
+  without a process. Patches live in rizin's `io.cache`, in memory; a copy on
+  disk comes only from an explicit export into `%TEMP%\rizin_uploads`, named
+  `….patched.<ext>`, with a `….patch.txt` beside it that records the
+  original's path, both SHA-256 digests, the time and one line per patch.
+  Handing the copy to the Submit tab selects it there and submits nothing.
+  A saved project is disarmed when it is opened: a breakpoint can carry a rizin
+  command that rizin runs when it hits, and the project stores it, so those
+  fields are cleared (see [Projects](rizin.md#projects)).
 - **Headers:** no framing (clickjacking), `nosniff`, same-origin referrers.
 - `WEBUI_HOST=127.0.0.1` restricts the listener to the VM itself.
 

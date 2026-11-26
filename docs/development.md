@@ -17,11 +17,12 @@ unsafe inline handlers in `app.js`), charts that count other numbers than
 their tables and filters, the RIZIN tab (the console allowlist, sessions and
 views, against a stand-in for rizin; with a real rizin where one is
 installed), MCP tool output, documentation drift (the routes and the MCP
-tools against [api.md](api.md), the tab table and the pictures of the README,
+tools against [api.md](api.md) and [api-rizin.md](api-rizin.md), the tab table and the pictures of the README,
 the shape of every page of this guide and the numbers the pages quote, in
-`tests/test_docs.py`), and the offline wiki itself (`tests/test_wiki.py`: the
+`tests/test_docs.py`), the offline wiki itself (`tests/test_wiki.py`: the
 markdown the generator carries, the navigation, the search index, and that no
-resource is loaded over the network). GitHub Actions runs the suite on every
+resource is loaded over the network) and the documentation website
+(`tests/test_site.py`). GitHub Actions runs the suite on every
 push (`.github/workflows/tests.yml`). `make test` is different: it submits a
 test sample to the running VM.
 
@@ -56,5 +57,14 @@ it into one self-contained `webui/static/wiki.html` with navigation, search and
 rendered diagrams, which works without a network — on the host and on the VM. The
 file is generated, never edited by hand, and the deploy paths upload it when it
 exists.
+
+The same pages are also a website: `make site` (or `.\make.ps1 site`) builds
+`site/` from the same `docs/*.md` and the README — one address per page, a
+search over all of them, and the diagrams drawn — and
+`.github/workflows/pages.yml` publishes it on every push to `main`, so changing
+a page here publishes it. `make site-serve` serves the build folder locally for
+a look before that, and `tests/test_site.py` holds its shape: every page of the
+index has an address, every link and every search hit reaches it, and no page
+asks anything of a server that is not this one.
 
 **Next:** [Troubleshooting](troubleshooting.md)

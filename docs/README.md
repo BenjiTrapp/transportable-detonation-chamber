@@ -1,6 +1,8 @@
 # Transportable Detonation Chamber — Documentation
 
 This is the guide: how to set the chamber up, and how to work with it once it runs.
+The same pages are on the web, one address each and searchable:
+[the documentation website](https://benjitrapp.github.io/transportable-detonation-chamber/).
 
 The Transportable Detonation Chamber is a pre-configured Windows 11 VM for malware
 detonation testing against multiple EDR solutions. A sample goes in; the detection
@@ -37,7 +39,8 @@ tools, in the order you meet them:
 7. **[Tool updates](updates.md)** — checking, installing and pinning the VM's tools.
 8. **[Web UI](web-ui.md)** — the two themes, the charts of every tab and the
    screenshots.
-9. **[API](api.md)** — every REST route and every MCP tool.
+9. **[API](api.md)** — every REST route and every MCP tool; the RIZIN tab's
+   routes have a page of their own.
 
 ## All pages
 
@@ -55,6 +58,7 @@ tools, in the order you meet them:
 | [updates.md](updates.md) | How do the tools on the VM stay current? |
 | [web-ui.md](web-ui.md) | What do the themes, the charts and every tab look like? |
 | [api.md](api.md) | Which routes and MCP tools can I call? |
+| [api-rizin.md](api-rizin.md) | Which routes does the RIZIN tab serve? |
 | [development.md](development.md) | How do I run the tests and change the code? |
 | [troubleshooting.md](troubleshooting.md) | Nothing works — where do I look? |
 

@@ -5397,8 +5397,11 @@ def _rizin_arg_text():
     return q.casefold()
 
 
-def _rizin_body():
+def _rizin_body(optional=False):
+    """The request's JSON object; with ``optional`` a request without a body counts as an empty one."""
     body = request.get_json(silent=True)
+    if body is None and optional:
+        return {}
     if not isinstance(body, dict):
         raise rizin_sessions.RizinRefused("a JSON object is expected")
     return body
@@ -5831,6 +5834,126 @@ def _rizin_comment_at(session):
     return {"offset": addr, "comment": (op["comment"] or "") if op else ""}
 
 
+def _rizin_emulation_start(session):
+    addr = _rizin_body().get("addr")
+    return session.emulation_start(None if addr is None else _rizin_address(addr))
+
+
+def _rizin_emulation_run(session):
+    body = _rizin_body()
+    addr = body.get("addr")
+    try:
+        return session.emulation_run(body.get("kind"), None if addr is None else _rizin_address(addr))
+    finally:
+        _rizin_forget(session)  # a run changes bytes, and with them the strings, imports, flags and functions
+
+
+def _rizin_emulation_register(session):
+    body = _rizin_body()
+    return session.emulation_register(body.get("name"), _rizin_address(body.get("value"), "value"))
+
+
+def _rizin_breakpoint_set(session):
+    """POST: addr. There is no disabled breakpoint to ask for: rizin 0.9.1 stops a run at one whose
+    `enabled` is false all the same, so an `on` is refused rather than answered with an enabled one."""
+    body = _rizin_body()
+    if "on" in body:
+        raise rizin_sessions.RizinRefused("there is no 'on': rizin 0.9.1 stops at a disabled breakpoint "
+                                          "too, so remove it (DELETE) instead of switching it off")
+    return session.breakpoint_set(_rizin_address(body.get("addr")))
+
+
+def _rizin_breakpoint_clear(session):
+    """DELETE: addr removes that breakpoint; a request without one (an empty object, or no body) all."""
+    addr = _rizin_body(optional=True).get("addr")
+    return session.breakpoint_clear(None if addr is None else _rizin_address(addr))
+
+
+def _rizin_waiting(body):
+    """The ``waiting`` flag of a patch request: true says the request is about the patches that wait (held
+    back over a run's bytes) at ``addr``, and not about the cache."""
+    waiting = body.get("waiting", False)
+    if not isinstance(waiting, bool):
+        raise rizin_sessions.RizinRefused("waiting is true or false")
+    return waiting
+
+
+def _rizin_patch(session):
+    """POST: addr, plus either bytes (hex digits) or kind (one of the four patch kinds), or ``waiting: true``
+    alone: write the patches that wait at addr now (only where a run's bytes lie under it again)."""
+    body = _rizin_body()
+    addr = _rizin_address(body.get("addr"))
+    data, kind = body.get("bytes"), body.get("kind")
+    try:
+        if _rizin_waiting(body):
+            if data is not None or kind is not None:
+                raise rizin_sessions.RizinRefused("a patch that waits is written as it was held back: "
+                                                  "waiting takes no bytes and no kind")
+            return session.patch_waiting(addr)
+        if (data is None) == (kind is None):
+            raise rizin_sessions.RizinRefused("a patch takes bytes or kind, not both and not neither")
+        return session.patch(addr, data) if kind is None else session.patch_op(addr, kind)
+    finally:
+        _rizin_forget(session)  # patched bytes: the strings, imports, flags and functions are stale
+
+
+def _rizin_unpatch(session):
+    """DELETE: addr takes that patch back; a request without one (an empty object, or no body) the whole
+    cache, an emulation run's bytes included (rizin has one). With ``waiting: true`` it takes the patches that
+    wait at addr out of the project instead, and then addr is required."""
+    body = _rizin_body(optional=True)
+    addr = body.get("addr")
+    try:
+        if _rizin_waiting(body):
+            if addr is None:
+                raise rizin_sessions.RizinRefused("a patch that waits is named by its addr")
+            return session.drop_waiting(_rizin_address(addr))
+        return session.unpatch(None if addr is None else _rizin_address(addr))
+    finally:
+        _rizin_forget(session)
+
+
+def _rizin_restore(session):
+    """POST (no body): replay the project's timeline of the emulation and prove the bytes it gave. A replay
+    runs the emulation and writes the cache, so the copies of the views are stale after it, whatever came of it."""
+    try:
+        return session.restore_run()
+    finally:
+        _rizin_forget(session)
+
+
+def _rizin_reanalyze(session):
+    """POST: start and end (both optional, both or neither; default the range the run wrote). A request
+    without a body at all is one without a range, as for DELETE /patch and DELETE /breakpoints."""
+    body = _rizin_body(optional=True)
+    start, end = body.get("start"), body.get("end")
+    try:
+        return session.reanalyze(None if start is None else _rizin_address(start, "start"),
+                                 None if end is None else _rizin_address(end, "end"))
+    finally:
+        # the range now holds functions, strings and flags rizin did not have: the copies are stale
+        _rizin_forget(session)
+
+
+def _rizin_call_assist(session):
+    """GET: addr (without it the session's current address) -- the call the assistant answers for."""
+    return session.call_assist(_rizin_arg_address(session))
+
+
+def _rizin_call_skip(session):
+    """POST: addr, and what to apply -- value (optional: `null` or none leaves the return register as
+    it is, decimal or `0x…`) and stack_fix (optional, default 0, a whole number of bytes)."""
+    body = _rizin_body()
+    value = body.get("value")
+    try:
+        return session.call_skip(_rizin_address(body.get("addr")),
+                                 None if value is None else _rizin_address(value, "value"),
+                                 body.get("stack_fix", 0))
+    finally:
+        # a skip can map memory and copy bytes: the strings, imports, flags and functions are stale
+        _rizin_forget(session)
+
+
 def _rizin_listable(path):
     try:
         return _readable(path) and os.path.isfile(path) and os.path.getsize(path) > 0
@@ -5876,13 +5999,220 @@ def _rizin_folder_files(folder, recursive, limit):
 
 
 def _rizin_prune_uploads(keep):
-    # The oldest uploads go; one that rizin has open stays (Windows refuses to delete it).
+    """The oldest uploads go; `keep` (a path, or several) stays: one that rizin has open (Windows refuses to
+    delete it, elsewhere nothing does), an exported copy and the note that says what was changed in it."""
+    def same(path):
+        return os.path.normcase(os.path.realpath(path))
+
+    kept = {same(path) for path in ((keep,) if isinstance(keep, str) else keep)}
     for old in _rizin_folder_files(RIZIN_UPLOAD_DIR, False, RIZIN_SCAN_MAX)[RIZIN_UPLOADS_KEEP:]:
-        if old["path"] != keep:
+        if same(old["path"]) not in kept:
             try:
                 os.remove(old["path"])
             except OSError:
                 pass
+
+
+RIZIN_NOTE_SUFFIX = ".patch.txt"
+
+
+def _rizin_patch_paddr(opened, maps, row, size):
+    """The file offset of the patch `row`, or None where its bytes are not one run of the file.
+
+    `opened` is `ol.j`, `maps` `omlj` and `size` what the file is long: **exactly one map** of `maps` may
+    touch the row's bytes, it has to be a map of the opened file (its fd), and it has to hold all of them.
+    Then byte *n* of the row is the file's byte at the map's delta + (address - from) + *n*.
+
+    Two checks that look enough are not. The offsets of the first byte and of the last: a PE with
+    SectionAlignment == FileAlignment and its raw data out of order has side-by-side maps whose first and
+    last byte are as far apart in the file as in memory while the section between them is somewhere else.
+    And the first map that holds the row: where two maps cover the same addresses rizin reads through the
+    topmost (`oml.j` and `px` answer it), which `omlj` does not say, so the row would be written where
+    rizin does not show it (both measured). With only one map over the bytes, that is the topmost.
+
+    A row in the zero-filled room past a section's data, in memory the emulation mapped, in no map, across
+    two maps, or past the end of the map or of the file is None as well."""
+    def number(value):
+        return value if isinstance(value, int) and not isinstance(value, bool) and value >= 0 else None
+
+    addr, end = row["addr"], row["addr"] + row["size"]
+    touching = []
+    for m in maps:
+        if isinstance(m, dict) and number(m.get("from")) is not None and number(m.get("to")) is not None \
+                and m["from"] < end and m["to"] > addr:
+            touching.append(m)
+    fd = number(opened.get("fd"))
+    if len(touching) != 1 or fd is None:
+        return None
+    m = touching[0]
+    delta = number(m.get("delta"))
+    if number(m.get("fd")) != fd or delta is None or m["from"] > addr or end > m["to"]:
+        return None
+    paddr = delta + addr - m["from"]
+    sizes = [n for n in (number(opened.get("size")), number(size)) if n is not None]
+    return paddr if sizes and paddr + row["size"] <= min(sizes) else None
+
+
+def _rizin_note_bytes(hexdigits, shown=32):
+    """Hex for one line of the note: a long patch shows its first `shown` bytes and says how many there are."""
+    if len(hexdigits) <= 2 * shown:
+        return hexdigits
+    return f"{hexdigits[:2 * shown]}... ({len(hexdigits) // 2} bytes)"
+
+
+def _rizin_export_note(session, original_sha, copy_name, copy_sha, placed, skipped):
+    """The note beside the copy. ``placed`` is [(row, file offset, the **original's** bytes there, hex)].
+
+    A row's ``before`` is rizin's: what stood at the address when the patch was written, which is a
+    **run's** byte where the patch went over bytes an emulation run had written (measured on rizin
+    0.9.1: a file holding 73317331, a run's `wx 41 @ 1` and then a patch `wx 90 @ 1` give a second row
+    with `before: "41"`, and the copy came out 73907331 against an original 73317331). The note is
+    about the copy on disk, so the bytes it shows as replaced are the file's own -- and every row where
+    the two differ is named, because the copy has the file's bytes around that patch: a patch inside
+    code a run decrypted therefore sits in bytes that are still encrypted on disk, and nothing else
+    would say so.
+
+    The comparison decides, not the row's ``over_run`` mark: the mark rests on the session's mirror of
+    its own writes, and a note that said nothing after a restart lost that mirror would be wrong about
+    the file. A row is named where either says so.
+
+    What the three ways into the block have in common is the one thing the predicate tests: rizin's write
+    cache already held a write at that address when the patch was made -- a run's (or the console's) byte
+    that is not the file's, an **earlier hand patch** that covers the address (no run involved: the same
+    address, or one inside a longer patch -- measured: ``wx 90909090 @ 1`` then ``wx ab @ 3`` gives a row
+    at 3 with ``before: "90"``), or a run's write of the file's own byte back (the bytes replaced then
+    *are* the file's). The header says that and no more; each row's own line says which of the two it is
+    as far as the session knows (``over_run``): a run wrote there first -- the copy then holds the patch in
+    bytes still as they are on disk -- or no run is known to have, which is an earlier patch of yours.
+    """
+    over = [(row, paddr, was) for row, paddr, was in placed
+            if was != row["before"].lower() or row.get("over_run")]
+    lines = [
+        "Patched copy made by TDC (RIZIN tab). Only the patches set by hand are in it; what an emulation run",
+        "wrote is not.",
+        "",
+        f"Original:         {session.path}",
+        f"Original SHA-256: {original_sha}",
+        f"Copy:             {copy_name}",
+        f"Copy SHA-256:     {copy_sha}",
+        f"Time:             {datetime.datetime.now(datetime.timezone.utc).strftime('%Y-%m-%d %H:%M:%S')} UTC",
+        "",
+        f"Patches in the copy ({len(placed)}): address, offset in the file, the file's bytes -> the copy's",
+    ]
+    lines += [f"  {row['addr']:#x}  file {paddr:#x}  {_rizin_note_bytes(was)} -> {_rizin_note_bytes(row['after'])}"
+              for row, paddr, was in placed]
+    if over:
+        lines += ["", f"rizin's write cache already held a write at the address of these patches when they were made ({len(over)}):",
+                  "a write by an emulation run (or the console), or an earlier patch of yours that covers it. Each",
+                  "line gives what rizin says the patch replaced and what the file holds there; the two are the same",
+                  "where that write was the file's own byte. The copy has the file's own bytes everywhere else, so such",
+                  "a patch sits in bytes as they are on disk -- still encrypted, where a run had decrypted them:"]
+        lines += [f"  {row['addr']:#x}  file {paddr:#x}  the patch replaced {_rizin_note_bytes(row['before'])}; "
+                  f"in the file they are {_rizin_note_bytes(was)}; "
+                  + ("a run wrote there first" if row.get("over_run") else "no run is known to have written there")
+                  for row, paddr, was in over]
+    if skipped:
+        lines += ["", f"Patches that could not be placed in the file, so the copy does not have them ({len(skipped)}):",
+                  "(there is no byte of the file at such an address: memory the emulation created, a section's "
+                  "zero-filled room past its data, or a patch that runs out of the file or across two maps)"]
+        lines += [f"  {row['addr']:#x}  {_rizin_note_bytes(row['before'])} -> {_rizin_note_bytes(row['after'])}"
+                  for row in skipped]
+    return "\n".join(lines) + "\n"
+
+
+def _rizin_export(session):
+    """POST: the patched copy -- the original with the hand-made patches at their file offsets, built here
+    (rizin writes no file, and the original is only ever read) -- and a note beside it.
+
+    {path, name, sha256 (of the copy), patched (bytes written), skipped (addresses of the patches that have
+    no place in the file), note (the note's text)}. The copy is `<digest>_<stem>.patched<suffix>` in
+    RIZIN_UPLOAD_DIR (the digest is the original's, as for an upload) and the note `<that>.patch.txt`; a
+    second export of the same file replaces both together, so the note always describes the copy beside it.
+
+    The bytes the note shows as the ones a patch replaced are read from the **original**, not taken from
+    rizin's cache: see _rizin_export_note.
+    """
+    mine = [row for row in session.patches_made() if row["mine"]]
+    if not mine:
+        raise rizin_sessions.RizinRefused(
+            "no patches to export: only patches set by hand go into the copy, and what an emulation run wrote "
+            "does not")
+    opened, maps = session.json("ol.j"), session.json("omlj")
+    if not isinstance(opened, dict) or not isinstance(maps, list):
+        raise ValueError("ol.j or omlj did not answer what it should")
+    placed, skipped = [], []
+    for row in mine:
+        paddr = _rizin_patch_paddr(opened, maps, row, session.size)
+        if paddr is None:
+            skipped.append(row)
+        else:
+            placed.append((row, paddr))
+    if not placed:
+        addrs = ", ".join(f"{a:#x}" for a in sorted({row["addr"] for row in skipped}))
+        raise rizin_sessions.RizinRefused(f"none of the patches could be placed in the file: {addrs}")
+
+    source = session.path
+    # the name the upload route gives a file: the digest first, so that two samples of one name (in two
+    # folders) do not replace each other's copy and note. The suffix is made apart from the stem, because
+    # secure_filename drops a name that has no ASCII in it down to the suffix ("пример.exe" -> "exe")
+    stem, ext = os.path.splitext(os.path.basename(source))
+    stem, ext = secure_filename(stem) or "sample", secure_filename(ext.lstrip("."))[:15]
+    name = f"{session.sha256[:16]}_{stem[:80]}.patched{'.' + ext if ext else ''}"
+    dest = os.path.join(RIZIN_UPLOAD_DIR, name)
+    note_dest = dest + RIZIN_NOTE_SUFFIX
+    if os.path.normcase(os.path.realpath(dest)) == os.path.normcase(os.path.realpath(source)):
+        raise rizin_sessions.RizinRefused("the copy would be written over the original: rename the original")
+    os.makedirs(RIZIN_UPLOAD_DIR, exist_ok=True)
+    tmps = []
+    try:
+        fd, copy_tmp = tempfile.mkstemp(dir=RIZIN_UPLOAD_DIR, prefix=".export-")
+        tmps.append(copy_tmp)
+        original_sha = hashlib.sha256()
+        with os.fdopen(fd, "wb") as out, open(source, "rb") as src:
+            for chunk in iter(lambda: src.read(1024 * 1024), b""):
+                original_sha.update(chunk)
+                out.write(chunk)
+        if original_sha.hexdigest() != session.sha256:
+            raise rizin_sessions.RizinRefused("the original changed on disk since it was opened: open it again")
+        with open(copy_tmp, "r+b") as out:
+            # the file's own bytes at every offset first, from the untouched copy: a row's `before` is
+            # what rizin had at the address, which is a run's byte where the patch went over one, and
+            # reading after the writes would give an earlier patch's bytes where two overlap
+            for i, (row, paddr) in enumerate(placed):
+                out.seek(paddr)
+                placed[i] = (row, paddr, out.read(row["size"]).hex())
+            for row, paddr, _was in placed:  # in the order they were written: a later patch wins
+                out.seek(paddr)
+                out.write(bytes.fromhex(row["after"]))
+        copy_sha = hashlib.sha256()
+        with open(copy_tmp, "rb") as out:
+            for chunk in iter(lambda: out.read(1024 * 1024), b""):
+                copy_sha.update(chunk)
+        note = _rizin_export_note(session, original_sha.hexdigest(), name, copy_sha.hexdigest(), placed, skipped)
+        fd, note_tmp = tempfile.mkstemp(dir=RIZIN_UPLOAD_DIR, prefix=".export-")
+        tmps.append(note_tmp)
+        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as out:
+            out.write(note)
+        os.replace(copy_tmp, dest)
+        try:
+            os.replace(note_tmp, note_dest)
+        except OSError:
+            # a copy with the old note beside it would say what was not changed in it
+            try:
+                os.remove(dest)
+            except OSError:
+                pass
+            raise
+    finally:
+        for tmp in tmps:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+    _rizin_prune_uploads(keep=(dest, note_dest, source))
+    return {"path": dest, "name": name, "sha256": copy_sha.hexdigest(),
+            "patched": sum(row["size"] for row, *_ in placed),
+            "skipped": sorted({row["addr"] for row in skipped}), "note": note}
 
 
 @app.route("/api/rizin/status")
@@ -6087,6 +6417,96 @@ def api_rizin_comment(sid):
 def api_rizin_comment_at(sid):
     """The comment at addr ('' without one), for the right-click menu's Comment… field."""
     return _rizin_call(sid, _rizin_comment_at)
+
+
+@app.route("/api/rizin/<sid>/emulation/start", methods=["POST"])
+def api_rizin_emulation_start(sid):
+    return _rizin_call(sid, _rizin_emulation_start)
+
+
+@app.route("/api/rizin/<sid>/emulation")
+def api_rizin_emulation(sid):
+    return _rizin_call(sid, lambda session: session.emulation_state())
+
+
+@app.route("/api/rizin/<sid>/emulation/stop", methods=["POST"])
+def api_rizin_emulation_stop(sid):
+    return _rizin_call(sid, lambda session: session.emulation_stop())
+
+
+@app.route("/api/rizin/<sid>/emulation/run", methods=["POST"])
+def api_rizin_emulation_run(sid):
+    return _rizin_call(sid, _rizin_emulation_run)
+
+
+@app.route("/api/rizin/<sid>/emulation/register", methods=["POST"])
+def api_rizin_emulation_register(sid):
+    return _rizin_call(sid, _rizin_emulation_register)
+
+
+@app.route("/api/rizin/<sid>/breakpoints")
+def api_rizin_breakpoints(sid):
+    """The breakpoints rizin holds, lowest address first; they need no running emulation."""
+    return _rizin_call(sid, lambda session: session.breakpoints())
+
+
+@app.route("/api/rizin/<sid>/breakpoints", methods=["POST"])
+def api_rizin_breakpoint_set(sid):
+    return _rizin_call(sid, _rizin_breakpoint_set)
+
+
+@app.route("/api/rizin/<sid>/breakpoints", methods=["DELETE"])
+def api_rizin_breakpoint_clear(sid):
+    return _rizin_call(sid, _rizin_breakpoint_clear)
+
+
+@app.route("/api/rizin/<sid>/patches")
+def api_rizin_patches(sid):
+    """What rizin's write cache holds, lowest address first (`mine` tells a patch from a run's bytes), and the
+    patches held back over a run's bytes, which are in the project and not in the cache."""
+    return _rizin_call(sid, lambda session: session.patches())
+
+
+@app.route("/api/rizin/<sid>/patch", methods=["POST"])
+def api_rizin_patch(sid):
+    return _rizin_call(sid, _rizin_patch)
+
+
+@app.route("/api/rizin/<sid>/patch", methods=["DELETE"])
+def api_rizin_unpatch(sid):
+    return _rizin_call(sid, _rizin_unpatch)
+
+
+@app.route("/api/rizin/<sid>/restore", methods=["POST"])
+def api_rizin_restore(sid):
+    """Replay the timeline of the emulation the project keeps, check it gave the same bytes, then write the
+    patches that were held back."""
+    return _rizin_call(sid, _rizin_restore)
+
+
+@app.route("/api/rizin/<sid>/export", methods=["POST"])
+def api_rizin_export(sid):
+    """Build the patched copy (the hand-made patches at their file offsets) and the note beside it."""
+    return _rizin_call(sid, _rizin_export)
+
+
+@app.route("/api/rizin/<sid>/reanalyze", methods=["POST"])
+def api_rizin_reanalyze(sid):
+    """Analyse the range an emulation run wrote again, so FUNCTIONS and STRINGS see what it decrypted."""
+    return _rizin_call(sid, _rizin_reanalyze)
+
+
+@app.route("/api/rizin/<sid>/call")
+def api_rizin_call_assist(sid):
+    """What a SKIP of the call at addr can answer: the API behind it, a value and the stack correction."""
+    return _rizin_call(sid, _rizin_call_assist)
+
+
+@app.route("/api/rizin/<sid>/call", methods=["POST"])
+def api_rizin_call_skip(sid):
+    """Skip that call and apply the answer: the value in the return register, the stack correction, a
+    memory API's buffer and a copying one's copy."""
+    return _rizin_call(sid, _rizin_call_skip)
 
 
 # --- ThreatCheck / DefenderCheck Integration ---

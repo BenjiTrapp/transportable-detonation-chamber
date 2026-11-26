@@ -22,6 +22,8 @@
 #   make logs         Tail Web UI logs from the VM
 #   make test         Submit a test sample and verify pipeline
 #   make docs         Build the offline wiki (webui/static/wiki.html)
+#   make site         Build the documentation website (site/)
+#   make site-serve   Serve the built website locally
 #   make clean        Destroy VM and remove local Vagrant artifacts
 #
 # Prerequisites:
@@ -52,6 +54,11 @@ endif
 
 VM_IP          ?= 127.0.0.1
 WEBUI_URL      := http://$(VM_IP):9000
+
+# The documentation website: the build folder (git-ignored) and the port the
+# local preview listens on.
+SITE_DIR       ?= site
+SITE_PORT      ?= 8099
 
 export VAGRANT_VAGRANTFILE := $(VAGRANT_FILE)
 
@@ -91,6 +98,8 @@ help:
 	@echo ""
 	@echo "  Documentation:"
 	@echo "    make docs            Build the offline wiki -> webui/static/wiki.html"
+	@echo "    make site            Build the documentation website -> $(SITE_DIR)/ (builds the wiki too)"
+	@echo "    make site-serve      Build it and serve it on http://localhost:$(SITE_PORT)/"
 	@echo ""
 	@echo "  MCP:"
 	@echo "    make mcp-setup       Create mcp/.venv for the MCP server (Claude Code etc.)"
@@ -328,6 +337,7 @@ deploy:
 		vagrant upload webui/log_store.py C:\\DetonationChamberUI\\log_store.py; \
 		vagrant upload webui/dashboards.py C:\\DetonationChamberUI\\dashboards.py; \
 		vagrant upload webui/rizin_sessions.py C:\\DetonationChamberUI\\rizin_sessions.py; \
+		vagrant upload webui/rizin_emulation.py C:\\DetonationChamberUI\\rizin_emulation.py; \
 		vagrant upload webui/tool_updates.py C:\\DetonationChamberUI\\tool_updates.py; \
 		vagrant upload webui/firewall.py C:\\DetonationChamberUI\\firewall.py; \
 		vagrant upload webui/firewall_fetch.py C:\\DetonationChamberUI\\firewall_fetch.py; \
@@ -375,6 +385,7 @@ deploy-app:
 		vagrant upload webui/log_store.py C:\\DetonationChamberUI\\log_store.py; \
 		vagrant upload webui/dashboards.py C:\\DetonationChamberUI\\dashboards.py; \
 		vagrant upload webui/rizin_sessions.py C:\\DetonationChamberUI\\rizin_sessions.py; \
+		vagrant upload webui/rizin_emulation.py C:\\DetonationChamberUI\\rizin_emulation.py; \
 		vagrant upload webui/tool_updates.py C:\\DetonationChamberUI\\tool_updates.py; \
 		vagrant upload webui/firewall.py C:\\DetonationChamberUI\\firewall.py; \
 		vagrant upload webui/firewall_fetch.py C:\\DetonationChamberUI\\firewall_fetch.py; \
@@ -489,6 +500,29 @@ docs:
 		command -v $$p >/dev/null 2>&1 && $$p -c 'import sys; sys.exit(sys.version_info < (3, 9))' && { echo $$p; break; }; done); \
 	[ -n "$$PY" ] || { echo "[docs] no Python on PATH: the generator needs Python >= 3.9 as python3 or python (standard library only, no packages)"; exit 1; }; \
 	$$PY scripts/build-wiki.py -o webui/static/wiki.html
+
+.PHONY: site
+# The website is the second output of the same generator: one folder per page,
+# published on GitHub Pages. It depends on `docs`, because the download the
+# header offers is webui/static/wiki.html - git-ignored, and not there at all
+# in a fresh clone, so a site built without it would promise a file that is not
+# published. The wiki takes half a second, so this costs nothing.
+site: docs
+	@echo "[site] Building the documentation website from docs/ and README.md ..."
+	@PY=$$(for p in python3 python; do \
+		command -v $$p >/dev/null 2>&1 && $$p -c 'import sys; sys.exit(sys.version_info < (3, 9))' && { echo $$p; break; }; done); \
+	[ -n "$$PY" ] || { echo "[site] no Python on PATH: the generator needs Python >= 3.9 as python3 or python (standard library only, no packages)"; exit 1; }; \
+	$$PY scripts/build-wiki.py --site $(SITE_DIR) -o webui/static/wiki.html
+
+.PHONY: site-serve
+# A look at what would be published, before it is: the site has to open from a
+# plain folder too, so this is the same server a reader gets, without Pages.
+site-serve: site
+	@PY=$$(for p in python3 python; do \
+		command -v $$p >/dev/null 2>&1 && $$p -c 'import sys; sys.exit(sys.version_info < (3, 9))' && { echo $$p; break; }; done); \
+	[ -n "$$PY" ] || { echo "[site-serve] no Python on PATH: the preview needs Python >= 3.9 as python3 or python"; exit 1; }; \
+	echo "[site-serve] http://localhost:$(SITE_PORT)/ - Ctrl-C stops it"; \
+	cd $(SITE_DIR) && $$PY -m http.server $(SITE_PORT)
 
 .PHONY: test
 test:
