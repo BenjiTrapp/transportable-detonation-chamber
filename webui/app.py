@@ -7911,6 +7911,8 @@ def _net_summary(report):
         "errors": len(report.get("errors") or []),
         "verdict": verdict,
         "score": score,
+        # what the analysis could not read: the verdict of a cut capture is a lower bound
+        "incomplete": memory_evidence.network_incomplete(report),
     }
 
 

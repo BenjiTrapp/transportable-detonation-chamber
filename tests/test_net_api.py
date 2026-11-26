@@ -25,6 +25,8 @@ Regressions covered:
     found": 20,001 junk GETs before a C2 were CLEAN 0 with no word of the
     cut; the verdict now carries ``incomplete`` and says what was cut
     (follow-up F2)
+  * the reports list gave a cut capture's verdict and score without saying it
+    was cut; its summary carries ``incomplete`` (follow-up review, Minor 6)
 """
 
 import base64
@@ -920,3 +922,14 @@ def test_the_flask_the_requirements_allow_lets_a_request_set_its_own_limit():
     with app.test_request_context("/", method="POST"):
         request.max_content_length = 10
         assert request.max_content_length == 10
+
+
+def test_the_reports_list_says_which_report_is_incomplete(client, tmp_path, monkeypatch):
+    monkeypatch.setattr(na.net_analyze, "MAX_EVENTS_PER_FLOW", 50)
+    cap = Capture()
+    na._padded_c2(cap, pad_gets=200)
+    assert _upload(client, _write(tmp_path, cap, "pad.pcap"), "pad.pcap").status_code == 200
+    assert _upload(client, _pcap_with_http_c2(tmp_path), "whole.pcap").status_code == 200
+    rows = {r["filename"]: r["summary"] for r in client.get("/api/network/reports").get_json()["reports"]}
+    assert any("more than 50 events" in line for line in rows["pad.pcap"]["incomplete"])
+    assert rows["whole.pcap"]["incomplete"] == []
