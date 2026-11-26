@@ -25,7 +25,17 @@ SHA256, a PID entry from a different sample is ignored"). Richtung: beim Nachsch
 gegebene PID verlangen, statt den Hash-Treffer zu bevorzugen — das berührt alle Werkzeuge
 und braucht eine eigene Runde.
 
-## 2. Der Vorbehalt auf der Graph-Leinwand kreuzt die Zeichnung
+## 2. Der Vorbehalt auf der Graph-Leinwand kreuzt die Zeichnung — behoben am 26.11.2026
+
+**Behoben.** Beide Texte, die auf der Leinwand liegen (der Vorbehalt und `Opening…`), bekommen
+zuerst einen Streifen in `--bg-secondary` hinter sich, so breit wie der Text misst und nicht
+breiter. In Chrome gegen die VM nachgemessen, 400 Knoten, beide Themes: die Zeile des Streifens
+ist über 1200 px **eine** flache Farbe (`20,13,36` in Cyberpunk, `18,21,40` in Classic), 40 px
+darunter sind es 42 bis 44 Farben — dort liegt die Zeichnung. Der Streifen ist absichtlich
+deckend: der Vorbehalt sagt, dass eine Zahl eine Untergrenze ist, und wer ihn nicht lesen kann,
+ist schlechter dran als wer ein Stück schwenken muss.
+
+Der Befund, wie er stand:
 
 Er wird mit `ctx.fillText` bei (12, 10) auf die Leinwand gezeichnet, damit er beim
 Schwenken und Zoomen nicht wegscrollt. Seit die Fläche gewachsen ist (240 → 661 px),

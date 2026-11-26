@@ -725,7 +725,7 @@ def test_the_curated_edge_and_the_match_do_not_look_like_a_deviation():
 
 def test_the_assets_moved_on():
     html = _read(INDEX_HTML)
-    for asset, minimum in (("style.css", 94), ("theme-cyberpunk.css", 38), ("app.js", 162)):
+    for asset, minimum in (("style.css", 94), ("theme-cyberpunk.css", 38), ("app.js", 166)):
         version = int(re.search(rf"{re.escape(asset)}\?v=(\d+)", html).group(1))
         assert version >= minimum, f"{asset} was changed and kept its ?v="
 
@@ -791,15 +791,18 @@ const ctx = { globalAlpha: 1, fillStyle: '', strokeStyle: '', lineWidth: 1, font
   fill() { log.push({ op: 'fill', color: this.fillStyle, alpha: this.globalAlpha }); },
   stroke() { log.push({ op: 'stroke', color: this.strokeStyle, width: this.lineWidth, alpha: this.globalAlpha, dash: this.dash.join(' ') }); },
   fillText(text, x, y) { log.push({ op: 'text', text: String(text), x, y, color: this.fillStyle }); },
-  fillRect() {}, measureText: t => ({ width: String(t).length * 6 }) };
+  fillRect(x, y, w, h) { log.push({ op: 'rect', x, y, w, h, color: this.fillStyle }); },
+  measureText: t => ({ width: String(t).length * 6 }) };
 els['binary-explore-canvas'].ctx = ctx; els['binary-explore-canvas'].getContext = () => ctx;
 els['binary-explore-canvas'].width = 600; els['binary-explore-canvas'].height = 400;
 // the last frame: node discs (an arc that is filled), rings (an arc that is only stroked) and edges (a stroked line,
 // in the order of the edges that are drawn)
 const frame = () => {
   const shapes = []; let cur = null;
-  for (const e of log) { if (e.op === 'begin') { cur = { ops: [] }; shapes.push(cur); } else if (cur && e.op !== 'text') cur.ops.push(e); }
-  const f = { discs: [], rings: [], lines: [], texts: log.filter(e => e.op === 'text').map(e => e.text) };
+  for (const e of log) { if (e.op === 'begin') { cur = { ops: [] }; shapes.push(cur); } else if (cur && e.op !== 'text' && e.op !== 'rect') cur.ops.push(e); }
+  const f = { discs: [], rings: [], lines: [], texts: log.filter(e => e.op === 'text').map(e => e.text),
+              placed: log.filter(e => e.op === 'text'), strips: log.filter(e => e.op === 'rect'),
+              order: log.filter(e => e.op === 'text' || e.op === 'rect') };
   for (const s of shapes) {
     const arc = s.ops.find(o => o.op === 'arc'), stroke = s.ops.find(o => o.op === 'stroke'), fill = s.ops.find(o => o.op === 'fill');
     if (arc && fill) f.discs.push({ x: arc.x, y: arc.y, r: arc.r, fill: fill.color, stroke: stroke && stroke.color, dash: stroke && stroke.dash });
@@ -2294,3 +2297,43 @@ def test_a_file_the_graph_could_not_read_at_all_is_said_beside_the_cut_tables():
     assert "7" in r["both"] and "5" in r["both"], r["both"]
     assert r["both"].index("cut short") < r["both"].index("not read"), \
         "the cut tables first, then the files that were not read"
+
+
+@needs_node
+def test_a_text_on_the_canvas_gets_a_strip_behind_it_so_it_never_crosses_the_drawing():
+    """Seen in Chrome on the VM at 1920x1080 with 400 nodes: the caveat is painted on the canvas, at (12, 10), so
+    that panning and zooming cannot scroll it out of sight - and since the surface grew from 240px to 661px it has
+    the whole neighbourhood under it. The orange text crossed the drawing and ran through the label of bi.dll.
+
+    So each of the two texts the canvas carries - the caveat and "Opening…" - gets a strip of the backdrop filled
+    behind it first, as wide as the text measures and no wider. The strip is opaque on purpose: the caveat says a
+    count is a lower bound, and a reader who cannot read it is worse off than one who has to pan a little. It is
+    drawn before its text, or it would cover what it is there to protect."""
+    r = _explore_flow(r"""
+      (async () => {
+        GRAPH['ntdll.dll'] = { in_degree: 9, imports: { 'kernel32.dll': ['CloseHandle'] }, partial: true };
+        await binaryGraphExploreStart('ntdll.dll');
+        await binaryGraphExpand('ntdll.dll');
+        const cut = frame();
+        st.loading = true; binaryGraphDraw();
+        const busy = frame();
+        st.loading = false;
+        out({ cut: { order: cut.order, strips: cut.strips, placed: cut.placed },
+              busy: { order: busy.order, strips: busy.strips, placed: busy.placed } });
+      })();""")
+    caveat = next((t for t in r["cut"]["placed"] if t["text"].startswith("Not the whole")), None)
+    assert caveat, [t["text"][:40] for t in r["cut"]["placed"]]
+    strip = next((s for s in r["cut"]["strips"] if abs(s["y"] - caveat["y"]) < 6), None)
+    assert strip, f"no strip behind the caveat: {r['cut']['strips']}"
+    assert strip["x"] <= caveat["x"] and strip["w"] >= len(caveat["text"]) * 6, \
+        f"the strip is narrower than the text it covers: {strip['w']} for {len(caveat['text']) * 6}"
+    assert strip["w"] <= len(caveat["text"]) * 6 + 40, "and no wider than it needs to be"
+    assert strip["h"] >= 12, strip
+    order = [e["op"] for e in r["cut"]["order"] if e["op"] == "rect" or (e.get("text") or "").startswith("Not the whole")]
+    assert order[:2] == ["rect", "text"], f"the strip must be filled before its text: {order[:3]}"
+    assert "bg" in strip["color"] or strip["color"] != caveat["color"], \
+        f"the strip takes the backdrop, not the text's colour: {strip['color']}"
+    opening = next((t for t in r["busy"]["placed"] if t["text"].startswith("Opening")), None)
+    assert opening, [t["text"][:30] for t in r["busy"]["placed"]]
+    assert any(abs(s["y"] - opening["y"]) < 6 for s in r["busy"]["strips"]), \
+        "Opening… lies on the drawing just as the caveat does"
