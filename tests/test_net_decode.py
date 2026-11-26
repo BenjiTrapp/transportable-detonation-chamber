@@ -97,6 +97,9 @@ Regressions covered:
     to four nested elements, so ``<keys><server>evil-c2.top</server>`` hid the
     server; the name is read word by word and only a value wrapper
     (``<value>``, ``<v>``...) is looked into, flag and mask alike (follow-up F3)
+  * the flag did not say which shape made a text a credential, so a text
+    flagged only by a line shape was masked in part and leaked its bare
+    password line; ``credential_shapes`` names the shapes (Ruling 78)
 """
 
 import base64
@@ -1368,3 +1371,17 @@ def test_the_xml_flag_and_mask_agree_on_generated_names():
                     if flagged == ("Val-9" in masked) or "http://evil-c2.top/" not in masked:
                         disagree.append((n, flagged))
     assert disagree == []
+
+
+@pytest.mark.parametrize("text,shapes", [
+    ("login: bob\nSec-Pw-10", {"line"}),
+    ("https://bank.example/login\tbob\tS", {"line"}),
+    ("user=bob&password=S", {"pair"}),
+    ("http://bob:S@x.top/", {"userinfo"}),
+    ("user%3Dbob%26password%3DS", {"percent"}),
+    ("<cfg><pwd>S</pwd></cfg>", {"xml"}),
+    ('{"c2": "http://evil-c2.top/", "note": "x"}', set()),
+])
+def test_credential_shapes_name_why_a_text_is_a_credential(text, shapes):
+    assert net_decode.credential_shapes(text) == shapes
+    assert net_decode._is_credential("body_text", "", _Text(text)) is bool(shapes)

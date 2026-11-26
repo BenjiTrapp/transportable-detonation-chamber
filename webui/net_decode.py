@@ -578,14 +578,33 @@ def _is_credential(field, name, decoded):
     if credential_by_name(field, name):
         return True
     text = (decoded.text or "")[:MAX_CREDENTIAL_CHARS]
-    if _SECRET_PAIR.search(text) or _URL_USERINFO.search(text):
-        return True
-    if _SECRET_PERCENT.search(text) or _xml_secret(text):
-        return True
+    return bool(credential_shapes(text))
+
+
+def credential_shapes(text):
+    """Why a text is a credential by what it holds: a set of ``"pair"`` (a
+    secret key's ``key=value`` / JSON / form pair), ``"userinfo"``,
+    ``"percent"``, ``"xml"`` and ``"line"`` (a ``name: value`` line or a
+    credential-dump record, ``_colon_pair`` / ``_credential_record``); empty
+    when it is none. The first four name where the secret is, so
+    ``mask_credentials`` can mask it and keep the rest. A line shape does not:
+    after ``login: bob`` the password may be the bare next line, or line 301
+    of a dump, where no shape points at it, so such a text is masked whole."""
+    text = (text or "")[:MAX_CREDENTIAL_CHARS]
+    found = set()
+    if _SECRET_PAIR.search(text):
+        found.add("pair")
+    if _URL_USERINFO.search(text):
+        found.add("userinfo")
+    if _SECRET_PERCENT.search(text):
+        found.add("percent")
+    if _xml_secret(text):
+        found.add("xml")
     for line in text.splitlines()[:MAX_CREDENTIAL_LINES]:
         if _colon_pair(line) or _credential_record(line):
-            return True
-    return False
+            found.add("line")
+            break
+    return found
 
 
 def credential_by_name(field, name):

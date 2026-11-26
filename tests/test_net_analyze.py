@@ -95,6 +95,10 @@ Regressions covered:
     believed: forty spoofed OCSP uploads to the C2 stayed known to the
     baseline; the baseline learns the clean machine's resolvers and, with a
     baseline, only their answers count (Ruling 77)
+  * a decoded text flagged only by a line shape was masked in part:
+    ``login: bob`` kept the password on the bare next line, a dump of 300
+    ``name: value`` lines its bare secret line; such a text is masked whole
+    (Ruling 78)
 """
 
 import base64
@@ -1357,3 +1361,28 @@ def test_a_baseline_that_learned_no_resolver_believes_no_answer(tmp_path):
     _ocsp(sample, 10.0, 640)
     r = net_analyze.analyze_pcap(_write(tmp_path, sample), baseline=bl)
     assert _uploads(r) == [(640, None)]
+
+
+# --- a credential by line shape alone is masked whole (Ruling 78) -------------------------------------
+
+def test_a_decoded_text_flagged_only_by_a_line_shape_is_masked_whole(tmp_path):
+    cases = [b"login: bob\nSec-Pw-10\n",
+             b"".join(b"line %d: x\n" % i for i in range(300)) + b"Sec-Pw-19 admin\n",
+             b"https://bank.example/login\tbob\tSec-Pw-02\n"]
+    cap = Capture()
+    for i, text in enumerate(cases):
+        _served(cap, 10.0 + i, "h%d.example" % i, base64.b64encode(text))
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    blob = json.dumps(r)
+    for secret in ("Sec-Pw-10", "Sec-Pw-19", "Sec-Pw-02"):
+        assert secret not in blob, secret
+    decoded = [e for e in r["events"] if e["type"] == "decoded"]
+    assert len(decoded) == 3 and all(d["credential"] and d["text"] == "***" for d in decoded)
+
+
+def test_a_shape_that_says_where_the_secret_is_still_masks_in_part(tmp_path):
+    cap = Capture()
+    _served(cap, 10.0, "h.example", base64.b64encode(b"host: evil-c2.top\n<cfg><pwd>Sec-Pw-5</pwd></cfg>"))
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    d = [e for e in r["events"] if e["type"] == "decoded"][0]
+    assert "Sec-Pw-5" not in json.dumps(r) and "<pwd>***</pwd>" in d["text"]

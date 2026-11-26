@@ -563,10 +563,13 @@ def _mask_decoded(events, copies, source_of):
 
     A value that is a credential by where it was found (an Authorization
     header, a form key or cookie that says secret) is masked whole. One that
-    is a credential by its text (a decoded config with a ``<key>`` or
-    ``"password":`` in it) keeps its text with the secrets masked
+    is a credential by a shape that says where the secret is (a decoded
+    config with a ``<key>`` or ``"password":``, a form, URL userinfo, a
+    percent-encoded pair) keeps its text with the secrets masked
     (``net_decode.mask_credentials``, which removes whatever the flag found):
-    replaced whole, a decoded C2 config lost its C2 URL. Its encoded form,
+    replaced whole, a decoded C2 config lost its C2 URL. One flagged only by
+    a line shape (``name: value``, a dump record) is masked whole: after
+    ``login: bob`` the password may be the bare next line. Its encoded form,
     its hash and the encoded value in the source are masked either way: they
     give the secret back."""
     position = {id(e): i for i, e in enumerate(events)}
@@ -574,8 +577,10 @@ def _mask_decoded(events, copies, source_of):
         if event.get("type") != "decoded" or not event.get("credential"):
             continue
         if copy.get("text") is not None:
-            whole = net_decode.credential_by_name(event.get("field") or "",
-                                                  event.get("name") or "")
+            # whole when the place says so, or when only a line shape flagged the text
+            # (``login: bob`` with the password on the bare next line has no shape to mask)
+            whole = (net_decode.credential_by_name(event.get("field") or "", event.get("name") or "")
+                     or net_decode.credential_shapes(event.get("text")) <= {"line"})
             copy["text"] = "***" if whole else net_decode.mask_credentials(copy["text"],
                                                                          lines=True)
         copy["encoded"] = "***"
