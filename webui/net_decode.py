@@ -575,20 +575,33 @@ def _is_credential(field, name, decoded):
     left unmarked is text with no such shape: ``address:port``, a drive path, a
     URL without userinfo, a clock time, JSON without a secret key, prose.
     """
-    if field in _CREDENTIAL_HEADERS:
-        return True
-    header = field.partition(".")[2] if field.startswith(("headers.", "resp_headers.")) else ""
-    if _SECRET_NAME.search(name) or _SECRET_NAME.search(header) or is_session_header(header):
+    if credential_by_name(field, name):
         return True
     text = (decoded.text or "")[:MAX_CREDENTIAL_CHARS]
     if _SECRET_PAIR.search(text) or _URL_USERINFO.search(text):
         return True
-    if _SECRET_PERCENT.search(text) or _SECRET_XML.search(text):
+    if _SECRET_PERCENT.search(text) or _xml_secret(text):
         return True
     for line in text.splitlines()[:MAX_CREDENTIAL_LINES]:
         if _colon_pair(line) or _credential_record(line):
             return True
     return False
+
+
+def credential_by_name(field, name):
+    """Is a decoded value a credential for where it was found, whatever it holds?
+
+    True for a value of an ``Authorization`` header and one found under a
+    name (form key, cookie, header) that says secret or session: the whole
+    value is then the secret, and only masking all of it hides it. A value
+    that is a credential by its text alone (``_is_credential`` for any other
+    reason) holds the secret somewhere in it, and ``mask_credentials`` removes
+    what made it one, keeping the rest (a C2 URL beside a key)."""
+    if field in _CREDENTIAL_HEADERS:
+        return True
+    header = field.partition(".")[2] if field.startswith(("headers.", "resp_headers.")) else ""
+    return bool(_SECRET_NAME.search(name) or _SECRET_NAME.search(header)
+                or is_session_header(header))
 
 
 def _colon_pair(line):
@@ -709,13 +722,24 @@ _SECRET_PERCENT = re.compile(
     "(" + _PERCENT_KEY + r"%3[dD])((?:%(?!26|3[bB]|2[cC])[0-9A-Fa-f]{2}"
     r"|[^\s&;,\"'<>%])+)", re.I)
 # An XML element whose name says secret: ``<pwd>S</pwd>``, ``<password type="x">S``,
-# ``<password><value>S</value>``. Only the long words: ``<p>`` is a paragraph.
-# The value is the first text after the tag and any elements it opens, up to
-# the next tag, closed or not (a body cut short).
-_XML_KEY = "[:" + _NAME_CHARS + "]{0,32}" + _SECRET_WORDS + "[" + _NAME_CHARS + "]{0,32}"
-_SECRET_XML = re.compile(
-    "(<" + _XML_KEY + r"(?:\s[^<>]{0,256})?>(?:\s{0,64}<[A-Za-z][^<>/]{0,256}>){0,4})"
+# ``<password><value>S</value>``. The value is the first text right after the
+# tag, up to the next tag, closed or not (a body cut short); only a value
+# wrapper (``<value>``, ``<v>``, ``<string>``...) is looked into, not any
+# element: ``<keys><server>evil-c2.top</server>`` names a server, not a key.
+# The name is read word by word (``_xml_secret_name``), not as a substring:
+# ``<keywords>``, ``<author>`` and ``<authority>`` are no secrets.
+_XML_ELEMENT = re.compile(
+    r"(<([A-Za-z_][\w.:-]{0,64})(?:\s[^<>]{0,256})?>"
+    r"(?:\s{0,64}<(?:value|val|v|string|str|data|text)(?:\s[^<>]{0,256})?>){0,2})"
     r"([^<]*[^<\s][^<]*)", re.I)
+_XML_WORD = re.compile(r"[A-Z]+(?![a-z])|[A-Z]?[a-z0-9]+")
+# a word of a tag name that ends in one of these is a secret (``apikey``,
+# ``accesstoken``, ``credentials``), and one that starts with one of the second
+# (``passwordhash``, ``tokenid``); "key" and "auth" do not start one, or
+# ``keywords`` and ``author`` would be. ``<p>`` and ``<pw>`` are not: ``<p>`` is a paragraph.
+_XML_SECRET_ENDS = ("pass", "passwd", "password", "passphrase", "pwd", "secret", "token",
+                    "key", "auth", "cred", "credential")
+_XML_SECRET_STARTS = ("pass", "pwd", "secret", "token")
 _SECRET_BARE_COLON = re.compile(
     "(" + _COLON_START + "(" + _KEY_BODY + r")[\"']?[ \t]*:" + _BARE_VALUE, re.I)
 _PORT = re.compile(r"\d{1,5}(?:[/?#]|$)")
@@ -760,6 +784,26 @@ def _mask_parts(text):
             ending = content[len(content.rstrip("\r\n")):]
             pieces[i] = part[:blank.end()] + MASK + ending
     return boundary.join(pieces)
+
+
+def _xml_secret_name(name):
+    """Does an XML element's name say its text is a secret, read word by word?"""
+    for word in _XML_WORD.findall(name.replace(":", "_")):
+        word = word.lower()
+        for one in (word, word[:-1] if word.endswith("s") else word):
+            if one.endswith(_XML_SECRET_ENDS) or one.startswith(_XML_SECRET_STARTS):
+                return True
+    return False
+
+
+def _xml_secret(text):
+    """Is there an XML element whose name says secret with text in it?"""
+    return "<" in text and any(_xml_secret_name(m.group(2)) for m in _XML_ELEMENT.finditer(text))
+
+
+def _mask_xml(text):
+    return _XML_ELEMENT.sub(
+        lambda m: m.group(1) + MASK if _xml_secret_name(m.group(2)) else m.group(0), text)
 
 
 def is_session_header(name):
@@ -833,7 +877,7 @@ def mask_credentials(text, lines=False, colons=None, path=False):
     if "%" in text:
         text = _SECRET_PERCENT.sub(bare, text)
     if "<" in text:
-        text = _SECRET_XML.sub(lambda m: m.group(1) + MASK, text)
+        text = _mask_xml(text)
     if lines:
         out = []
         for line in text.splitlines(True):

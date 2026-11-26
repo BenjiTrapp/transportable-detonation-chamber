@@ -94,8 +94,9 @@ module is that order, in ``analyze_pcap``. The false assumptions it avoids:
     ``net_decode.mask_credentials``, the detection behind the ``credential``
     flag, for every string (bodies, replies and messages line by line);
     credential, cookie and secret-named header values are ``***``. A decoded
-    credential is also masked in its own event and where its encoded value
-    sat. Rules and findings ran on the plain events before, so masking changes
+    credential is also masked in its own event (whole when it was found under
+    a secret name, else only its secrets: a decoded config keeps its C2 URL)
+    and where its encoded value sat. Rules and findings ran on the plain events before, so masking changes
     no verdict. Nothing secret is written to the baseline either.
   * Every address is an indicator. The servers of ``known_good`` names are
     the idle machine's and are not listed, but only where a DNS answer in the
@@ -557,13 +558,25 @@ def mask_report(value, key=None):
 
 
 def _mask_decoded(events, copies, source_of):
-    """A decoded credential and the encoded value it came from, masked in the copies."""
+    """A decoded credential and the encoded value it came from, masked in the copies.
+
+    A value that is a credential by where it was found (an Authorization
+    header, a form key or cookie that says secret) is masked whole. One that
+    is a credential by its text (a decoded config with a ``<key>`` or
+    ``"password":`` in it) keeps its text with the secrets masked
+    (``net_decode.mask_credentials``, which removes whatever the flag found):
+    replaced whole, a decoded C2 config lost its C2 URL. Its encoded form,
+    its hash and the encoded value in the source are masked either way: they
+    give the secret back."""
     position = {id(e): i for i, e in enumerate(events)}
     for event, copy in zip(events, copies):
         if event.get("type") != "decoded" or not event.get("credential"):
             continue
         if copy.get("text") is not None:
-            copy["text"] = "***"
+            whole = net_decode.credential_by_name(event.get("field") or "",
+                                                  event.get("name") or "")
+            copy["text"] = "***" if whole else net_decode.mask_credentials(copy["text"],
+                                                                         lines=True)
         copy["encoded"] = "***"
         copy["preview"] = ""
         copy["sha256"] = None       # the hash of a short "user:password" is the password

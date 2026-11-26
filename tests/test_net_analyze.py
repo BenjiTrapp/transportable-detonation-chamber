@@ -77,6 +77,12 @@ Regressions covered:
     text, every flow keeps its connection event, the report's text budget
     cuts only what the report keeps, and a cut capture says so in
     ``incomplete`` (follow-up F2)
+  * a decoded value flagged as a credential was replaced whole, so a base64
+    XML config with a ``<key>`` lost its C2 URL, and ``<keywords>``,
+    ``<author>`` or a ``<keys>`` around a ``<server>`` hid a config that holds
+    no secret; a value that is a credential by its text keeps the text with
+    the secrets masked, one found under a secret name is still masked whole
+    (follow-up F3)
 """
 
 import base64
@@ -1172,3 +1178,53 @@ def test_the_report_budget_cuts_the_report_not_the_analysis(tmp_path, monkeypatc
     assert [e["kind"] for e in r["events"] if e["type"] == "decoded"] == ["pe"]
     assert "net.exe_in_encoded_field" in {h["rule_id"] for h in r["rule_hits"]}
     assert r["report_text_cut"] is True and r["incomplete"] == []
+
+
+# --- a decoded config keeps its C2 URL (follow-up F3) --------------------------------------------
+
+def _served(cap, ts, host, body):
+    cap.web(ts, host, b"GET /c HTTP/1.1\r\nHost: %s\r\n\r\n" % host.encode(),
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n"
+            % len(body) + body)
+
+
+def test_a_decoded_config_with_a_key_keeps_its_c2_url_and_loses_only_the_key(tmp_path):
+    configs = {
+        "xml": b"<config><c2>http://evil-c2.top/gate.php</c2><key>A1B2C3D4E5</key><sleep>60</sleep></config>",
+        "json": b'{"c2": "http://evil-c2.top/gate.php", "author": "Kit-Author-7", "api_key": "A1B2C3D4E5"}',
+    }
+    for kind, config in configs.items():
+        cap = Capture()
+        encoded = base64.b64encode(config)
+        _served(cap, 10.0, "cdn.example", encoded)
+        r = net_analyze.analyze_pcap(_write(tmp_path, cap, kind + ".pcap"))
+        text = json.dumps(r)
+        assert "A1B2C3D4E5" not in text and encoded.decode() not in text, kind
+        d = [e for e in r["events"] if e["type"] == "decoded"][0]
+        assert d["credential"] is True and "http://evil-c2.top/gate.php" in d["text"], kind
+        assert d["encoded"] == "***" and d["sha256"] is None and d["preview"] == "", kind
+        assert "***" in d["text"], kind
+
+
+def test_a_decoded_config_without_a_secret_is_not_a_credential(tmp_path):
+    for i, config in enumerate((b"<doc><keywords>invoice</keywords><server>http://evil-c2.top/a</server></doc>",
+                                b"<keys><server>evil-c2.top</server><port>443</port></keys>",
+                                b"<cfg><authority>https://evil-c2.top/login</authority></cfg>")):
+        cap = Capture()
+        _served(cap, 10.0, "cdn.example", base64.b64encode(config))
+        _served(cap, 20.0, "cdn2.example", config)
+        r = net_analyze.analyze_pcap(_write(tmp_path, cap, "c%d.pcap" % i))
+        d = [e for e in r["events"] if e["type"] == "decoded"][0]
+        assert d["credential"] is False and d["text"] == config.decode()
+        plain = [e for e in r["events"] if e["type"] == "http" and e["dest"] == "cdn2.example"][0]
+        assert plain["resp_text"] == config.decode()
+
+
+def test_a_value_under_a_secret_name_is_still_masked_whole(tmp_path):
+    cap = Capture()
+    value = base64.b64encode(b"http://evil-c2.top/a and more text").decode()
+    cap.post(10.0, "evil.top", "/x", ("password=%s&x=1" % value).encode())
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    d = [e for e in r["events"] if e["type"] == "decoded"][0]
+    assert d["credential"] is True and d["text"] == "***" and d["encoded"] == "***"
+    assert value not in json.dumps(r) and "evil-c2.top/a and more" not in json.dumps(r)

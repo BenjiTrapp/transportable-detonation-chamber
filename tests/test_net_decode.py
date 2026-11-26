@@ -92,6 +92,11 @@ Regressions covered:
     query values each were 800 decoded events, 60 MB of report and 14 s; a
     ``DecodeBudget`` shared by many events bounds their number, the text they
     keep and their inflating, and says when it refused anything (follow-up F1)
+  * an XML element was a secret when its name only contained a secret word
+    (``<keywords>``, ``<author>``, ``<authority>``), and the mask looked into up
+    to four nested elements, so ``<keys><server>evil-c2.top</server>`` hid the
+    server; the name is read word by word and only a value wrapper
+    (``<value>``, ``<v>``...) is looked into, flag and mask alike (follow-up F3)
 """
 
 import base64
@@ -1308,3 +1313,58 @@ def test_without_a_budget_nothing_changes():
     event = http(query="v=" + _BIG, body_text="data=aGVsbG8gd29ybGQ=")
     assert net_decode.decode_event_fields(event) == net_decode.decode_event_fields(event, budget)
     assert budget.capped is False
+
+
+# --- XML names are read word by word (follow-up F3) ----------------------------------
+
+_XML_SECRET_NAMES = ("key", "keys", "apiKey", "api_key", "access_token", "accessToken", "mypassword",
+                     "credentials", "creds", "oauth", "passwordHash", "x:password", "AuthToken", "SECRET",
+                     "pwd", "passphrase", "tokenId", "user.password")
+_XML_PLAIN_NAMES = ("keywords", "author", "authority", "authors", "keyboard", "server", "c2", "p", "pw",
+                    "url", "link", "sleep", "port", "item", "description", "host")
+
+
+@pytest.mark.parametrize("name", _XML_SECRET_NAMES)
+def test_an_element_named_after_a_secret_is_flagged_and_masked(name):
+    text = "<cfg><c2>http://evil-c2.top/gate.php</c2><%s>Val-9</%s></cfg>" % (name, name)
+    assert net_decode._is_credential("body_text", "", _Text(text)), name
+    masked = net_decode.mask_credentials(text)
+    assert "Val-9" not in masked and "http://evil-c2.top/gate.php" in masked, masked
+
+
+@pytest.mark.parametrize("name", _XML_PLAIN_NAMES)
+def test_an_element_whose_name_only_contains_a_secret_word_is_left_alone(name):
+    text = "<doc><%s>Val-9</%s><server>http://evil-c2.top/a</server></doc>" % (name, name)
+    assert not net_decode._is_credential("body_text", "", _Text(text)), name
+    assert net_decode.mask_credentials(text) == text
+
+
+def test_the_mask_does_not_look_into_nested_elements_only_into_a_value_wrapper():
+    nested = "<keys><server>evil-c2.top</server><port>443</port></keys>"
+    assert net_decode.mask_credentials(nested) == nested
+    assert not net_decode._is_credential("body_text", "", _Text(nested))
+    for wrapper in ("value", "v", "string", "data"):
+        text = "<password>\n  <%s>Val-9</%s></password>" % (wrapper, wrapper)
+        assert "Val-9" not in net_decode.mask_credentials(text), wrapper
+        assert net_decode._is_credential("body_text", "", _Text(text)), wrapper
+
+
+def test_the_xml_flag_and_mask_agree_on_generated_names():
+    """Generated: every name built from a word list with every joiner; whatever
+    the flag marks the mask removes, and what it does not mark stays whole."""
+    words = ["key", "keys", "token", "pass", "password", "auth", "author", "keyword", "server",
+             "cred", "secret", "api", "access", "user", "id", "word", "x", "monkey", "authority"]
+    disagree = []
+    for a in words:
+        for b in words + [""]:
+            # ":" is left out: in a body "<x:password>" is also a "name: value" line, masked to its end
+            for joiner in ("", "_", ".", "-"):
+                name = a + (joiner + b if b else "")
+                name2 = a + b[:1].upper() + b[1:] if b else a
+                for n in (name, name2):
+                    text = "<cfg><%s>Val-9</%s><u>http://evil-c2.top/</u></cfg>" % (n, n)
+                    flagged = net_decode._is_credential("body_text", "", _Text(text))
+                    masked = net_decode.mask_credentials(text, lines=True)
+                    if flagged == ("Val-9" in masked) or "http://evil-c2.top/" not in masked:
+                        disagree.append((n, flagged))
+    assert disagree == []
