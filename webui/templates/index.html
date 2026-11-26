@@ -19,9 +19,9 @@
             document.documentElement.dataset.theme = 'cyberpunk';
         }
     </script>
-    <link rel="stylesheet" href="/static/css/style.css?v=92">
+    <link rel="stylesheet" href="/static/css/style.css?v=95">
     <link rel="stylesheet" href="/static/css/theme-layout.css?v=13">
-    <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=36">
+    <link rel="stylesheet" href="/static/css/theme-cyberpunk.css?v=38">
 </head>
 <body>
     <!-- Global loading overlay (shown on slow fetches) -->
@@ -93,6 +93,7 @@
                     <button class="tab" data-tab="hexeditor">Hex</button>
                     <button class="tab" data-tab="filemap">FileMap</button>
                     <button class="tab" data-tab="rizin">Rizin</button>
+                    <button class="tab" data-tab="syscalls">SYSCALLS</button>
                     <button class="tab" data-tab="litterbox">LitterBox</button>
                     <button class="tab" data-tab="submit">Submit</button>
                 </nav>
@@ -1283,6 +1284,172 @@
                 </div>
             </div>
 
+            <!-- SYSCALLS Tab: the map of every syscall of ntdll.dll and win32u.dll, one cell each, a band per
+                 module (block SYSCALLS of app.js). The toolbar in one line that wraps, the notices (no baseline,
+                 NTSleuth missing), the line a scan leaves, then the work area: the map with its legend and the
+                 catalog under it, each scrolling in itself. The detail panel stands to the right of them, the deviations
+                 and the known hooks under them; below 1400px the map and the detail panel take turns. GRAPH puts the
+                 binary graph's answers in the map's place: a query bar, the layered paths and their legend. -->
+            <div class="tab-content" id="tab-syscalls">
+                <div class="content-header">
+                    <h2 data-info="Every syscall of ntdll.dll and win32u.dll as one cell, from the NTSleuth baseline of this build. Choose a process and SCAN to colour each cell with the state its stub is in.">Syscalls</h2>
+                    <span class="content-subtitle" id="syscalls-subtitle">Syscall baseline and live stub measurement</span>
+                    <div class="header-actions">
+                        <button type="button" class="btn btn-sm" id="syscall-refresh" onclick="syscallRefresh(true)" title="Read the status and the baseline again">Refresh</button>
+                    </div>
+                </div>
+                <div class="syscall-toolbar" id="syscall-toolbar">
+                    <span class="chart-range syscall-switch" role="group" aria-label="Surface">
+                        <button type="button" class="chart-range-btn" id="syscall-view-map" aria-pressed="true" onclick="syscallSetView('map')">MAP</button>
+                        <button type="button" class="chart-range-btn" id="syscall-view-graph" aria-pressed="false" title="The import graph of System32: follow an import down to its syscall" onclick="syscallSetView('graph')">GRAPH</button>
+                    </span>
+                    <span class="chart-range syscall-switch syscall-pane-switch" role="group" aria-label="Pane">
+                        <button type="button" class="chart-range-btn" id="syscall-pane-map" aria-pressed="true" onclick="syscallSetPane('map')">MAP</button>
+                        <button type="button" class="chart-range-btn" id="syscall-pane-detail" aria-pressed="false" onclick="syscallSetPane('detail')">DETAIL</button>
+                    </span>
+                    <div class="syscall-group syscall-target-group">
+                        <select id="syscall-target" class="filter-select" aria-label="Process to scan" onchange="syscallOnTarget()">
+                            <option value="">-- select a process --</option>
+                        </select>
+                        <label class="syscall-check" title="win32u stubs exist only in GUI processes, so a scan leaves them out unless asked for"><input type="checkbox" id="syscall-win32u"> win32u</label>
+                        <button type="button" class="btn btn-sm btn-primary" id="syscall-scan" onclick="runSyscallScan()" disabled title="Choose a process first">SCAN</button>
+                        <button type="button" class="btn btn-sm" id="syscall-stubs-run" onclick="runSyscallStubs()" disabled title="Choose a process first">STUBS</button>
+                    </div>
+                    <div class="syscall-group syscall-filter-group">
+                        <input type="text" id="syscall-filter" class="filter-input" placeholder="Filter by name or number" aria-label="Filter syscalls by name or number" autocomplete="off" spellcheck="false" oninput="syscallOnFilter()">
+                        <select id="syscall-module-filter" class="filter-select" aria-label="Module" onchange="syscallOnFilter()">
+                            <option value="">both modules</option>
+                            <option value="ntdll.dll">ntdll.dll</option>
+                            <option value="win32u.dll">win32u.dll</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="syscall-notices" id="syscall-notices" hidden></div>
+                <div class="syscall-scan-result" id="syscall-scan-result" role="status" hidden></div>
+                <div class="syscall-work" id="syscall-work" data-pane="map">
+                    <div class="syscall-main" id="syscall-surface-map">
+                        <div class="syscall-map-panel">
+                            <div class="syscall-legend" id="syscall-legend"></div>
+                            <div class="syscall-map" id="syscall-map"></div>
+                            <div class="syscall-tip" id="syscall-tip" role="tooltip" hidden></div>
+                        </div>
+                        <div class="syscall-catalog">
+                            <div class="syscall-catalog-head" id="syscall-catalog-head">Catalog</div>
+                            <div class="syscall-rows" id="syscall-rows"></div>
+                        </div>
+                    </div>
+                    <div class="syscall-main binary-graph" id="syscall-surface-graph" hidden>
+                        <div class="binary-graph-panel">
+                            <div class="binary-graph-modes">
+                                <span class="chart-range syscall-switch" role="group" aria-label="Graph view">
+                                    <button type="button" class="chart-range-btn" id="binary-graph-mode-path" aria-pressed="true" title="One question, drawn as a path from left to right" onclick="binaryGraphSetMode('path')">PATH</button>
+                                    <button type="button" class="chart-range-btn" id="binary-graph-mode-explore" aria-pressed="false" title="Start from one binary and open its neighbours node by node" onclick="binaryGraphSetMode('explore')">EXPLORE</button>
+                                </span>
+                                <button type="button" class="btn btn-sm binary-graph-max" id="binary-graph-max" aria-pressed="false" title="Give the graph the height of the figures table" aria-label="Give the graph the height of the figures table" onclick="binaryGraphToggleMax()">⇱</button>
+                            </div>
+                            <div class="binary-graph-pathview" id="binary-graph-path">
+                            <form class="binary-graph-bar" id="binary-graph-bar" onsubmit="binaryGraphSubmit(event)">
+                                <h3 class="syscall-panel-title" data-info="One question to the import graph of this system's System32, drawn left to right with one layer per hop. A solid edge is read from the binaries, a dashed one marked curated comes from the hand-curated Win32 to Nt table.">BINARY GRAPH</h3>
+                                <select id="binary-graph-query" class="filter-select" aria-label="Query" onchange="binaryGraphOnQuery()">
+                                    <option value="path-to-syscall">path to syscall</option>
+                                    <option value="importers">importers</option>
+                                    <option value="imports">imports</option>
+                                    <option value="syscall-callers">syscall callers</option>
+                                    <option value="forwarders">forwarders</option>
+                                    <option value="shared">shared dependencies</option>
+                                </select>
+                                <input type="text" id="binary-graph-module" class="filter-input" placeholder="Module, such as kernel32.dll" aria-label="Start node" autocomplete="off" spellcheck="false">
+                                <input type="text" id="binary-graph-function" class="filter-input" placeholder="Function, such as OpenProcess" aria-label="Function" autocomplete="off" spellcheck="false">
+                                <button type="submit" class="btn btn-sm btn-primary" id="binary-graph-run">QUERY</button>
+                            </form>
+                            <div class="binary-graph-status" id="binary-graph-status" role="status" hidden></div>
+                            <div class="binary-graph-canvas" id="binary-graph-canvas"></div>
+                            <div class="syscall-legend binary-graph-legend" id="binary-graph-legend"></div>
+                            </div>
+                            <div class="binary-explore" id="binary-explore" hidden>
+                                <form class="binary-graph-bar" id="binary-explore-bar" onsubmit="binaryGraphExploreSubmit(event)">
+                                    <h3 class="syscall-panel-title" data-info="One binary drawn alone, then opened node by node: EXPAND draws the modules it imports from, with the functions counted on each edge, and the modules that import it. FUNCTIONS draws the functions; a disc grows with its importers, and 400 nodes are the most drawn.">EXPLORE</h3>
+                                    <input type="text" id="binary-explore-start" class="filter-input" placeholder="Binary to start from, such as kernel32.dll" aria-label="Binary to start from" autocomplete="off" spellcheck="false">
+                                    <button type="submit" class="btn btn-sm btn-primary" id="binary-explore-run">START</button>
+                                    <span class="binary-explore-depth-label">DEPTH</span>
+                                    <span class="chart-range syscall-switch" id="binary-explore-depth" role="group" aria-label="Hops opened by one expansion">
+                                        <button type="button" class="chart-range-btn" id="binary-explore-depth-1" aria-pressed="true" onclick="binaryGraphSetDepth(1)">1</button>
+                                        <button type="button" class="chart-range-btn" id="binary-explore-depth-2" aria-pressed="false" onclick="binaryGraphSetDepth(2)">2</button>
+                                        <button type="button" class="chart-range-btn" id="binary-explore-depth-3" aria-pressed="false" onclick="binaryGraphSetDepth(3)">3</button>
+                                    </span>
+                                    <button type="button" class="btn btn-sm" id="binary-explore-expand" disabled title="Open the neighbours of the chosen node" onclick="binaryGraphExpand(binaryGraphExplore.selected)">EXPAND</button>
+                                    <button type="button" class="btn btn-sm" id="binary-explore-functions" disabled title="Draw the functions the chosen module imports, one node each" onclick="binaryGraphOpenFunctions(binaryGraphExplore.selected)">FUNCTIONS</button>
+                                    <span class="binary-explore-view">
+                                        <button type="button" class="btn btn-sm" title="Zoom in" onclick="binaryGraphZoom(1.25)">+</button>
+                                        <span class="binary-explore-zoom" id="binary-explore-zoom">100%</span>
+                                        <button type="button" class="btn btn-sm" title="Zoom out" onclick="binaryGraphZoom(0.8)">&minus;</button>
+                                        <button type="button" class="btn btn-sm" title="Bring every node into view" onclick="binaryGraphFit()">FIT</button>
+                                        <button type="button" class="btn btn-sm" title="Lay every node out again" onclick="binaryGraphRelayout()">LAYOUT</button>
+                                    </span>
+                                </form>
+                                <div class="binary-graph-status" id="binary-explore-status" role="status" hidden></div>
+                                <div class="binary-explore-stage" id="binary-explore-stage">
+                                    <canvas class="binary-explore-canvas" id="binary-explore-canvas" width="600" height="400" aria-label="The import graph, opened node by node"></canvas>
+                                </div>
+                                <div class="binary-explore-info" id="binary-explore-info"></div>
+                                <div class="syscall-legend binary-graph-legend" id="binary-explore-legend"></div>
+                            </div>
+                            <section class="binary-graph-metrics" aria-label="Figures of the whole stock">
+                                <div class="binary-graph-bar">
+                                    <h3 class="syscall-panel-title" data-info="The figures of the whole System32 graph, which as a cloud of nodes would be unreadable. A number opens the list behind it in the detail panel, a row of that list starts an exploration from it, and a figure of zero has no list.">FIGURES</h3>
+                                    <button type="button" class="btn btn-sm" id="binary-graph-metrics-reload" title="Read the figures again" onclick="binaryGraphMetricsLoad(true)">RELOAD</button>
+                                </div>
+                                <div class="binary-graph-status" id="binary-graph-metrics-status" role="status" hidden></div>
+                                <div class="view-table-wrap binary-graph-metrics-wrap">
+                                    <table class="view-table" data-sortable data-sort-id="binary-graph-metrics">
+                                        <thead><tr><th>FIGURE</th><th>VALUE</th><th>MEANING</th></tr></thead>
+                                        <tbody id="binary-graph-metrics-body"></tbody>
+                                    </table>
+                                </div>
+                            </section>
+                        </div>
+                    </div>
+                    <section class="syscall-panel syscall-detail" id="syscall-detail" aria-label="Syscall detail">
+                        <div class="syscall-panel-head">
+                            <h3 class="syscall-panel-title" data-info="The syscall chosen on the map, in the catalog or in the graph: number, address, signature and parameters from the baseline, and after a scan the stub bytes with the differences marked. A module, function or edge chosen in the graph is described here too.">DETAIL</h3>
+                        </div>
+                        <div class="syscall-detail-body" id="syscall-detail-body"></div>
+                        <div class="syscall-draft" id="syscall-draft" hidden></div>
+                    </section>
+                    <div class="syscall-lower" id="syscall-lower">
+                        <div class="syscall-lower-bar">
+                            <button type="button" class="syscall-lower-fold" id="syscall-lower-fold" aria-expanded="true" aria-controls="syscall-lower-body" title="Fold the panels of the last scan away" aria-label="Fold the panels of the last scan away" onclick="syscallToggleLower()">▾</button>
+                            <span class="syscall-lower-note" id="syscall-lower-note"></span>
+                        </div>
+                        <div class="syscall-lower-body" id="syscall-lower-body">
+                        <div class="syscall-lower-left">
+                            <section class="syscall-panel syscall-deviations" aria-label="Deviations">
+                                <div class="syscall-panel-head">
+                                    <h3 class="syscall-panel-title" data-info="Every stub of the last scan that is not as the baseline has it, the loudest first, with the bytes expected and read, the jump target and what it added to the evidence score. Draft rule makes a signature entry from a stub and writes nothing.">DEVIATIONS</h3>
+                                    <span class="syscall-panel-note" id="syscall-deviations-head"></span>
+                                </div>
+                                <div class="syscall-panel-body" id="syscall-deviations"></div>
+                            </section>
+                            <section class="syscall-panel syscall-stubs" id="syscall-stubs" aria-label="Syscall stubs of the sample" hidden>
+                                <div class="syscall-panel-head">
+                                    <h3 class="syscall-panel-title" data-info="Syscall stubs the chosen process carries itself, in its private executable memory and its image file: one in the file whose function the file does not import, by the curated Win32 to Nt table, is a proven bypass, the rest are hints. Draft rule makes a YARA rule for its bytes and writes nothing.">DIRECT SYSCALL STUBS</h3>
+                                    <span class="syscall-panel-note" id="syscall-stubs-head"></span>
+                                </div>
+                                <div class="syscall-panel-body" id="syscall-stubs-body"></div>
+                            </section>
+                        </div>
+                        <section class="syscall-panel syscall-hooks" aria-label="Known hooks">
+                            <div class="syscall-panel-head">
+                                <h3 class="syscall-panel-title" data-info="Hooks recorded as known, as pairs of syscall and owning module for one build and view; a known hook stays on the map and in the list but no longer counts as evidence. Record them only on a host you believe is clean.">KNOWN HOOKS</h3>
+                                <span class="syscall-panel-note" id="syscall-hooks-head"></span>
+                            </div>
+                            <div class="syscall-panel-body" id="syscall-hooks"></div>
+                        </section>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
             <!-- ETW Browser Tab -->
             <div class="tab-content" id="tab-etw">
                 <div class="content-header">
@@ -1569,6 +1736,11 @@
                             <p>A patch set over bytes a run wrote is saved with a mark (the ⚠). A patch set over bytes a run wrote is not written when the file is opened again: opening happens before any run, so it would land in the file's own, still encrypted bytes, and the next decryption would XOR over it. It waits instead: PATCHES shows it in a group of its own, WAITING (not applied · kept with the project), with its reason, and the session's note names it once when the file is opened. A waiting patch has two ways out, and no third: ✕ takes it out of the project, and Apply now writes it into the cache. Apply now appears only where a run's bytes cover the address again, and the server decides that, not the pane; the server checks it again when it is pressed, and says why not. Restore the run, at the head of the right column of the EMULATION tab, replays the timeline the project keeps of the emulation (the start, the runs, each skipped call with the answer that was applied, and your patches, in the order they were made in) and then writes the patches that waited and that a run's bytes cover again. It is one button press, and never on its own when a file is opened, because it runs the file's code in the emulator again and a run can take as long as <code>esil.timeout</code> (5 s). The SHA-256 is the proof: the project holds one for each range the run decrypted, made over the bytes as the run left them (so not over your patches), and the replay is checked against them. If the bytes differ, nothing is applied, and the cache is as it was when the file was opened; the notice says so, and so it does when an action is refused or the replay needs more than 60 s. The timeline is not kept, and the button says why it is off, after a run that ended at the time limit, a register set by hand, a console command that writes or sets, a breakpoint that stands other than the timeline began with, a rizin that restarted, something taken out of the cache, and a run with nothing to prove. The decrypted bytes are not stored in the project: the web UI reads only the last 64 KB of the project file, and the patches and the timeline share 32 KB of characters, the patches first. What is saved is the timeline, with a SHA-256 for each range, at most 500 actions; a timeline that does not fit is dropped whole, and the next open says so.</p>
                         </div>
                         <div class="help-guide-item">
+                            <h4>SYSCALLS</h4>
+                            <p>Aether does not look at <code>ntdll.dll</code>: it skips everything under <code>C:\Windows\</code>, and its disk comparison answers only yes or no, without a name, an address or bytes. This tab fills that gap with a baseline of what every syscall stub should look like, and names what differs. The map of every syscall of <code>ntdll.dll</code> and <code>win32u.dll</code>, one cell each in the order of its number, a band per module, comes from the NTSleuth baseline of this Windows build and view (arm64, x64). Without a scan the cells carry the baseline in one quiet tone and the map is the catalog. Choose a process, tick win32u if it is a GUI process (ntdll alone is scanned otherwise; the box is off, with the reason, when the baseline holds no win32u syscalls, as the x64 view of an ARM64 host has, and the map then has no win32u band) and press SCAN: the stubs are read from the process and each cell takes the state it was measured in, with the legend counting them. <em>intact</em>: as the baseline has it; <em>hooked (file-backed module)</em>: the jump ends in a loaded module other than ntdll that a file backs, which is what an EDR does and so normal on a host with one, weak evidence, but also what a DLL the sample loaded or a legitimate DLL it overwrote in place would look like; <em>patched</em>: the jump ends in private memory, a section no file backs or a mapped view of a file (no loaded module, whatever file it maps), or in a core Windows module such as kernelbase.dll (a code cave), which no hooking product explains, so who owns the target tells the two apart and not the instruction. A first jump into private memory is followed when it is itself a jump, up to two relays, because MinHook and Detours hook through such a relay; the detail names the relay. A relay that leads back into ntdll is patched too, as no jump of ntdll's own goes out and back; <em>diverged</em>: the bytes differ but the jump is neither of those or cannot be resolved, which is never guessed at; <em>unreadable</em>: no stub could be read. A single deviation among the cells (some 2,000 of them in an arm64 baseline) stands out by its colour and a ring. The filter takes a name, a decimal or hex number, and the module menu narrows it to one module: cells that do not match are dimmed, not removed, so a cell stays where it is. Hover a cell for its name and number, click it to mark it; the catalog under the map lists the first 300 matches. DETAIL shows the chosen syscall with its parameters, its signature to copy, the stub bytes of the baseline and, after a scan, the bytes read with the differences marked, and links to ntdoc and WinGraph (at its root, nothing is fetched from it); Open in Rizin appears for the native view only. DEVIATIONS lists every stub of the last scan that is not intact, the loudest first, with what it added to the evidence score; Draft rule makes a signature entry and writes nothing. STUBS searches the chosen process, and its file, for syscall stubs it carries itself, a way round ntdll: each hit names its syscall, and Draft rule makes a YARA rule that names the build and view. APPLY TO THIS VM writes that rule where Rustinel reads its rules, which should load it within about two seconds (not yet verified on a VM) and is gone with the VM; DOWNLOAD FOR THE REPO gives the file to commit under <code>rules/yara/</code>, to keep it in version control; whether a committed rule is loaded again after a rebuild is not yet verified. Nothing is written before one of them is pressed. KNOWN HOOKS holds the hooks of this host as pairs of syscall and owning module: record them once on a host you believe is clean, and they stay on the map and in the list but no longer count as evidence. A patch is never recorded. The notices over the map say what is missing: NTSleuth not installed, no baseline for this build and view yet (it is extracted in the background), and, on an ARM64 host, an x64 view that cannot be told from the arm64 one under emulation, whose baseline is discarded on purpose and which so cannot measure emulated x64 processes; that is not a fault, and it is not the same as no baseline.</p>
+                            <p><strong>GRAPH</strong>, beside MAP, draws the import graph of <code>C:\Windows\System32</code> in the map's place: what each of the binaries there (3,999 on the build this was measured on) imports and exports, with every forwarder followed to the module that defines it. It is made on this VM from the files themselves, offline, by <code>scripts/build-binary-graph.ps1</code> at provisioning; when it is missing the web UI builds it in the background and the tab says so. <em>PATH</em> asks one question, <em>path to syscall</em>, <em>importers</em>, <em>imports</em>, <em>syscall callers</em>, <em>forwarders</em> or <em>shared dependencies</em>, and draws the answer from left to right, one layer per hop: from an import such as <code>kernel32.dll</code> and <code>WriteProcessMemory</code> down to the syscall number of this build's baseline. <em>EXPLORE</em> starts at one binary and opens its neighbours node by node: EXPAND opens the modules it imports from and the ones that import it, as many hops as DEPTH says, and FUNCTIONS the functions it imports, always one hop; at most 400 nodes are drawn, and the line above the canvas says what was left out. <em>FIGURES</em> counts the whole stock, and a number opens the list behind it. The graph gets the room: in GRAPH the panels of the last scan (DEVIATIONS, DIRECT SYSCALL STUBS, KNOWN HOOKS) are folded away, with a bar that names them, carries each one's count as it is written, says when a stub search was not complete or the hook list could not be read, and opens them again in one click, and <strong>&#8689;</strong> folds the rows of the figures table too, which on the chamber takes the canvas from 240 to 647 px. EXPLORE, which works on the canvas, starts with those rows folded; PATH, whose answer is short, keeps them beside it. The figures' own line stays either way, the one that says how many binaries had a table cut short and how many files were not read at all, and a fold or unfold by hand is kept from then on. The canvas zooms with the wheel and the + and &minus; buttons, FIT brings every node into view, LAYOUT lays them out again, and dragging moves a node or the view. A <strong>solid edge is read from the binaries</strong>. The last hop from a Win32 function to its Nt counterpart is not in any binary: it comes from a hand-curated table, and it is a <strong>dashed edge marked curated</strong>, at most one per path and always the last. The step from a Zw name of ntdll to its Nt name is curated too, a naming convention that no binary states, in a path and in the syscall callers alike, and so are the rows of the table that FIGURES lists as curated transitions. A path that ends in an Nt name which ntdll or win32u exports is derived throughout. Where a table of a binary was cut short when it was read, the answer says so: the counts of the exploration and the figures are lower bounds, and any other answer is not certain. WinGraph is only linked to, never queried.</p>
+                        </div>
+                        <div class="help-guide-item">
                             <h4>LitterBox</h4>
                             <p>Files in the LitterBox sandbox with static, dynamic and EDR results.</p>
                         </div>
@@ -1582,7 +1754,7 @@
                 <!-- API Reference -->
                 <div class="help-section" id="help-api">
                     <h3>API</h3>
-                    <p class="help-muted">Served on port <code>9000</code>, JSON. No login (keep the VM on an isolated network); state-changing requests from other web sites are refused. The full reference with all endpoints is the API page of the offline wiki (<a href="/static/wiki.html#api" target="_blank" rel="noopener">open it here</a> &mdash; Overview says whether that file is on this machine), and <code>docs/api.md</code> in the repository; the MCP server (<code>mcp/server.py</code>, 49 tools) wraps the same API.</p>
+                    <p class="help-muted">Served on port <code>9000</code>, JSON. No login (keep the VM on an isolated network); state-changing requests from other web sites are refused. The full reference with all endpoints is the API page of the offline wiki (<a href="/static/wiki.html#api" target="_blank" rel="noopener">open it here</a> &mdash; Overview says whether that file is on this machine), and <code>docs/api.md</code> in the repository, with the RIZIN tab's routes in <code>docs/api-rizin.md</code>; the MCP server (<code>mcp/server.py</code>, 49 tools) wraps the same API.</p>
 
                     <h4>Core</h4>
                     <table class="help-api-table">
@@ -1630,6 +1802,18 @@
                             <tr><td class="api-post">POST</td><td><code>/api/scan/beacons</code></td><td>Hunt-Sleeping-Beacons (also <code>beaconeye</code>)</td></tr>
                             <tr><td class="api-post">POST</td><td><code>/api/memory/sweep</code></td><td>Scan every process (or capture the baseline)</td></tr>
                             <tr><td class="api-get">GET</td><td><code>/api/memory/baseline</code></td><td>Host memory baseline status</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/syscalls/status</code></td><td>NTSleuth installed, baselines per build and view, background extraction</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/syscalls/baseline</code></td><td>Syscall catalog, paged. Params: <code>view</code>, <code>query</code>, <code>module</code>, <code>offset</code>, <code>limit</code></td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/syscalls/&lt;name&gt;</code></td><td>One syscall with parameters and stub, found under its Nt or its Zw name (the baseline holds one of the two; a stub hit names it by its Nt name). Param: <code>view</code></td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/syscalls/scan</code></td><td>Measure the syscall stubs of a PID against the baseline. Params: <code>pid</code>, <code>modules</code></td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/syscalls/stubs</code></td><td>Syscall stubs outside ntdll, in a PID or a file, each named by its Nt name. Params: <code>pid</code> or <code>path</code> with <code>view</code></td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/syscalls/hook-baseline</code></td><td>Known hooks (also <code>POST</code> to record a PID's hooks on a clean host, <code>DELETE</code> to forget)</td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/syscalls/rule</code></td><td>Draft a YARA rule from a stub hit, or a signature from a deviation. Writes nothing. Params: <code>hit</code> or <code>deviation</code>, <code>view</code>, <code>build</code></td></tr>
+                            <tr><td class="api-post">POST</td><td><code>/api/syscalls/rule/apply</code></td><td>Write a YARA draft where Rustinel reads its rules; it should load within about two seconds (not yet verified on a VM)</td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/binary-graph/query</code></td><td>One query over the System32 import graph, cut at 400 nodes. <code>q=path-to-syscall</code> follows an import (<code>module</code>, <code>function</code>) down to a syscall number. The edge from a Win32 function to its syscall is curated, the word of a hand-made table and not read from any binary: at most one per path, always the last. The other answers with curated edges are <code>q=syscall-callers</code>, whose step from a Zw name of ntdll to its Nt syscall is curated, a naming convention, and the list of the table's own rows, <code>q=metric</code> with <code>metric=curated_transitions</code>, each the table's word. Every other edge is derived, and a direct Nt import is derived throughout; a Zw name reaches its Nt name by a curated edge too, a naming convention that is not read from any binary. A sample outside the graph does not descend: give the DLL it imports from, such as <code>kernel32.dll</code>, as <code>module</code>. The answer has <code>total</code> (how many importers, chains or modules there were before the cut) and <code>partial</code>: true when a table it read was cut short when it was read, so a negative or a count is not certain. <code>q=metric</code> with <code>metric</code> lists what is behind one figure of <code>/api/binary-graph/metrics</code>: its rows as <code>nodes</code>, <code>total</code> of them (<code>binaries</code>, <code>edges</code>, <code>api_sets_resolved</code>, <code>forwarders</code>, <code>isolated</code>, <code>circular_pairs</code>, <code>curated_transitions</code>, <code>most_imported</code>, <code>skipped</code>, <code>partial</code>); an unknown figure is 400. Params: <code>q</code>, <code>module</code>, <code>function</code>, <code>syscall</code>, <code>other</code>, <code>metric</code></td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/binary-graph/node</code></td><td>Imports, exports, forwarders and in-degree of one binary or api set. Param: <code>name</code></td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/binary-graph/metrics</code></td><td>The figures of the whole stock of the import graph as numbers: binaries, edges (the imports of every binary), resolved api sets, forwarded exports, isolated binaries, circular pairs, curated Win32 to Nt transitions (null where the table cannot be read), the most imported modules, skipped files and the binaries with a table (import, delay-load or export) cut short. The list behind each is the query <code>metric</code> of <code>/api/binary-graph/query</code></td></tr>
+                            <tr><td class="api-get">GET</td><td><code>/api/syscalls/rule/download</code></td><td>A YARA draft as a file for <code>rules/yara/</code>. Params: <code>name</code>, <code>text</code></td></tr>
                         </tbody>
                     </table>
 
@@ -1811,6 +1995,6 @@ C:\Users\Public\Downloads\        Samples written by DetonatorAgent</pre>
         <div id="decision-toasts" class="decision-stack" role="region" aria-label="Firewall decisions"></div>
     </div>
 
-    <script src="/static/js/app.js?v=137"></script>
+    <script src="/static/js/app.js?v=163"></script>
 </body>
 </html>

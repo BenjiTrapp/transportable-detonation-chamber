@@ -1093,7 +1093,7 @@ def test_run_digests_hash_the_bytes_the_run_left_not_the_patch():
     proof matters. The digest covers the run's range whole, and what it hashes there is what the run
     wrote, not the patch.
 
-    rizin's ``before`` for a patch over a run's byte is that byte (measured, docs/api.md GET /patches),
+    rizin's ``before`` for a patch over a run's byte is that byte (measured, docs/api-rizin.md GET /patches),
     and the row of the run says the same in its ``after``: the second is what is read, because a second
     patch over the same byte has the first one's bytes in its ``before``."""
     run = _cache_row(0x1000, "4142434445464748")  # the decryption wrote eight bytes

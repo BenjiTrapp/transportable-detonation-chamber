@@ -5,7 +5,9 @@ test gets a clean in-memory store and its own result/baseline files, so tests
 never touch the files next to app.py or talk to the VM.
 """
 
+import json
 import os
+import shutil
 import sys
 import tempfile
 import threading
@@ -58,6 +60,17 @@ def tdc(app_module, monkeypatch, tmp_path):
     monkeypatch.setattr(m, "_memory_baseline",
                         m.memory_evidence.MemoryBaseline(str(tmp_path / "baseline.json")))
     m._alerts_body_cache["entry"] = None
+    # the syscall baselines, NTSleuth and the hook allowlist are files of the test's own; no symbol server is asked
+    monkeypatch.setattr(m, "NTSLEUTH_DIR", str(tmp_path / "ntsleuth"))
+    monkeypatch.setattr(m, "NTSLEUTH_BASELINE_DIR", str(tmp_path / "ntsleuth" / "baseline"))
+    monkeypatch.setattr(m, "SYSCALL_HOOK_ALLOWLIST_FILE", str(tmp_path / "syscall_hook_allowlist.json"))
+    monkeypatch.setattr(m, "_hook_allowlist", None)
+    monkeypatch.setattr(m, "_syscall_baselines", {})
+    monkeypatch.setattr(m, "_syscall_extract_state", m._new_syscall_extract_state())
+    # the binary graph: no build of an earlier test running, no graph of an earlier test held
+    monkeypatch.setattr(m, "_binary_graph_build_state", m._new_binary_graph_build_state())
+    monkeypatch.setattr(m, "_binary_graph_held", {})
+    monkeypatch.setattr(m, "_symbol_server_reachable", lambda: False)
     m.set_log_store(m.log_store.LogStore(persist_dir=str(tmp_path / "logs")))
     # the own dashboards of a test are a file of its own, never webui/dashboards.json
     m.set_dashboard_store(m.dashboards.DashboardStore(str(tmp_path / "dashboards.json")))
@@ -69,6 +82,36 @@ def tdc(app_module, monkeypatch, tmp_path):
 @pytest.fixture
 def client(tdc):
     return tdc.app.test_client()
+
+
+def _baseline_dir(tdc, monkeypatch, tmp_path, symbols=None):
+    """The baselines of tests/samples in a directory of the test's own, which is the one the web UI reads; the
+    system it runs on has the build they were named for. `symbols` False marks them as extracted without symbols."""
+    directory = tmp_path / "ntsleuth-baselines"
+    directory.mkdir()
+    for view in ("arm64", "x64"):
+        name = f"ntsleuth-26220.5770-{view}.json"
+        source = os.path.join(ROOT, "tests", "samples", name)
+        if symbols is None:
+            shutil.copy(source, directory / name)
+            continue
+        with open(source, encoding="utf-8") as fh:
+            document = json.load(fh)
+        document["symbols"] = symbols
+        (directory / name).write_text(json.dumps(document), encoding="utf-8")
+    monkeypatch.setattr(tdc, "NTSLEUTH_BASELINE_DIR", str(directory))
+    monkeypatch.setattr(tdc, "_current_os_build", lambda: "26220.5770")
+    return directory
+
+
+@pytest.fixture
+def fake_baseline_dir(tdc, monkeypatch, tmp_path):
+    return _baseline_dir(tdc, monkeypatch, tmp_path)
+
+
+@pytest.fixture
+def degraded_baseline_dir(tdc, monkeypatch, tmp_path):
+    return _baseline_dir(tdc, monkeypatch, tmp_path, symbols=False)
 
 
 def make_alert(i, pid, ts, image, ppid=None, parent_name="", engine="sigma",
@@ -91,6 +134,114 @@ def make_alert(i, pid, ts, image, ppid=None, parent_name="", engine="sigma",
     }
     alert.update(extra)
     return alert
+
+
+def make_pe(*, imports=(), delay=(), exports=(), forwarders=(), code=b"",
+            export_rva=None, machine=0x8664, sections=(), nameless=(), ordinal_base=1, dll=False) -> bytes:
+    """A minimal PE whose directories pefile parses.
+
+    imports, delay: (module, (function, ...)) pairs — several modules, not one; an int function is an ordinal
+    exports:        names this image defines itself
+    forwarders:     (name, "MODULE.Function") pairs
+    sections:       (name, bytes) pairs, for a section such as ".apiset"
+    machine:        0x8664 x64, 0xAA64 arm64
+    nameless:       (ordinal, "MODULE.Function" or None) pairs: exports without a name, a forwarder or a definition
+    ordinal_base:   the export directory's Base; the named exports, then the forwarders, take Base, Base + 1, ...
+    dll:            sets IMAGE_FILE_DLL in the COFF characteristics (0x2022 instead of 0x22)
+
+    A PE32+ whose first section starts at RVA 0x1000, file offset 0x200. `code` sits at RVA 0x11C0, file offset
+    0x3C0, where the exports point unless `export_rva` says otherwise (without code, at 0x1000); the tables follow
+    it. A forwarder's address is the RVA of its string inside the export directory's Size window: that, and only
+    that, is what makes pefile report `forwarder`. Without imports or delay there is no such directory at all."""
+    import struct
+    base, code_at = 0x1000, 0x1C0
+    body = bytearray(code_at) + code
+
+    def align(n):
+        body.extend(bytes(-len(body) % n))
+
+    def put(blob, n=8):
+        align(n)
+        rva = base + len(body)
+        body.extend(blob)
+        return rva
+
+    def name_table(functions):
+        entries = []
+        for function in functions:
+            if isinstance(function, int):
+                entries.append(1 << 63 | function)
+            else:
+                entries.append(put(struct.pack("<H", 0) + function.encode() + b"\0", 2))
+        return put(struct.pack(f"<{len(entries) + 1}Q", *entries, 0))
+
+    descriptors = b""
+    for module, functions in imports:
+        dll, table = put(module.encode() + b"\0", 2), name_table(functions)
+        descriptors += struct.pack("<IIIII", table, 0, 0, dll, table)
+    import_dir = (put(descriptors + bytes(20), 4), len(descriptors) + 20) if imports else None
+    descriptors = b""
+    for module, functions in delay:
+        dll, table, handle = put(module.encode() + b"\0", 2), name_table(functions), put(bytes(8))
+        descriptors += struct.pack("<IIIIIIII", 1, dll, handle, table, table, 0, 0, 0)
+    delay_dir = (put(descriptors + bytes(32), 4), len(descriptors) + 32) if delay else None
+
+    export_dir = None
+    entries = [(name, None) for name in exports] + list(forwarders)
+    if entries or nameless:
+        align(4)
+        start, n = base + len(body), len(entries)
+        slots = {ordinal_base + i: entry for i, entry in enumerate(entries)}
+        for ordinal, forwarder in nameless:
+            assert ordinal >= ordinal_base and ordinal not in slots, ordinal
+            slots[ordinal] = (None, forwarder)
+        count = max(slots) - ordinal_base + 1                       # an ordinal without an export is a zero slot
+        functions_at = start + 40
+        names_at = functions_at + 4 * count
+        ordinals_at = names_at + 4 * n
+        strings = bytearray()
+
+        def string(text):
+            rva = ordinals_at + 2 * n + len(strings)
+            strings.extend(text.encode() + b"\0")
+            return rva
+
+        image_name = string("image.dll")
+        name_rvas = [string(name) for name, _ in entries]
+        target = export_rva if export_rva is not None else (base + code_at if code else base)
+        addresses = [0] * count
+        for ordinal, (_, forwarder) in sorted(slots.items()):
+            addresses[ordinal - ordinal_base] = target if forwarder is None else string(forwarder)
+        block = struct.pack("<IIHHIIIIIII", 0, 0, 0, 0, image_name, ordinal_base, count, n,
+                            functions_at, names_at, ordinals_at)
+        block += struct.pack(f"<{count}I", *addresses) + struct.pack(f"<{n}I", *name_rvas)
+        block += struct.pack(f"<{n}H", *range(n)) + bytes(strings)
+        export_dir = (put(block, 1), len(block))
+    align(0x200)
+
+    assert len(sections) <= 3, "the section headers must fit before file offset 0x200"
+    layout = [(b".idata", bytes(body))] + [(name.encode(), data) for name, data in sections]
+    headers, rva, offset = b"", base, 0x200
+    for name, data in layout:
+        raw = len(data) + (-len(data) % 0x200)
+        headers += struct.pack("<8sIIIIIIHHI", name, len(data), rva, raw, offset, 0, 0, 0, 0, 0x40000040)
+        rva += len(data) + (-len(data) % 0x1000)
+        offset += raw
+    optional = struct.pack("<HBBIIIII", 0x20B, 14, 0, 0, 0x200, 0, 0, 0x1000)
+    optional += struct.pack("<QIIHHHHHHIIIIHH", 0x140000000, 0x1000, 0x200, 6, 0, 0, 0, 6, 0, 0, rva, 0x200, 0, 3, 0)
+    optional += struct.pack("<QQQQII", 0x100000, 0x1000, 0x100000, 0x1000, 0, 16)
+    directories = bytearray(128)
+    for index, entry in ((0, export_dir), (1, import_dir), (13, delay_dir)):
+        if entry:
+            directories[index * 8:index * 8 + 8] = struct.pack("<II", *entry)
+    optional += bytes(directories)
+    assert len(optional) == 0xF0
+    coff = struct.pack("<HHIIIHH", machine, len(layout), 0, 0, 0, 0xF0, 0x2022 if dll else 0x22)
+    header = b"MZ" + bytes(0x3A) + struct.pack("<I", 0x40) + b"PE\0\0" + coff + optional + headers
+    out = header.ljust(0x200, b"\0")
+    for _, data in layout:
+        out += data + bytes(-len(data) % 0x200)
+    return out
 
 
 # --- FIREWALL tab -------------------------------------------------------------------------------

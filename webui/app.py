@@ -29,13 +29,22 @@ import subprocess
 import sys
 import weakref
 from pathlib import Path
-from flask import Flask, render_template, jsonify, request, send_from_directory, g, has_request_context
+from flask import Flask, render_template, jsonify, request, send_from_directory, g, has_request_context, Response
 from werkzeug.utils import secure_filename
 import requests
 
 # Tool-agnostic scoring layer for live-memory findings. Scanners are plugged in
 # as normalizers there, so the verdict logic does not depend on any one tool.
 import memory_evidence
+# Syscall baseline (NTSleuth) and the measurement of a process against it, for the SYSCALLS tab.
+import syscall_baseline
+import syscall_rules
+import syscall_scan
+# The curated Win32 to Nt table: what turns a stub the sample carries into a proven bypass.
+import win32_to_nt
+# The import graph of the System32 binaries and the questions the SYSCALLS tab asks of it.
+import binary_graph
+import binary_graph_query
 import pipe_analysis
 import pipe_proxy
 # Offline analysis of exit-time minidumps (no scanner binary involved).
@@ -299,6 +308,16 @@ SCAN_HISTORY_MAX = 200
 # counterpart to Process Dump's clean-hash database.
 MEMORY_BASELINE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "memory_baseline.json")
 
+# NTSleuth and the syscall baselines it extracted (ntsleuth-<build>-<view>.json), written when it is provisioned.
+NTSLEUTH_DIR = r"C:\tools\ntsleuth"
+NTSLEUTH_BASELINE_DIR = os.path.join(NTSLEUTH_DIR, "baseline")
+# Hooks seen on this host while it was considered clean; see syscall_scan.HookAllowlist.
+SYSCALL_HOOK_ALLOWLIST_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "syscall_hook_allowlist.json")
+# Rustinel reads its YARA rules from yara-combined (install-detection-rules.ps1) and reloads them when a file changes.
+# `tdc` is ours: the only directory a rule drafted in the SYSCALLS tab is written to. Not Aether's rules directory,
+# which the upstream clone replaces.
+YARA_RULES_DIR = r"C:\tools\detection-rules\yara-combined\tdc"
+
 
 def _decode_console(raw):
     """Decode output of a Windows console program.
@@ -471,7 +490,7 @@ def _normalize_scan(tool, result):
     elif tool and tool.lower() == "capa":  # capa reports capabilities, not a verdict
         cc = result.get("capability_count")
         verdict = "analyzed" if cc is not None else "unknown"
-    elif tool and tool.lower() == "aether":  # live-memory findings, not a file verdict
+    elif tool and tool.lower() in ("aether", "syscalls"):  # live-memory findings, not a file verdict
         # The evidence layer is authoritative: it already accounts for the host
         # baseline, persistence and corroboration.
         ev = result.get("evidence") or {}
@@ -556,7 +575,7 @@ def _extract_sha256(hashes):
     return ""
 
 
-_PROCESS_SCAN_TOOLS = {"aether", "process dump", "exit capture", "hunt-sleeping-beacons", "beaconeye"}
+_PROCESS_SCAN_TOOLS = {"aether", "syscalls", "process dump", "exit capture", "hunt-sleeping-beacons", "beaconeye"}
 
 
 def _summarize_scan_entry(e):
@@ -3989,6 +4008,7 @@ def api_submit():
 
     # Submit to DetonatorAgent
     agent_pid = None
+    agent_file_path = None
     exit_capture_armed_at = None
     if target in ("agent", "both"):
         # Arm dump-on-exit before the sample starts: a sample that exits within
@@ -4011,6 +4031,7 @@ def api_submit():
                 agent_data = r.json() if r.ok else {}
                 if isinstance(agent_data, dict):
                     agent_pid = agent_data.get("pid")
+                    agent_file_path = agent_data.get("file_path") or agent_data.get("path")
         except Exception as e:
             results["agent"] = {"status": 502, "error": str(e)}
 
@@ -4094,9 +4115,10 @@ def api_submit():
     memory_tools_available = (os.path.isfile(HUNT_SLEEPING_BEACONS_EXE)
                               or os.path.isfile(BEACONEYE_EXE)
                               or os.path.isfile(AETHER_EXE)
-                              or os.path.isfile(PROCESSDUMP_EXE))
+                              or os.path.isfile(PROCESSDUMP_EXE)
+                              or _syscall_stage_available())
     if agent_pid and memory_tools_available:
-        _run_memory_scans_async(agent_pid, file_sha256)
+        _run_memory_scans_async(agent_pid, file_sha256, agent_file_path)
         results["beacon_scan"] = {
             "triggered": True,
             "tools": [],
@@ -4107,6 +4129,8 @@ def api_submit():
             results["beacon_scan"]["tools"].append("BeaconEye")
         if os.path.isfile(AETHER_EXE):
             results["beacon_scan"]["tools"].append("Aether")
+        if _syscall_stage_available():
+            results["beacon_scan"]["tools"].append("Syscalls")
         if os.path.isfile(PROCESSDUMP_EXE):
             results["beacon_scan"]["tools"].append("Process Dump")
     else:
@@ -4251,6 +4275,7 @@ def api_detonation_results():
     hsb_result = _rs.lookup("hsb", pid, sha256)
     beaconeye_result = _rs.lookup("beaconeye", pid, sha256)
     aether_result = _rs.lookup("aether", pid, sha256)
+    syscalls_result = _rs.lookup("syscalls", pid, sha256)
     processdump_result = _rs.lookup("processdump", pid, sha256)
     exitcapture_result = _rs.lookup("exitcapture", pid, sha256)
 
@@ -4260,6 +4285,8 @@ def api_detonation_results():
         results["beaconeye"] = beaconeye_result
     if aether_result:
         results["aether"] = aether_result
+    if syscalls_result:
+        results["syscalls"] = syscalls_result
     if processdump_result:
         results["process_dump"] = processdump_result
     if exitcapture_result:
@@ -4276,6 +4303,7 @@ def api_detonation_results():
         "hsb_installed": os.path.isfile(HUNT_SLEEPING_BEACONS_EXE),
         "beaconeye_installed": os.path.isfile(BEACONEYE_EXE),
         "aether_installed": os.path.isfile(AETHER_EXE),
+        "syscall_stage_available": _syscall_stage_available(),
         "process_dump_installed": os.path.isfile(PROCESSDUMP_EXE),
     }
 
@@ -4682,6 +4710,57 @@ def _pipe_events_for(pids, sample_keys, resolve, since, until):
     return events, truncated
 
 
+def _syscall_stubs_measured(counts):
+    """How many stubs a syscall scan measured: every state but `unreadable`, which is a stub nobody read."""
+    counts = counts if isinstance(counts, dict) else {}
+    return sum(v for k, v in counts.items() if k != "unreadable" and isinstance(v, int) and not isinstance(v, bool))
+
+
+def _syscall_mark_unobserved(result):
+    """A syscall scan `result` that measured no stub is NOT OBSERVED, not CLEAN: what it did not read is not evidence
+    of being clean. A label another finding raised (a stub the sample carries) is left as it is."""
+    evidence = result.get("evidence")
+    if (isinstance(evidence, dict) and evidence.get("label") == "CLEAN"
+            and not _syscall_stubs_measured(result.get("counts"))):
+        evidence["label"] = "NOT OBSERVED"
+        evidence["note"] = f"The syscall scan measured no stub: {result.get('note') or 'nothing was read'}"
+    return result
+
+
+def _syscall_verdict_reasons(stage, evidence, reasons, only_source=False):
+    """What the syscall stage of a detonation leaves unsaid by its score, said in the verdict, the way a live scan
+    that observed nothing is: a partial measurement, a stub search that did not cover the process, and stubs that
+    diverged, which are not scored. Without it a result full of `diverged` or of unread stubs reads as a clean
+    process. A stage that measured no stub at all, as the only memory source, is NOT OBSERVED."""
+    if not stage:
+        return
+    counts = stage.get("counts") if isinstance(stage.get("counts"), dict) else {}
+    gaps = []
+    if stage.get("partial"):
+        gaps.append(str(stage.get("note") or "not every stub could be measured"))
+    stubs = stage.get("stubs") if isinstance(stage.get("stubs"), dict) else {}
+    search = stubs.get("process") if isinstance(stubs.get("process"), dict) else {}
+    if search.get("error"):
+        gaps.append(f"the search of its memory for stubs failed: {search['error']}")
+    elif search.get("partial"):
+        gaps.append(f"the search of its memory for stubs is partial: {search.get('note') or 'not all of it was read'}")
+    if gaps:
+        evidence.setdefault("partial_sources", []).append("syscalls")
+        reasons.append(f"Syscall measurement is partial ({'; '.join(gaps)[:400]}) - what it did not read is not "
+                       "evidence of being clean")
+    # an unreadable stub was not measured: a stage that read none is a stage that observed nothing
+    if not _syscall_stubs_measured(counts) and only_source and evidence.get("label") == "CLEAN":
+        evidence["label"] = "NOT OBSERVED"
+        evidence["note"] = f"The syscall stage measured no stub: {stage.get('note') or 'nothing was read'}"
+    renumbered = stage.get("renumbered") if isinstance(stage.get("renumbered"), int) else 0
+    diverged = max(0, int(counts.get("diverged") or 0) - renumbered)
+    if diverged:
+        evidence["syscalls_diverged"] = diverged
+        reasons.append(f"{diverged} syscall stub{'s' if diverged != 1 else ''} diverged: the bytes changed, and nothing "
+                       "tells a hook from a patch - there is no jump to follow, its owner could not be resolved, or it "
+                       "goes straight into ntdll or the stub's own module - not scored, and not evidence of being clean")
+
+
 def _compute_verdict(results, matching_alerts):
     """Aggregate a single verdict from EDR alerts, LitterBox findings, and beacon scans.
     Mirrors the Detonator reference UI's edr_verdict concept."""
@@ -4736,8 +4815,11 @@ def _compute_verdict(results, matching_alerts):
         process_name = (results.get("file_info") or {}).get("name") or ""
 
     mem_findings = memory_evidence.collect(results, process=process_name)
+    mem_findings += _syscall_stage_findings(results.get("syscalls"))
     mem_sources = [k for k in ("aether", "process_dump", "hunt_sleeping_beacons",
                                "beaconeye", "exit_capture_result") if results.get(k)]
+    if _syscall_stage_entry(results.get("syscalls")):
+        mem_sources.append("syscalls")
     if (results.get("network_beaconing") or {}).get("evidence_findings"):
         mem_sources.append("network_beaconing")
     if (results.get("named_pipes") or {}).get("evidence_findings"):
@@ -4764,6 +4846,8 @@ def _compute_verdict(results, matching_alerts):
             evidence["note"] = ("Process exited before the live scan; it was "
                                 "analyzed from its exit-time memory dump instead.")
         evidence["sources_present"] = mem_sources
+        _syscall_verdict_reasons(_syscall_stage_entry(results.get("syscalls")), evidence, reasons,
+                                 only_source=mem_sources == ["syscalls"])
 
         # Emitted even when empty, so the UI can tell "tools ran, nothing
         # scored" apart from "tools never ran".
@@ -7769,7 +7853,44 @@ def _sweep_entry(per_pid, pid, image):
     return entry
 
 
-def _run_sweep(use_aether, use_processdump, capture_baseline):
+def _sweep_syscalls(names, per_pid, errors, stats):
+    """The syscall scan of every process in `names` (pid -> image) that has a baseline and can be opened; the
+    others are counted. The findings go into `per_pid` like those of the other tools."""
+    scanned = skipped = 0
+    allowlist, build = _get_hook_allowlist(), _current_os_build()
+    baselines = {}
+    for pid, image in sorted(names.items()):
+        view = _syscall_view_for_pid(pid)
+        if view not in SYSCALL_BASELINE_VIEWS:
+            skipped += 1
+            continue
+        if view not in baselines:
+            baselines[view], why = _syscall_baseline_for(view, extract=False)
+            if baselines[view] is None:
+                errors.append(f"Syscall sweep of the {view} processes: {why}")
+        baseline = baselines[view]
+        if baseline is None:
+            skipped += 1
+            continue
+        try:
+            measured = _syscall_read_process(
+                pid, view, build,
+                lambda reader: syscall_scan.measure(baseline, reader, view, build, ("ntdll.dll",), allowlist))
+        except Exception:
+            skipped += 1
+            continue
+        # a process none of whose stubs could be read was not scanned, whatever else the sweep says of it
+        if not _syscall_stubs_measured(measured.get("counts")):
+            skipped += 1
+            continue
+        scanned += 1
+        entry = _sweep_entry(per_pid, pid, image)
+        entry["findings"] += memory_evidence.collect({"syscall_scan": measured}, process=entry["identity"])
+    stats["syscall_processes"] = scanned
+    stats["syscall_skipped"] = skipped
+
+
+def _run_sweep(use_aether, use_processdump, capture_baseline, use_syscalls=False):
     started = time.time()
     names = _running_process_names()
     per_pid, errors, stats = {}, [], {}
@@ -7812,6 +7933,9 @@ def _run_sweep(use_aether, use_processdump, capture_baseline):
                 entry = _sweep_entry(per_pid, pid, image)
                 entry["findings"] += memory_evidence.from_process_dump(
                     {"dumps": dumps}, process=entry["identity"])
+
+    if use_syscalls and _syscall_baseline_present():
+        _sweep_syscalls(names, per_pid, errors, stats)
 
     captured = 0
     pipe_captured = None
@@ -7878,17 +8002,21 @@ def _run_sweep(use_aether, use_processdump, capture_baseline):
 def api_memory_sweep_start():
     """Start a background sweep of every process.
 
-    Body: {"aether": true, "processdump": false, "baseline": false}
+    Body: {"aether": true, "processdump": false, "syscalls": false, "baseline": false}
     With "baseline": true the findings are recorded as the host baseline
-    instead of being scored - run that on a clean box.
+    instead of being scored - run that on a clean box. The syscall scan is
+    opt-in: a body without "syscalls" leaves it out, so neither SWEEP nor a
+    recorded baseline changes until a clean VM is known to sweep clean.
     """
     data = request.get_json(force=True) if request.is_json else request.form
     truthy = lambda v, d: d if v is None else str(v).lower() in ("1", "true", "yes")
     use_aether = truthy(data.get("aether"), True)
     use_pd = truthy(data.get("processdump"), False)
+    use_syscalls = truthy(data.get("syscalls"), False)
     capture_baseline = truthy(data.get("baseline"), False)
 
-    if not (use_aether and os.path.isfile(AETHER_EXE)) and not (use_pd and os.path.isfile(PROCESSDUMP_EXE)):
+    if (not (use_aether and os.path.isfile(AETHER_EXE)) and not (use_pd and os.path.isfile(PROCESSDUMP_EXE))
+            and not (use_syscalls and _syscall_baseline_present())):
         return jsonify({"error": "No selected sweep tool is installed"}), 400
 
     with _sweep_lock:
@@ -7898,13 +8026,13 @@ def api_memory_sweep_start():
         _sweep_state.clear()
         _sweep_state.update({
             "running": True, "started": time.time(),
-            "options": {"aether": use_aether, "processdump": use_pd,
+            "options": {"aether": use_aether, "processdump": use_pd, "syscalls": use_syscalls,
                         "baseline": capture_baseline},
         })
 
     def _job():
         try:
-            result = _run_sweep(use_aether, use_pd, capture_baseline)
+            result = _run_sweep(use_aether, use_pd, capture_baseline, use_syscalls)
             with _sweep_lock:
                 _sweep_state.update({"running": False, "result": result})
         except Exception as e:
@@ -8112,6 +8240,7 @@ def api_memory_evidence():
             "hunt_sleeping_beacons": _beacon_results_cache.lookup("hsb", pid),
             "beaconeye": _beacon_results_cache.lookup("beaconeye", pid),
             "exit_capture_result": _beacon_results_cache.lookup("exitcapture", pid),
+            "syscalls": _syscall_stage_entry(_beacon_results_cache.lookup("syscalls", pid)),
         }
     cached = {k: v for k, v in cached.items() if v}
     net = _network_beaconing_for_pid(pid)
@@ -8131,12 +8260,1469 @@ def api_memory_evidence():
             break
     process_name = process_name or _image_name_for_pid(pid)
     findings = memory_evidence.collect(cached, process=process_name)
+    findings += _syscall_stage_findings(cached.get("syscalls"))
     return jsonify({
         "pid": pid,
         "process": process_name,
         "sources": sorted(cached.keys()),
         "evidence": memory_evidence.score(findings, baseline=_memory_baseline),
     })
+
+
+# --- Syscall map: baseline, measurement, stubs outside ntdll ---
+
+SYSCALL_VIEWS = ("arm64", "x64", "x86")
+# NTSleuth extracts a baseline for these two; an x86 process has none
+SYSCALL_BASELINE_VIEWS = ("arm64", "x64")
+SYSCALL_MODULES = ("ntdll.dll", "win32u.dll")
+# The longest a request waits for a process to be read (seconds), and how long a reader that is
+# stuck in one call gets to come back after that
+SYSCALL_SCAN_TIMEOUT = 120
+SYSCALL_SCAN_GRACE = 10
+SYSCALL_EXTRACT_TIMEOUT = 300
+# A failed extraction of a build and view is not tried again for this long (seconds)
+SYSCALL_EXTRACT_RETRY = 600
+SYSCALL_PAGE_MAX = 500
+SYSCALL_FILE_MAX = 32 * 1024 * 1024     # a file searched for stubs is read whole, and the search holds the GIL
+SYMBOL_SERVER = ("msdl.microsoft.com", 443)
+SYMBOL_SERVER_WAIT = 3.0
+# _process_machine's names for the machine of an image -> the view of its ntdll; ARM64EC code sees the x64 one
+# the most bytes of a stub a scan reads, of any view (syscall_baseline.READ_LEN)
+SYSCALL_READ_HEX_MAX = max(syscall_baseline.READ_LEN.values())
+_SYSCALL_MACHINE_VIEW = {"x64": "x64", "ARM64": "arm64", "ARM64EC": "x64", "x86": "x86"}
+_SYSCALL_PARAMETERS_NOTE = ("The parameter table is incomplete: this baseline was extracted without the symbol "
+                            "server. The measurement is not affected, numbers, RVAs and stub bytes come from "
+                            "the disassembly.")
+
+_syscall_baselines = {}                  # file path -> (stamp, Baseline)
+_syscall_baselines_lock = threading.Lock()
+_hook_allowlist = None
+_hook_allowlist_lock = threading.Lock()
+
+
+def _new_syscall_extract_state():
+    # running: (build, view) being extracted; failed: (build, view) -> (when, why); thread: the latest one;
+    # indistinguishable: the failed ones whose reason is that the x64 extraction was the arm64 view
+    return {"running": set(), "failed": {}, "indistinguishable": set(), "thread": None}
+
+
+_syscall_extract_state = _new_syscall_extract_state()
+_syscall_extract_lock = threading.Lock()
+# NTSleuth writes to one output folder: one run at a time
+_syscall_extract_serial = threading.Lock()
+
+_syscall_scans = 0
+_syscall_scans_lock = threading.Lock()
+
+
+def _get_hook_allowlist():
+    """The one hook allowlist of this process. A second instance would write its sets over the first's: each
+    commits what it holds in memory."""
+    global _hook_allowlist
+    with _hook_allowlist_lock:
+        if _hook_allowlist is None:
+            _hook_allowlist = syscall_scan.HookAllowlist(SYSCALL_HOOK_ALLOWLIST_FILE)
+        return _hook_allowlist
+
+
+def _syscall_view_for_pid(pid):
+    """'arm64', 'x64' or 'x86': the ntdll a process runs against, or None if unknown. From the image's PE header
+    (_process_machine), which tells an x64 process under emulation from a native one."""
+    return _SYSCALL_MACHINE_VIEW.get(_process_machine(pid))
+
+
+def _syscall_default_view():
+    return "arm64" if platform.machine().upper() in ("ARM64", "AARCH64") else "x64"
+
+
+def _current_os_build():
+    r"""`<build>.<revision>` of the running system, the form baseline files are named in, or None."""
+    try:
+        import winreg
+        with winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows NT\CurrentVersion") as key:
+            number = winreg.QueryValueEx(key, "CurrentBuildNumber")[0]
+            revision = winreg.QueryValueEx(key, "UBR")[0]
+    except (ImportError, OSError):
+        return None
+    return f"{number}.{revision}"
+
+
+def _symbol_server_reachable():
+    """Whether the Microsoft symbol server answers a connection; the chamber is usually cut off from it."""
+    import socket
+    try:
+        socket.create_connection(SYMBOL_SERVER, timeout=SYMBOL_SERVER_WAIT).close()
+        return True
+    except OSError:
+        return False
+
+
+def _ntsleuth_exe(view):
+    return os.path.join(NTSLEUTH_DIR, f"ntsleuth-{view}.exe")
+
+
+def _ntsleuth_args(view, symbols=None):
+    """The command line that extracts the baseline of `view`. Without the symbol server, `--no-symbols`:
+    NTSleuth would wait on downloads that never come. `symbols` None asks the server."""
+    if symbols is None:
+        symbols = _symbol_server_reachable()
+    args = [_ntsleuth_exe(view), "--auto-params", "--format", "json"]
+    return args if symbols else args + ["--no-symbols"]
+
+
+class _ViewNotDistinguishable(RuntimeError):
+    """The x64 extraction is the arm64 one: ntsleuth-x64.exe did not see the x64 view of ntdll.dll."""
+
+
+def _same_view_baseline(parsed, build, other_view):
+    """The path of the baseline of `other_view` and `build` if it exists, loads and has the fingerprint of `parsed`,
+    else None. With no such baseline (an x64 host, a native-only one, an unreadable file) there is nothing to be
+    identical to."""
+    path = syscall_baseline.find_baseline(NTSLEUTH_BASELINE_DIR, build, other_view)
+    if path is None:
+        return None
+    try:
+        # without the shape check: an x64 lookalike has the arm64 shape, which is what is being looked for
+        other = syscall_baseline.load_baseline(path, check_shape=False)
+    except syscall_baseline.BaselineError:
+        return None
+    return path if syscall_baseline.view_fingerprint(other) == syscall_baseline.view_fingerprint(parsed) else None
+
+
+def _refuse_arm64_lookalike(parsed, build):
+    """Raises _ViewNotDistinguishable if `parsed`, an x64 extraction, is the arm64 view: it has the fingerprint of
+    the arm64 baseline of `build`, or, whether or not that file exists, the stubs of the arm64 view. Stored, it would
+    be the arm64 baseline under another name: every emulated x64 sample would be measured against the wrong
+    reference."""
+    if syscall_baseline.shape_share(parsed, "arm64") >= syscall_baseline.SHAPE_SHARE:
+        raise _ViewNotDistinguishable(
+            f"the x64 view is not distinguishable on this host: ntsleuth-x64.exe extracted ARM64 stubs (SVC) for "
+            f"build {build}, so it did not see the x64 ntdll.dll. No x64 baseline is stored; measuring emulated x64 "
+            f"samples against the ARM64 stubs would be wrong")
+    if _same_view_baseline(parsed, build, "arm64"):
+        raise _ViewNotDistinguishable(
+            f"the x64 view is not distinguishable on this host: ntsleuth-x64.exe extracted the same RVAs and stub "
+            f"bytes as the arm64 baseline of build {build}, so it did not see the x64 ntdll.dll. No x64 baseline "
+            f"is stored; measuring emulated x64 samples against the ARM64 stubs would be wrong")
+
+
+def _drop_x64_lookalike(parsed, build):
+    """The other order: `parsed`, an arm64 extraction about to be stored, equals an x64 baseline already there. The
+    x64 one is the wrong one, whichever came first: ntsleuth-arm64.exe gives the arm64 view by construction on an
+    ARM64 host, it is the emulated x64 binary that may not have seen its own. So the arm64 baseline stays and the x64
+    one goes, and the x64 view is recorded as not distinguishable, as the other order does."""
+    path = _same_view_baseline(parsed, build, "x64")
+    if path is None:
+        return
+    removed = True
+    try:
+        os.remove(path)
+    except OSError:
+        removed = False
+    why = (f"the x64 view is not distinguishable on this host: the x64 baseline of build {build} had the same RVAs "
+           f"and stub bytes as the arm64 one, so ntsleuth-x64.exe had not seen the x64 ntdll.dll. "
+           + ("It was removed; emulated x64 samples are not measured" if removed else
+              f"It could not be removed: delete {os.path.basename(path)} by hand. It is not used meanwhile, its stubs "
+              f"do not have the x64 shape, so emulated x64 samples are not measured"))
+    with _syscall_extract_lock:
+        _syscall_extract_state["failed"][(build, "x64")] = (time.time(), why)
+        _syscall_extract_state["indistinguishable"].add((build, "x64"))
+
+
+def _extract_baseline(view, symbols, build):
+    """Extract the baseline of `view` with NTSleuth and store it as the one of `build`, the build the caller is
+    keyed by, where the web UI reads it. True when it did; False when NTSleuth is not installed for that view.
+    Raises RuntimeError with the reason when the run fails: nothing is stored then."""
+    exe = _ntsleuth_exe(view)
+    if not os.path.isfile(exe):
+        return False
+    # NTSleuth writes output/syscalls.json beside where it runs; a file left by an earlier run must not pass
+    output = os.path.join(NTSLEUTH_DIR, "output", "syscalls.json")
+    try:
+        os.remove(output)
+    except OSError:
+        pass
+    try:
+        proc = _run_cmd(_ntsleuth_args(view, symbols), timeout=SYSCALL_EXTRACT_TIMEOUT, cwd=NTSLEUTH_DIR)
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"NTSleuth timed out ({SYSCALL_EXTRACT_TIMEOUT}s)") from None
+    if proc.returncode != 0:
+        tail = ((proc.stderr or proc.stdout or "").strip().splitlines() or [""])[-1][:300]
+        raise RuntimeError(f"NTSleuth exited with {proc.returncode}: {tail}")
+    try:
+        with open(output, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"NTSleuth wrote no usable JSON: {exc}") from None
+    entries = payload.get("syscalls") if isinstance(payload, dict) else payload
+    document = {"symbols": bool(symbols), "syscalls": entries}
+    try:
+        parsed = syscall_baseline.parse_baseline(document, build, view)
+    except syscall_baseline.BaselineError as exc:
+        raise RuntimeError(str(exc)) from None
+    if not parsed.syscalls:
+        raise RuntimeError("NTSleuth's output holds no usable syscall")
+    if view == "x64":
+        _refuse_arm64_lookalike(parsed, build)
+    try:
+        syscall_baseline.check_view_shape(parsed)
+    except syscall_baseline.BaselineError as exc:
+        raise RuntimeError(f"NTSleuth's output is not stored: {exc}") from None
+    os.makedirs(NTSLEUTH_BASELINE_DIR, exist_ok=True)
+    target = os.path.join(NTSLEUTH_BASELINE_DIR, f"ntsleuth-{build}-{view}.json")
+    with open(target + ".tmp", "w", encoding="utf-8") as fh:
+        json.dump(document, fh)
+    os.replace(target + ".tmp", target)
+    if view == "arm64":
+        _drop_x64_lookalike(parsed, build)
+    return True
+
+
+def _syscall_extract_job(build, view):
+    key = (build, view)
+    why = None
+    same_view = False
+    try:
+        with _syscall_extract_serial:
+            if not _extract_baseline(view, _symbol_server_reachable(), build):
+                why = f"NTSleuth is not installed for the {view} view ({_ntsleuth_exe(view)})"
+    except Exception as exc:
+        why = str(exc) or type(exc).__name__
+        same_view = isinstance(exc, _ViewNotDistinguishable)
+    with _syscall_extract_lock:
+        _syscall_extract_state["running"].discard(key)
+        _syscall_extract_state["indistinguishable"].discard(key)
+        if why is None:
+            _syscall_extract_state["failed"].pop(key, None)
+        else:
+            _syscall_extract_state["failed"][key] = (time.time(), why)
+            if same_view:
+                _syscall_extract_state["indistinguishable"].add(key)
+
+
+def _start_baseline_extraction(build, view):
+    """Extract the baseline of `build` and `view` in a thread of its own, as a request must not wait for NTSleuth.
+    False when one is running for that pair already, or failed too recently to try again: any number of requests
+    that find the baseline missing start one run between them. Nothing starts while tools are being updated: the
+    update replaces the NTSleuth binary, and a GET, which the maintenance gate lets through, may not run it."""
+    key = (build, view)
+    if _updating_tools():
+        return False
+    with _syscall_extract_lock:
+        state = _syscall_extract_state
+        failed = state["failed"].get(key)
+        if key in state["running"] or (failed and time.time() - failed[0] < SYSCALL_EXTRACT_RETRY):
+            return False
+        state["running"].add(key)
+        state["thread"] = threading.Thread(target=_syscall_extract_job, args=(build, view),
+                                           name="syscall-baseline", daemon=True)
+        state["thread"].start()
+    return True
+
+
+def _forget_extraction_failure(build, view):
+    """A usable baseline of `build` and `view` is there: an earlier failure to extract it is refuted, whoever wrote
+    the file (the installer writes it without the web UI). Kept, it would contradict the baseline in the status,
+    hold back a retry and name a reason that no longer holds."""
+    with _syscall_extract_lock:
+        _syscall_extract_state["failed"].pop((build, view), None)
+        _syscall_extract_state["indistinguishable"].discard((build, view))
+
+
+def _load_syscall_baseline(path):
+    """The baseline in `path`, read again only when the file changed. One that loads clears the failure record of
+    its build and view."""
+    try:
+        info = os.stat(path)
+    except OSError as exc:
+        raise syscall_baseline.BaselineError(f"cannot read baseline {path}: {exc}") from exc
+    stamp = (info.st_mtime_ns, info.st_size)
+    with _syscall_baselines_lock:
+        hit = _syscall_baselines.get(path)
+        if not hit or hit[0] != stamp:
+            # a file that cannot be loaded is remembered too, or every request would parse it again
+            try:
+                hit = (stamp, syscall_baseline.load_baseline(path))
+            except syscall_baseline.BaselineError as exc:
+                hit = (stamp, exc)
+            _syscall_baselines[path] = hit
+        loaded = hit[1]
+    if isinstance(loaded, syscall_baseline.BaselineError):
+        raise syscall_baseline.BaselineError(str(loaded))
+    _forget_extraction_failure(loaded.build, loaded.view)
+    return loaded
+
+
+def _syscall_extracting():
+    """Whether NTSleuth is being run for a baseline. A tool update must wait for it: it replaces the binary."""
+    with _syscall_extract_lock:
+        return bool(_syscall_extract_state["running"])
+
+
+def _updating_tools():
+    manager = _update_manager
+    return manager is not None and bool(manager.maintenance)
+
+
+def _syscall_extraction_note(build, view):
+    if _updating_tools():
+        return " Tool updates are running: no extraction is started while NTSleuth is being updated."
+    with _syscall_extract_lock:
+        if (build, view) in _syscall_extract_state["running"]:
+            return " It is being extracted in the background, try again in a few seconds."
+        failed = _syscall_extract_state["failed"].get((build, view))
+        same_view = (build, view) in _syscall_extract_state["indistinguishable"]
+    if failed and same_view:
+        return f" {failed[1][:1].upper()}{failed[1][1:]}."
+    return f" The last extraction failed: {failed[1]}." if failed else ""
+
+
+def _syscall_baseline_for(view, extract=True):
+    """`(baseline, None)` for `view` on this system's build, or `(None, why)`. A baseline of another build is no
+    baseline: its RVAs are about other bytes. When there is none for this build, one is extracted in the
+    background, unless `extract` is False: a detonation does not start NTSleuth."""
+    if view not in SYSCALL_BASELINE_VIEWS:
+        return None, f"there is no syscall baseline for the {view or 'unknown'} view"
+    build = _current_os_build()
+    if not build:
+        return None, "no syscall baseline can be chosen: the build of this system cannot be determined"
+    path = syscall_baseline.find_baseline(NTSLEUTH_BASELINE_DIR, build, view)
+    if path is None:
+        if extract:
+            _start_baseline_extraction(build, view)
+        return None, (f"no syscall baseline for build {build}, view {view}."
+                      + _syscall_extraction_note(build, view))
+    try:
+        return _load_syscall_baseline(path), None
+    except syscall_baseline.BaselineError as exc:
+        return None, (f"the syscall baseline is unusable: {exc}. It is not extracted again by itself: delete "
+                      f"{os.path.basename(path)} in {NTSLEUTH_BASELINE_DIR} to have it extracted anew.")
+
+
+def _get_syscall_baseline(view):
+    """The baseline of `view` for this system's build, or None."""
+    return _syscall_baseline_for(view)[0]
+
+
+class _SyscallRouteError(Exception):
+    def __init__(self, message, status=400):
+        super().__init__(message)
+        self.status = status
+
+
+@app.errorhandler(_SyscallRouteError)
+def _syscall_route_error(exc):
+    return jsonify({"error": str(exc)}), exc.status
+
+
+def _syscall_view_param(raw):
+    """The view of a request: one of SYSCALL_VIEWS, this host's own when none is given."""
+    if raw in (None, ""):
+        return _syscall_default_view()
+    if raw not in SYSCALL_VIEWS:
+        raise _SyscallRouteError("view must be one of " + ", ".join(SYSCALL_VIEWS))
+    return raw
+
+
+def _syscall_int_param(raw, name, default, low, high):
+    if raw in (None, ""):
+        return default
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        raise _SyscallRouteError(f"{name} must be an integer") from None
+    return max(low, min(value, high))
+
+
+def _syscall_flag_param(raw, name):
+    """A request flag: 1 or true, 0 or false; absent is false. Anything else is refused, not guessed at."""
+    if raw in (None, "", "0", "false"):
+        return False
+    if raw in ("1", "true"):
+        return True
+    raise _SyscallRouteError(f"{name} must be 0 or 1")
+
+
+def _syscall_body():
+    data = request.get_json(silent=True) if request.is_json else request.form
+    return data if hasattr(data, "get") else {}
+
+
+def _syscall_pid(raw):
+    try:
+        pid = int(raw)
+    except (TypeError, ValueError):
+        pid = 0
+    if isinstance(raw, bool) or not 0 < pid < 2 ** 32:
+        raise _SyscallRouteError("pid must be a positive integer")
+    return pid
+
+
+def _syscall_modules(raw):
+    """The modules to measure, ntdll alone unless the request names more (a list, or names separated by commas)."""
+    if raw in (None, "", []):
+        return ("ntdll.dll",)
+    names = raw.split(",") if isinstance(raw, str) else raw
+    if not isinstance(names, list) or not all(isinstance(n, str) for n in names):
+        raise _SyscallRouteError("modules must be a list of module names")
+    modules = tuple(dict.fromkeys(n.strip().lower() for n in names))
+    if not modules or not set(modules) <= set(SYSCALL_MODULES):
+        raise _SyscallRouteError("modules must be among " + ", ".join(SYSCALL_MODULES))
+    return modules
+
+
+def _syscall_target(pid):
+    """`(view, baseline)` for the process `pid`, or a refusal naming what is missing."""
+    view = _syscall_view_for_pid(pid)
+    if view is None:
+        raise _SyscallRouteError(f"cannot choose a syscall baseline: the architecture of process {pid} is "
+                                 "unknown (it is gone, or its image cannot be read)")
+    baseline, why = _syscall_baseline_for(view)
+    if baseline is None:
+        raise _SyscallRouteError(why)
+    return view, baseline
+
+
+def _syscall_identity(pid):
+    """What findings of a process are keyed by: its image path, as for the other memory scanners."""
+    return _image_path_for_pid(pid) or _image_name_for_pid(pid)
+
+
+class _SyscallTimeout(Exception):
+    pass
+
+
+class _DeadlineReader(syscall_scan.ProcessReader):
+    """`reader` until `deadline` (time.monotonic), then a process that reads nothing. A read cannot be cancelled
+    from outside, so the scan stops by finding nothing more to read, and `expired` says that it did."""
+
+    def __init__(self, reader, deadline):
+        self._reader, self._deadline, self.expired = reader, deadline, False
+
+    def _live(self):
+        if time.monotonic() >= self._deadline:
+            self.expired = True
+        return not self.expired
+
+    def view(self):
+        return self._reader.view()
+
+    def build(self):
+        return self._reader.build()
+
+    def modules(self):
+        return self._reader.modules() if self._live() else None
+
+    def modules_whole(self):
+        return self._reader.modules_whole() if self._live() else None
+
+    def read(self, addr, size):
+        return self._reader.read(addr, size) if self._live() else None
+
+    def region(self, addr):
+        return self._reader.region(addr) if self._live() else None
+
+
+def _open_syscall_reader(pid, view, build):
+    return syscall_scan.Win32Reader(pid, view, build)
+
+
+def _syscall_scan_running():
+    """Whether a syscall scan is reading a process. Also one whose request has given up waiting: its thread
+    holds the process open until its reader returns."""
+    with _syscall_scans_lock:
+        return _syscall_scans > 0
+
+
+def _syscall_read_process(pid, view, build, work):
+    """`work(reader)` on a thread of its own, for the process `pid`, within SYSCALL_SCAN_TIMEOUT.
+
+    `measure` and the stub search have no clock, so the limit is kept here: the request waits for the thread
+    for that long, and a reader that is past its deadline reads nothing, which ends the work. Raises
+    _SyscallRouteError for a refusal, a process that cannot be opened, or a scan that ran out of time."""
+    global _syscall_scans
+    box = {}
+    deadline = time.monotonic() + SYSCALL_SCAN_TIMEOUT
+
+    def job():
+        global _syscall_scans
+        try:
+            with _open_syscall_reader(pid, view, build) as reader:
+                guard = box["guard"] = _DeadlineReader(reader, deadline)
+                box["result"] = work(guard)
+        except Exception as exc:
+            box["error"] = exc
+        finally:
+            with _syscall_scans_lock:
+                _syscall_scans -= 1
+
+    with _syscall_scans_lock:
+        _syscall_scans += 1
+    try:
+        thread = threading.Thread(target=job, name="syscall-scan", daemon=True)
+        thread.start()
+    except BaseException:
+        with _syscall_scans_lock:
+            _syscall_scans -= 1
+        raise
+    thread.join(SYSCALL_SCAN_TIMEOUT + SYSCALL_SCAN_GRACE)
+    error = box.get("error")
+    if isinstance(error, syscall_scan.ScanRefused):
+        raise _SyscallRouteError(error.reason)
+    if isinstance(error, OSError):
+        raise _SyscallRouteError(f"cannot read process {pid}: {error}")
+    if error is not None:
+        raise error
+    if thread.is_alive() or "result" not in box or box["guard"].expired:
+        raise _SyscallRouteError(f"the scan of process {pid} timed out ({SYSCALL_SCAN_TIMEOUT}s)", 504)
+    return box["result"]
+
+
+def _syscall_measure(pid, modules, allowlist=None):
+    """`(measurement, view, build, process)` of the stubs of `modules` in the process `pid`."""
+    view, baseline = _syscall_target(pid)
+    build = _current_os_build()
+    measured = _syscall_read_process(
+        pid, view, build,
+        lambda reader: syscall_scan.measure(baseline, reader, view, build, modules, allowlist))
+    return measured, view, build
+
+
+def _syscall_stage_enabled():
+    """False when the detonation's syscall stage is switched off for the whole web UI: TDC_NO_SYSCALL_STAGE=1."""
+    return os.environ.get("TDC_NO_SYSCALL_STAGE") != "1"
+
+
+def _syscall_baseline_present():
+    """Whether a baseline of this system's build exists for some view. Measuring needs the baseline file alone:
+    NTSleuth, the binary, is needed only to make one."""
+    build = _current_os_build()
+    return bool(build) and any(syscall_baseline.find_baseline(NTSLEUTH_BASELINE_DIR, build, view)
+                               for view in SYSCALL_BASELINE_VIEWS)
+
+
+def _syscall_stage_available():
+    """Whether a detonation has a syscall stage to run: it is not switched off and there is a baseline to measure by."""
+    return _syscall_stage_enabled() and _syscall_baseline_present()
+
+
+def _syscall_stage_file(path, baseline):
+    """`(hits, info)`: the stubs the file at `path` carries and what is known of the search. A file that cannot be
+    searched is a note in `info`. The names the file holds (imports and exports) are passed raw and expanded through
+    the Win32 to Nt table: only the expanded set can prove a bypass, and only for a syscall a curated row leads to.
+    The file speaks for the sample alone; its process memory, searched beside it, speaks for everything loaded there
+    and proves only when the binary graph holds every loaded module (_syscall_search_process)."""
+    if not isinstance(path, str) or not path:
+        return [], {"skipped": "the path of the sample is not known"}
+    real = _readable_path(path)
+    if real is None:
+        return [], {"skipped": "the sample is outside the folders the web UI reads"}
+    try:
+        if os.path.getsize(real) > SYSCALL_FILE_MAX:
+            return [], {"skipped": f"the sample is larger than {SYSCALL_FILE_MAX // (1024 * 1024)} MB"}
+        with open(real, "rb") as fh:
+            content = fh.read()
+    except OSError as exc:
+        return [], {"skipped": f"the sample cannot be read: {exc.strerror or exc}"}
+    hits, imports, doors_note = _syscall_search_file(content, baseline)
+    return hits, {"path": real, "size": len(content), "imports_read": imports is not None,
+                  "doors_complete": not doors_note, "doors_note": doors_note}
+
+
+def _syscall_stage(pid, path):
+    """The syscall scan of a detonated process: its stubs measured against the baseline, the stubs it carries
+    outside ntdll, and the stubs the sample file carries. Raises _SyscallRouteError for what it cannot do."""
+    view = _syscall_view_for_pid(pid)
+    if view is None:
+        raise _SyscallRouteError(f"the architecture of process {pid} is unknown (it is gone, or its image cannot "
+                                 "be read)")
+    baseline, why = _syscall_baseline_for(view, extract=False)
+    if baseline is None:
+        raise _SyscallRouteError(why)
+    build = _current_os_build()
+    identity = _syscall_identity(pid)
+    modules = _syscall_modules(None)
+    measured = _syscall_read_process(
+        pid, view, build,
+        lambda reader: syscall_scan.measure(baseline, reader, view, build, modules, _get_hook_allowlist()))
+    # the process first, while it is as the detonation left it. Its private memory is not the sample's alone: a stub
+    # there proves a bypass only against the doors of every loaded module, and stays a hint while one is unknown
+    try:
+        image_path = _image_path_for_pid(pid)
+        imports = _pe_import_names_of_file(image_path)
+        found, doors_note = _syscall_search_process(pid, view, build, baseline, image_path, imports)
+        # StubScan's own attributes are lost to list() and json.dumps: they become keys here
+        in_process = {"hits": list(found), "partial": found.partial, "imports_read": imports is not None,
+                      "doors_complete": not doors_note, "doors_note": doors_note,
+                      "regions_searched": found.regions_searched, "note": found.note}
+    except Exception as exc:
+        in_process = {"hits": [], "error": str(exc)}
+    file_hits, in_file = _syscall_stage_file(path, baseline)
+    in_file["hits"] = list(file_hits)
+    findings = memory_evidence.collect({"syscall_scan": measured}, process=identity)
+    # the file's copies decide a finding's answer whatever their place in the list (the weakest claim among them,
+    # Ruling 72): the file speaks for the sample itself, the process for everything loaded beside it
+    findings += memory_evidence.from_direct_stubs(in_file["hits"] + in_process["hits"], identity)
+    return _syscall_mark_unobserved({
+        **{k: v for k, v in measured.items() if k != "states"},
+        "tool": "Syscalls", "pid": pid, "process": identity, "modules": list(modules),
+        "stubs": {"process": in_process, "file": in_file},
+        "evidence_findings": findings,
+        "evidence": memory_evidence.score(findings, baseline=_memory_baseline)})
+
+
+def _run_syscall_stage(pid, path, notes=None):
+    """The syscall stage of a detonation, or None when it skips itself, the reason appended to `notes`.
+
+    It never raises and starts no extraction: switched off, without a baseline of this build and view (one being
+    extracted is not one yet), for a process that is gone or cannot be read, or for a scan that runs out of time,
+    a detonation goes on without it. NTSleuth itself is not needed: only the baseline it once made. `path` is the
+    sample's file, searched for stubs as well."""
+    def skip(why):
+        if notes is not None:
+            notes.append(why)
+        return None
+
+    if not _syscall_stage_enabled():
+        return skip("the syscall stage is switched off (TDC_NO_SYSCALL_STAGE)")
+    try:
+        return _syscall_stage(pid, path)
+    except _SyscallRouteError as exc:
+        return skip(str(exc))
+    except Exception as exc:
+        return skip(f"the syscall scan failed: {exc}")
+
+
+def _syscall_stage_entry(entry):
+    """`entry`, a stored result of the stage, when the scan ran; None for one that skipped or failed."""
+    return entry if isinstance(entry, dict) and "evidence_findings" in entry else None
+
+
+def _syscall_stage_findings(entry):
+    """The findings of a stored result of the stage."""
+    entry = _syscall_stage_entry(entry)
+    return list(entry["evidence_findings"] or []) if entry else []
+
+
+@app.route("/api/syscalls/status")
+def api_syscalls_status():
+    """Whether NTSleuth is installed, which baselines exist and whether one is being extracted."""
+    build = _current_os_build()
+    executables = {view: os.path.isfile(_ntsleuth_exe(view)) for view in SYSCALL_BASELINE_VIEWS}
+    try:
+        names = sorted(os.listdir(NTSLEUTH_BASELINE_DIR))
+    except OSError:
+        names = []
+    baselines = []
+    for name in names:
+        parsed = syscall_baseline.parse_baseline_name(name)
+        if parsed is None:
+            continue
+        entry = {"file": name, "build": parsed[0], "view": parsed[1], "current": parsed[0] == build}
+        try:
+            loaded = _load_syscall_baseline(os.path.join(NTSLEUTH_BASELINE_DIR, name))
+        except syscall_baseline.BaselineError as exc:
+            entry.update(symbols=None, error=str(exc),
+                         note="This file is unusable and is not replaced automatically: delete it to have the "
+                              "baseline extracted again.")
+        else:
+            entry.update(symbols=loaded.symbols, syscalls=len(loaded.syscalls))
+            if not loaded.symbols:
+                entry["note"] = _SYSCALL_PARAMETERS_NOTE
+        baselines.append(entry)
+    with _syscall_extract_lock:
+        running = sorted(_syscall_extract_state["running"])
+        failed = sorted((k, v) for k, v in _syscall_extract_state["failed"].items())
+        same_view = set(_syscall_extract_state["indistinguishable"])
+    return jsonify({
+        "installed": any(executables.values()),
+        "path": NTSLEUTH_DIR,
+        "executables": executables,
+        "build": build,
+        "machine": platform.machine(),
+        "default_view": _syscall_default_view(),
+        "baselines": baselines,
+        "extraction": {
+            "running": [{"build": b, "view": v} for b, v in running],
+            # indistinguishable: not a failed run but the x64 binary seeing the arm64 view, so no x64 baseline
+            "failed": [{"build": b, "view": v, "reason": why, "indistinguishable": (b, v) in same_view}
+                       for (b, v), (_, why) in failed],
+        },
+    })
+
+
+@app.route("/api/syscalls/baseline")
+def api_syscalls_baseline():
+    """The syscall catalog of a view, filtered and in pages. Params: view, query, module, offset, limit, lean.
+
+    With `lean=1` each item is its name, module and number: what a map of all of them draws, without the
+    parameters and stub bytes, which `/api/syscalls/<name>` gives for one syscall."""
+    view = _syscall_view_param(request.args.get("view"))
+    lean = _syscall_flag_param(request.args.get("lean"), "lean")
+    baseline, why = _syscall_baseline_for(view)
+    if baseline is None:
+        return jsonify({"error": why, "view": view}), 503
+    page = syscall_baseline.catalog(
+        baseline, query=(request.args.get("query") or "")[:100], module=(request.args.get("module") or "")[:64],
+        offset=_syscall_int_param(request.args.get("offset"), "offset", 0, 0, 10 ** 9),
+        limit=_syscall_int_param(request.args.get("limit"), "limit", 200, 0, SYSCALL_PAGE_MAX), lean=lean)
+    page.update(build=baseline.build, view=baseline.view, symbols=baseline.symbols,
+                skipped=len(baseline.skipped), shadowed=len(baseline.shadowed))
+    return jsonify(page)
+
+
+@app.route("/api/syscalls/<name>")
+def api_syscalls_lookup(name):
+    """One syscall with its parameters and stub, found under its Nt or its Zw name (the baseline holds one of the two;
+    a hit and the graph name it by its Nt name). Param: view."""
+    view = _syscall_view_param(request.args.get("view"))
+    baseline, why = _syscall_baseline_for(view)
+    if baseline is None:
+        return jsonify({"error": why, "view": view}), 503
+    sc = syscall_baseline.find(baseline, name)
+    if sc is None:
+        return jsonify({"error": f"unknown syscall {name[:100]}", "view": view}), 404
+    return jsonify({**syscall_baseline.describe(sc), "build": baseline.build, "view": baseline.view,
+                    "prefix_len": syscall_baseline.stub_prefix_len(sc, baseline.view)})
+
+
+@app.route("/api/syscalls/scan", methods=["POST"])
+def api_syscalls_scan():
+    """Measure the syscall stubs of a process against the baseline. Params: pid, modules (ntdll.dll, win32u.dll).
+
+    The measurement, scored in the evidence model. A scan that takes longer than SYSCALL_SCAN_TIMEOUT is a 504."""
+    data = _syscall_body()
+    pid = _syscall_pid(data.get("pid"))
+    modules = _syscall_modules(data.get("modules"))
+    measured, view, build = _syscall_measure(pid, modules, _get_hook_allowlist())
+    process = _syscall_identity(pid)
+    findings = memory_evidence.collect({"syscall_scan": measured}, process=process)
+    result = _syscall_mark_unobserved({**measured, "tool": "Syscalls", "pid": pid, "process": process,
+                                       "modules": list(modules),
+                                       "evidence": memory_evidence.score(findings, baseline=_memory_baseline)})
+    # the history keeps what a timeline row expands to, not the state of every one of some 2,000 stubs
+    _record_scan("Syscalls", f"PID {pid}", {k: v for k, v in result.items() if k != "states"})
+    return jsonify(result)
+
+
+def _syscall_expanded_imports(imports):
+    """The keywords of a stub search for the import table `imports`: the table expanded through the curated Win32
+    to Nt table, and the syscalls that table leads to. Without an import table, or without the curated table, both
+    are None and every hit stays a hint."""
+    if imports is None:
+        return {"expanded_imports": None, "covered": None}
+    try:
+        table = win32_to_nt.load_table()
+    except win32_to_nt.TableError as exc:
+        print(f"[syscalls] the Win32 to Nt table is unusable, every stub stays a hint: {exc}")
+        return {"expanded_imports": None, "covered": None}
+    return {"expanded_imports": table.expand(imports), "covered": table.covered}
+
+
+def _syscall_image_record(path):
+    """The record of the process image at `path`, read as binary_graph reads a System32 binary (imports by ordinal and
+    a table cut short kept as such); None when it cannot be read or is larger than SYSCALL_FILE_MAX."""
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        if os.path.getsize(path) > SYSCALL_FILE_MAX:
+            return None
+        return binary_graph.extract_binary(path)
+    except (OSError, binary_graph.ExtractError):
+        return None
+
+
+def _syscall_module_identity(listed):
+    return None if listed is None else sorted((str(m.get("path")), m.get("base")) for m in listed)
+
+
+def _syscall_imported_by(hit, doors):
+    name = hit.get("syscall")
+    if not isinstance(name, str):
+        return False
+    return name in doors or (name.startswith("Nt") and "Zw" + name[2:] in doors)
+
+
+def _syscall_search_process(pid, view, build, baseline, image_path, imports):
+    """`(found, doors_note)`: the stub search of the process `pid`, and why it could not prove, "" when it could.
+
+    A stub in private memory is judged against the union of the doors every loaded module imports
+    (binary_graph_query.doors_of_process), never against the image's table alone: the memory is not the image's
+    alone. The union needs the binary graph of this system, which is taken as it is and never built from here, and
+    is taken from the module list of the reader that searches, before the search and again after it, as
+    `modules_whole`: a list the reader thinned (a module whose information or name it could not read) is no list,
+    and neither is an empty one.
+
+    The denominator covers every module loaded at any point of the search, so it is the union over both lists: a
+    module loaded only for a while still had its doors in the address space, and may be the stub's author. A module
+    of either list the cache does not cover makes the union incomplete, and a list that cannot be had after the
+    search does too. Both calls are needed; one would miss what came or went while the search ran."""
+    graph, _ = _binary_graph_for(start_build=False)
+    table, why = None, ""
+    if graph is None:
+        why = "there is no binary graph of this system to read the imports of the loaded modules from"
+    else:
+        try:
+            table = win32_to_nt.load_table()
+        except win32_to_nt.TableError as exc:
+            why = f"the Win32 to Nt table is unusable: {exc}"
+    image = _syscall_image_record(image_path) if table is not None else None
+
+    def work(reader):
+        doors, note = None, why
+        listed = reader.modules_whole() if table is not None else None
+        if table is not None:
+            doors, note = binary_graph_query.doors_of_process(graph, listed, table, view=view,
+                                                              image_path=image_path, image=image)
+        keywords = {"expanded_imports": doors, "covered": table.covered} if doors is not None else {}
+        found = syscall_scan.find_stubs_in_process(reader, baseline, imports, **keywords)
+        if doors is None:
+            return found, note
+        after = reader.modules_whole()
+        if _syscall_module_identity(after) == _syscall_module_identity(listed):
+            return found, note
+        # the first list was found complete and its doors applied during the search, so over both lists the
+        # question left is the second one's; listed + after says the rule, and changes no answer beside after alone
+        if not after:
+            # an empty list is no list: nothing is known of what loaded while the search ran
+            doors, note = None, "the modules of the process could not be listed again after the search"
+        else:
+            doors, note = binary_graph_query.doors_of_process(graph, listed + after, table, view=view,
+                                                              image_path=image_path, image=image)
+            if doors is None:
+                note = f"the modules of the process changed during the search: {note}"
+        # only ever weaker: a proof becomes a hint, or the door a module loaded meanwhile brought
+        for hit in found:
+            if hit.get("import_present") is False:
+                hit["import_present"] = None if doors is None else _syscall_imported_by(hit, doors)
+        return found, note
+
+    return _syscall_read_process(pid, view, build, work)
+
+
+def _pe_import_names_of_file(path):
+    """The import table of the PE at `path` (a process image), None when it cannot be read or is too large."""
+    if not isinstance(path, str) or not path:
+        return None
+    try:
+        if os.path.getsize(path) > SYSCALL_FILE_MAX:
+            return None
+        with open(path, "rb") as fh:
+            return _pe_import_names(fh.read())
+    except OSError:
+        return None
+
+
+def _syscall_search_file(content, baseline):
+    """`(hits, imports, doors_note)`: the stub search of a file's bytes, judged against its import table run through
+    the Win32 to Nt table, that table (None when the file is no PE that can be read), and why no absence could be
+    claimed, "" when one could.
+
+    The file is read by binary_graph's reader (_pe_sample_record), as process mode reads its image: a directory
+    pefile refused leaves the table unread (None), and a record cut short keeps its True but claims no absence.
+
+    An import by ordinal is named through the binary graph (binary_graph_query.name_ordinal_imports), never built
+    from here. One it cannot name may be a door: the hits keep their True, and no stub becomes a proof.
+
+    A stub that is the body of an export under its own Nt or Zw name is the documented path itself, a copy of ntdll,
+    and is imported (True): one that starts at the export's address or less than one stub's read length after it.
+    Nothing else in the export table counts: the author of a sample writes it, so a door name or the Nt name pointing
+    anywhere but at the stub would buy off the proof for one line.
+
+    A view the file's machine does not match claims no absence and reads no export: the export table describes the
+    native view only (an ARM64X ntdll names its ARM64 stubs, not its x64 ones)."""
+    info, why = _pe_sample_record(content)
+    imports = _record_import_names(info) if info is not None else None
+    # the reader's reason says what happened: no PE at all, or which of its directories pefile refused
+    doors_note = "" if info is not None else f"the file cannot be read as a PE: {why}"
+    named = set()
+    if info is not None:
+        if any(f.startswith("#") for functions in info.imports.values() for f in functions):
+            graph, _ = _binary_graph_for(start_build=False)
+            named, doors_note = binary_graph_query.name_ordinal_imports(graph, info.imports, view=baseline.view)
+        if named:
+            imports = imports | named
+        if info.partial:
+            cut = "a table (import, delay-load or export) of the file was cut short when it was read"
+            doors_note = f"{cut}; {doors_note}" if doors_note else cut
+    # Ruling 70: the export table pefile reads describes the code of the file's own machine. On an ARM64X image
+    # (Machine ARM64) the x64 stubs lie elsewhere, so a stub found in a view the machine does not match cannot be
+    # matched against it: the denominator is unreadable, no absence is claimed. A True of the imports still stands
+    foreign = info is not None and info.machine != baseline.view
+    if foreign:
+        other = (f"the file's machine is {info.machine} and the view searched is {baseline.view}: its export table "
+                 f"describes the file's native view (as on an ARM64X image), so a stub found in another view cannot "
+                 f"be matched against it")
+        doors_note = f"{other}; {doors_note}" if doors_note else other
+    keywords = _syscall_expanded_imports(imports)
+    # what could not be named, or was lost when a table was cut short, may be the door: nothing is claimed absent
+    if (named is None or foreign or (info is not None and info.partial)) and keywords["covered"] is not None:
+        keywords["covered"] = frozenset()
+    hits = syscall_scan.find_stubs_in_bytes(content, baseline, imports, **keywords)
+    exported = _pe_export_offsets(content) if imports is not None and not foreign else {}
+    # Ruling 71: the stub is the body of the export, so inside it, not only at its first byte (arm64 ntdll has a
+    # second SVC 16 bytes into NtUnmapViewOfSection). The bound is one stub's read length of the view: with none, any
+    # stub after an export would match it, and the rescue would buy off every proof behind a single Nt export
+    span = syscall_baseline.READ_LEN.get(baseline.view, 0)
+    for hit in hits:
+        name, at = hit.get("syscall"), hit.get("offset")
+        hit["own_export"] = False
+        if hit.get("import_present") is True or not isinstance(name, str) or not name.startswith("Nt"):
+            continue
+        if not isinstance(at, int):
+            continue
+        starts = (exported.get(alias) for alias in (name, "Zw" + name[2:]))
+        if any(isinstance(start, int) and 0 <= at - start < span for start in starts):
+            hit["import_present"] = True
+            hit["own_export"] = True
+    return hits, imports, doors_note
+
+
+def _pe_export_offsets(data):
+    """Each name a PE exports with the file offset its address resolves to; {} when there is none or the table cannot
+    be read. A forwarded export, or one outside the file, has no offset and is left out."""
+    try:
+        import pefile
+        pe = pefile.PE(data=data, fast_load=True)
+        try:
+            pe.parse_data_directories(directories=[pefile.DIRECTORY_ENTRY["IMAGE_DIRECTORY_ENTRY_EXPORT"]])
+            out = {}
+            for sym in getattr(getattr(pe, "DIRECTORY_ENTRY_EXPORT", None), "symbols", None) or []:
+                if not sym.name or sym.forwarder or not sym.address:
+                    continue
+                try:
+                    out[sym.name.decode("ascii", "replace")] = pe.get_offset_from_rva(sym.address)
+                except Exception:
+                    continue
+            return out
+        finally:
+            pe.close()
+    except Exception:
+        return {}
+
+
+def _pe_sample_record(data):
+    """`(record, why)`: a sample's bytes read by binary_graph's reader, the one process mode reads its image and the
+    loaded modules with, or `(None, the reason)` when it yields no record. A declared import, delay-load or export
+    directory pefile refused yields none, so an unread table never reads as one that imports nothing; one cut short
+    yields a record marked partial."""
+    try:
+        return binary_graph.extract_bytes(data, "sample"), ""
+    except binary_graph.ExtractError as exc:
+        return None, str(exc)
+
+
+def _record_import_names(info):
+    """The names `info` imports, delay-loaded ones included; its imports by ordinal ("#<n>") are left to the graph.
+    Expanded through the Win32 to Nt table the set can say that a function is not imported, so a function the sample
+    delay-loads has to be in it: it is a path the sample has."""
+    return {f for functions in info.imports.values() for f in functions if not f.startswith("#")}
+
+
+def _pe_import_names(data):
+    """The names a PE imports (_record_import_names), None when `data` yields no record (_pe_sample_record)."""
+    info, _ = _pe_sample_record(data)
+    return None if info is None else _record_import_names(info)
+
+
+@app.route("/api/syscalls/stubs", methods=["POST"])
+def api_syscalls_stubs():
+    """Search for syscall stubs outside ntdll: in a running process (pid) or in a file (path, with view).
+
+    Each hit names the syscall of its number. For a file `import_present` is tri-state: False for a syscall a curated
+    Win32 to Nt row leads to and the file's imports and exports, expanded through that table, do not hold (a proven
+    bypass); True for one they hold; None where no row leads to the syscall, the file is no PE that can be read, a
+    table of it was cut short, or it imports by an ordinal the binary graph cannot name (see
+    syscall_scan.find_stubs_in_bytes). For a process it is judged against the doors every loaded module imports
+    (_syscall_search_process): False only when the binary graph of this system holds every loaded module and none of
+    them, the image included, imports a door to the syscall; True when one does, or the image imports the function;
+    None otherwise. `doors_complete` says whether that union could be built, and `doors_note` why not."""
+    data = _syscall_body()
+    pid_given, path_given = data.get("pid") not in (None, ""), data.get("path") not in (None, "")
+    if pid_given == path_given:
+        raise _SyscallRouteError("give a pid or a path")
+    if pid_given:
+        pid = _syscall_pid(data.get("pid"))
+        view, baseline = _syscall_target(pid)
+        build = _current_os_build()
+        # the raw table of the image can say that the function is imported as well, without the binary graph too
+        image_path = _image_path_for_pid(pid)
+        imports = _pe_import_names_of_file(image_path)
+        found, doors_note = _syscall_search_process(pid, view, build, baseline, image_path, imports)
+        process = _syscall_identity(pid)
+        result = {"mode": "process", "pid": pid, "process": process, "imports_read": imports is not None,
+                  "doors_complete": not doors_note, "doors_note": doors_note,
+                  "partial": found.partial, "regions_searched": found.regions_searched, "note": found.note}
+    else:
+        if data.get("view") in (None, ""):
+            raise _SyscallRouteError("a path needs the view to search it for: arm64, x64 or x86")
+        view = _syscall_view_param(data.get("view"))
+        real = _readable_path(data.get("path"))
+        if real is None:
+            raise _SyscallRouteError("Access denied: path outside allowed directories", 403)
+        if not os.path.isfile(real):
+            raise _SyscallRouteError("the file does not exist")
+        if os.path.getsize(real) > SYSCALL_FILE_MAX:
+            raise _SyscallRouteError(f"the file is larger than {SYSCALL_FILE_MAX // (1024 * 1024)} MB")
+        baseline, why = _syscall_baseline_for(view)
+        if baseline is None:
+            raise _SyscallRouteError(why)
+        try:
+            with open(real, "rb") as fh:
+                content = fh.read()
+        except OSError as exc:
+            raise _SyscallRouteError(f"the file cannot be read: {exc.strerror or exc}")
+        found, imports, doors_note = _syscall_search_file(content, baseline)
+        process = os.path.basename(real)
+        result = {"mode": "file", "path": real, "size": len(content), "process": process,
+                  "imports_read": imports is not None, "doors_complete": not doors_note, "doors_note": doors_note,
+                  "partial": False, "note": ""}
+    hits = list(found)
+    findings = memory_evidence.from_direct_stubs(hits, process)
+    result.update(tool="Syscalls", view=baseline.view, build=baseline.build, hits=hits,
+                  evidence=memory_evidence.score(findings, baseline=_memory_baseline))
+    return jsonify(result)
+
+
+def _hook_scope():
+    """`(build, view)` from the query, or `(None, None)`: one of them alone is a mistake, not a wildcard."""
+    build, view = request.args.get("build"), request.args.get("view")
+    if build is None and view is None:
+        return None, None
+    if not build or not view:
+        raise _SyscallRouteError("build and view are given together, or neither")
+    return build, _syscall_view_param(view)
+
+
+@app.route("/api/syscalls/hook-baseline", methods=["GET"])
+def api_syscalls_hook_baseline():
+    """The hooks known on this host, as (syscall, owner) pairs per build and view. Params: build and view,
+    together, to list one set."""
+    build, view = _hook_scope()
+    allowlist = _get_hook_allowlist()
+    return jsonify({"entries": allowlist.entries(build, view), "problem": allowlist.problem,
+                    "path": SYSCALL_HOOK_ALLOWLIST_FILE})
+
+
+@app.route("/api/syscalls/hook-baseline", methods=["POST"])
+def api_syscalls_hook_baseline_capture():
+    """Record the hooks found in a process as known on this host. Params: pid.
+
+    Only on a host known to be clean: whatever hooks the process holds now stops counting as evidence. A patch
+    is never recorded, only a jump into a module."""
+    pid = _syscall_pid(_syscall_body().get("pid"))
+    measured, view, build = _syscall_measure(pid, ("ntdll.dll",))
+    allowlist = _get_hook_allowlist()
+    try:
+        added = allowlist.add_from(measured)
+    except OSError as exc:
+        return jsonify({"error": f"cannot write the hook allowlist: {exc}"}), 500
+    return jsonify({"pid": pid, "build": build, "view": view, "added": added,
+                    "entries": len(allowlist.entries(build, view)), "partial": measured["partial"]})
+
+
+@app.route("/api/syscalls/hook-baseline", methods=["DELETE"])
+def api_syscalls_hook_baseline_clear():
+    """Forget the known hooks: those of one build and view (params build and view, together), or all."""
+    build, view = _hook_scope()
+    allowlist = _get_hook_allowlist()
+    try:
+        allowlist.clear(build, view)
+    except OSError as exc:
+        return jsonify({"error": f"cannot write the hook allowlist: {exc}"}), 500
+    return jsonify({"ok": True, "entries": len(allowlist.entries())})
+
+
+def _draft_error(exc):
+    """A refusal of the rule module, as a route error. Its messages name what is wrong, never what the request held."""
+    return _SyscallRouteError(str(exc))
+
+
+@app.route("/api/syscalls/rule", methods=["POST"])
+def api_syscalls_rule():
+    """Draft a detection rule from what the tab observed, and write nothing.
+
+    Params: `hit` (a stub found outside ntdll, as /api/syscalls/stubs lists it; it may carry `sample`), with `build`
+    (default: this system's), `view` (this one or the hit's own, never guessed) and `source`: a YARA rule. Or
+    `deviation` (a stub measured in ntdll) with `view`: an entry for syscall_signatures.json, to be added by hand.
+    A rule is applied, or downloaded, as a second step."""
+    data = _syscall_body()
+    hit, deviation = data.get("hit"), data.get("deviation")
+    if (hit is None) == (deviation is None):
+        raise _SyscallRouteError("give a hit (a stub found outside ntdll) or a deviation (a stub measured in ntdll)")
+    subject = hit if hit is not None else deviation
+    if not isinstance(subject, dict):
+        raise _SyscallRouteError("the hit or deviation must be an object")
+    view = data.get("view") if data.get("view") not in (None, "") else subject.get("view")
+    if hit is not None and data.get("view") not in (None, "") and subject.get("view") not in (None, data.get("view")):
+        raise _SyscallRouteError("the view of the request and the view of the hit differ")
+    if view in (None, ""):
+        raise _SyscallRouteError("give the view the rule is for: arm64, x64 or x86")
+    if not isinstance(view, str) or view not in SYSCALL_VIEWS:
+        raise _SyscallRouteError("view must be one of " + ", ".join(SYSCALL_VIEWS))
+    build = data.get("build") if data.get("build") not in (None, "") else _current_os_build()
+    if build is not None and not isinstance(build, str):
+        raise _SyscallRouteError("build must be a string like 26220.5770")
+    try:
+        if hit is not None:
+            if not build:
+                raise _SyscallRouteError("the build of this system is unknown: give the build the rule is for")
+            return jsonify(syscall_rules.draft_yara(hit, build, view, data.get("source") or "direct_syscall_stub"))
+        if (deviation.get("state") == syscall_baseline.STATE_HOOKED and build
+                and _get_hook_allowlist().knows(str(deviation.get("name")), deviation.get("target_owner"), build, view)):
+            deviation = {**deviation, "allowlisted": True}
+        entry = syscall_rules.draft_signature(deviation, view)
+    except ValueError as exc:
+        raise _draft_error(exc) from None
+    # the catalog names forms longer than the compared prefix (ADRP; LDR; BR, MOVZ/MOVK; BR): it is asked about
+    # every byte the scan read, where the deviation has them, and about the prefix otherwise
+    read = deviation.get("read")
+    if not (isinstance(read, str) and 0 < len(read) <= 2 * SYSCALL_READ_HEX_MAX and len(read) % 2 == 0
+            and re.fullmatch(r"[0-9a-fA-F]+", read)):
+        read = deviation["actual"]
+    covered = syscall_rules.matching(read, view)
+    return jsonify({"kind": "signature", "entry": entry, "text": json.dumps(entry, indent=2),
+                    "target": "webui/syscall_signatures.json",
+                    "covered_by": [{"family": c["family"], "pattern": c["pattern"], "match": c["match"]}
+                                   for c in covered]})
+
+
+@app.route("/api/syscalls/rule/apply", methods=["POST"])
+def api_syscalls_rule_apply():
+    """Write a drafted YARA rule where Rustinel reads its rules; it should take effect within about two seconds
+    (not verified on a VM).
+
+    The body is the draft as /api/syscalls/rule returned it. Only a rule of exactly that form is written, one file
+    named after the rule, into YARA_RULES_DIR and nowhere else. A rule of that name already there is a 409."""
+    draft = _syscall_body()
+    try:
+        name, _ = syscall_rules.check_draft(draft)
+    except ValueError as exc:
+        raise _draft_error(exc) from None
+    if not _path_within(os.path.join(YARA_RULES_DIR, name + ".yar"), [YARA_RULES_DIR]):
+        return jsonify({"error": "Access denied: write not allowed to this path", "allowed": [YARA_RULES_DIR]}), 403
+    try:
+        result = syscall_rules.apply_draft(draft, YARA_RULES_DIR)
+    except ValueError as exc:
+        raise _draft_error(exc) from None
+    except syscall_rules.RulesFull as exc:
+        return jsonify({"error": f"{exc} (the cap keeps a flood of rules out of {YARA_RULES_DIR})"}), 507
+    except OSError as exc:
+        return jsonify({"error": f"cannot write the rule into {YARA_RULES_DIR}: {exc.strerror or exc}"}), 500
+    if result["status"] == "exists":
+        return jsonify({**result, "error": "a rule of this name is already there: it is the same stub, build and "
+                                           "view, and was left alone"}), 409
+    return jsonify(result)
+
+
+@app.route("/api/syscalls/rule/download", methods=["GET"])
+def api_syscalls_rule_download():
+    """A drafted YARA rule as a file, to be committed under rules/yara/: the copy written by /apply is lost with
+    this VM. Params: `name` and `text`, as the draft route returned them (checked, then handed back as they are)."""
+    try:
+        name, text = syscall_rules.check_draft({"name": request.args.get("name"), "text": request.args.get("text")})
+    except ValueError as exc:
+        raise _draft_error(exc) from None
+    return Response(text, mimetype="text/plain",
+                    headers={"Content-Disposition": f'attachment; filename="{name}.yar"'})
+
+
+# --- SYSCALLS tab: the import graph of the System32 binaries ---
+
+# binary_graph.py reads every PE of System32: minutes, and a few hundred MB, so it runs as a process of its own and
+# the web UI only ever holds the finished cache. build-binary-graph.ps1 waits as long for the same build.
+BINARY_GRAPH_BUILD_TIMEOUT = 1800
+# A failed build of a build and architecture is not tried again for this long (seconds)
+BINARY_GRAPH_BUILD_RETRY = 600
+# and not at all after this many failures in a row: a build reads all of System32 for minutes, CPU taken from the
+# sample under analysis, and a failure that persists (a disk fault, a bug of our encoder) is not cured by trying again
+BINARY_GRAPH_BUILD_ATTEMPTS = 3
+BINARY_GRAPH_PARAM_MAX = 512
+_binary_graph_log = logging.getLogger("tdc.binary_graph")
+
+
+def _new_binary_graph_build_state():
+    # running: (build, arch) being built; failed: (build, arch) -> (when, why); built: (build, arch) -> the stamp of
+    # the cache the last build that ended well left behind, to tell a rebuild that did not help; attempts:
+    # (build, arch) -> failures in a row, cleared only by a usable cache; thread: the latest one
+    return {"running": set(), "failed": {}, "built": {}, "attempts": {}, "thread": None}
+
+
+_binary_graph_build_state = _new_binary_graph_build_state()
+_binary_graph_build_lock = threading.Lock()
+# binary_graph.py writes one cache per build and architecture into one directory: one build at a time
+_binary_graph_build_serial = threading.Lock()
+# The one graph this process holds, loaded once and kept: "path", "stamp" (mtime and size of the file it was read
+# from) and "graph", the Graph or the CacheMismatch the file gave. A changed file is read once more; nothing else is.
+_binary_graph_held = {}
+_binary_graph_held_lock = threading.Lock()
+
+
+def _build_binary_graph(build, arch):
+    """Build the cache of `build` and `arch` into NTSLEUTH_BASELINE_DIR with binary_graph.py. Raises RuntimeError with
+    the reason when it fails; binary_graph.py then leaves an earlier cache as it was. A cache the web UI still holds
+    open on Windows makes its os.replace fail with PermissionError, which it reports as a non-zero exit: that is a
+    failure here like any other, named, never a silent end."""
+    args = [sys.executable, os.path.join(APP_DIR, "binary_graph.py"), "--out", NTSLEUTH_BASELINE_DIR,
+            "--build", build, "--arch", arch]
+    try:
+        # below normal priority: the build must not take the CPU from a sample being observed
+        proc = _run_cmd(args, timeout=BINARY_GRAPH_BUILD_TIMEOUT, cwd=APP_DIR,
+                        creationflags=getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0)
+                        | getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(f"binary_graph.py timed out ({BINARY_GRAPH_BUILD_TIMEOUT}s)") from None
+    except OSError as exc:
+        raise RuntimeError(f"binary_graph.py could not be started ({exc.__class__.__name__})") from None
+    if proc.returncode != 0:
+        tail = ((proc.stderr or proc.stdout or "").strip().splitlines() or [""])[-1][:300]
+        raise RuntimeError(f"binary_graph.py exited with {proc.returncode}: {tail}")
+
+
+def _binary_graph_stat(path):
+    """`(mtime_ns, size)` of `path`, None when it cannot be read."""
+    try:
+        info = os.stat(path)
+    except OSError:
+        return None
+    return info.st_mtime_ns, info.st_size
+
+
+def _record_binary_graph_failure(key, why):
+    """Record a failed build of `key` and count it. Called with _binary_graph_build_lock held."""
+    state = _binary_graph_build_state
+    state["failed"][key] = (time.time(), why)
+    state["attempts"][key] = state["attempts"].get(key, 0) + 1
+
+
+def _binary_graph_build_job(build, arch):
+    key = (build, arch)
+    why = None
+    try:
+        with _binary_graph_build_serial:
+            _build_binary_graph(build, arch)
+    except Exception as exc:
+        why = str(exc) or type(exc).__name__
+        _binary_graph_log.warning("the binary graph of build %s (%s) was not built: %s", build, arch, why)
+    path = binary_graph.find_cache(NTSLEUTH_BASELINE_DIR, build, arch) if why is None else None
+    stamp = _binary_graph_stat(path) if path else None
+    with _binary_graph_build_lock:
+        state = _binary_graph_build_state
+        state["running"].discard(key)
+        state["built"].pop(key, None)
+        if why is not None:
+            _record_binary_graph_failure(key, why)
+        elif stamp is None:
+            # it said it wrote the cache and there is none: without a count, the next request would build again
+            _record_binary_graph_failure(key, "binary_graph.py ended well but left no cache")
+        else:
+            state["failed"].pop(key, None)
+            state["built"][key] = stamp
+
+
+def _start_binary_graph_build(build, arch):
+    """Build the graph of `build` and `arch` in a thread of its own. False when one is running already, one failed
+    too recently to try again, BINARY_GRAPH_BUILD_ATTEMPTS failed in a row, or tools are being updated: an update
+    that swaps files in System32 or the web UI's Python under a build is the opposite of help."""
+    key = (build, arch)
+    if _updating_tools():
+        return False
+    with _binary_graph_build_lock:
+        state = _binary_graph_build_state
+        failed = state["failed"].get(key)
+        if (state["running"] or state["attempts"].get(key, 0) >= BINARY_GRAPH_BUILD_ATTEMPTS
+                or (failed and time.time() - failed[0] < BINARY_GRAPH_BUILD_RETRY)):
+            return False
+        state["running"].add(key)
+        state["thread"] = threading.Thread(target=_binary_graph_build_job, args=(build, arch),
+                                           name="binary-graph", daemon=True)
+        state["thread"].start()
+    return True
+
+
+def _binary_graph_building():
+    """Whether a binary graph is being built. A tool update must wait for it."""
+    with _binary_graph_build_lock:
+        return bool(_binary_graph_build_state["running"])
+
+
+def _forget_binary_graph_failure(build, arch):
+    """A usable cache of `build` and `arch` is there: an earlier failure to build it is refuted, whoever wrote the
+    file (build-binary-graph.ps1 writes it without the web UI), and so is the count of attempts. Kept, it would
+    contradict the graph being served and hold back the next build for nothing."""
+    with _binary_graph_build_lock:
+        for field in ("failed", "built", "attempts"):
+            _binary_graph_build_state[field].pop((build, arch), None)
+
+
+def _rebuild_did_not_help(build, arch, stamp, reason):
+    """The cache that does not load is the very file the last build left: record that as a failure, so the throttle
+    holds the next rebuild back instead of building on every request."""
+    key = (build, arch)
+    with _binary_graph_build_lock:
+        state = _binary_graph_build_state
+        if stamp is not None and state["built"].get(key) == stamp:
+            state["built"].pop(key)
+            _record_binary_graph_failure(key, f"the cache the build wrote does not load either ({reason})")
+
+
+def _utc(seconds):
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(seconds))
+
+
+def _binary_graph_refusal(error, build=None, arch=None):
+    """The body of a 404 without a graph: `cache` null, `building`, and `failed` (`reason`, `at`, `attempts` and
+    `retry_at`, UTC, null once no attempt is left) or null. `error` gets a sentence on which of them it is."""
+    with _binary_graph_build_lock:
+        building = (build, arch) in _binary_graph_build_state["running"]
+        failed = _binary_graph_build_state["failed"].get((build, arch))
+        attempts = _binary_graph_build_state["attempts"].get((build, arch), 0)
+    record = None
+    if building:
+        error += " It is being built in the background; that takes a minute or two."
+    elif failed:
+        at, why = failed
+        retry = at + BINARY_GRAPH_BUILD_RETRY if attempts < BINARY_GRAPH_BUILD_ATTEMPTS else None
+        record = {"reason": why, "at": _utc(at), "attempts": attempts, "retry_at": _utc(retry) if retry else None}
+        if retry is None:
+            error += (f" Building it failed {attempts} attempts in a row, the last at {_utc(at)}: {why}. It is not "
+                      f"built again by itself: rebuild it by hand with scripts\\build-binary-graph.ps1 -Force, and "
+                      f"the tab takes the new graph without a restart.")
+        else:
+            error += f" The last build failed at {_utc(at)}: {why}."
+            error += (f" It is tried again from {_utc(retry)} on." if retry > time.time() else
+                      " It is tried again on the next request.")
+    elif build and _updating_tools():
+        error += " Tool updates are running: no graph is built while they are."
+    return {"error": error, "cache": None, "building": building, "failed": record}
+
+
+def _binary_graph_for(start_build=True):
+    """`(graph, None)` for this system's build and architecture, or `(None, refusal)`: the JSON body of a 404, with
+    `cache` null, that says why. A cache of another build or architecture is no graph: there is exactly one per
+    system, and the architecture is the registry's (binary_graph.host_arch), never `platform.machine()`, which an
+    emulated x64 Python on ARM64 answers with AMD64. A cache that is missing or does not load is built in the
+    background, as build-binary-graph.ps1 does at provisioning; a failed build is not tried again for
+    BINARY_GRAPH_BUILD_RETRY seconds, and a build that ended well but left a cache that still does not load counts as
+    failed. With `start_build` False nothing is built: a syscall scan takes the graph that is there, and does not start
+    minutes of reading System32 under a sample being observed."""
+    build = _current_os_build()
+    if not build:
+        return None, _binary_graph_refusal("No binary graph can be chosen: the build of this system cannot be "
+                                           "determined.")
+    arch = binary_graph.host_arch()
+    path = binary_graph.find_cache(NTSLEUTH_BASELINE_DIR, build, arch)
+    stamp = _binary_graph_stat(path) if path else None
+    if stamp is None:
+        with _binary_graph_held_lock:
+            _binary_graph_held.clear()          # its file is gone: no reason to keep 40-90 MB of it
+        if start_build:
+            _start_binary_graph_build(build, arch)
+        return None, _binary_graph_refusal(f"There is no binary graph for build {build} ({arch}) yet.", build, arch)
+    with _binary_graph_held_lock:
+        if _binary_graph_held.get("path") != path or _binary_graph_held.get("stamp") != stamp:
+            _binary_graph_held.clear()          # the old graph goes before the new one is read, not after
+            try:
+                loaded = binary_graph.load_graph(path, build, arch)
+            except binary_graph.CacheMismatch as exc:
+                loaded = exc
+            # a file that cannot be opened right now (a scanner holding it without read sharing) is not a broken
+            # one: it is not held, and is read again on the next request rather than rebuilt
+            if not (isinstance(loaded, binary_graph.CacheMismatch) and loaded.reason == "unreadable"):
+                _binary_graph_held.update(path=path, stamp=stamp, graph=loaded)
+        else:
+            loaded = _binary_graph_held["graph"]
+    if isinstance(loaded, binary_graph.CacheMismatch) and loaded.reason == "unreadable":
+        return None, _binary_graph_refusal(f"The binary graph {os.path.basename(path)} cannot be opened right now; "
+                                           f"it is read again on the next request.", build, arch)
+    if isinstance(loaded, binary_graph.CacheMismatch):
+        _rebuild_did_not_help(build, arch, stamp, loaded.reason)
+        if start_build:
+            _start_binary_graph_build(build, arch)
+        return None, _binary_graph_refusal(
+            f"The binary graph {os.path.basename(path)} cannot be used ({loaded.reason}: {loaded}).", build, arch)
+    _forget_binary_graph_failure(build, arch)
+    return loaded, None
+
+
+def _binary_graph_param(name):
+    value = request.args.get(name) or ""
+    if len(value) > BINARY_GRAPH_PARAM_MAX:
+        raise _SyscallRouteError(f"{name} is longer than {BINARY_GRAPH_PARAM_MAX} characters")
+    return value
+
+
+def _binary_graph_stamp(graph):
+    return {"build": graph.build, "arch": graph.arch, "created": graph.created,
+            "cache": binary_graph.cache_name(graph.build, graph.arch)}
+
+
+def _binary_graph_context(graph, query):
+    """What query `query` reads besides its parameters. The path to a syscall reads the curated Win32 to Nt table and
+    the syscall baseline, each None where it cannot be had (the answer then says so); the list behind a figure reads the
+    table only. No baseline is extracted for a question about the graph."""
+    if query not in ("path-to-syscall", "metric"):
+        return binary_graph_query.Context(graph)
+    table = _curated_table()
+    baseline = _syscall_baseline_for(graph.arch, extract=False)[0] if query == "path-to-syscall" else None
+    return binary_graph_query.Context(graph, table, baseline)
+
+
+def _curated_table():
+    """The curated Win32 to Nt table, or None where it cannot be read: what reads it says so, it never reads it as empty."""
+    try:
+        return win32_to_nt.load_table()
+    except win32_to_nt.TableError as exc:
+        print(f"[binary graph] the Win32 to Nt table is unusable, no path can reach a syscall and no row of it is listed: {exc}")
+        return None
+
+
+@app.route("/api/binary-graph/query")
+def api_binary_graph_query():
+    """One query over the import graph. Params: `q` (a name of binary_graph_query.QUERIES) and what it reads of
+    `module`, `function`, `syscall`, `other` and `metric`."""
+    run = binary_graph_query.QUERIES.get(request.args.get("q") or "")
+    if run is None:
+        return jsonify({"error": "q must be one of " + ", ".join(binary_graph_query.QUERIES)}), 400
+    params = {name: _binary_graph_param(name) for name in ("module", "function", "syscall", "other", "metric")}
+    try:
+        binary_graph_query.check_parameters(request.args.get("q"), params)
+    except (binary_graph_query.MissingParameter, binary_graph_query.BadParameter) as exc:
+        return jsonify({"error": str(exc)}), 400
+    graph, refusal = _binary_graph_for()
+    if graph is None:
+        return jsonify(refusal), 404
+    try:
+        answer = run(_binary_graph_context(graph, request.args.get("q")), params)
+    except binary_graph_query.MissingParameter as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({**binary_graph_query.answer_json(answer), **_binary_graph_stamp(graph)})
+
+
+@app.route("/api/binary-graph/metrics")
+def api_binary_graph_metrics():
+    """The figures of the whole stock (binary_graph_query.metrics), with the stamp of the graph; the list behind each is
+    the query `metric`. `curated_transitions` is null where the Win32 to Nt table cannot be read."""
+    graph, refusal = _binary_graph_for()
+    if graph is None:
+        return jsonify(refusal), 404
+    return jsonify({**binary_graph_query.metrics(graph, _curated_table()), **_binary_graph_stamp(graph)})
+
+
+@app.route("/api/binary-graph/node")
+def api_binary_graph_node():
+    """What the import graph knows of one name. Param: `name`. `404` when it is neither a binary nor an api set."""
+    name = _binary_graph_param("name").strip()
+    if not name:
+        return jsonify({"error": "the parameter name is required"}), 400
+    graph, refusal = _binary_graph_for()
+    if graph is None:
+        return jsonify(refusal), 404
+    detail = binary_graph_query.node_detail(graph, name)
+    if detail["is"] == "none":
+        return jsonify({"error": f"{detail['name']} is neither a binary nor an api set in the binary graph of this "
+                                 f"system.", "in_degree": detail["in_degree"], **_binary_graph_stamp(graph)}), 404
+    return jsonify({**detail, **_binary_graph_stamp(graph)})
 
 
 # --- Memory dumping: Process Dump ---
@@ -8412,11 +9998,12 @@ def _parse_beaconeye_output(output):
     return findings
 
 
-def _run_memory_scans_async(pid, sha256):
+def _run_memory_scans_async(pid, sha256, path=None):
     """Run every live-memory tool against a detonated process, in background.
 
     Order matters: the read-only scanners go first so their view of the process
-    is undisturbed, and Process Dump runs last because it writes files.
+    is undisturbed, and Process Dump runs last because it writes files. `path`
+    is the sample's file, which the syscall stage searches as well.
     """
     def _scan():
         try:
@@ -8453,6 +10040,21 @@ def _run_memory_scans_async(pid, sha256):
                     _record_scan("Aether", f"PID {pid}", aether_result)
             except Exception as e:
                 _beacon_results_cache.put("aether", {"tool": "Aether", "error": str(e)}, pid=pid, sha256=sha256)
+
+        # Syscalls: the stubs of the process against the NTSleuth baseline, and the stubs the sample carries
+        # itself. It only reads, and skips itself, with its reason kept, where it cannot run.
+        if _syscall_stage_enabled():
+            try:
+                notes = []
+                syscall_result = _run_syscall_stage(pid, path, notes)
+                if syscall_result:
+                    _beacon_results_cache.put("syscalls", syscall_result, pid=pid, sha256=sha256)
+                    _record_scan("Syscalls", f"PID {pid}", syscall_result)
+                else:
+                    _beacon_results_cache.put("syscalls", {"tool": "Syscalls", "skipped": "; ".join(notes) or "skipped"},
+                                              pid=pid, sha256=sha256)
+            except Exception as e:
+                _beacon_results_cache.put("syscalls", {"tool": "Syscalls", "error": str(e)}, pid=pid, sha256=sha256)
 
         # Process Dump last: it writes files, and running it after the scanners
         # keeps their view of the process undisturbed. The clean-hash database
@@ -8529,6 +10131,7 @@ SUSPICIOUS_IMPORTS = {
         "GetModuleHandle", "GetModuleHandleA",
     ],
 }
+binary_graph_query.set_categories(SUSPICIOUS_IMPORTS)
 
 # Known packer/protector section names
 PACKER_SECTIONS = {
@@ -10996,6 +12599,12 @@ def _update_preconditions():
         return "A process dump is running."
     if _scans_running() > 0:
         return "A scan is running. Wait until it finishes."
+    if _syscall_scan_running():
+        return "A syscall scan is running. Wait until it finishes."
+    if _syscall_extracting():
+        return "A syscall baseline is being extracted. Wait until it finishes."
+    if _binary_graph_building():
+        return "A binary graph is being built. Wait until it finishes."
     return None
 
 

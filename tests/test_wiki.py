@@ -202,11 +202,12 @@ def test_the_wiki_is_one_file_that_needs_no_network(real_wiki):
 
 def test_the_navigation_follows_the_index(real_wiki):
     order = wiki.page_order(_read("docs", "README.md"))
-    # The index and fourteen pages, the set the design fixes (FIREWALL added one). A pin, not a
+    # The index and fifteen pages, the set the design fixes (FIREWALL added one, the
+    # RIZIN tab's API rows another when they outgrew docs/api.md). A pin, not a
     # floor - but one that says what to do (round 4, Minor 2): a page added to
     # the guide is a change of that design, so this number moves with it.
-    assert order[0] == "README.md" and len(order) == 15, \
-        "the guide is the index and fourteen pages; it has %d. If docs/ gained " \
+    assert order[0] == "README.md" and len(order) == 16, \
+        "the guide is the index and fifteen pages; it has %d. If docs/ gained " \
         "or lost a page on purpose, update this number: %s" % (len(order), order)
     nav = real_wiki[real_wiki.index('<nav id="toc"'):real_wiki.index("</nav>")]
     pages = re.findall(r'<a class="toc-page" href="#([^"]+)"', nav)
@@ -361,8 +362,8 @@ def test_page_order_reads_the_index():
     order = wiki.page_order(_read("docs", "README.md"))
     assert order == ["README.md", "setup.md", "installation.md", "configuration.md",
                      "workflow.md", "memory.md", "pipes.md", "rizin.md", "logs.md",
-                     "firewall.md", "updates.md", "web-ui.md", "api.md", "development.md",
-                     "troubleshooting.md"], order
+                     "firewall.md", "updates.md", "web-ui.md", "api.md", "api-rizin.md",
+                     "development.md", "troubleshooting.md"], order
     # A link that is not a page of the guide is not a page of the wiki
     assert wiki.page_order("# x\n[up](../README.md) [web](https://example.com)\n") \
         == ["README.md"]
@@ -549,8 +550,8 @@ def test_the_search_index_keeps_names_whole(real_wiki):
         assert [r for r in records if name in r["t"]], "the index lost %s" % name
     assert [r for r in records if "**" in r["t"]] == [], "a bold marker in a hit"
     # Every page of the guide has lines in the index, and a long row is in it
-    # whole: the rows of docs/api.md run past 1800 characters
-    assert len({r["p"] for r in records}) == 15
+    # whole: the rows of docs/api-rizin.md run past 1800 characters
+    assert len({r["p"] for r in records}) == 16
     assert max(len(r["t"]) for r in records) <= wiki.MAX_SEARCH_LINE
 
 

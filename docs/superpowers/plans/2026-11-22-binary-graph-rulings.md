@@ -1,0 +1,121 @@
+# Binary-Graph: die Entscheidungen, die ohne Rückfrage fielen
+
+Begleitdokument zu `2026-11-22-binary-graph.md`. Während der Ausführung lagen 54
+Entscheidungen an, die der Plan nicht beantwortete. Ich habe sie getroffen, damit die
+Arbeit nicht stehenblieb, und jede hier festgehalten — mit dem, was sie kostet, wenn sie
+falsch war. Wer eine davon anders will, findet hier die Stelle.
+
+Die Nummern stammen aus den Dispatch-Briefen und wiederholen sich zwischen Tasks; die
+Gruppierung unten ist nach Sache, nicht nach Zeit. Vollständige Begründungen samt
+Testbelegen stehen im Ledger (`.superpowers/sdd/2026-11-22-binary-graph/progress.md`),
+das aber gitignoriert ist und mit dem Worktree verschwindet.
+
+## Der Fehlbeschuldigungs-Pfad
+
+Ein `import_present: False` ist ein struktureller Befund mit Gewicht 4.0, der keine
+Bestätigung braucht. Ein falsches `False` beschuldigt ein sauberes Programm. **Acht
+verschiedene Wege dorthin** sind während dieses Plans gefunden worden; von den ersten fünf
+kamen drei erst ans Licht, nachdem ein Reviewer sie reproduziert hatte.
+
+| Entscheidung | Kosten, wenn falsch |
+|---|---|
+| **Die Deckung wird am Ziel entschieden, nicht am Import.** `False` nur für einen Syscall in `Table.covered`. Mein Plantext sagte das Gegenteil und war falsch — belegt mit `NtCreateFile`-Stub plus `CreateFileW`-Import, der unter Plan 1s Regel als belegte Umgehung las. | Nichts wird je ein Beleg, weil fast jedes PE `GetProcAddress` importiert. |
+| **`expanded_imports` ohne `covered` ist ein `ValueError`**, kein milder Vorgabewert. | Neun Testzeilen Arbeit. |
+| **Die Grenze wählt Syscalls, nicht Türen.** Ob ein Syscall gedeckt ist, entscheidet `SUSPICIOUS_IMPORTS`; ist er gedeckt, gehört **jede** Tür dazu. Das Anti-Ziel schlägt das Nicht-Ziel „kein Win32-Lexikon". | Eine fehlende Tür beschuldigt ein sauberes Programm. |
+| **Ein Win32-Name darf zu mehreren Syscalls führen.** Eindeutigkeit gilt für das Paar. | Ein Wrapper mit zwei Syscalls erzeugt einen falschen Beleg. |
+| **Eine Tür ist eine API, deren dokumentierter Vertrag die Operation dieses Syscalls auf den Operanden des Aufrufers ausführt** — nicht jede API, die ihn intern erreicht. Daraus: der Heap bleibt draußen, `LoadLibrary* → NtProtectVirtualMemory` fiel weg. | Zu streng beschuldigt sie ein sauberes Programm, zu weit belegt sie nie etwas. Die Spec zeigt streng. |
+| **Die Restgefahr der Deckungsregel ist aufgeschrieben:** eine seltene Tür zu einem gedeckten Syscall liest als Umgehung. | Ein sauberes Programm wird beschuldigt — benannt statt verborgen. |
+| **Im Prozessmodus wurde der Beleg abgeschaltet** (mein Plan schrieb den falschen Nenner vor: privater Speicher ist nicht zuordenbar). | Ein gepacktes Sample bleibt bis Task 6 ein Hinweis — ein verlorener Beleg, kein falscher. |
+| **Wiederhergestellt als Vereinigung der Türen jedes geladenen Moduls**, jede Lücke erzwingt `None`. Das Hauptabbild trägt bei, jedes andere ungecachte Modul macht die Vereinigung unvollständig. | Malware, die eine eigene DLL lädt, bekommt `None`. Die ehrliche Antwort. |
+| **Eine ausgedünnte Modulliste ist keine vollständige** — `modules_whole()` sichert nur zu, wenn der Leser nichts ausgelassen hat. | Ein Beleg über einem Nenner, von dem niemand weiß, ob er vollständig war. |
+| **Imports nach Ordinal werden über den Cache aufgelöst**, in beiden Modi; ein unauflösbares Ordinal ist eine unbekannte Tür. | Eine per Ordinal importierte Tür las als nicht importiert. |
+| **Der Prozessmodus belegt praktisch nie**, weil `kernelbase` — in jedem Win32-Prozess geladen — die Nt-Funktionen direkt importiert. Der Nenner bleibt **unverändert**; der Satz wird gesagt. | Den Nenner zu ändern hieße: ein Prozess, dessen dokumentierter Weg wirklich in kernelbase liegt, liest als Umgehung. |
+| **`partial` heißt „ein Verzeichnis war nicht vollständig lesbar", nicht „pefile hat irgendetwas gewarnt."** pefiles „typical of packed executables" ist eine Beobachtung, kein Lesefehler — und schaltete den Datei-Beleg genau für Loader ab. Ausschlussliste benannt, alles andere zählt weiter als Schnitt. **Entscheidung 67** setzt pefiles „Damaged Import Table information" dazu, das auf `26200.9974` 851 von 3994 System32-Binaries als abgeschnitten zählen ließ — aber nur, wenn beide genannten Thunk-Tabellen wirklich leer sind (RVA 0 oder erster Thunk null). Dieselben Worte fallen, wenn pefile eine Tabelle als unsinnig verwirft (ein Ordinal über `0xFFFF`), und dann sind die Funktionen des Deskriptors ungelesen verloren. | Eine Umformulierung bei pefile führt zu Über-, nie zu Untermeldung. Ohne die Leerprüfung importierte ein präpariertes Sample seine Tür unsichtbar, und ein mitgebrachter Stub läse als belegte Umgehung. |
+| **Ein Syscall, den die Baseline unter seinem `Zw`-Namen hält, heißt beim Suchen der Stubs mit seinem `Nt`-Namen** (Entscheidung 69, statt der drei Stellen von 68). `parse_baseline` behält je Nummer einen Namen; auf `26200.9974` war das für vier gedeckte Syscalls je Sicht die `Zw`-Form, und `import_present` blieb für sie `None`. Umbenannt wird an einer Stelle, `syscall_scan._numbers`; alles, was einen Treffer beurteilt, spricht die `Nt`-Form, und ein Befund ist in beiden Sichten derselbe. Nachschlagen unter einem Namen (`/api/syscalls/<name>`, der Pfad zum Syscall, `missing_from`, die Karte) findet beide Formen. | Die drei Stellen von 68 allein hätten zwei neue Wege zum falschen `False` geöffnet: die Nachprüfung im Prozessmodus und den Export-Test einer echten `ntdll.dll`. |
+| **Eine Sicht, die nicht zur Maschine der Datei passt, trägt kein Fehlen** (Entscheidung 70). Verglichen wird die gesuchte Sicht mit `FileHeader.Machine`; die Exporttabelle, die pefile liest, beschreibt nur die native Sicht. Gemessen auf der VM: eine unveränderte ARM64X-ntdll in der x64-Sicht las mit 9 `False` als MALICIOUS 8.0, weil ihre x64-Stubs um `0x2fb000` liegen und jeder Export unter `0x2400`. Bei Abweichung kein `False`, kein Export-Abgleich, `doors_complete` `false`; ein `True` der Importtabelle bleibt. Die hybride Exporttabelle wird nicht gelesen. | Ein x64-Sample mit falscher Maschine im Header verliert seinen Datei-Beleg — ein verlorener Beleg, kein falscher. |
+| **Ein Stub ist Rumpf seines Exports, wenn er innerhalb einer Stub-Leselänge (`READ_LEN`) hinter dessen Adresse beginnt**, nicht nur genau dort (Entscheidung 71). Gemessen: die ARM64-ntdll trägt einen zweiten `SVC` 16 Byte tief in `NtUnmapViewOfSection` (`READ_LEN` arm64: 20). | Ohne Grenze passte jeder Stub hinter einem Export des Namens; mit ihr kauft ein Autor nichts, was ihm der genaue Abgleich nicht schon gab. |
+| **Ein Befund sagt den schwächsten Anspruch unter seinen Kopien** (Entscheidung 72): `True` vor `None` vor `False`, gleich in welcher Reihenfolge — vorher entschied die erste Kopie, und eine nicht exportierte vor der exportierten machte eine Datei, die ihren eigenen Stub exportiert, zum Beleg. Die Ordnung gilt je Quelle; Kopien der Sample-Datei entscheiden vor denen im Prozessspeicher, wie bisher. | Ohne die Quellen-Regel ließe das `True` von kernelbase in jedem Prozess jeden Datei-Beleg einer Detonation fallen. |
+| **Ein Treffer, dessen Tür der eigene Export ist, sagt das** (Entscheidung 73, `own_export`), statt „importiert es auch". Kein `copy_of_ntdll`, keine Schwelle. Die Urteilsgründe nennen die Art, nicht das Detail, und bleiben unverändert. | Ein Analyst, der ntdll durchsucht, liest weiter SUSPICIOUS — ein Kategorienfehler des Analysten, benannt statt aufgefangen. |
+| **Der Befundtext spricht nur für die Kopien, die er beschreibt** (Entscheidung 76). „Eigener Code des Moduls" nur, wenn jede Kopie Rumpf eines eigenen Exports ist; sonst: k der n Kopien in der Datei sind es, die übrigen nicht, darum ein Hinweis, und die Datei verdient einen Blick. Gezählt werden die Kopien in der Datei, und der Satz sagt das, denn `copies` zählt in einer Detonation auch die im Prozessspeicher. | Der Text nannte einen Köder-Export „own code" — das Gegenteil dessen, was `docs/memory.md` über dieselbe Datei sagt. |
+| **Hingenommen: ein billig erklärter Köder-Export über einer Kopie macht den Befund seines Syscalls zum Hinweis**, seit Entscheidung 72 unabhängig von der Reihenfolge. Das Schlupfloch gab es unter der Regel der ersten Kopie schon; 72 hat nur die Abhängigkeit von der Reihenfolge genommen. Es fällt zum Hinweis, die Doku nennt es einen lauten Hinweis, und seit 76 nennt der Befund es nicht mehr eigenen Code. | Ein Sample mit Köder-Export verliert seinen Beleg — ein verlorener Beleg, kein falscher, und benannt. |
+| **Das fünfte Residual ist nicht gemindert**, und meine behauptete Minderung existierte nicht: ein Stub-Befund ist am Prozess verschlüsselt, und nichts schreibt ihn je in die Host-Baseline. **Darum sperrt VM-Punkt 7 den Merge.** | Ein 4.0-Befund gegen einen sauberen Host, falls ein System32-Modul Stubs schreibt. |
+
+## Das Anti-Ziel: eine kuratierte Kante darf nicht als abgeleitete lesen
+
+| Entscheidung | Kosten, wenn falsch |
+|---|---|
+| **Keine `defines`-Kante.** Die Spec nennt vier Kantenarten; eine fünfte wäre erfundene Struktur. Ein Funktionsknoten trägt sein Modul in der `id`. | Tasks 8–10 hätten je eine eigene Lösung erfunden. |
+| **Eine `imports`-Kante darf keine Ableitung behaupten, die sie nicht hat.** Ein unbekanntes Startmodul bekommt keine Kante. | Das Anti-Ziel im Kleinen. |
+| **Ein Nt-benannter Import erreicht seinen Syscall allein aus Daten** — `derived`, und aus „genau eine kuratierte Kante" wurde „höchstens eine". | Der saubere Pfad las als unbekannt. |
+| **Die Zw→Nt-Kante ist `curated`** mit `zw-alias`, in **beiden** Abfragen. Ein mechanischer Namenswechsel ist nichts, was aus einer Binary gelesen wurde. | Die Richtung des Anti-Ziels. |
+| **Eine unbekannte Herkunft liest als unbekannt, nicht als `derived`.** | Heute unsichtbar — das ist der Punkt: die Richtung, in die der Vorgabewert fällt. |
+| **Aggregation darf keine Herkunft waschen:** eine zusammengefasste Kante ist nur `derived`, wenn jede dahinter es ist. | Die Erkundungsansicht hätte das Anti-Ziel neu geöffnet. |
+| **Eine umgeschriebene Regel braucht einen Test.** Der Kennzahl-Listen-Ausnahme folgte ein Test über 400+ Antworten aus jeder Abfrage. | Die Regel war vorher unerzwungen und wäre es geblieben. |
+| **T8 schreibt eigenes SVG nach dem Muster von `rizinGraphSvg`**, ruft es nicht auf. | Jemand verbiegt `rizinGraphSvg` für zwei Aufrufer und bricht den Rizin-Tab. |
+
+## Falsche Aussagen, korrigiert statt umgangen
+
+Fünfzehn. Jede einzelne kam aus einem Review, keine aus einer Selbstmeldung.
+
+1. Spec Ziel 7 erzählte von einer Kette „über kernel32 und kernelbase **zu ntdll**", während Ziel 6 selbst sagt, kernelbase **ruft** `NtWriteVirtualMemory` und leitet nicht weiter.
+2. „Der Loader probiert die Hosts der Reihe nach" — eine Behauptung über `ApiSetResolveToHost`, die keiner von uns geprüft hatte. Gestrichen, nicht umgedreht.
+3. `#help-api`: „its last edge is curated, **not derived**" — seit der Nt-Import-Regel falsch.
+4. README und `#help-usage`: „GRAPH switched off until the binary graph exists" — Plan 1 schrieb es, als es stimmte; Task 8 schaltete den Knopf frei.
+5. README: „Every edge is derived … except the last hop" — die Zw-Kante ist auch kuratiert.
+6. `docs/memory.md`: „except one kind", dann zwei aufgezählt.
+7. Die Kennzahl `partial` hieß „import table cut short", zählt aber drei Verzeichnisarten — an sechs Stellen, plus vier weiteren im Nachgang.
+8. Der Tooltip sagte „The sample imports this function as well" für einen Prozesstreffer, wo `true` „ein geladenes Modul" heißt.
+9. Ein Docstring: „an api-set name has dots of its own (`api-ms-win-core-heap-l1-1-0`)" — das eigene Beispiel hat keine.
+10. Tooltip und Detailpanel einer `zw-alias`-Kante sagten „from the Win32 to Nt table", was keine Tabellenzeile stützt.
+11. Eine Fixture packte `HashedLength` nach Vermutung, gegen zwei dokumentierte Quellen — unbenutzt, und darum eine Zeile wert.
+12. Entscheidung 66 stand an sechs Stellen als Behebung eines Fehlers, der nie gemessen war: 144 Einträge „mit leerem Host nach dem ersten", darunter Memory und Processthreads. Gemessen haben alle 144 einen einzigen Wert ohne Importeur und Host; die Regel für spätere Werte hat auf `26200.9974` keinen Fall (Entscheidung 75).
+13. Der Befundtext eines Stubs, von dessen Kopien nur einige Rumpf eines eigenen Exports sind, nannte alle Kopien „the module's own code" — die übrigen sind gerade mitgebrachte Stubs, und `docs/memory.md` nennt genau diesen Fall einen lauten Hinweis (Entscheidung 76).
+14. VM-Prüfung 5 erwartete für eine echte `ntdll.dll` in der x64-Sicht `True` auf jedem Treffer, was Entscheidung 70 verbietet (Entscheidung 77).
+15. Task 11 nannte den Screenshot `webui/static/syscalls-graph.png`. Beides falsch: die Screenshots des Repos liegen in `static/` an der Wurzel, und sie heißen mit Unterstrich (`theme_cyberpunk.png`). Dazu begrenzt das Design der README ihren Schaukasten auf 8 bis 11 Einträge, und er hielt bereits 11 — der Screenshot gehört also auf die Seite, die den Graphen erklärt (`docs/memory.md`), nicht in die README. Gefunden, weil der Test „jeder PNG in `static/` wird genannt" und der Test über den Schaukasten beide zusahen.
+
+Dazu zwei ungemessene Zahlen, die wie gemessene lasen: „a few hundred MB" (ohne jede
+Quelle, gestrichen) und „a build takes a few minutes über ~4.000 Dateien" (zuerst als
+Erwartung gekennzeichnet, dann auf der VM gemessen: 3.999 Dateien, 78 Sekunden, 28,2 MB).
+
+## Ehrlichkeit als Regel, nicht als Stil
+
+| Entscheidung | Kosten, wenn falsch |
+|---|---|
+| **Ein fehlender Knoten heißt „nicht gezeigt", nie „importiert nicht."** Zweimal brach das: ein übersprungener Teil mit schon gezeichnetem Kopf, dann ein verworfener Kopf, der später erschien. Lösung: nicht passende Teile werden **ganz** gehalten und freigegeben, wenn ihre Enden da sind. | Zwei sichtbare Knoten ohne Kante lesen als „importiert nicht". |
+| **Eine Kennzahl-Liste nimmt ihre Zahl aus der Kennzahl**, mit `ValueError`, wenn sie abweichen. | Zwei Zahlen für eine Tatsache. |
+| **`Answer` trägt `total` und `partial` strukturiert**, nicht als Satz in der Prosa. | Drei Frontend-Tasks müssten Prosa parsen. |
+| **Die Warnung zeigt auf die Zahl**, statt dauernd sichtbar zu sein; die konservative Regel bleibt. | Eine dauernde Warnung erzieht zum Ignorieren. Die engere Regel wäre eine schwächere Behauptung als die Wahrheit. |
+| **Der Hinweis muss das Ende nennen, das wirklich eintrat** — nicht eine fehlende Baseline einer kuratierten Zeile anlasten. | Der Analyst handelt nach dem falschen Grund. |
+| **Ein leerer Host verwirft seinen API-Set-Eintrag nur, wenn er in `value[0]` steht** (Entscheidung 66, ersetzt 20). Ein leerer späterer Wert fällt allein weg, die übrigen behalten ihre Reihenfolge. **Diese Regel hat auf `26200.9974` keinen Fall**, und sie behebt keinen gemessenen Fehler: die erste Diagnose (144 Einträge mit leerem Host nach dem Standard, darunter Memory und Processthreads) hat die spätere Messung widerlegt. Die Map erklärt 985 Einträge, 841 haben einen Host; die 144 übrigen tragen einen einzigen Wert ohne Importeur und Host (Flag `0x1`), API-Sets, die die Edition nicht hostet, und fallen zu Recht über `value[0]` weg, denn auch der Loader löst sie nicht auf. Memory und Processthreads stehen in der Map als `-l1-1-9` und `-l1-1-8`; die `-l1-1-0`-Weiterleitungen löst der Familien-Rückfall (Entscheidung 23) auf, gemessen für 35 Namen. Die Regel ist ein Modell für einen Fall, den die echte Map derzeit nicht enthält, wie der Platz für mehrere `nt`. | Ein Override rutscht auf den Platz der Vorgabe — das geht nur über `value[0]`, und dort bleibt die Regel streng. |
+| **Ein Teil-Parse wird sichtbar** (`BinaryInfo.partial`), statt still eine abgeschnittene Tabelle zu behalten. | Eine Kante hinter dem Schnitt fehlt stillschweigend. |
+| **Eine Fixture darf keinen Wert packen, den wir für falsch halten**, auch einen unbenutzten. | Der nächste Leser glaubt ihm. |
+| **Die Doors-Fixture wurde realistisch gemacht** — und zwölf Prozessmodus-Tests fielen um. Das war der Beweis, dass die Fixture sie grün hielt. | Ein Mechanismus, der nur gegen ein unmögliches System32 funktioniert. |
+
+## Technische Festlegungen
+
+| Entscheidung | Kosten, wenn falsch |
+|---|---|
+| **Die Architektur des Graphen kommt aus der Registry**, nicht aus `platform.machine()` — das meldet `AMD64` für ein emuliertes x64-Python auf ARM64, was Plan 1 auf der VM erlebt hat. Es gibt **einen** Cache, also heißt falsche Architektur „kein Graph". | Der Tab sagt für immer „kein Graph", während eine gute Datei unter dem anderen Namen liegt. |
+| **Ein API-Set-Lookup fällt auf den am letzten `-` gekürzten Familiennamen zurück**, wie `HashedLength` es vorzeichnet. | Exakt-nur tötet eine Kette bei Versions-Drift; der Rückfall löst über eine Nachbarversion derselben Familie auf. |
+| **Ein Cache, der nicht lädt, wird im Hintergrund neu gebaut**, mit Zehn-Minuten-Sperre und **drei** Versuchen, dann Abweisung mit Hinweis auf `-Force`. | Ein Graph-Bau liest 4.000 Dateien; eine endlose Schleife konkurriert mit dem Sample um CPU. |
+| **Ein Fehlereintrag verschwindet, sobald ein brauchbarer Cache da ist**, egal wer die Datei schrieb. | Plan 1 hat das Gegenteil ausgeliefert: eine Antwort meldete eine geladene Baseline und den Fehlschlag, sie zu erzeugen. |
+| **Die eigene Abschnittsprüfung fiel weg** — übersprungen wird nur, was `pefile` selbst verweigert. | Eine legitime System32-Datei verschwindet still aus dem Graphen. |
+| **`kind` kommt aus `IMAGE_FILE_DLL`**, nur ersatzweise aus der Endung. | Eine umbenannte DLL wäre im Graphen ein EXE-Knoten. |
+| **`BinaryInfo` trägt Ordinale** (`ordinal_names`). | Task 4 bricht an einer Ordinal-Forwarder-Kette ab. |
+| **Die Erkundung ist eine Ansicht auf Modulebene.** Ein Exe mit 300 Importen aus 20 DLLs hätte die 400er-Grenze bei **einem** Aufklappen gesprengt. Zusammenfassen ist Aggregation, keine Erfindung. | Die Ansicht wäre beim Ersten unbrauchbar, was ein Analyst tut. |
+| **Aufklappen läuft über die Abfrage-Route**, in beiden Richtungen. | Nur nach vorn hätte den Explorer bei `ntdll` blind gemacht — dem interessantesten Knoten. |
+| **Die eigene Kamera der Erkundung ist angenommen**, statt sechs Funktionen des Prozessgraphen umzubauen. | Vierzig Zeilen Dopplung gegen das Risiko, einen funktionierenden Tab zu brechen. |
+| **`pefile` wird nicht gepinnt**, und sein Warntext wird nur für die benannten Notizen gelesen (Entscheidungen 65 und 67); jede andere Warnung zählt als Schnitt, ohne gelesen zu werden. | Eine abgeschnittene Datei läge als „importiert nichts" im Graphen. |
+| **Der Visited-Schlüssel ist `(module, function)`** und ist festgenagelt. | Nur am Modul geschlüsselt hätte eine legitime Kette `a!F → b!X → a!G` als Zyklus gegolten. |
+| **Jeder Abschnitt der GRAPH-Fläche behält seine Inhaltshöhe, und das Panel scrollt** (Entscheidung 78). Gemessen in echtem Chrome gegen die VM: die Pfadansicht durfte unter ihren Inhalt schrumpfen und malte Leinwand und Legende über die Zahlen — bei 1920 und 1280 px, in beiden Themes. Der erste Fix ließ dafür die Zahlen schrumpfen und machte aus 243 px Inhalt ein **30-px-Fenster ohne eine ganze Zeile**. Also: beide Ansichten auf `min-content`, die Zahlen schrumpfen nicht, ein Scrollbalken für das Panel. | Die Legende ist der einzige Ort, der eine kuratierte Kante von einer abgeleiteten trennt — unleserlich ist sie dort schlimmer als fehlend. |
+
+## Vorgehen
+
+| Entscheidung | Kosten, wenn falsch |
+|---|---|
+| **Task 6 lief als zwei Dispatches mit je eigenem Review.** Sie mischte Routinearbeit mit der Wiederherstellung des Belegs im Prozessmodus — und genau diese Mischung hat in Plan 1 einen falschen Beleg durch dreizehn Reviews getragen. | Ein Review-Sitz mehr. |
+| **Der Wächter über die kuratierten Nt-Namen war zirkulär und ist ersetzt.** Eine auf die Tabelle hin erweiterte Fixture hätte sich selbst geprüft; die Namen beurteilt `missing_from` gegen die echte Baseline auf der VM. | Ein falscher Nt-Name überlebt bis zur VM-Prüfung — sichtbar, nicht still. |
+| **Die Test-Werkstatt wird geteilt und erweitert, nicht neu gebaut.** Sie existierte schon in `tests/test_syscalls.py`. | Eine zweite Werkstatt wäre die Dopplung eines Logikblocks. |
+| **Die ganze Suite muss grün sein, bevor ein Review läuft.** | Ein Zustand mit zwei Fehlschlägen ist nicht reviewbar. |
+| **Der Dateibaum wird von der Task eingetragen, die das Modul anlegt.** | Ein doppelter Eintrag. |
+| **`QUERIES` hält Adapter `(ctx, params) -> Answer`**, nicht die Abfragefunktionen. | Die Route hätte einen `if`-Baum über ungleiche Signaturen. |

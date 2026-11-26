@@ -159,6 +159,20 @@
     --graph-pipe-rgb: 0, 229, 255;
     --graph-detonated: #d4ff00;
     --graph-detonated-rgb: 212, 255, 0;
+    /* The binary graph of the SYSCALLS tab: a kind of node each, the curated edge (the word of the Win32 to Nt
+       table, not of a binary) and a filter match; neither of the last two may look like a deviation state */
+    --graph-node-dll: #9b8cff;
+    --graph-node-dll-rgb: 155, 140, 255;
+    --graph-node-exe: #34f5a0;
+    --graph-node-exe-rgb: 52, 245, 160;
+    --graph-node-apiset: #4d8dff;
+    --graph-node-apiset-rgb: 77, 141, 255;
+    --graph-node-syscall: #e8ecff;
+    --graph-node-syscall-rgb: 232, 236, 255;
+    --graph-edge-curated: #ff2bd6;
+    --graph-edge-curated-rgb: 255, 43, 214;
+    --graph-match: #d4ff00;
+    --graph-match-rgb: 212, 255, 0;
     --pe-code: #4d8dff;
     --pe-data: #34f5a0;
     --pe-readonly: #6c7399;
@@ -183,6 +197,20 @@
     --assess-protected-tint-rgb: 255, 191, 38;
     --assess-suspicious: #ffbf26;
     --assess-suspicious-rgb: 255, 191, 38;
+    /* The SYSCALLS map: the state each syscall stub was measured in. intact is held near the surface, so a map
+       without a deviation draws no eye; every deviation is bright and has a hue of its own: hooked amber (a
+       jump into another module, an EDR hook), patched red (a jump into private memory), diverged blue (the
+       bytes differ, nothing is guessed), unreadable a light grey (drawn as an outline) */
+    --syscall-intact: #323b75;
+    --syscall-intact-rgb: 50, 59, 117;
+    --syscall-hooked: #ffbf26;
+    --syscall-hooked-rgb: 255, 191, 38;
+    --syscall-patched: #ff2b4a;
+    --syscall-patched-rgb: 255, 43, 74;
+    --syscall-diverged: #3dbdff;
+    --syscall-diverged-rgb: 61, 189, 255;
+    --syscall-unreadable: #8089b8;
+    --syscall-unreadable-rgb: 128, 137, 184;
     --font-mono: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
     --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
     --radius: 4px;
@@ -12724,4 +12752,1008 @@ button.logs-trunc:hover { color: var(--accent-orange); text-decoration: underlin
 /* Tab titles: the gradient (--cp-heading) with a cyan glow */
 :root[data-theme="classic"] .content-header h2 {
     filter: drop-shadow(0 0 22px rgba(var(--accent-cyan-rgb), .25));
+}
+
+/* =============================================
+   SYSCALLS tab (block SYSCALLS of app.js): the toolbar in one line that wraps in a narrow window, the notices
+   over the map, then the work area that fills the tab: the map (a canvas per module, drawn by app.js) and the
+   catalog under it, each scrolling in itself. The colours of the states are variables of both themes; the
+   canvas reads them through themeColor().
+   ============================================= */
+.syscall-toolbar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px 16px;
+    margin: 10px 14px 0;
+    padding: 6px 10px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-secondary);
+}
+.syscall-group {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+}
+.syscall-filter-group {
+    margin-left: auto;
+}
+/* The MAP / GRAPH switch is the chart-range group of the other tabs, as tall as the buttons beside it */
+.syscall-toolbar .chart-range .chart-range-btn {
+    height: 22px;
+    padding: 0 12px;
+    font-size: 11px;
+}
+.syscall-switch .chart-range-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+.syscall-check {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    cursor: pointer;
+}
+.syscall-filter-group .filter-input {
+    width: 190px;
+}
+.syscall-notices {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin: 10px 14px 0;
+}
+.syscall-notices[hidden],
+.syscall-scan-result[hidden],
+.syscall-tip[hidden],
+.syscall-main[hidden] {
+    display: none;
+}
+.syscall-notice {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 10px;
+    padding: 6px 10px;
+    font-size: 12px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-primary);
+    border-left: 3px solid var(--border-accent);
+    border-radius: var(--radius);
+}
+.syscall-notice-title {
+    font-family: var(--font-mono);
+    font-weight: 600;
+    color: var(--text-primary);
+}
+.syscall-notice-text {
+    min-width: 0;
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
+}
+.syscall-notice-info {
+    border-left-color: var(--severity-info);
+}
+.syscall-notice-warn {
+    border-left-color: var(--severity-medium);
+    background: rgba(var(--severity-medium-rgb), 0.06);
+}
+.syscall-notice-error {
+    border-left-color: var(--severity-critical);
+    background: rgba(var(--severity-critical-rgb), 0.08);
+}
+/* A view that cannot be told from the other one is a decision of the extraction, not a missing file: own accent */
+.syscall-notice-indistinguishable {
+    border-left-color: var(--accent-purple);
+    background: rgba(var(--accent-purple-rgb), 0.08);
+}
+.syscall-scan-result {
+    margin: 8px 14px 0;
+    padding: 4px 10px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-secondary);
+    border-left: 3px solid var(--border-accent);
+    overflow-wrap: anywhere;
+}
+.syscall-scan-result-ok {
+    border-left-color: var(--accent-green);
+}
+.syscall-scan-result-warn {
+    border-left-color: var(--severity-medium);
+}
+.syscall-scan-result-error {
+    border-left-color: var(--severity-critical);
+    color: var(--severity-critical);
+}
+/* The work area: the map and the catalog on the left, the detail panel on the right, the deviations and the
+   known hooks under the map. Below 1400px the map and the detail panel take turns (MAP | DETAIL in the toolbar). */
+.syscall-work {
+    flex: 1;
+    min-height: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) minmax(340px, 28%);
+    grid-template-rows: minmax(0, 1fr) auto;
+    gap: 8px;
+    padding: 8px 14px 12px;
+}
+.syscall-main {
+    grid-column: 1;
+    grid-row: 1;
+    min-height: 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+.syscall-detail {
+    grid-column: 2;
+    grid-row: 1 / span 2;
+}
+.syscall-lower {
+    grid-column: 1;
+    grid-row: 2;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+/* The bar that stays when the row is folded: ▾ and what is behind it, so a stub run in the graph view is not silent */
+.syscall-lower-bar {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
+}
+.syscall-lower-fold {
+    flex: 0 0 auto;
+    padding: 0 6px;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 1.3;
+    color: var(--accent-cyan);
+    background: none;
+    border: 1px solid transparent;
+    border-radius: 3px;
+    cursor: pointer;
+}
+.syscall-lower-fold:hover {
+    border-color: var(--border-accent);
+}
+.syscall-lower-folded .syscall-lower-fold {
+    transform: rotate(-90deg);
+}
+.syscall-lower-note {
+    min-width: 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+    overflow-wrap: anywhere;
+}
+.syscall-lower-body {
+    flex: 1 1 auto;
+    height: clamp(170px, 30vh, 320px);
+    min-height: 0;
+    display: grid;
+    grid-template-columns: minmax(0, 3fr) minmax(0, 2fr);
+    gap: 8px;
+}
+.syscall-lower.with-stubs .syscall-lower-body {
+    height: clamp(260px, 42vh, 440px);
+}
+.syscall-lower.syscall-lower-folded > .syscall-lower-body {
+    display: none;
+}
+.syscall-lower-left {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    min-width: 0;
+    min-height: 0;
+}
+.syscall-lower-left > .syscall-panel {
+    flex: 1 1 0;
+}
+.syscall-stubs[hidden] {
+    display: none;
+}
+.syscall-stubs-summary {
+    margin-bottom: 4px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+.syscall-pane-switch {
+    display: none;
+}
+@media (max-width: 1399px) {
+    .syscall-work {
+        grid-template-columns: minmax(0, 1fr);
+    }
+    .syscall-main,
+    .syscall-detail {
+        grid-column: 1;
+        grid-row: 1;
+    }
+    .syscall-lower {
+        grid-row: 2;
+    }
+    .syscall-work[data-pane="map"] .syscall-detail,
+    .syscall-work[data-pane="detail"] .syscall-main {
+        display: none;
+    }
+    .syscall-pane-switch {
+        display: inline-flex;
+    }
+}
+.syscall-map-panel,
+.syscall-catalog {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    background: var(--bg-card);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+}
+.syscall-map-panel {
+    flex: 3 1 0;
+}
+.syscall-catalog {
+    flex: 2 1 0;
+}
+/* The GRAPH surface: the query bar, the line an answer leaves, the layered paths (scrolling in themselves, never
+   squeezed: a path keeps the size it is readable at) and the legend. When the views and the figures together do not
+   fit, the panel scrolls instead of painting them over each other or over the panels below it. */
+.binary-graph-panel {
+    flex: 1 1 0;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    overflow-y: auto;
+    background: var(--bg-card);
+    border: 1px solid var(--border-primary);
+    border-radius: 4px;
+}
+.binary-graph-bar {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 6px 8px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border-primary);
+}
+.binary-graph-bar .filter-input {
+    flex: 1 1 180px;
+    min-width: 0;
+}
+.binary-graph-bar .filter-input[hidden] {
+    display: none;
+}
+.binary-graph-status {
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border-primary);
+    border-left: 3px solid var(--border-primary);
+    font-size: 12px;
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
+}
+.binary-graph-status[hidden] {
+    display: none;
+}
+.binary-graph-status-warn {
+    border-left-color: var(--severity-medium);
+}
+.binary-graph-cut {
+    color: var(--text-primary);
+    font-weight: 600;
+}
+.binary-graph-canvas {
+    flex: 1 1 0;
+    min-height: 120px;
+    overflow: auto;
+}
+.binary-graph-svg {
+    display: block;
+}
+.binary-graph-svg text {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    white-space: pre;
+    pointer-events: none;
+}
+.binary-graph-svg .binary-graph-sub,
+.binary-graph-svg .binary-graph-edge-tag {
+    font-size: 10px;
+}
+.binary-graph-edge-tag {
+    font-weight: 600;
+    letter-spacing: 0.04em;
+}
+.binary-graph-node,
+.binary-graph-edge {
+    cursor: pointer;
+}
+.binary-graph-edge-hit {
+    fill: none;
+    stroke: transparent;
+    stroke-width: 12px;
+    pointer-events: stroke;
+}
+.binary-graph-legend {
+    border-top: 1px solid var(--border-primary);
+    border-bottom: 0;
+}
+.binary-graph-legend-mark {
+    flex: 0 0 auto;
+}
+/* The explore view beside the path: its own bar, its canvas (the stage is the box the canvas follows) and the line under it */
+.binary-graph-modes {
+    display: flex;
+    align-items: center;
+    padding: 8px 12px 0;
+}
+/* Never shorter than their content: at min-height 0 the path view shrank to 158px while its bar, canvas and legend
+   needed 270, and the legend (the only place that tells a derived edge from a curated one) was painted over the
+   figures. Neither do the figures shrink: when the three do not fit together, the panel scrolls. */
+.binary-graph-pathview,
+.binary-explore {
+    flex: 1 1 0;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: min-content;
+}
+.binary-graph-pathview[hidden],
+.binary-explore[hidden] {
+    display: none;
+}
+.binary-explore-depth-label {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.binary-explore-view {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    margin-left: auto;
+}
+.binary-explore-zoom {
+    min-width: 40px;
+    text-align: center;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+.binary-explore-stage {
+    position: relative;
+    flex: 1 1 0;
+    min-height: 240px;
+    overflow: hidden;
+}
+.binary-explore-canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    display: block;
+    cursor: grab;
+}
+.binary-explore-info {
+    padding: 6px 12px;
+    border-top: 1px solid var(--border-primary);
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
+}
+/* ⇱ folds the figures' rows away and gives their height to the graph; the bar, RELOAD and the caveats stay */
+.binary-graph-max {
+    margin-left: auto;
+    flex: 0 0 auto;
+}
+.binary-graph-maxed .binary-graph-metrics-wrap {
+    display: none;
+}
+/* The figures of the whole stock under the canvases, and the list of one in the detail panel. They never shrink below
+   their content (up to 260px, past which their body scrolls): shrunk, they left a 30px window with no whole row. */
+.binary-graph-metrics {
+    flex: 0 0 auto;
+    display: flex;
+    flex-direction: column;
+    max-height: 260px;
+    border-top: 1px solid var(--border-primary);
+}
+.binary-graph-metrics .binary-graph-bar {
+    flex: 0 0 auto;
+    padding-top: 6px;
+    padding-bottom: 6px;
+}
+.binary-graph-metrics-wrap {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow: auto;
+}
+.view-table td.binary-graph-means {
+    white-space: normal;
+    color: var(--text-secondary);
+}
+.binary-graph-figure,
+.binary-graph-member-name:is(button) {
+    padding: 0;
+    border: 0;
+    background: none;
+    font: inherit;
+    font-family: var(--font-mono);
+    color: var(--accent-cyan);
+    text-decoration: underline;
+    cursor: pointer;
+    overflow-wrap: anywhere;
+    text-align: left;
+}
+.binary-graph-figure:hover,
+.binary-graph-member-name:is(button):hover {
+    color: var(--text-primary);
+}
+.binary-graph-close {
+    margin-left: auto;
+}
+.binary-graph-members {
+    margin: 0;
+    padding: 0;
+    list-style: none;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+}
+.binary-graph-member {
+    padding: 4px 0;
+    border-bottom: 1px solid rgba(var(--border-primary-rgb), 0.5);
+    overflow-wrap: anywhere;
+}
+.binary-graph-links {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 2px 12px;
+    margin-top: 2px;
+    color: var(--text-secondary);
+}
+.binary-graph-link-tag {
+    color: var(--text-muted);
+}
+.binary-graph-curated-note {
+    margin: 8px 0;
+    padding: 6px 8px;
+    border-left: 3px solid var(--graph-edge-curated);
+    background: rgba(var(--graph-edge-curated-rgb), 0.08);
+    font-size: 12px;
+    color: var(--text-primary);
+}
+.syscall-legend {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px 18px;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border-primary);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-secondary);
+}
+.syscall-legend-item {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    cursor: help;
+}
+.syscall-legend-count {
+    color: var(--text-primary);
+    font-variant-numeric: tabular-nums;
+}
+.syscall-legend-note {
+    color: var(--text-muted);
+}
+.syscall-legend-dot,
+.syscall-row-dot {
+    flex: 0 0 auto;
+    width: 10px;
+    height: 10px;
+    border: 1px solid transparent;
+    border-radius: 2px;
+}
+.syscall-state-intact {
+    background: var(--syscall-intact);
+}
+.syscall-state-baseline {
+    background: rgba(var(--syscall-intact-rgb), 0.75);
+}
+.syscall-state-hooked {
+    background: var(--syscall-hooked);
+}
+.syscall-state-patched {
+    background: var(--syscall-patched);
+    box-shadow: 0 0 0 2px rgba(var(--syscall-patched-rgb), 0.35);
+}
+.syscall-state-diverged {
+    background: var(--syscall-diverged);
+    box-shadow: 0 0 0 2px rgba(var(--syscall-diverged-rgb), 0.35);
+}
+.syscall-state-unreadable {
+    background: transparent;
+    border-color: var(--syscall-unreadable);
+    box-shadow: 0 0 0 2px rgba(var(--syscall-unreadable-rgb), 0.35);
+}
+.syscall-map {
+    flex: 1 1 0;
+    min-height: 0;
+    padding: 10px 12px 12px;
+    overflow-x: hidden;
+    overflow-y: auto;
+    scrollbar-gutter: stable;
+}
+.syscall-band + .syscall-band {
+    margin-top: 14px;
+}
+.syscall-band-head {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin: 0 0 6px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    font-weight: 600;
+    letter-spacing: 0.06em;
+    color: var(--text-secondary);
+}
+.syscall-band-count {
+    font-weight: 400;
+    color: var(--text-muted);
+}
+.syscall-canvas {
+    display: block;
+    width: 100%;
+}
+.syscall-empty {
+    padding: 16px;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--text-muted);
+    overflow-wrap: anywhere;
+}
+.syscall-tip {
+    position: absolute;
+    z-index: 5;
+    padding: 4px 8px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-primary);
+    white-space: nowrap;
+    background: var(--bg-tertiary);
+    border: 1px solid var(--border-accent);
+    border-radius: var(--radius);
+    pointer-events: none;
+}
+.syscall-catalog-head {
+    padding: 6px 12px;
+    border-bottom: 1px solid var(--border-primary);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.syscall-rows {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+}
+.syscall-row {
+    display: grid;
+    grid-template-columns: 12px minmax(0, 1fr) 64px 64px;
+    align-items: center;
+    gap: 10px;
+    width: 100%;
+    padding: 3px 12px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-secondary);
+    text-align: left;
+    background: transparent;
+    border: 0;
+    border-bottom: 1px solid var(--border-primary);
+    cursor: pointer;
+}
+.syscall-row:hover {
+    background: var(--bg-card-hover);
+}
+.syscall-row:focus-visible {
+    outline: 1px solid var(--accent-cyan);
+    outline-offset: -1px;
+}
+.syscall-row.selected {
+    background: rgba(var(--accent-cyan-rgb), 0.12);
+}
+.syscall-row-name {
+    overflow: hidden;
+    color: var(--text-primary);
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+.syscall-row-module {
+    color: var(--text-muted);
+}
+.syscall-row-num {
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+}
+
+/* The detail panel, the deviations and the known hooks: panels as the Rizin tab has them */
+.syscall-panel {
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+    padding: 8px 10px;
+    background: var(--bg-card);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+}
+.syscall-panel-head {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+    margin-bottom: 6px;
+}
+.syscall-panel-title {
+    display: flex;
+    align-items: center;
+    margin: 0;
+    font-size: 10.5px;
+    font-weight: 600;
+    letter-spacing: .1em;
+    white-space: nowrap;
+    color: var(--accent-cyan);
+}
+.syscall-panel-note {
+    min-width: 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.syscall-panel-body {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow: auto;
+}
+.syscall-detail-body {
+    flex: 1 1 0;
+    min-height: 0;
+    overflow-x: hidden;
+    overflow-y: auto;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+.syscall-empty-error {
+    color: var(--severity-critical);
+}
+.syscall-muted {
+    color: var(--text-muted);
+}
+.syscall-detail-name {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 8px;
+    font-family: var(--font-mono);
+}
+.syscall-detail-sc {
+    min-width: 0;
+    font-size: 14px;
+    font-weight: 600;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+}
+.syscall-detail-state {
+    padding: 1px 6px;
+    font-size: 10px;
+    letter-spacing: .08em;
+    text-transform: uppercase;
+    color: var(--text-primary);
+    border: 1px solid var(--border-accent);
+    border-radius: var(--radius);
+}
+.syscall-detail-note {
+    margin: 6px 0;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.syscall-facts {
+    display: grid;
+    grid-template-columns: max-content minmax(0, 1fr);
+    gap: 2px 12px;
+    margin: 0 0 8px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+}
+.syscall-facts dt {
+    color: var(--text-muted);
+}
+.syscall-facts dd {
+    margin: 0;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+}
+.syscall-owner {
+    font-weight: 600;
+}
+.syscall-owner-private {
+    color: var(--syscall-patched);
+}
+.syscall-owner-unresolved {
+    color: var(--syscall-diverged);
+}
+.syscall-finding {
+    margin: 0 0 10px;
+    padding: 6px 8px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-left: 3px solid var(--syscall-diverged);
+    border-radius: var(--radius);
+}
+.syscall-finding-intact {
+    border-left-color: var(--syscall-intact);
+}
+.syscall-finding-hooked {
+    border-left-color: var(--syscall-hooked);
+}
+.syscall-finding-patched {
+    border-left-color: var(--syscall-patched);
+}
+.syscall-finding-unreadable {
+    border-left-color: var(--syscall-unreadable);
+}
+.syscall-finding-help {
+    margin-bottom: 6px;
+    font-size: 11.5px;
+}
+.syscall-number-differs {
+    color: var(--syscall-patched);
+}
+.syscall-known-hook {
+    margin: 6px 0 0;
+    padding-top: 6px;
+    border-top: 1px dashed var(--border-primary);
+    font-size: 11.5px;
+    color: var(--text-primary);
+}
+.syscall-section {
+    margin: 0 0 10px;
+}
+.syscall-section-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 4px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: .1em;
+    color: var(--text-muted);
+}
+.syscall-stub-line {
+    display: flex;
+    align-items: baseline;
+    gap: 10px;
+    margin-bottom: 2px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+}
+.syscall-stub-label {
+    flex: 0 0 52px;
+    color: var(--text-muted);
+}
+.syscall-bytes {
+    min-width: 0;
+    letter-spacing: .06em;
+    color: var(--text-secondary);
+    overflow-wrap: anywhere;
+}
+/* A byte that differs is marked by more than its colour: heavier, and underlined */
+.syscall-bytes-diff {
+    padding: 0 1px;
+    font-weight: 700;
+    color: var(--text-primary);
+    text-decoration: underline;
+    background: rgba(var(--severity-medium-rgb), 0.25);
+}
+.syscall-stub-note {
+    margin-top: 2px;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.syscall-signature {
+    margin: 0;
+    padding: 6px 8px;
+    font-family: var(--font-mono);
+    font-size: 11.5px;
+    color: var(--text-primary);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+}
+.syscall-links {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    margin-top: 4px;
+}
+.syscall-links a.btn {
+    text-decoration: none;
+}
+.syscall-link {
+    padding: 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--accent-cyan);
+    text-align: left;
+    background: none;
+    border: 0;
+    cursor: pointer;
+}
+.syscall-link:hover {
+    text-decoration: underline;
+}
+.syscall-deviations .view-table tr.selected td {
+    background: rgba(var(--accent-cyan-rgb), 0.12);
+}
+.syscall-deviations .syscall-bytes {
+    letter-spacing: 0;
+}
+/* the bytes of a row give way to the jump target and the score, the whole of them is in the title */
+.syscall-deviations .view-table-clip {
+    max-width: 9em;
+}
+.syscall-flag {
+    padding: 0 4px;
+    font-size: 10px;
+    color: var(--syscall-patched);
+    border: 1px solid var(--syscall-patched);
+    border-radius: var(--radius);
+}
+.syscall-known {
+    color: var(--syscall-hooked);
+    cursor: help;
+}
+.syscall-hooks .syscall-notice {
+    margin-bottom: 6px;
+}
+.syscall-hook-capture {
+    margin-top: 8px;
+    padding: 6px 8px;
+    background: rgba(var(--severity-medium-rgb), 0.08);
+    border-left: 3px solid var(--severity-medium);
+    border-radius: var(--radius);
+}
+.syscall-hook-warning {
+    margin: 0 0 6px;
+    font-size: 11.5px;
+    color: var(--text-secondary);
+}
+.syscall-hook-warning strong {
+    color: var(--text-primary);
+}
+.syscall-hook-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+.syscall-hook-actions .btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+/* The rule draft: shown as text; applying it (this VM, now) and downloading it (the repo, for good) are two blocks */
+.syscall-draft {
+    flex: 0 1 auto;
+    max-height: 60%;
+    margin-top: 8px;
+    overflow-y: auto;
+}
+.syscall-draft[hidden] {
+    display: none;
+}
+.syscall-draft-card {
+    padding-top: 8px;
+    border-top: 1px solid var(--border-primary);
+}
+.syscall-draft-name {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--text-primary);
+    overflow-wrap: anywhere;
+}
+.syscall-draft-meta {
+    margin-bottom: 4px;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+.syscall-draft-text {
+    max-height: 200px;
+    margin: 0 0 6px;
+    padding: 6px 8px;
+    overflow: auto;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--text-primary);
+    white-space: pre;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-radius: var(--radius);
+}
+.syscall-draft-hint {
+    margin: 0 0 6px;
+    font-size: 11.5px;
+    color: var(--text-secondary);
+}
+.syscall-draft-actions {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+.syscall-draft-action {
+    padding: 6px 8px;
+    background: var(--bg-secondary);
+    border: 1px solid var(--border-primary);
+    border-left-width: 3px;
+    border-radius: var(--radius);
+}
+.syscall-draft-action p {
+    margin: 0 0 6px;
+    font-size: 11.5px;
+    color: var(--text-secondary);
+}
+.syscall-draft-action-title {
+    margin-bottom: 2px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: .1em;
+    color: var(--text-primary);
+}
+.syscall-draft-vm {
+    border-left-color: var(--severity-medium);
+}
+.syscall-draft-repo {
+    border-left-color: var(--accent-green);
+}
+.syscall-draft-action a.btn {
+    display: inline-block;
+    text-decoration: none;
+}
+.syscall-draft-result {
+    margin-top: 6px;
+    padding: 4px 8px;
+    font-size: 11.5px;
+    color: var(--text-secondary);
+    border-left: 3px solid var(--border-accent);
+    overflow-wrap: anywhere;
+}
+.syscall-draft-result-ok {
+    border-left-color: var(--accent-green);
+}
+.syscall-draft-result-info {
+    border-left-color: var(--severity-info);
+}
+.syscall-draft-result-warn {
+    border-left-color: var(--severity-medium);
+}
+.syscall-draft-result-error {
+    border-left-color: var(--severity-critical);
+    color: var(--severity-critical);
 }

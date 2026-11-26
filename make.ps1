@@ -385,6 +385,14 @@ switch ($Target) {
         try {
             Copy-Item 'webui\app.py' -Destination 'C:\DetonationChamberUI\app.py' -ToSession $s -Force
             Copy-Item 'webui\memory_evidence.py' -Destination 'C:\DetonationChamberUI\memory_evidence.py' -ToSession $s -Force
+            Copy-Item 'webui\syscall_baseline.py' -Destination 'C:\DetonationChamberUI\syscall_baseline.py' -ToSession $s -Force
+            Copy-Item 'webui\syscall_scan.py' -Destination 'C:\DetonationChamberUI\syscall_scan.py' -ToSession $s -Force
+            Copy-Item 'webui\syscall_rules.py' -Destination 'C:\DetonationChamberUI\syscall_rules.py' -ToSession $s -Force
+            Copy-Item 'webui\syscall_signatures.json' -Destination 'C:\DetonationChamberUI\syscall_signatures.json' -ToSession $s -Force
+            Copy-Item 'webui\win32_to_nt.py' -Destination 'C:\DetonationChamberUI\win32_to_nt.py' -ToSession $s -Force
+            Copy-Item 'webui\win32_to_nt.json' -Destination 'C:\DetonationChamberUI\win32_to_nt.json' -ToSession $s -Force
+            Copy-Item 'webui\binary_graph.py' -Destination 'C:\DetonationChamberUI\binary_graph.py' -ToSession $s -Force
+            Copy-Item 'webui\binary_graph_query.py' -Destination 'C:\DetonationChamberUI\binary_graph_query.py' -ToSession $s -Force
             Copy-Item 'webui\minidump_analysis.py' -Destination 'C:\DetonationChamberUI\minidump_analysis.py' -ToSession $s -Force
             Copy-Item 'webui\pipe_analysis.py' -Destination 'C:\DetonationChamberUI\pipe_analysis.py' -ToSession $s -Force
             Copy-Item 'webui\pipe_signatures.json' -Destination 'C:\DetonationChamberUI\pipe_signatures.json' -ToSession $s -Force
@@ -425,7 +433,7 @@ switch ($Target) {
             }
             # Install scripts for the tool updates, the logging set-up and the way out of ISOLATED
             Invoke-Command -Session $s -ScriptBlock { New-Item -ItemType Directory -Path 'C:\tdc\scripts' -Force | Out-Null }
-            foreach ($installScript in @(Get-ChildItem 'scripts' -Filter 'install-*.ps1') + @(Get-Item 'scripts\configure-logging.ps1', 'scripts\tdc-unisolate.ps1')) {
+            foreach ($installScript in @(Get-ChildItem 'scripts' -Filter 'install-*.ps1') + @(Get-Item 'scripts\configure-logging.ps1', 'scripts\tdc-unisolate.ps1', 'scripts\build-binary-graph.ps1')) {
                 Copy-Item $installScript.FullName -Destination "C:\tdc\scripts\$($installScript.Name)" -ToSession $s -Force
             }
             Write-Host "[deploy] Files synced successfully." -ForegroundColor Green
@@ -440,6 +448,14 @@ switch ($Target) {
         try {
             Copy-Item 'webui\app.py' -Destination 'C:\DetonationChamberUI\app.py' -ToSession $s -Force
             Copy-Item 'webui\memory_evidence.py' -Destination 'C:\DetonationChamberUI\memory_evidence.py' -ToSession $s -Force
+            Copy-Item 'webui\syscall_baseline.py' -Destination 'C:\DetonationChamberUI\syscall_baseline.py' -ToSession $s -Force
+            Copy-Item 'webui\syscall_scan.py' -Destination 'C:\DetonationChamberUI\syscall_scan.py' -ToSession $s -Force
+            Copy-Item 'webui\syscall_rules.py' -Destination 'C:\DetonationChamberUI\syscall_rules.py' -ToSession $s -Force
+            Copy-Item 'webui\syscall_signatures.json' -Destination 'C:\DetonationChamberUI\syscall_signatures.json' -ToSession $s -Force
+            Copy-Item 'webui\win32_to_nt.py' -Destination 'C:\DetonationChamberUI\win32_to_nt.py' -ToSession $s -Force
+            Copy-Item 'webui\win32_to_nt.json' -Destination 'C:\DetonationChamberUI\win32_to_nt.json' -ToSession $s -Force
+            Copy-Item 'webui\binary_graph.py' -Destination 'C:\DetonationChamberUI\binary_graph.py' -ToSession $s -Force
+            Copy-Item 'webui\binary_graph_query.py' -Destination 'C:\DetonationChamberUI\binary_graph_query.py' -ToSession $s -Force
             Copy-Item 'webui\minidump_analysis.py' -Destination 'C:\DetonationChamberUI\minidump_analysis.py' -ToSession $s -Force
             Copy-Item 'webui\pipe_analysis.py' -Destination 'C:\DetonationChamberUI\pipe_analysis.py' -ToSession $s -Force
             Copy-Item 'webui\pipe_signatures.json' -Destination 'C:\DetonationChamberUI\pipe_signatures.json' -ToSession $s -Force

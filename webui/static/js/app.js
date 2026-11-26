@@ -153,6 +153,10 @@ function onThemeChange() {
     _themeColorCache.clear();
     if (state.activeTab === 'graph') renderGraph();
     if (state.activeTab === 'tracing') renderRtraceTimeline();
+    if (state.activeTab === 'syscalls') {
+        renderSyscallMap();
+        renderBinaryGraph();
+    }
     renderDashboard();
     FileMapView.repaint();
 }
@@ -484,6 +488,7 @@ function switchTab(tabName) {
     if (tabName === 'rizin') {
         rizinTabShown();
     }
+    if (tabName === 'syscalls') syscallsTabShown();
 }
 
 // Fetch scanner/EMBER tool availability and update badges + dashboard state.
@@ -9623,9 +9628,7 @@ function renderDetonationPanels(data) {
     }
 
     // Memory scanning tab (beacon scanners + live-memory forensics + dumps)
-    const hasBeaconResults = data.hunt_sleeping_beacons || data.beaconeye
-        || data.aether || data.process_dump || data.exit_capture_result
-        || (data.network_beaconing && (data.network_beaconing.evidence_findings || []).length);
+    const hasBeaconResults = detHasMemoryResults(data);
     if (hasBeaconResults) {
         let body = '';
         // The aggregated, cross-source verdict comes first: it is what the
@@ -9682,6 +9685,9 @@ function renderDetonationPanels(data) {
         }
         if (data.process_dump) {
             body += renderProcessDumpBlock(data.process_dump);
+        }
+        if (data.syscalls) {
+            body += renderSyscallStageBlock(data.syscalls);
         }
         if (data.exit_capture_result) {
             body += renderExitCaptureBlock(data.exit_capture_result);
@@ -9741,10 +9747,12 @@ function renderDetonationPanels(data) {
                 // No aggregated block yet: fall back to the raw tool counts.
                 const raw = (data.hunt_sleeping_beacons?.suspicious_count || 0)
                     + (data.beaconeye?.beacons_found || 0);
+                const sys = data.syscalls && typeof data.syscalls === 'object' ? data.syscalls : null;
                 icon.innerHTML = raw > 0 ? '&#x26A0;' : '&#x2705;';
-                detail.textContent = raw > 0
+                detail.textContent = (raw > 0
                     ? `${raw} beacon indicator(s) found`
-                    : 'Scan complete — no beacons detected';
+                    : 'Scan complete — no beacons detected')
+                    + (sys && (sys.skipped || sys.error) ? ' · syscall stage skipped, see the Memory tab' : '');
             }
         }
     }
@@ -17012,7 +17020,7 @@ function firewallTabShown() {
 }
 
 // --- The decision toasts ---
-// A download from the chamber is blocked at once and then asked about (spec, "Der Download-Fall"). The deadline
+// A download from the chamber is blocked at once and then asked about (spec, the download case). The deadline
 // is the server's: when it runs out, the server keeps the block and fetches the file itself, whether a browser is
 // open or not. So the countdown only shows what is going to happen anyway; nothing here is the way the default
 // is taken, and a closed page changes no outcome. Every tab asks /pending (fwPendingPoll), and the FIREWALL
@@ -19565,6 +19573,86 @@ function renderProcessDumpBlock(pd) {
     });
     html += `</tbody></table>`;
     return html + _detRawButton('View Process Dump raw', pd);
+}
+
+// Whether a detonation has anything for its Memory tab. The syscall stage counts on its own, a stage that skipped
+// itself too: its reason belongs where the analyst looks for the memory results.
+function detHasMemoryResults(data) {
+    const d = data && typeof data === 'object' ? data : {};
+    return Boolean(d.hunt_sleeping_beacons || d.beaconeye || d.aether || d.process_dump || d.exit_capture_result
+        || d.syscalls
+        || (d.network_beaconing && (d.network_beaconing.evidence_findings || []).length));
+}
+
+// The syscall stage of a detonation (app.py _run_syscall_stage): the ntdll stubs of the process measured against
+// the baseline, and the stubs the process and the sample file carry. A stage that skipped itself says why; a
+// partial one says what it did not read. Names, owners and notes come from the process: all of it is escaped.
+function renderSyscallStageBlock(sc) {
+    let html = '<div class="det-sub-title" data-info="The ntdll syscall stubs of the process measured against the NTSleuth baseline of this build and view, and the stubs the process memory and the sample file carry. Diverged and unreadable stubs are not scored.">Syscalls &mdash; ntdll stubs against the baseline</div>';
+    if (!sc || typeof sc !== 'object') return '';
+    if (sc.skipped || sc.error) {
+        return html + `<div class="det-sub-value det-warn">Skipped: ${escapeHtml(String(sc.skipped || sc.error))}</div>`
+            + '<div class="det-sub-value muted">Nothing was measured, which is not evidence of being clean.</div>';
+    }
+    const counts = sc.counts && typeof sc.counts === 'object' ? sc.counts : {};
+    const num = v => (Number.isFinite(Number(v)) ? Number(v) : 0);
+    const chip = (label, value, cls) =>
+        `<span class="mem-chip ${cls || ''}"><span class="mem-chip-val">${escapeHtml(String(value))}</span>${escapeHtml(label)}</span>`;
+    const where = [sc.pid !== undefined && `PID ${sc.pid}`, sc.build && `build ${sc.build}`, sc.view && `view ${sc.view}`].filter(Boolean);
+    if (where.length) html += `<div class="det-sub-value muted">${escapeHtml(where.join(' · '))}</div>`;
+    html += '<div class="mem-chips">';
+    html += chip('intact', num(counts.intact));
+    if (num(counts.hooked)) html += chip('hooked (file-backed module)', num(counts.hooked), 'sev-medium');
+    if (num(counts.patched)) html += chip('patched', num(counts.patched), 'sev-high');
+    if (num(sc.renumbered)) html += chip('renumbered', num(sc.renumbered), 'sev-high');
+    if (num(counts.diverged)) html += chip('diverged, not scored', num(counts.diverged), 'sev-medium');
+    if (num(counts.unreadable)) html += chip('unreadable', num(counts.unreadable), 'sev-medium');
+    html += '</div>';
+    if (sc.partial) {
+        html += `<div class="det-sub-value det-warn">Partial: ${escapeHtml(String(sc.note || 'not every stub could be measured'))}. `
+            + 'What was not read is not evidence of being clean.</div>';
+    } else if (sc.note) {
+        html += `<div class="det-sub-value muted">${escapeHtml(String(sc.note))}</div>`;
+    }
+    const stubs = sc.stubs && typeof sc.stubs === 'object' ? sc.stubs : {};
+    const search = (label, part) => {
+        if (!part || typeof part !== 'object') return '';
+        const hits = Array.isArray(part.hits) ? part.hits.length : 0;
+        let text = `${label}: ${hits} stub${hits === 1 ? '' : 's'} of its own`;
+        if (part.skipped) text += ` · not searched: ${part.skipped}`;
+        if (part.error) text += ` · failed: ${part.error}`;
+        else if (part.partial) text += ` · partial: ${part.note || 'not all of it could be read'}`;
+        if (hits && part.doors_complete === false && part.doors_note) text += ` · no proof: ${part.doors_note}`;
+        return `<div class="det-sub-value ${hits || part.partial || part.error ? 'det-warn' : 'muted'}">${escapeHtml(text)}</div>`;
+    };
+    html += search('Process memory', stubs.process) + search('Sample file', stubs.file);
+
+    const devs = (Array.isArray(sc.deviations) ? sc.deviations : []).filter(d => d && typeof d === 'object');
+    if (devs.length) {
+        const rank = d => (Object.prototype.hasOwnProperty.call(SYSCALL_SEVERITY_RANK, d.state) ? SYSCALL_SEVERITY_RANK[d.state] : 2);
+        html += '<div class="mem-section-label">Deviations</div>';
+        html += '<table class="mem-dump-table" data-sortable data-sort-id="det-syscall-deviations"><thead><tr>'
+            + '<th>syscall</th><th>state</th><th>jump target</th><th>pattern</th><th>note</th></tr></thead><tbody>';
+        devs.slice().sort((a, b) => rank(a) - rank(b)).slice(0, 50).forEach(d => {
+            const state = String(d.state ?? '');
+            const cls = state === 'patched' ? 'sev-high' : state === 'unreadable' ? '' : 'sev-medium';
+            const notes = [];
+            const relay = Array.isArray(d.relay) ? d.relay.filter(h => h && typeof h === 'object') : [];
+            if (relay.length) {
+                notes.push('via relay ' + relay.map(h => `${syscallHex(h.address)} (${h.owner || 'unresolved'}${h.pattern ? ', ' + h.pattern : ''})`).join(' → '));
+            }
+            if (d.number_matches === false) notes.push(`loads number ${syscallHex(d.live_number)} of another syscall, the baseline has ${syscallHex(d.number)}`);
+            if (state === 'hooked' && d.allowlisted === true) notes.push('on the hook allowlist, not scored');
+            html += '<tr>'
+                + `<td>${escapeHtml(String(d.name ?? ''))}</td>`
+                + `<td><span class="mem-chip ${cls}">${escapeHtml(state)}</span></td>`
+                + `<td>${state === 'unreadable' ? '' : syscallOwnerHtml(d.target_owner)}</td>`
+                + `<td>${escapeHtml(String(d.pattern || ''))}</td>`
+                + `<td>${escapeHtml(notes.join('; '))}</td></tr>`;
+        });
+        html += '</tbody></table>';
+    }
+    return html + _detRawButton('View Syscalls raw', sc);
 }
 
 // --- On-demand scans from the process views ---
@@ -26330,4 +26418,3628 @@ async function rizinCheckInstalled() {
         rizinSetUi('not-installed', { path: typeof r.data.path === 'string' ? r.data.path : null });
     }
     return !!r.data.installed;
+}
+
+// =============================================
+// SYSCALLS
+// =============================================
+// The map of every syscall of ntdll.dll and win32u.dll: one cell per syscall in
+// the order of its number, a band per module (/api/syscalls/...). Without a scan
+// the cells show the baseline and the map is the catalog; after a scan each
+// cell carries the state the stub was measured in. Names, owners and notes
+// come from the baseline and from the target process, so they are escaped or
+// set as text. The map is drawn on canvas, colours through themeColor(); the
+// cells keep their place whatever the filter says, which only dims them.
+const SYSCALL_STATES = ['intact', 'hooked', 'patched', 'diverged', 'unreadable'];
+const SYSCALL_STATE_COLORS = {
+    intact: '--syscall-intact', hooked: '--syscall-hooked', patched: '--syscall-patched',
+    diverged: '--syscall-diverged', unreadable: '--syscall-unreadable',
+};
+const SYSCALL_STATE_HELP = {
+    intact: 'The stub is as the baseline has it.',
+    hooked: 'hooked (file-backed module): the jump ends in a loaded module other than ntdll that a file backs. An EDR does that, ' +
+            'but so does a DLL the sample loaded, or a legitimate DLL it overwrote in place (module stomping), which this scan cannot tell apart.',
+    patched: 'The jump ends in memory no hooking product explains: private memory, a section no file backs or a mapped view of a file, ' +
+             'after any relay was followed, or a core Windows module such as kernelbase.dll (a code cave), or ntdll itself reached through such a relay.',
+    diverged: 'The bytes differ, but the jump is not into a foreign module and not into private memory, or its target cannot be resolved. Not guessed at.',
+    unreadable: 'No stub could be read.',
+};
+const SYSCALL_MODULES = ['ntdll.dll', 'win32u.dll'];
+const SYSCALL_WIN32U_TITLE = 'win32u stubs exist only in GUI processes, so a scan leaves them out unless asked for';
+// Where a syscall is documented, and where the modules are that Rizin opens
+const SYSCALL_DOC_URL = 'https://ntdoc.m417z.com/';
+// WinGraph, a dependency graph of the System32 binaries: only its root is linked, it has no address for one module
+const SYSCALL_WINGRAPH_URL = 'https://wingraph.m0n1x90.dev/';
+const SYSCALL_SYSTEM_DIR = 'C:\\Windows\\System32\\';
+// Below this width the map and the detail panel share the room as two panes
+const SYSCALL_NARROW = '(max-width: 1399px)';
+const SYSCALL_PANE_NAMES = ['map', 'detail'];
+// The deviations list begins with the loudest; a state this tab does not know ranks as diverged
+const SYSCALL_SEVERITY_RANK = { patched: 0, hooked: 1, diverged: 2, unreadable: 3 };
+// The map in px: a cell and the gap between cells, the room around the grid for the ring of the outer
+// cells, the ring a patched or diverged cell gets and its alpha; the alpha of the baseline tone (no scan)
+// and of a cell the filter does not match
+// `reach`: how far a ring of a cell reaches beyond it; what a repaint of one cell clears and draws again
+const SYSCALL_MAP = { cell: 10, gap: 2, pad: 3, halo: 2, haloAlpha: 0.35, baseline: 0.75, dim: 0.18, reach: 3 };
+// The catalog under the map lists this many rows of the filtered baseline; /baseline pages hold at most SYSCALL_PAGE
+const SYSCALL_ROWS_MAX = 300;
+const SYSCALL_PAGE = 500;
+const SYSCALL_POLL_MS = 4000;
+
+// The syscalls grouped by module, the modules in SYSCALL_MODULES order and the others after them, each band by number
+function syscallBands(items) {
+    const byModule = new Map();
+    for (const item of items) {
+        const key = String(item.module || '').toLowerCase();
+        if (!byModule.has(key)) byModule.set(key, []);
+        byModule.get(key).push(item);
+    }
+    const known = SYSCALL_MODULES.filter(m => byModule.has(m));
+    const others = [...byModule.keys()].filter(m => !SYSCALL_MODULES.includes(m)).sort();
+    return [...known, ...others].map(module => ({
+        module, items: byModule.get(module).slice().sort((a, b) => a.number - b.number),
+    }));
+}
+
+// Where the cells of a band of `count` go in a canvas `width` px wide: rows from the left, a whole number of columns
+function syscallBandLayout(count, width) {
+    const { cell, gap, pad } = SYSCALL_MAP;
+    const pitch = cell + gap;
+    const cols = Math.max(1, Math.floor((width - 2 * pad + gap) / pitch));
+    const rows = count > 0 ? Math.ceil(count / cols) : 0;
+    return { cols, rows, cell, pitch, pad, count, width, height: rows > 0 ? rows * pitch - gap + 2 * pad : 0 };
+}
+
+function syscallCellOrigin(layout, index) {
+    return { x: layout.pad + (index % layout.cols) * layout.pitch,
+             y: layout.pad + Math.floor(index / layout.cols) * layout.pitch };
+}
+
+// The index of the cell at a point of the canvas; -1 in a gap, outside the grid and past the last cell
+function syscallCellAt(layout, x, y) {
+    const dx = x - layout.pad, dy = y - layout.pad;
+    if (dx < 0 || dy < 0) return -1;
+    const col = Math.floor(dx / layout.pitch), row = Math.floor(dy / layout.pitch);
+    if (col >= layout.cols || dx - col * layout.pitch >= layout.cell || dy - row * layout.pitch >= layout.cell) return -1;
+    const index = row * layout.cols + col;
+    return index < layout.count ? index : -1;
+}
+
+// How a cell is drawn. Without a measurement (state null or undefined) it is the baseline tone: the colour of an
+// intact stub, held back, so a map that was never scanned draws no eye. A measured intact stub is that colour in
+// full; every deviation is a colour of its own, and patched, diverged and unreadable get a ring in the gap around
+// the cell (a stub that reads as zeros is tampering, not absence).
+// A state the server does not send counts as diverged, never as quiet. `dimmed`: the filter does not match.
+function syscallCellLook(state, dimmed) {
+    let look;
+    if (state === null || state === undefined) {
+        look = { state: 'intact', alpha: SYSCALL_MAP.baseline, halo: 0, hollow: false, loud: false };
+    } else {
+        const known = Object.prototype.hasOwnProperty.call(SYSCALL_STATE_COLORS, state) ? state : 'diverged';
+        look = {
+            state: known, alpha: 1, loud: known !== 'intact',
+            halo: known === 'patched' || known === 'diverged' || known === 'unreadable' ? SYSCALL_MAP.halo : 0,
+            hollow: known === 'unreadable',
+        };
+    }
+    if (dimmed) look = { ...look, alpha: SYSCALL_MAP.dim, halo: 0, loud: false };
+    look.color = SYSCALL_STATE_COLORS[look.state];
+    return look;
+}
+
+// The colour of a state from the theme; a state the server does not send reads as diverged
+function syscallStateColor(state, alpha) {
+    const known = Object.prototype.hasOwnProperty.call(SYSCALL_STATE_COLORS, state) ? state : 'diverged';
+    return themeColor(SYSCALL_STATE_COLORS[known], alpha);
+}
+
+// One band onto its canvas context (in CSS px). model: states (Map name → state, or null without a scan), match
+// (Set of the names the filter matches, or null for all), selected and hover (names). The quiet cells first and
+// the deviations after them, so no neighbour paints over a ring.
+// `only`: the indexes of the cells that changed (a hover moved). Then nothing but their surroundings is drawn
+// again: a cell's rings reach SYSCALL_MAP.reach px beyond it, so the square of that reach round the cell is
+// cleared and drawn again (clipped to it) from the cell and the eight round it, which are all that touch it.
+function syscallDrawBand(ctx, layout, cells, model, only) {
+    const { states, match, selected, hover } = model;
+    const size = layout.cell;
+    const lookOf = i => syscallCellLook(states ? states.get(cells[i].name) : null,
+                                        match !== null && match !== undefined && !match.has(cells[i].name));
+    const paint = indexes => {
+        const looks = indexes.map(lookOf);
+        for (const pass of [false, true]) {
+            for (let k = 0; k < indexes.length; k++) {
+                const look = looks[k];
+                if (look.loud !== pass) continue;
+                const { x, y } = syscallCellOrigin(layout, indexes[k]);
+                ctx.globalAlpha = look.alpha;
+                if (look.halo) {
+                    ctx.fillStyle = syscallStateColor(look.state, SYSCALL_MAP.haloAlpha);
+                    ctx.fillRect(x - look.halo, y - look.halo, size + 2 * look.halo, size + 2 * look.halo);
+                }
+                if (look.hollow) {
+                    ctx.strokeStyle = syscallStateColor(look.state);
+                    ctx.lineWidth = 1;
+                    ctx.strokeRect(x + 0.5, y + 0.5, size - 1, size - 1);
+                } else {
+                    ctx.fillStyle = syscallStateColor(look.state);
+                    ctx.fillRect(x, y, size, size);
+                }
+            }
+        }
+        ctx.globalAlpha = 1;
+        for (const [name, color, width] of [[selected, '--text-primary', 2], [hover, '--text-secondary', 1]]) {
+            const index = name ? cells.findIndex(cell => cell.name === name) : -1;
+            if (index < 0 || (only !== undefined && !indexes.includes(index))) continue;
+            const { x, y } = syscallCellOrigin(layout, index);
+            ctx.strokeStyle = themeColor(color);
+            ctx.lineWidth = width;
+            ctx.strokeRect(x - 1.5, y - 1.5, size + 3, size + 3);
+        }
+    };
+    if (only === undefined) {
+        ctx.clearRect(0, 0, layout.width, layout.height);
+        paint(cells.map((_, i) => i));
+        return;
+    }
+    const reach = SYSCALL_MAP.reach, side = size + 2 * reach;
+    for (const index of new Set(only)) {
+        if (!(index >= 0 && index < cells.length)) continue;
+        const { x, y } = syscallCellOrigin(layout, index);
+        const near = [], col = index % layout.cols, row = Math.floor(index / layout.cols);
+        for (let r = row - 1; r <= row + 1; r++) {
+            for (let c = col - 1; c <= col + 1; c++) {
+                const i = r * layout.cols + c;
+                if (r >= 0 && c >= 0 && c < layout.cols && i < cells.length) near.push(i);
+            }
+        }
+        ctx.save();
+        ctx.beginPath();
+        ctx.rect(x - reach, y - reach, side, side);
+        ctx.clip();
+        ctx.clearRect(x - reach, y - reach, side, side);
+        paint(near);
+        ctx.restore();
+    }
+}
+
+// A syscall number as 0x3A
+function syscallHex(number) {
+    const n = Number(number);
+    return Number.isFinite(n) ? '0x' + Math.trunc(n).toString(16).toUpperCase().padStart(2, '0') : '?';
+}
+
+// The legend under the toolbar: each state with its count, `–` before a scan. `unscanned`: syscalls of the baseline
+// the measurement did not cover (win32u is left out unless asked for), which keep the baseline tone.
+function syscallMapLegendHtml(counts, unscanned) {
+    const measured = counts !== null && typeof counts === 'object';
+    let html = '';
+    for (const state of SYSCALL_STATES) {
+        const n = measured ? Number(counts[state]) : NaN;
+        html += `<span class="syscall-legend-item" title="${escapeHtml(SYSCALL_STATE_HELP[state])}">` +
+                `<span class="syscall-legend-dot syscall-state-${cssToken(state)}"></span>` +
+                `<span class="syscall-legend-name">${escapeHtml(state)}</span>` +
+                `<span class="syscall-legend-count">${Number.isFinite(n) ? n.toLocaleString('en-US') : '–'}</span></span>`;
+    }
+    if (measured && unscanned > 0) {
+        html += `<span class="syscall-legend-note">${Number(unscanned).toLocaleString('en-US')} not scanned</span>`;
+    }
+    return html;
+}
+
+// One row of the catalog under the map: the dot of its state, its name, its module and its number. `state` is
+// the measured state, absent without a scan; `selected` marks the chosen syscall.
+function syscallRowHtml(entry) {
+    const name = String(entry.name === null || entry.name === undefined ? '' : entry.name);
+    const state = entry.state ? String(entry.state) : '';
+    const module = String(entry.module || '').replace(/\.dll$/i, '');
+    return `<button type="button" class="syscall-row${entry.selected ? ' selected' : ''}"${entry.selected ? ' aria-current="true"' : ''} ` +
+           `data-name="${escapeHtml(name)}" ` +
+           `aria-label="${escapeHtml(`${name}, ${state || 'not scanned'}`)}" onclick="syscallSelect(${jsArg(name)})">` +
+           `<span class="syscall-row-dot syscall-state-${cssToken(state || 'baseline')}" title="${escapeHtml(state || 'not scanned')}"></span>` +
+           `<span class="syscall-row-name">${escapeHtml(name)}</span>` +
+           `<span class="syscall-row-module">${escapeHtml(module)}</span>` +
+           `<span class="syscall-row-num" title="${escapeHtml(entry.number)}">${escapeHtml(syscallHex(entry.number))}</span>` +
+           `</button>`;
+}
+
+// A query that reads as a number: decimal, or hex with or without 0x (the server's catalog reads it so too)
+function syscallNumberOf(query) {
+    if (/^[0-9]+$/.test(query)) return parseInt(query, 10);
+    if (/^(0x)?[0-9a-f]+$/i.test(query)) return parseInt(query.replace(/^0x/i, ''), 16);
+    return null;
+}
+
+// Whether the filter matches a syscall: its module, and its name or its number
+function syscallMatches(item, query, module) {
+    const wanted = String(module || '').trim().toLowerCase();
+    if (wanted && String(item.module || '').toLowerCase() !== wanted) return false;
+    const text = String(query || '').trim();
+    if (!text) return true;
+    return String(item.name).toLowerCase().includes(text.toLowerCase()) || item.number === syscallNumberOf(text);
+}
+
+// The names the filter matches, or null when there is no filter and every cell matches
+function syscallMatchSet(items, query, module) {
+    if (!String(query || '').trim() && !String(module || '').trim()) return null;
+    return new Set(items.filter(item => syscallMatches(item, query, module)).map(item => item.name));
+}
+
+// What each view the host needs stands at, from /api/syscalls/status. An arm64 host measures arm64 processes and
+// emulated x64 ones, each against its own view's baseline; an x64 host has the one. ready: the baseline of this
+// build is there; extracting; indistinguishable: the x64 binary under emulation saw the arm64 view, so that
+// extraction was discarded on purpose (not a failure of NTSleuth, and no baseline either); failed; stale: only
+// the baseline of another build; unusable: a file that cannot be read; missing.
+function syscallViewStates(status) {
+    const known = status && typeof status === 'object' ? status : {};
+    const views = known.default_view === 'arm64' ? ['arm64', 'x64'] : ['x64'];
+    const baselines = Array.isArray(known.baselines) ? known.baselines : [];
+    const extraction = known.extraction || {};
+    const running = Array.isArray(extraction.running) ? extraction.running : [];
+    const failed = Array.isArray(extraction.failed) ? extraction.failed : [];
+    return views.map(view => {
+        const ofView = baselines.filter(b => b.view === view);
+        const current = ofView.find(b => b.current);
+        if (current && current.error) {
+            return { view, state: 'unusable', text: `The baseline file ${current.file || ''} cannot be read: ${current.error}` };
+        }
+        if (current) return { view, state: 'ready', text: `Build ${current.build}` };
+        if (running.some(r => r.view === view)) {
+            return { view, state: 'extracting', text: 'NTSleuth is extracting the baseline; this takes a few seconds.' };
+        }
+        const failure = failed.find(f => f.view === view && (!known.build || f.build === known.build));
+        if (failure && failure.indistinguishable) {
+            return { view, state: 'indistinguishable',
+                     text: `ntsleuth-${view}.exe under emulation produced the same view as the native arm64 one, so the ${view} ` +
+                           `baseline was discarded instead of measuring against a wrong reference. Emulated ${view} processes ` +
+                           'cannot be measured on this host.' };
+        }
+        if (failure) return { view, state: 'failed', text: `The extraction failed: ${failure.reason}` };
+        if (ofView.length) {
+            return { view, state: 'stale',
+                     text: `The baseline is of build ${ofView[0].build}, this system is build ${known.build || 'unknown'}.` };
+        }
+        const exe = known.executables && known.executables[view] === false && known.installed
+            ? ` ntsleuth-${view}.exe is not installed.` : '';
+        return { view, state: 'missing',
+                 text: known.installed === false ? 'No baseline. Install NTSleuth to extract one.'
+                                                 : `No baseline for build ${known.build || 'unknown'} yet.${exe}` };
+    });
+}
+
+// The notices over the map: NTSleuth missing, each view that has no baseline (and why), an incomplete parameter table
+function syscallNotices(status, baseline) {
+    const notices = [];
+    if (status && status.installed === false) {
+        notices.push({ kind: 'not-installed', tone: 'warn', title: 'NTSleuth not installed',
+                       text: status.path ? `Expected in ${status.path}. Baselines that exist already still work.` : '' });
+    }
+    const titles = { extracting: 'extracting the baseline', indistinguishable: 'not distinguishable on this host',
+                     failed: 'extraction failed', stale: 'baseline of another build', unusable: 'baseline unusable',
+                     missing: 'no baseline' };
+    const tones = { extracting: 'info', failed: 'error', unusable: 'error' };
+    if (status) {
+        for (const v of syscallViewStates(status)) {
+            if (v.state === 'ready') continue;
+            notices.push({ kind: v.state, tone: tones[v.state] || 'warn', title: `${v.view}: ${titles[v.state]}`, text: v.text });
+        }
+    }
+    if (baseline && baseline.symbols === false) {
+        notices.push({ kind: 'symbols', tone: 'info', title: 'Parameter table incomplete',
+                       text: 'This baseline was extracted without the symbol server. Numbers, RVAs and stub bytes come ' +
+                             'from the disassembly, so the measurement is not affected.' });
+    }
+    return notices;
+}
+
+function syscallNoticesHtml(notices) {
+    return notices.map(n => `<div class="syscall-notice syscall-notice-${cssToken(n.tone)} syscall-notice-${cssToken(n.kind)}">` +
+        `<span class="syscall-notice-title">${escapeHtml(n.title)}</span>` +
+        (n.text ? `<span class="syscall-notice-text">${escapeHtml(n.text)}</span>` : '') + '</div>').join('');
+}
+
+// The line under the tab's title: the stock of the baseline
+function syscallSubtitle(baseline) {
+    if (!baseline || !baseline.items) return 'Syscall baseline and live stub measurement';
+    const total = baseline.items.length;
+    const parts = [`${total.toLocaleString('en-US')} syscall${total === 1 ? '' : 's'}`];
+    for (const band of syscallBands(baseline.items)) parts.push(`${band.module} ${band.items.length.toLocaleString('en-US')}`);
+    if (baseline.build) parts.push(`build ${baseline.build}`);
+    if (baseline.view) parts.push(baseline.view);
+    return parts.join(' · ');
+}
+
+// The <option>s of the target picker: the running processes the UI knows, by name and PID. An exited instance
+// (its PID may be reused) and anything whose PID is no number is left out.
+function syscallTargetsHtml(processes, selected) {
+    const targets = [];
+    for (const proc of Object.values(processes && typeof processes === 'object' ? processes : {})) {
+        if (!proc || proc.exit_time || String(proc.key === undefined ? '' : proc.key).includes('@')) continue;
+        const pid = /^[0-9]+$/.test(String(proc.pid)) ? parseInt(proc.pid, 10) : 0;
+        if (pid > 0) targets.push({ pid, name: String(proc.name || proc.image || 'unknown') });
+    }
+    targets.sort((a, b) => a.name.toLowerCase().localeCompare(b.name.toLowerCase()) || a.pid - b.pid);
+    return '<option value="">-- select a process --</option>' + targets.map(t =>
+        `<option value="${t.pid}"${String(t.pid) === String(selected) ? ' selected' : ''}>${escapeHtml(t.name)} (${t.pid})</option>`).join('');
+}
+
+// The line a scan leaves under the toolbar, as text
+function syscallScanSummary(scan) {
+    const counts = scan.counts || {};
+    const total = SYSCALL_STATES.reduce((sum, s) => sum + (Number(counts[s]) || 0), 0);
+    const deviations = total - (Number(counts.intact) || 0);
+    const unreadable = Number(counts.unreadable) || 0;
+    const name = String(scan.process || '').split(/[\\/]/).pop();
+    let text = `PID ${scan.pid}` + (name ? ` (${name})` : '');
+    if (scan.view) text += ` · ${scan.view}`;
+    if (scan.build) text += ` · build ${scan.build}`;
+    // an unreadable stub is one nobody read: a scan of nothing else measured nothing and found no deviation
+    text += total === 0 ? ': no stub measured'
+        : total === unreadable ? `: no stub could be read (${unreadable.toLocaleString('en-US')} unreadable)`
+        : `: ${deviations === 0 ? 'no deviations' : `${deviations} deviation${deviations === 1 ? '' : 's'}`} of ${total.toLocaleString('en-US')} stubs`;
+    const evidence = scan.evidence;
+    if (evidence && evidence.label) {
+        text += ` · ${evidence.label}` + (typeof evidence.score === 'number' ? ` ${evidence.score.toFixed(2)}` : '');
+    }
+    if (scan.note) text += ` · ${scan.note}`;
+    else if (scan.partial) text += ' · partial result';
+    return text;
+}
+
+// --- The detail panel, the deviation list and the rule draft: markup from what the baseline, the target and a
+// drafted rule hold. Every string of them goes through escapeHtml; a rule is shown as text, never as markup. ---
+
+// A hex string as its bytes ('4c8b' → ['4c', '8b']); null for anything that is not whole bytes of hex
+function syscallBytesOf(hex) {
+    const text = typeof hex === 'string' ? hex.trim().toLowerCase() : '';
+    return /^(?:[0-9a-f]{2})+$/.test(text) ? text.match(/../g) : null;
+}
+
+// The bytes of `own` as markup, the runs that differ from `other` marked and the rest plain. Without an `other`
+// (null, or not hex) nothing is marked; a byte past the end of `other` differs. '' for what is not bytes.
+function syscallBytesHtml(own, other) {
+    const mine = syscallBytesOf(own);
+    if (!mine) return '';
+    const theirs = syscallBytesOf(other);
+    const runs = [];
+    mine.forEach((byte, i) => {
+        const differs = theirs !== null && byte !== theirs[i];
+        const last = runs[runs.length - 1];
+        if (last && last.differs === differs) last.text += byte;
+        else runs.push({ differs, text: byte });
+    });
+    return runs.map(r => `<span class="syscall-bytes-${r.differs ? 'diff' : 'same'}">${escapeHtml(r.text)}</span>`).join('');
+}
+
+// How many bytes of `a` and `b` differ, over the longer of the two; 0 when either is not bytes
+function syscallBytesDiffer(a, b) {
+    const left = syscallBytesOf(a), right = syscallBytesOf(b);
+    if (!left || !right) return 0;
+    let n = 0;
+    for (let i = 0; i < Math.max(left.length, right.length); i++) if (left[i] !== right[i]) n++;
+    return n;
+}
+
+// Who a jump goes to: a module by name, memory no file backs, a mapped view of a file, or nobody that could be found out
+function syscallOwnerHtml(owner) {
+    if (owner === 'private') return '<span class="syscall-owner syscall-owner-private">private</span> memory, no file backs it';
+    if (owner === 'mapped') return 'a <span class="syscall-owner syscall-owner-private">mapped view</span> of a file, no loaded module';
+    if (typeof owner === 'string' && owner) return `<span class="syscall-owner">${escapeHtml(owner)}</span>`;
+    return '<span class="syscall-owner syscall-owner-unresolved">unresolved</span>';
+}
+
+// The signature as one text to copy: the return type, the name and each parameter with its SAL annotation. A baseline
+// extracted without the symbol server has no parameters to list, which is not the same as none.
+function syscallSignature(sc) {
+    const name = String(sc.name ?? '');
+    const ret = String(sc.return_type || '?');
+    const params = Array.isArray(sc.parameters) ? sc.parameters.filter(p => p && typeof p === 'object') : [];
+    if (!params.length) return `${ret} ${name}(${sc.symbols === false ? '/* parameters unknown */' : 'VOID'});`;
+    const lines = params.map(p => '    ' + [p.sal_annotation, p.type, p.name]
+        .filter(v => v !== undefined && v !== null && v !== '').map(String).join(' '));
+    return `${ret} ${name}(\n${lines.join(',\n')}\n);`;
+}
+
+// One syscall as the detail panel shows it. `sc` is what /api/syscalls/<name> returns, with what a scan measured
+// of it (state, pattern, target_owner, expected, actual, number_matches, allowlisted) and what the panel knows
+// (symbols: false when the baseline was extracted without the symbol server; scanned: false when a scan did not
+// cover this syscall; rizin: true when it can be opened in Rizin, rizin_note: why not). Nothing of it is markup.
+function renderSyscallDetail(sc) {
+    if (!sc || typeof sc !== 'object') return '<p class="syscall-empty">Choose a syscall on the map or in the catalog.</p>';
+    const name = String(sc.name ?? '');
+    const state = typeof sc.state === 'string' ? sc.state : '';
+    const known = Object.prototype.hasOwnProperty.call(SYSCALL_STATE_COLORS, state);
+    const fact = (label, value) => `<dt>${label}</dt><dd>${value}</dd>`;
+    const hasNumber = sc.number !== undefined && sc.number !== null && Number.isFinite(Number(sc.number));
+    const facts = [];
+    facts.push(fact('Number', hasNumber ? `${escapeHtml(syscallHex(sc.number))} (${escapeHtml(sc.number)})` : escapeHtml(sc.number)));
+    facts.push(fact('Module', escapeHtml(sc.module)));
+    if (sc.rva !== undefined && sc.rva !== null) facts.push(fact('RVA', escapeHtml(syscallHex(sc.rva))));
+    if (sc.return_type) facts.push(fact('Returns', escapeHtml(sc.return_type)));
+    if (sc.calling_convention) facts.push(fact('Convention', escapeHtml(sc.calling_convention)));
+    if (sc.build || sc.view) facts.push(fact('Baseline', escapeHtml([sc.build && `build ${sc.build}`, sc.view].filter(Boolean).join(' · '))));
+
+    let html = `<div class="syscall-detail-name"><span class="syscall-row-dot syscall-state-${cssToken(state || 'baseline')}"></span>` +
+               `<span class="syscall-detail-sc">${escapeHtml(name)}</span>` +
+               (state ? `<span class="syscall-detail-state">${escapeHtml(state)}</span>` : '') + '</div>' +
+               `<dl class="syscall-facts">${facts.join('')}</dl>`;
+
+    if (sc.scanned === false) {
+        html += '<p class="syscall-detail-note">This syscall is not part of the last scan (win32u is left out unless it is asked for).</p>';
+    }
+    const jumps = state === 'hooked' || state === 'patched' || state === 'diverged';
+    if (state) {
+        let finding = `<div class="syscall-finding-help">${escapeHtml(known ? SYSCALL_STATE_HELP[state]
+            : 'A state this tab does not know: it is read as diverged and never as quiet.')}</div>`;
+        const rows = [];
+        if (jumps) {
+            rows.push(fact('Jump target', syscallOwnerHtml(sc.target_owner)));
+            const relay = Array.isArray(sc.relay) ? sc.relay.filter(h => h && typeof h === 'object') : [];
+            if (relay.length) {
+                rows.push(fact('Relay', relay.map(h => `${escapeHtml(syscallHex(h.address))} ${syscallOwnerHtml(h.owner)}` +
+                    (h.pattern ? ` (${escapeHtml(h.pattern)})` : ' (not read)')).join(' → ') +
+                    ' · the first jump lands here, and the owner above is where the relay leads'));
+            }
+            if (sc.pattern) rows.push(fact('Pattern', escapeHtml(sc.pattern)));
+            // number_matches is true, false or null: null is a jump over the prologue, which shows no number
+            if (sc.number_matches === true) rows.push(fact('Number', 'The live bytes carry the number of the baseline.'));
+            else if (sc.number_matches === false) rows.push(fact('Number', '<strong class="syscall-number-differs">The live bytes do NOT carry the number of the baseline: the stub names another syscall.</strong> That is a finding of its own.'));
+            else rows.push(fact('Number', 'The live bytes do not show a number: a jump overwrote the prologue.'));
+        }
+        if (rows.length) finding += `<dl class="syscall-facts">${rows.join('')}</dl>`;
+        if (state === 'hooked' && sc.allowlisted === true) {
+            finding += `<p class="syscall-known-hook">Known hook: ${syscallOwnerHtml(sc.target_owner)} is on the hook allowlist for this build and view, ` +
+                       'so this hook does not score. It stays listed on purpose: it is there, and a module that hooks ntdll in this process is worth knowing.</p>';
+        }
+        html += `<div class="syscall-finding syscall-finding-${cssToken(state)}">${finding}</div>`;
+    }
+
+    // the stub: the baseline's bytes as far as they are compared, and after a scan the bytes read, the differences marked
+    const baselineHex = typeof sc.expected === 'string' ? sc.expected : typeof sc.stub_hex === 'string' ? sc.stub_hex : '';
+    const baselineBytes = syscallBytesOf(baselineHex);
+    const prefix = Number(sc.prefix_len) > 0 && baselineBytes ? baselineBytes.slice(0, Number(sc.prefix_len)).join('') : baselineHex;
+    const measured = state !== '';
+    const readBytes = measured ? syscallBytesOf(sc.actual) : null;
+    const compared = syscallBytesOf(prefix) ? syscallBytesOf(prefix).length : 0;
+    if (compared) {
+        let stub = `<div class="syscall-stub-line"><span class="syscall-stub-label">baseline</span><code class="syscall-bytes" title="${escapeHtml(prefix)}">${syscallBytesHtml(prefix, readBytes ? sc.actual : null)}</code></div>`;
+        if (readBytes) {
+            stub += `<div class="syscall-stub-line"><span class="syscall-stub-label">read</span><code class="syscall-bytes" title="${escapeHtml(sc.actual)}">${syscallBytesHtml(sc.actual, prefix)}</code></div>`;
+        }
+        let note = `${compared} bytes compared`;
+        if (readBytes) {
+            const differ = syscallBytesDiffer(prefix, sc.actual);
+            note += differ ? `, ${differ} differ` : ', all alike';
+            if (state === 'unreadable') note += ' · the stub reads as zeros, or too short to compare: a page that is not paged in, or a wiped stub';
+        } else if (state === 'unreadable' || measured) {
+            note += ' · No bytes could be read.';
+        }
+        html += `<div class="syscall-section"><div class="syscall-section-title">STUB</div>${stub}<div class="syscall-stub-note">${escapeHtml(note)}</div></div>`;
+    } else if (measured && readBytes) {
+        html += `<div class="syscall-section"><div class="syscall-section-title">STUB</div><div class="syscall-stub-line"><span class="syscall-stub-label">read</span>` +
+                `<code class="syscall-bytes" title="${escapeHtml(sc.actual)}">${syscallBytesHtml(sc.actual, null)}</code></div></div>`;
+    }
+
+    const params = Array.isArray(sc.parameters) ? sc.parameters : [];
+    let rows = params.map((p, i) => {
+        const param = p && typeof p === 'object' ? p : {};
+        return `<tr><td class="view-table-num" data-sort-value="${i}">${i}</td><td>${escapeHtml(param.type)}</td>` +
+               `<td>${escapeHtml(param.name)}</td><td>${escapeHtml(param.sal_annotation)}</td></tr>`;
+    }).join('');
+    if (!params.length) {
+        const why = sc.symbols === false ? 'The parameter table of this baseline is incomplete: it was extracted without the symbol server.'
+                                         : 'This syscall takes no parameters.';
+        rows = `<tr data-sort-skip><td colspan="4" class="view-table-empty">${escapeHtml(why)}</td></tr>`;
+    }
+    html += '<div class="syscall-section"><div class="syscall-section-title">PARAMETERS</div><div class="view-table-wrap">' +
+            '<table class="view-table" data-sortable data-sort-id="syscall-params"><thead><tr><th>#</th><th>TYPE</th><th>NAME</th><th>SAL</th></tr></thead>' +
+            `<tbody>${rows}</tbody></table></div></div>`;
+    html += '<div class="syscall-section"><div class="syscall-section-title">SIGNATURE ' +
+            '<button type="button" class="btn btn-xs" onclick="syscallCopySignature()" title="Copy the signature">Copy</button></div>' +
+            `<pre class="syscall-signature">${escapeHtml(syscallSignature(sc))}</pre></div>`;
+
+    let links = '';
+    if (name) {
+        links += `<a class="btn btn-sm" href="${escapeHtml(SYSCALL_DOC_URL + encodeURIComponent(name).toLowerCase())}" target="_blank" ` +
+                 'rel="noopener noreferrer" title="Documentation on ntdoc.m417z.com (opens in a new tab, needs a network)">ntdoc</a> ';
+    }
+    links += `<a class="btn btn-sm" href="${escapeHtml(SYSCALL_WINGRAPH_URL)}" target="_blank" rel="noopener noreferrer" ` +
+             'title="WinGraph, a dependency graph of the System32 binaries. This opens the site at its root, not one module (it has no address for one); nothing is fetched from it.">WinGraph</a> ';
+    if (sc.rizin === true) {
+        links += '<button type="button" class="btn btn-sm" onclick="syscallOpenRizin()" title="Open the module in the RIZIN tab and go to this syscall">Open in Rizin</button>';
+    } else if (sc.rizin_note) {
+        links += `<span class="syscall-detail-note">${escapeHtml(sc.rizin_note)}</span>`;
+    }
+    if (links) html += `<div class="syscall-links">${links}</div>`;
+    return html;
+}
+
+// The deviations of a scan as a table, the loudest first. `list` is what /scan holds under `deviations`: every state
+// but intact, unreadable and diverged included, so a row is not always a finding. options: scanned (false: no scan
+// yet), selected (a name), scores (name → what the stub added to the evidence score). A hook the allowlist knows
+// stays in the list, with its owner, and says that it does not score: an EDR that hooks ntdll in this process is
+// something to see, even though it is not evidence.
+function renderSyscallDeviations(list, options) {
+    const opts = options && typeof options === 'object' ? options : {};
+    const scores = opts.scores && typeof opts.scores === 'object' ? opts.scores : {};
+    const rank = d => Object.prototype.hasOwnProperty.call(SYSCALL_SEVERITY_RANK, d.state)
+        ? SYSCALL_SEVERITY_RANK[d.state] : SYSCALL_SEVERITY_RANK.diverged;
+    const items = (Array.isArray(list) ? list : []).filter(d => d && typeof d === 'object')
+        .sort((a, b) => rank(a) - rank(b) || (Number(a.number) - Number(b.number)) || 0);
+    const drawable = d => (d.state === 'hooked' || d.state === 'patched' || d.state === 'diverged')
+        && d.allowlisted !== true && typeof d.actual === 'string' && d.actual !== '';
+    const rows = items.slice(0, SYSCALL_ROWS_MAX).map(d => {
+        const name = String(d.name ?? '');
+        const state = String(d.state ?? '');
+        const known = state === 'hooked' && d.allowlisted === true;
+        const own = Object.prototype.hasOwnProperty.call(scores, name) ? Number(scores[name]) : NaN;
+        let score;
+        if (known) {
+            score = '<td data-sort-value="0"><span class="syscall-known" title="This hook is on the hook allowlist for this build and view. ' +
+                    'It stays listed because it is there, but it does not score.">on the allowlist · not scored</span></td>';
+        } else if (Number.isFinite(own)) {
+            score = `<td class="view-table-num" data-sort-value="${own}">+${own.toFixed(2)}</td>`;
+        } else {
+            score = '<td class="view-table-num" data-sort-value="-1" title="Not scored: a patched stub and a hook that is not on the allowlist score, a diverged or unreadable stub does not">–</td>';
+        }
+        const bytes = (own, other) => (typeof own === 'string' && syscallBytesOf(own)
+            ? `<code class="syscall-bytes view-table-clip" title="${escapeHtml(own)}">${syscallBytesHtml(own, other)}</code>` : '<span class="syscall-muted">–</span>');
+        return `<tr${name === opts.selected ? ' class="selected"' : ''}>` +
+            `<td data-sort-value="${escapeHtml(name)}"><button type="button" class="syscall-link" onclick="syscallSelect(${jsArg(name)})">${escapeHtml(name)}</button>` +
+            (d.number_matches === false ? ' <span class="syscall-flag" title="The live bytes carry another syscall number than the baseline">number differs</span>' : '') + '</td>' +
+            `<td class="view-table-num" data-sort-value="${escapeHtml(d.number)}">${escapeHtml(syscallHex(d.number))}</td>` +
+            `<td data-sort-value="${rank(d)}"><span class="syscall-row-dot syscall-state-${cssToken(state)}"></span> ${escapeHtml(state)}</td>` +
+            `<td>${bytes(d.expected, d.actual)}</td><td>${bytes(d.actual, d.expected)}</td>` +
+            `<td title="${escapeHtml(d.pattern || '')}">${state === 'unreadable' ? '<span class="syscall-muted">–</span>' : syscallOwnerHtml(d.target_owner)}</td>` +
+            score +
+            `<td>${drawable(d) ? `<button type="button" class="btn btn-xs" onclick="syscallDraftRule(${jsArg(name)})" title="Draft a signature entry from this stub. Nothing is written.">Draft rule</button>` : ''}</td></tr>`;
+    });
+    if (!items.length) {
+        const why = opts.scanned === false ? 'Scan a process to list the stubs that deviate from the baseline.' : 'No deviations: every stub measured is as the baseline has it.';
+        rows.push(`<tr data-sort-skip><td colspan="8" class="view-table-empty">${escapeHtml(why)}</td></tr>`);
+    } else if (items.length > SYSCALL_ROWS_MAX) {
+        const more = `Showing the first ${SYSCALL_ROWS_MAX} of ${items.length.toLocaleString('en-US')}, the loudest first.`;
+        rows.push(`<tr data-sort-skip><td colspan="8" class="view-table-empty">${escapeHtml(more)}</td></tr>`);
+    }
+    return '<table class="view-table" data-sortable data-sort-id="syscall-deviations"><thead><tr><th>SYSCALL</th><th>NUMBER</th><th>STATE</th>' +
+           `<th>BASELINE</th><th>READ</th><th>JUMP TARGET</th><th>SCORE</th><th></th></tr></thead><tbody>${rows.join('')}</tbody></table>`;
+}
+
+// A rule that was drafted, as the panel shows it. `draft` is what /api/syscalls/rule answers: a YARA rule ({ name,
+// text, target }, kind 'yara' or none) or a signature entry ({ kind: 'signature', entry, text, target, covered_by }).
+// The text is the one thing in it that a sample writes, and it is set as text, never as markup. A draft only drafts:
+// a YARA rule is applied (written where Rustinel reads, now, on this VM) or downloaded (handed back for the repo, to
+// commit; that a committed rule is loaded again after a rebuild is not verified) by a press of its own button, and
+// the two say what they do. options: busy (an apply is
+// under way), note ({ tone, text }: what the last apply answered).
+function showSyscallRuleDraft(draft, options) {
+    const d = draft && typeof draft === 'object' ? draft : {};
+    const opts = options && typeof options === 'object' ? options : {};
+    const signature = d.kind === 'signature';
+    const name = String(d.name ?? '');
+    const text = String(d.text ?? '');
+    const target = String(d.target ?? '');
+    const title = signature ? String(d.entry && d.entry.family || 'Signature entry') : name || 'Rule';
+    let html = '<section class="syscall-draft-card" aria-label="Rule draft"><div class="syscall-panel-head"><h3 class="syscall-panel-title">RULE DRAFT</h3>' +
+               '<button type="button" class="btn btn-xs" onclick="syscallCopyDraft()" title="Copy the text of the draft">Copy</button>' +
+               '<button type="button" class="btn btn-xs" onclick="syscallCloseDraft()" title="Close the draft">Close</button></div>' +
+               `<div class="syscall-draft-name">${escapeHtml(title)}</div>` +
+               `<div class="syscall-draft-meta">${signature ? 'Signature entry' : 'YARA rule'}${target ? ` · ${escapeHtml(target)}` : ''}</div>` +
+               `<pre class="syscall-draft-text">${escapeHtml(text)}</pre>`;
+    const note = opts.note && typeof opts.note === 'object' && opts.note.text ? opts.note : null;
+    if (signature) {
+        html += `<p class="syscall-draft-hint">Add this entry by hand to <code>${escapeHtml(target || 'webui/syscall_signatures.json')}</code> after replacing any address or displacement in the pattern. Nothing has been written.</p>`;
+        const covered = Array.isArray(d.covered_by) ? d.covered_by.filter(c => c && typeof c === 'object') : [];
+        if (covered.length) {
+            html += '<p class="syscall-draft-hint">Already covered by an entry of that file: ' +
+                    covered.map(c => `${escapeHtml(c.family)} (${escapeHtml(c.pattern)}, ${escapeHtml(c.match)})`).join('; ') + '.</p>';
+        }
+    } else if (name) {
+        const file = target || `${name}.yar`;
+        if (!note) html += '<p class="syscall-draft-hint">Nothing has been written yet. Choose what happens to this rule:</p>';
+        html += '<div class="syscall-draft-actions">' +
+            '<div class="syscall-draft-action syscall-draft-vm"><div class="syscall-draft-action-title">ON THIS VM · now</div>' +
+            `<p>Writes <code>${escapeHtml(file)}</code> into the folder Rustinel reads its rules from. Rustinel should load it within about 2 seconds, without a restart; that is not yet verified on a VM, so check its log. ` +
+            'A rebuilt VM does not have it.</p>' +
+            `<button type="button" class="btn btn-sm btn-primary" onclick="applySyscallRule(${jsArg(name)})"${opts.busy ? ' disabled' : ''}>APPLY TO THIS VM</button></div>` +
+            '<div class="syscall-draft-action syscall-draft-repo"><div class="syscall-draft-action-title">IN THE REPO · reviewable</div>' +
+            '<p>Saves the same rule as a file and writes nothing on this VM. Commit it under <code>rules/yara/</code> to keep it in version control and reviewable. Whether a committed rule is loaded again after a rebuild is not yet verified.</p>' +
+            `<a class="btn btn-sm btn-outline" href="${escapeHtml(`/api/syscalls/rule/download?name=${encodeURIComponent(name)}&text=${encodeURIComponent(text)}`)}" ` +
+            `download="${escapeHtml(`${name}.yar`)}">DOWNLOAD FOR THE REPO</a></div></div>`;
+    }
+    if (note) html += `<div class="syscall-draft-result syscall-draft-result-${cssToken(note.tone)}" role="status">${escapeHtml(note.text)}</div>`;
+    return html + '</section>';
+}
+
+// The key of a hook as the list keeps it: the syscall and the lower-case owner
+function syscallHookKey(name, owner) {
+    return `${name}|${String(owner).trim().toLowerCase()}`;
+}
+
+// The hooks of a scan that recording would add, as the server would take them: a hooked stub of ntdll (the one module
+// the server measures when it records) that a module owns, and that the list does not know. One pair once.
+function syscallHookPairs(scan) {
+    const pairs = new Map();
+    for (const d of Array.isArray(scan && scan.deviations) ? scan.deviations : []) {
+        if (d && d.state === 'hooked' && d.allowlisted !== true && String(d.module || '').toLowerCase() === 'ntdll.dll'
+            && typeof d.target_owner === 'string' && d.target_owner.trim() && d.target_owner !== 'private') {
+            pairs.set(syscallHookKey(d.name, d.target_owner), { name: String(d.name), owner: d.target_owner });
+        }
+    }
+    return [...pairs.values()].sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// What the keys `actual` have that `expected` has not (extra) and the other way round (missing)
+function syscallHookDifference(expected, actual) {
+    const have = new Set(expected), got = new Set(actual);
+    return { extra: [...got].filter(k => !have.has(k)).sort(), missing: [...have].filter(k => !got.has(k)).sort() };
+}
+
+// Why a scan taken now cannot stand in for the one the analyst reviewed, or '' when it can: another build or view,
+// another process behind the PID (it was reused), other hooks than those that were reviewed
+function syscallHookDrift(reviewed, now) {
+    const reasons = [];
+    if (String(now.build || '') !== String(reviewed.build || '') || String(now.view || '') !== String(reviewed.view || '')) {
+        reasons.push(`it is measured as build ${now.build}, ${now.view} view now, and was build ${reviewed.build}, ${reviewed.view} view`);
+    }
+    if (String(now.process || '').toLowerCase() !== String(reviewed.process || '').toLowerCase()) {
+        reasons.push(`PID ${reviewed.pid} is ${now.process || 'unknown'} now and was ${reviewed.process || 'unknown'}: the PID was reused`);
+    }
+    const label = key => key.replace('|', ' → ');
+    const diff = syscallHookDifference(syscallHookPairs(reviewed).map(p => syscallHookKey(p.name, p.owner)),
+                                       syscallHookPairs(now).map(p => syscallHookKey(p.name, p.owner)));
+    if (diff.extra.length) reasons.push(`new since: ${diff.extra.map(label).join(', ')}`);
+    if (diff.missing.length) reasons.push(`gone since: ${diff.missing.map(label).join(', ')}`);
+    return reasons.length ? `The hooks of PID ${reviewed.pid} are no longer those of the scan you reviewed (${reasons.join('; ')}).` : '';
+}
+
+// The sentence under the warning of the hook control: what pressing it records, and what that costs when the host is not clean
+function syscallHookWarning(scan) {
+    const what = scan && scan.pid
+        ? `This records the hooks that PID ${scan.pid}${scan.name ? ` (${scan.name})` : ''} shows as known, whoever installed them: from then on they stop counting as evidence in every process on this host, `
+        : 'Scan a process first. This records the hooks of that run as known, whoever installed them, so that from then on they stop counting as evidence in every process on this host, ';
+    return what + 'and recording the hooks of an infected host hides real findings until the list is cleared. A patched stub is never recorded. ' +
+           'The process is measured again first, and nothing is recorded if its hooks are no longer those of this scan.';
+}
+
+function syscallCaptureQuestion(scan) {
+    const n = Number(scan && scan.hookable) || 0;
+    const pairs = Array.isArray(scan && scan.pairs) ? scan.pairs : [];
+    const named = pairs.slice(0, 8).map(p => `  ${p.name} → ${p.owner}`).join('\n') + (pairs.length > 8 ? `\n  and ${pairs.length - 8} more` : '');
+    return 'Record the hooks of this run as known?\n\n' +
+           `PID ${scan && scan.pid}${scan && scan.name ? ` (${scan.name})` : ''} shows ${n} hooked stub${n === 1 ? '' : 's'} that ${n === 1 ? 'is' : 'are'} not known yet` +
+           `${named ? `:\n${named}\n` : '. '}` +
+           'From then on they stop counting as evidence in every process on this host, whoever installed them.\n\n' +
+           'Only do this on a host you believe is clean: recording the hooks of an infected host hides real findings until the list is cleared.';
+}
+
+// The hooks that are known on this host, and the control that records more. state: entries ({ syscall, owner, build,
+// view }), loaded, problem (the file cannot be used), error (the list could not be read), note ({ tone, text }), busy,
+// scope ({ build, view } of the baseline on the map, or null) and scan ({ pid, name, hookable: hooked stubs of the last
+// scan that are not known yet, allowlist: what that scan says about the list }, or null before a scan). The control
+// records the hooks of THIS RUN and says that this is only for a host believed to be clean.
+function renderHookAllowlist(state) {
+    const st = state && typeof state === 'object' ? state : {};
+    const scan = st.scan && typeof st.scan === 'object' ? st.scan : null;
+    const entries = Array.isArray(st.entries) ? st.entries.filter(e => e && typeof e === 'object') : [];
+    const notices = [];
+    if (st.error) notices.push({ kind: 'hooks-error', tone: 'error', title: 'Known hooks unavailable', text: String(st.error) });
+    if (st.problem) notices.push({ kind: 'hooks-problem', tone: 'error', title: 'Hook allowlist unusable', text: String(st.problem) });
+    if (scan && scan.allowlist && scan.allowlist.applied === false && scan.allowlist.reason) {
+        notices.push({ kind: 'hooks-not-applied', tone: 'warn', title: 'Allowlist not applied to the last scan', text: String(scan.allowlist.reason) });
+    }
+    let rows = entries.map(e => `<tr><td>${escapeHtml(e.syscall)}</td><td>${escapeHtml(e.owner)}</td><td>${escapeHtml(e.build)}</td><td>${escapeHtml(e.view)}</td></tr>`).join('');
+    if (!entries.length) {
+        const why = st.loaded ? 'No hook is recorded as known: every hook a scan finds is scored.' : (st.error ? 'The list could not be read.' : 'Loading the known hooks…');
+        rows = `<tr data-sort-skip><td colspan="4" class="view-table-empty">${escapeHtml(why)}</td></tr>`;
+    }
+    const hookable = scan ? Number(scan.hookable) || 0 : 0;
+    const record = !scan || hookable === 0 || st.busy === true || st.loaded !== true;
+    const recordTitle = st.loaded !== true ? 'The known hooks have not been read yet: recording waits for them'
+        : !scan ? 'Scan a process first: the hooks of that run are what gets recorded'
+        : hookable === 0 ? 'The last scan found no hook that is not known already' : 'Record the hooks of the last scan as known (asks first)';
+    const forgetThis = !st.scope || !entries.length || st.busy === true;
+    const forgetAll = !entries.length || st.busy === true;
+    return syscallNoticesHtml(notices) +
+        '<div class="view-table-wrap"><table class="view-table" data-sortable data-sort-id="syscall-hooks"><thead><tr><th>SYSCALL</th><th>OWNER</th><th>BUILD</th><th>VIEW</th></tr></thead>' +
+        `<tbody>${rows}</tbody></table></div>` +
+        '<div class="syscall-hook-capture">' +
+        `<p class="syscall-hook-warning" role="note"><strong>Only on a host you believe is clean.</strong> ${escapeHtml(syscallHookWarning(scan))}</p>` +
+        '<div class="syscall-hook-actions">' +
+        `<button type="button" class="btn btn-sm syscall-hook-record" onclick="syscallCaptureHooks()"${record ? ' disabled' : ''} title="${escapeHtml(recordTitle)}">RECORD THE HOOKS OF THIS RUN AS KNOWN</button>` +
+        `<button type="button" class="btn btn-sm" onclick="syscallClearHooks('this')"${forgetThis ? ' disabled' : ''} title="Forget the known hooks of the build and view on the map">FORGET THIS BUILD AND VIEW</button>` +
+        `<button type="button" class="btn btn-sm" onclick="syscallClearHooks('all')"${forgetAll ? ' disabled' : ''} title="Forget every known hook, of every build and view">FORGET ALL</button>` +
+        '</div></div>' +
+        (st.note && st.note.text ? `<div class="syscall-draft-result syscall-draft-result-${cssToken(st.note.tone)}" role="status">${escapeHtml(st.note.text)}</div>` : '');
+}
+
+// The syscall stubs a sample carries itself, found in its process memory and in its file. Whether the sample imports
+// the function is known as a rule, through its import set widened by the curated Win32 to Nt table: not imported
+// (import_present false) is a proven bypass, imported too (true) a hint. It is unknown (null) where no curated row
+// leads to the syscall or the import table could not be read, and for a stub in process memory whenever a module loaded
+// in the process is one the binary graph of this system does not hold: that memory is not the sample's alone, so it is
+// judged against the doors every loaded module imports, and only a complete union can prove. For a process hit true and
+// false speak of those modules, never of the sample, and true is nearly every one: kernelbase imports the Nt functions. A stub whose number this build does not have
+// (number_known false) suggests a sample made for another build. A file hit whose door is the file's own export of
+// that stub (own_export) says so instead of "imported too": it is the module's own code, as in a copy of ntdll.
+// model: hits ({ ...hit, source: 'process' | 'file' }), notes ({ tone, title, text }), summary, partial.
+function renderSyscallStubs(model) {
+    const m = model && typeof model === 'object' ? model : {};
+    const all = Array.isArray(m.hits) ? m.hits : [];
+    const notes = (Array.isArray(m.notes) ? m.notes : []).filter(n => n && typeof n === 'object')
+        .map(n => ({ kind: 'stubs', tone: n.tone, title: n.title || 'Stub search', text: n.text }));
+    const rows = [];
+    all.forEach((h, i) => {
+        if (!h || typeof h !== 'object') return;
+        const known = h.number_known !== false;
+        const where = h.source === 'file' ? `file offset ${syscallHex(h.offset)}` : `process memory ${syscallHex(h.address)}`;
+        let imported;
+        // in process memory the answer is about every loaded module, never the sample alone (memory_evidence says the same)
+        const inProcess = h.source !== 'file';
+        if (h.import_present === true && !inProcess && h.own_export === true) {
+            // the file exports this very stub under its own Nt or Zw name: its own code, so no word of its imports
+            imported = '<span title="The file exports this stub under its own name: the module\'s own code, as in a copy of ntdll, not a stub carried past the documented path. A weaker hint.">own export</span>';
+        } else if (h.import_present === true) {
+            imported = inProcess
+                ? '<span title="A module loaded in the process imports a door to this syscall, so the documented path is in the address space: a weaker hint. ' +
+                  'That is nearly every process hit, since kernelbase.dll, loaded in every process, imports the Nt functions itself; it says nothing of the sample\'s own imports.">imported too</span>'
+                : '<span title="The sample imports this function as well: a weaker hint.">imported too</span>';
+        } else if (h.import_present === false) {
+            imported = inProcess
+                ? '<span title="No module loaded in the process imports a door to this syscall, by import sets widened through the curated Win32 to Nt table: a proven bypass of the import path.">not imported</span>'
+                : '<span title="Not imported by the sample, by an import set widened through the curated Win32 to Nt table: a proven bypass of the import path.">not imported</span>';
+        } else {
+            imported = '<span class="syscall-muted" title="No curated Win32 to Nt row leads to this syscall, the import table could not be read, or the stub ' +
+                       'is in process memory and a module loaded there is not in the binary graph of this system: a missing import proves nothing.">unknown</span>';
+        }
+        const drawable = typeof h.stub_hex === 'string' && h.stub_hex !== '' && Number.isInteger(h.number);
+        rows.push('<tr>' +
+            `<td data-sort-value="${escapeHtml(h.syscall || '')}">${known && h.syscall ? escapeHtml(h.syscall) : '<span class="syscall-muted">–</span>'}</td>` +
+            `<td class="view-table-num" data-sort-value="${escapeHtml(h.number)}">${escapeHtml(syscallHex(h.number))}</td>` +
+            (known ? '<td data-sort-value="1">in this build</td>'
+                   : '<td data-sort-value="0"><span class="syscall-flag" title="This build has no syscall with this number: the stub was probably made for another Windows build.">not in this build</span></td>') +
+            `<td>${escapeHtml(where)}</td><td>${escapeHtml(h.pattern)}</td><td>${imported}</td>` +
+            `<td>${drawable ? `<button type="button" class="btn btn-xs" onclick="syscallDraftStubRule(${jsInt(i)})" title="Draft a YARA rule for these bytes. Nothing is written.">Draft rule</button>` : ''}</td></tr>`);
+    });
+    if (!rows.length) {
+        const why = m.partial ? 'No hit, but what was searched was not all of it: this is not a clean result.'
+                              : 'No syscall stub of its own was found in what was searched.';
+        rows.push(`<tr data-sort-skip><td colspan="7" class="view-table-empty">${escapeHtml(why)}</td></tr>`);
+    }
+    return syscallNoticesHtml(notes) +
+        (m.summary ? `<div class="syscall-stubs-summary">${escapeHtml(m.summary)}</div>` : '') +
+        '<p class="syscall-draft-hint"><strong>Proof or hint.</strong> A syscall stub in the sample file whose function the sample does not import, ' +
+        'judged by its import set widened through the curated Win32 to Nt table, is a proven bypass of ntdll. ' +
+        'It stays a hint where the sample imports the function as well, where no curated row leads to the syscall, or where its import table could not be read. ' +
+        'A stub in process memory is judged against the doors every loaded module imports, and only when the binary graph of this system holds every one of them. ' +
+        'That practically never proves: kernelbase.dll, loaded in every process, imports the Nt functions itself, so the documented path is in the address space even when the sample does not use it. ' +
+        'The proof comes from the sample file. Look at each hit before drafting a rule.</p>' +
+        '<div class="view-table-wrap"><table class="view-table" data-sortable data-sort-id="syscall-stubs"><thead><tr><th>SYSCALL</th><th>NUMBER</th><th>BUILD</th>' +
+        `<th>FOUND</th><th>PATTERN</th><th>IMPORTED</th><th></th></tr></thead><tbody>${rows.join('')}</tbody></table></div>`;
+}
+
+const SYSCALL_VIEW_NAMES = ['map', 'graph'];
+const syscallState = {
+    ready: false,
+    // whether the win32u box was ticked when a baseline without win32u switched it off, to tick it again after
+    win32uWanted: false,
+    status: null, statusError: '',
+    // The baseline of one view: { view, build, symbols, items: [{ name, module, number }] }
+    // loading counts the refreshes under way; loadSeq numbers the reads of the baseline, of which only the last counts
+    baseline: null, baselineError: '', loading: 0, loadSeq: 0,
+    bands: [], bandsKey: 0, layouts: new Map(),
+    // The last scan: its answer, the state of each measured syscall (name → state) and the line under the toolbar
+    scan: null, states: null, scanning: false, note: null,
+    query: '', module: '', match: null,
+    selected: '', hover: '', hoverAt: null,
+    // The syscall of the detail panel: its lookup, as the server answered it; the rule drafted last ({ draft, note,
+    // busy } or { error }); the known hooks and what the last recording or forgetting said
+    detail: { name: '', data: null, error: '', loading: false }, detailSeq: 0,
+    draft: null, draftSeq: 0,
+    hooks: { entries: [], loaded: false, problem: '', error: '', note: null, busy: false },
+    // The stub search: where it stands, and what each of its two ways in answered ({ ok, data, sample } or { ok, error } or { skipped })
+    stubs: { searched: false, running: false, pid: 0, name: '', sources: {} },
+    pane: 'map',
+    view: 'map',
+    // The scan panels under the surface: folded by the graph view, until the reader folds or opens them by hand
+    lowerFolded: false, lowerByHand: false,
+    targets: {}, target: '',
+    timer: null,
+};
+
+// A request to /api/syscalls/...: never throws, `data` is an object whatever the answer was
+async function syscallApi(url, options) {
+    try {
+        const resp = await fetch(url, options);
+        let data = null;
+        try { data = await resp.json(); } catch { data = null; }
+        return { ok: resp.ok, status: resp.status, data: data && typeof data === 'object' ? data : {} };
+    } catch (e) {
+        return { ok: false, status: 0, data: { error: e && e.message ? e.message : 'Connection lost' } };
+    }
+}
+
+function syscallErrorText(result) {
+    const text = result.data && typeof result.data.error === 'string' ? result.data.error : '';
+    return text || `The server answered with status ${result.status}.`;
+}
+
+async function syscallLoadStatus() {
+    const r = await syscallApi('/api/syscalls/status');
+    syscallState.statusError = r.ok ? '' : syscallErrorText(r);
+    if (r.ok) syscallState.status = r.data;
+    return r.ok;
+}
+
+// The whole baseline of `view` (this host's own when empty), read page by page and lean: a name, a module and a
+// number of each syscall, which is all the map draws (the parameters and stub bytes of one come from its lookup). On success it replaces the baseline: { ok: true }; otherwise { ok: false, error }, or
+// { ok: false, superseded: true } when a newer load started meanwhile.
+async function syscallLoadBaseline(view) {
+    const seq = ++syscallState.loadSeq;
+    const items = [];
+    let meta = null, total = Infinity;
+    while (items.length < total) {
+        const params = new URLSearchParams({ offset: String(items.length), limit: String(SYSCALL_PAGE), lean: '1' });
+        if (view) params.set('view', view);
+        const r = await syscallApi(`/api/syscalls/baseline?${params}`);
+        if (seq !== syscallState.loadSeq) return { ok: false, superseded: true };
+        if (!r.ok) return { ok: false, error: syscallErrorText(r) };
+        meta = r.data;
+        const page = Array.isArray(r.data.items) ? r.data.items : [];
+        total = Number.isFinite(r.data.total) ? r.data.total : 0;
+        for (const item of page) {
+            items.push({ name: String(item.name), module: String(item.module || '').toLowerCase(), number: Number(item.number) });
+        }
+        if (!page.length) break;
+    }
+    syscallState.baseline = { view: meta.view, build: meta.build, symbols: meta.symbols, items };
+    syscallState.bands = syscallBands(items);
+    syscallState.bandsKey++;
+    if (syscallState.selected && !items.some(item => item.name === syscallState.selected)) syscallState.selected = '';
+    syscallDropForeignScan();
+    return { ok: true };
+}
+
+// The states of a scan belong to the view it measured. When the baseline on the map is another one (or none), the
+// measurement is cleared: a cell never shows what was measured against another reference.
+function syscallDropForeignScan() {
+    const scan = syscallState.scan, baseline = syscallState.baseline;
+    if (!scan || (baseline && baseline.view === scan.view)) return;
+    syscallState.scan = null;
+    syscallState.states = null;
+    syscallState.note = {
+        tone: 'warn',
+        text: `The scan of PID ${scan.pid} measured the ${scan.view} view, but the map shows ` +
+              `${baseline ? `the ${baseline.view} baseline` : 'no baseline'}: its measurement is cleared.`,
+    };
+}
+
+// The status always, the baseline when there is none yet or when `force`. While an extraction runs it looks again
+// every few seconds (not with force: the baseline is read again only when it is missing).
+async function syscallRefresh(force) {
+    syscallState.loading++;
+    syscallRenderAll();
+    try {
+        const wanted = force === true || !syscallState.baseline;
+        const [, loaded] = await Promise.all([syscallLoadStatus(), wanted ? syscallLoadBaseline('') : { ok: true }]);
+        // a read that another one overtook says nothing about the baseline: the newer read decides
+        if (!loaded.superseded) {
+            if (loaded.ok) {
+                syscallState.baselineError = '';
+            } else {
+                syscallState.baseline = null;
+                syscallState.bands = [];
+                syscallState.bandsKey++;
+                syscallState.baselineError = loaded.error;
+                syscallDropForeignScan();
+            }
+        }
+    } finally {
+        syscallState.loading--;
+    }
+    syscallApplyFilter();
+    syscallRenderAll();
+    syscallSchedulePoll();
+}
+
+function syscallSchedulePoll() {
+    clearTimeout(syscallState.timer);
+    syscallState.timer = null;
+    const extraction = syscallState.status && syscallState.status.extraction;
+    if (extraction && Array.isArray(extraction.running) && extraction.running.length && state.activeTab === 'syscalls') {
+        syscallState.timer = setTimeout(() => {
+            if (state.activeTab === 'syscalls') syscallRefresh();
+        }, SYSCALL_POLL_MS);
+    }
+}
+
+async function syscallLoadTargets() {
+    const r = await syscallApi('/api/processes?min_threats=0&max=0');
+    if (r.ok) syscallState.targets = r.data;
+    renderSyscallTargets();
+}
+
+function renderSyscallTargets() {
+    const select = document.getElementById('syscall-target');
+    if (!select) return;
+    select.innerHTML = syscallTargetsHtml(syscallState.targets, syscallState.target);
+    syscallState.target = select.value;
+    renderSyscallToolbar();
+}
+
+function syscallOnTarget() {
+    const select = document.getElementById('syscall-target');
+    syscallState.target = select ? select.value : '';
+    renderSyscallToolbar();
+}
+
+// What the map shows in place of cells
+function syscallEmptyText() {
+    if (syscallState.loading) return 'Loading the baseline…';
+    if (syscallState.baselineError) return syscallState.baselineError;
+    if (syscallState.baseline) return 'The baseline has no syscalls.';
+    return 'No baseline loaded.';
+}
+
+// The bands' markup: a heading and a canvas per module, built again only when the baseline (or what stands in
+// its place) changed
+function syscallEnsureBands(host) {
+    const key = syscallState.bands.length ? `bands:${syscallState.bandsKey}` : `empty:${syscallEmptyText()}`;
+    if (host.dataset.key === key) return;
+    host.dataset.key = key;
+    host.replaceChildren();
+    syscallState.layouts.clear();
+    if (!syscallState.bands.length) {
+        const empty = document.createElement('p');
+        empty.className = 'syscall-empty';
+        empty.textContent = syscallEmptyText();
+        host.appendChild(empty);
+        return;
+    }
+    for (const band of syscallState.bands) {
+        const section = document.createElement('section');
+        section.className = 'syscall-band';
+        section.dataset.module = band.module;
+        const head = document.createElement('h3');
+        head.className = 'syscall-band-head';
+        const name = document.createElement('span');
+        name.className = 'syscall-band-name';
+        name.textContent = band.module;
+        const count = document.createElement('span');
+        count.className = 'syscall-band-count';
+        count.textContent = band.items.length.toLocaleString('en-US');
+        head.appendChild(name);
+        head.appendChild(count);
+        const canvas = document.createElement('canvas');
+        canvas.className = 'syscall-canvas';
+        canvas.dataset.module = band.module;
+        canvas.setAttribute('role', 'img');
+        canvas.setAttribute('aria-label', `Map of the ${band.items.length} syscalls of ${band.module}, one cell each`);
+        section.appendChild(head);
+        section.appendChild(canvas);
+        host.appendChild(section);
+    }
+}
+
+// One band onto its canvas, at the density of the screen. A canvas with no width (its tab is not shown) is left
+// for when the tab is shown.
+function syscallPaintCanvas(canvas) {
+    const band = syscallState.bands.find(b => b.module === canvas.dataset.module);
+    if (!band) return;
+    const width = Math.floor(canvas.getBoundingClientRect().width);
+    if (width < 1) return;
+    const layout = syscallBandLayout(band.items.length, width);
+    const ratio = window.devicePixelRatio || 1;
+    const pixelsWide = Math.round(width * ratio), pixelsHigh = Math.round(layout.height * ratio);
+    if (canvas.width !== pixelsWide) canvas.width = pixelsWide;
+    if (canvas.height !== pixelsHigh) canvas.height = pixelsHigh;
+    canvas.style.height = `${layout.height}px`;
+    syscallState.layouts.set(band.module, layout);
+    const ctx = canvas.getContext('2d');
+    ctx.setTransform(ratio, 0, 0, ratio, 0, 0);
+    syscallDrawBand(ctx, layout, band.items, syscallModel());
+}
+
+// What the map draws: the states of the scan, the filter, the cell chosen and the cell under the pointer
+function syscallModel() {
+    return { states: syscallState.states, match: syscallState.match, selected: syscallState.selected, hover: syscallState.hover };
+}
+
+// The cells that changed, as [{ module, index }] (a null is left out): only their own bands are drawn again, and in
+// them only the cells round those. A band that was not drawn yet is drawn whole.
+function syscallRepaintCells(at) {
+    const host = document.getElementById('syscall-map');
+    if (!host) return;
+    const byModule = new Map();
+    for (const cell of at) {
+        if (!cell) continue;
+        if (!byModule.has(cell.module)) byModule.set(cell.module, []);
+        byModule.get(cell.module).push(cell.index);
+    }
+    for (const canvas of host.querySelectorAll('canvas')) {
+        const indexes = byModule.get(canvas.dataset.module);
+        if (!indexes) continue;
+        const band = syscallState.bands.find(b => b.module === canvas.dataset.module);
+        const layout = syscallState.layouts.get(canvas.dataset.module);
+        if (!band || !layout) syscallPaintCanvas(canvas);
+        else syscallDrawBand(canvas.getContext('2d'), layout, band.items, syscallModel(), indexes);
+    }
+}
+
+function renderSyscallMap() {
+    const host = document.getElementById('syscall-map');
+    if (!host) return;
+    syscallEnsureBands(host);
+    for (const canvas of host.querySelectorAll('canvas')) syscallPaintCanvas(canvas);
+}
+
+function renderSyscallLegend() {
+    const host = document.getElementById('syscall-legend');
+    if (!host) return;
+    const counts = syscallState.scan ? syscallState.scan.counts || {} : null;
+    const measured = counts ? SYSCALL_STATES.reduce((sum, s) => sum + (Number(counts[s]) || 0), 0) : 0;
+    const total = syscallState.baseline ? syscallState.baseline.items.length : 0;
+    host.innerHTML = syscallMapLegendHtml(counts, Math.max(total - measured, 0));
+}
+
+// The rows of the catalog under the map: the baseline as far as the filter matches, the first SYSCALL_ROWS_MAX
+function renderSyscallRows() {
+    const host = document.getElementById('syscall-rows');
+    const head = document.getElementById('syscall-catalog-head');
+    const items = syscallState.baseline ? syscallState.baseline.items : [];
+    const match = syscallState.match;
+    const matching = match ? items.filter(item => match.has(item.name)) : items;
+    const shown = matching.slice(0, SYSCALL_ROWS_MAX);
+    if (head) {
+        head.textContent = `Catalog · ${matching.length.toLocaleString('en-US')} of ${items.length.toLocaleString('en-US')} syscalls` +
+            (matching.length > shown.length ? ` · the first ${shown.length} listed, narrow the filter for the rest` : '');
+    }
+    if (!host) return;
+    const top = host.scrollTop;
+    host.innerHTML = shown.length
+        ? shown.map(item => syscallRowHtml({
+            ...item, state: syscallState.states ? syscallState.states.get(item.name) : '', selected: item.name === syscallState.selected,
+        })).join('')
+        : (items.length ? '<div class="syscall-empty">No syscall matches the filter.</div>' : '');
+    host.scrollTop = top;
+}
+
+function renderSyscallNotices() {
+    const host = document.getElementById('syscall-notices');
+    if (!host) return;
+    const notices = syscallNotices(syscallState.status, syscallState.baseline);
+    if (syscallState.statusError) {
+        notices.unshift({ kind: 'unreachable', tone: 'error', title: 'Status unavailable', text: syscallState.statusError });
+    }
+    host.innerHTML = syscallNoticesHtml(notices);
+    host.hidden = notices.length === 0;
+}
+
+// SCAN waits for a target and while a scan runs; the toggles show the surface that is on
+function renderSyscallToolbar() {
+    const scan = document.getElementById('syscall-scan');
+    if (scan) {
+        scan.disabled = syscallState.scanning || !syscallState.target;
+        scan.textContent = syscallState.scanning ? 'SCANNING…' : 'SCAN';
+        scan.title = syscallState.target ? 'Measure the syscall stubs of the chosen process against the baseline'
+                                          : 'Choose a process first';
+    }
+    const stubs = document.getElementById('syscall-stubs-run');
+    if (stubs) {
+        stubs.disabled = syscallState.stubs.running || syscallState.scanning || !syscallState.target;
+        stubs.textContent = syscallState.stubs.running ? 'SEARCHING…' : 'STUBS';
+        stubs.title = syscallState.target ? 'Search the process memory and the image file of the chosen process for syscall stubs of their own'
+                                          : 'Choose a process first';
+    }
+    for (const name of SYSCALL_VIEW_NAMES) {
+        const button = document.getElementById(`syscall-view-${name}`);
+        if (button) button.setAttribute('aria-pressed', name === syscallState.view ? 'true' : 'false');
+    }
+    // the narrow toggle names the surface that takes turns with the detail panel
+    const pane = document.getElementById('syscall-pane-map');
+    if (pane) pane.textContent = syscallState.view.toUpperCase();
+    const win32u = document.getElementById('syscall-win32u');
+    if (win32u) {
+        const missing = syscallWin32uMissing(syscallState.baseline);
+        if (missing && !win32u.disabled) {
+            syscallState.win32uWanted = win32u.checked;
+            win32u.checked = false;
+        } else if (!missing && win32u.disabled) {
+            win32u.checked = syscallState.win32uWanted;
+        }
+        win32u.disabled = !!missing;
+        win32u.title = missing || SYSCALL_WIN32U_TITLE;
+        if (win32u.parentElement) win32u.parentElement.title = win32u.title;
+    }
+}
+
+// Why the loaded baseline offers no win32u to scan, '' when it does or none is loaded. Read off the baseline, not
+// off its view: the x64 view of an ARM64 host has held none, and another build or host may differ.
+function syscallWin32uMissing(baseline) {
+    if (!baseline || !Array.isArray(baseline.items) || !baseline.items.length) return '';
+    if (baseline.items.some(item => item.module === 'win32u.dll')) return '';
+    return `The ${baseline.view} baseline of build ${baseline.build} holds no win32u.dll syscalls: there is nothing of win32u to scan`;
+}
+
+// The line under the toolbar: what the last scan found, or why it did not
+function renderSyscallScan() {
+    const host = document.getElementById('syscall-scan-result');
+    if (!host) return;
+    const note = syscallState.note;
+    host.textContent = note ? note.text : '';
+    host.className = note ? `syscall-scan-result syscall-scan-result-${cssToken(note.tone)}` : 'syscall-scan-result';
+    host.hidden = !note;
+}
+
+function syscallSetScanNote(tone, text) {
+    syscallState.note = text ? { tone, text } : null;
+    renderSyscallScan();
+}
+
+function syscallRenderAll() {
+    const subtitle = document.getElementById('syscalls-subtitle');
+    if (subtitle) subtitle.textContent = syscallSubtitle(syscallState.baseline);
+    renderSyscallToolbar();
+    renderSyscallNotices();
+    renderSyscallScan();
+    renderSyscallLegend();
+    renderSyscallMap();
+    renderBinaryGraph();
+    renderSyscallRows();
+    syscallSyncDetail();
+    renderSyscallDetailPanel();
+    renderSyscallDeviationPanel();
+    renderSyscallDraft();
+    renderSyscallHooks();
+    renderSyscallStubsPanel();
+    syscallApplyLower();
+}
+
+// The bar over the scan panels, which is all the reader has of them while the graph view keeps them folded. A panel
+// that is not there at all (the stub search has not run) is left out: the bar may only promise what the row holds.
+// A count alone would hide a search that read only one of its two ways in, or one the server marked partial, and an
+// empty hooks count looks exactly like "nothing to report" when the list could not be read at all.
+function syscallLowerNote() {
+    const el = id => document.getElementById(id);
+    const parts = [];
+    const add = (title, head, trouble) => {
+        const said = [(el(head)?.textContent || '').trim(), trouble].filter(Boolean).join(', ');
+        parts.push(said ? `${title} (${said})` : title);
+    };
+    add('DEVIATIONS', 'syscall-deviations-head');
+    const stubs = syscallState.stubs;
+    if (!el('syscall-stubs')?.hidden) {
+        const model = stubs.searched && !stubs.running ? syscallStubsModel() : null;
+        add('DIRECT SYSCALL STUBS', 'syscall-stubs-head', model && model.partial ? 'not complete' : '');
+    }
+    const hooks = syscallState.hooks;
+    // two causes, two words: `error` is a read that failed (a count beside it is the last good one, not current),
+    // `problem` is a list that was read and is unusable. "Could not be read" was wrong for both.
+    add('KNOWN HOOKS', 'syscall-hooks-head',
+        hooks.error ? 'the last read failed' : hooks.problem ? 'unusable' : '');
+    return parts.join(' · ');
+}
+
+// DEVIATIONS, DIRECT SYSCALL STUBS and KNOWN HOOKS are all about a process scanned on the map, and on the VM they
+// took 320px of the column the graph canvas sits in, which never grew past its 240px floor. GRAPH therefore folds
+// them away, and that is where the canvas gets its height. Folded is not silent: the bar keeps naming the panels
+// with their counts, because a stub run in the graph view writes the proof of the whole feature into that row.
+function syscallApplyLower() {
+    const row = document.getElementById('syscall-lower');
+    if (!row) return false;
+    const folded = !!syscallState.lowerFolded;
+    row.classList.toggle('syscall-lower-folded', folded);
+    const button = document.getElementById('syscall-lower-fold');
+    if (button) {
+        button.setAttribute('aria-expanded', String(!folded));
+        button.title = folded ? 'Show the panels of the last scan' : 'Fold the panels of the last scan away';
+        button.setAttribute('aria-label', button.title);
+    }
+    const note = document.getElementById('syscall-lower-note');
+    if (note) note.textContent = syscallLowerNote();
+    return true;
+}
+
+// A fold or unfold by hand wins over the view's default from then on: a view that keeps reclosing what the reader
+// opened is worse than one that never folded.
+function syscallToggleLower() {
+    syscallState.lowerFolded = !syscallState.lowerFolded;
+    syscallState.lowerByHand = true;
+    return syscallApplyLower();
+}
+
+// The modules the filter offers: those the loaded baseline has entries for, so no choice can only dim every cell.
+// Without a baseline, the modules a baseline may hold. A chosen module that is no longer offered is let go.
+function syscallSyncModuleFilter() {
+    const modules = syscallState.baseline ? syscallState.bands.map(band => band.module) : SYSCALL_MODULES;
+    if (syscallState.module && !modules.includes(syscallState.module)) syscallState.module = '';
+    const select = document.getElementById('syscall-module-filter');
+    if (!select) return;
+    const key = modules.join('|');
+    if (select.dataset.key !== key) {
+        select.dataset.key = key;
+        select.innerHTML = `<option value="">${modules.length === 2 ? 'both modules' : 'every module'}</option>`
+            + modules.map(m => `<option value="${escapeHtml(m)}">${escapeHtml(m)}</option>`).join('');
+    }
+    select.value = syscallState.module;
+}
+
+// The filter changed (or the baseline did): which cells match, then the map, the catalog and the graph
+function syscallApplyFilter() {
+    syscallSyncModuleFilter();
+    const items = syscallState.baseline ? syscallState.baseline.items : [];
+    syscallState.match = syscallMatchSet(items, syscallState.query, syscallState.module);
+    renderSyscallMap();
+    renderSyscallRows();
+    renderBinaryGraph();
+}
+
+function syscallOnFilter() {
+    const input = document.getElementById('syscall-filter');
+    const module = document.getElementById('syscall-module-filter');
+    syscallState.query = input ? input.value : '';
+    syscallState.module = module ? module.value : '';
+    syscallApplyFilter();
+}
+
+// The name the map holds for a syscall: `name`, or its Nt or Zw twin when the baseline holds that one instead. One
+// number, one stub: the baseline keeps whichever name NTSleuth listed first (ZwWriteVirtualMemory in the x64 view of
+// 26200.9974), and the graph names every syscall by its Nt name
+function syscallMapName(name) {
+    const items = syscallState.baseline ? syscallState.baseline.items : [];
+    if (!/^(Nt|Zw)./.test(name) || items.some(item => item.name === name)) return name;
+    const twin = (name.startsWith('Nt') ? 'Zw' : 'Nt') + name.slice(2);
+    return items.some(item => item.name === twin) ? twin : name;
+}
+
+// A syscall is chosen, on the map, in the catalog or in the graph. The map rings it, the catalog and the graph mark it.
+function syscallSelect(name) {
+    syscallState.selected = syscallMapName(String(name || ''));
+    binaryGraphFollowMap(syscallState.selected.replace(/^Zw(?=.)/, 'Nt'));
+    renderSyscallMap();
+    renderSyscallRows();
+    renderSyscallDeviationPanel();
+    const body = document.getElementById('syscall-detail-body');
+    if (body) body.scrollTop = 0;
+    syscallLoadDetail(syscallState.selected);
+    if (syscallState.selected && typeof window.matchMedia === 'function' && window.matchMedia(SYSCALL_NARROW).matches) syscallSetPane('detail');
+}
+
+// The cell under a pointer event on the map: { band, item, index } or null
+function syscallCellFromEvent(event) {
+    const canvas = event.target && event.target.closest ? event.target.closest('canvas.syscall-canvas') : null;
+    if (!canvas) return null;
+    const band = syscallState.bands.find(b => b.module === canvas.dataset.module);
+    const layout = syscallState.layouts.get(canvas.dataset.module);
+    if (!band || !layout) return null;
+    const rect = canvas.getBoundingClientRect();
+    const index = syscallCellAt(layout, event.clientX - rect.left, event.clientY - rect.top);
+    return index < 0 ? null : { band, item: band.items[index], index };
+}
+
+function syscallShowTip(hit, event) {
+    const tip = document.getElementById('syscall-tip');
+    if (!tip) return;
+    if (!hit) {
+        tip.hidden = true;
+        return;
+    }
+    const state = syscallState.states ? syscallState.states.get(hit.item.name) : '';
+    tip.textContent = `${hit.item.name} · ${syscallHex(hit.item.number)} (${hit.item.number}) · ${hit.band.module}` +
+        (state ? ` · ${state}` : '');
+    tip.hidden = false;
+    const panel = tip.parentElement;
+    const box = panel && panel.getBoundingClientRect ? panel.getBoundingClientRect() : { left: 0, top: 0, width: 0 };
+    let left = event.clientX - box.left + 14;
+    if (box.width && left + tip.offsetWidth > box.width) left = Math.max(event.clientX - box.left - tip.offsetWidth - 14, 0);
+    tip.style.left = `${left}px`;
+    tip.style.top = `${event.clientY - box.top + 16}px`;
+}
+
+function syscallHideTip() {
+    syscallShowTip(null);
+}
+
+function syscallOnMapMove(event) {
+    const hit = syscallCellFromEvent(event);
+    syscallShowTip(hit, event);
+    const name = hit ? hit.item.name : '';
+    if (name === syscallState.hover) return;
+    const previous = syscallState.hoverAt;
+    syscallState.hover = name;
+    syscallState.hoverAt = hit ? { module: hit.band.module, index: hit.index } : null;
+    syscallRepaintCells([previous, syscallState.hoverAt]);
+}
+
+function syscallOnMapLeave() {
+    syscallHideTip();
+    if (!syscallState.hover) return;
+    const previous = syscallState.hoverAt;
+    syscallState.hover = '';
+    syscallState.hoverAt = null;
+    syscallRepaintCells([previous]);
+}
+
+function syscallOnMapClick(event) {
+    const hit = syscallCellFromEvent(event);
+    if (hit) syscallSelect(hit.item.name);
+}
+
+// SCAN: the chosen process, ntdll and, if asked for, win32u. A scan that fails clears the measurement: the map goes
+// back to the baseline, so no cell shows what was measured in another process or before.
+async function runSyscallScan() {
+    if (syscallState.scanning) return;
+    const select = document.getElementById('syscall-target');
+    const pid = parseInt(select ? select.value : syscallState.target, 10);
+    if (!(pid > 0)) {
+        syscallSetScanNote('warn', 'Choose a process to scan first.');
+        return;
+    }
+    const win32u = document.getElementById('syscall-win32u');
+    const modules = win32u && win32u.checked && !win32u.disabled ? ['ntdll.dll', 'win32u.dll'] : ['ntdll.dll'];
+    syscallState.scanning = true;
+    syscallSetScanNote('info', `Scanning PID ${pid}…`);
+    renderSyscallToolbar();
+    const r = await syscallApi('/api/syscalls/scan', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pid, modules }),
+    });
+    // measured in another view: the cells are that view's, so is the catalog; without its baseline the states are not drawn
+    let problem = '';
+    if (r.ok && syscallState.baseline && r.data.view !== syscallState.baseline.view) {
+        const loaded = await syscallLoadBaseline(r.data.view);
+        if (loaded.superseded) problem = 'reading its baseline was overtaken by another read; scan again.';
+        else if (!loaded.ok) problem = `its baseline could not be loaded: ${loaded.error}`;
+    }
+    const fits = r.ok && syscallState.baseline && syscallState.baseline.view === r.data.view;
+    if (r.ok && !fits && !problem) problem = 'the baseline of that view is not loaded.';
+    syscallState.scanning = false;
+    if (!fits) {
+        syscallState.scan = null;
+        syscallState.states = null;
+        syscallSetScanNote('error', r.ok ? `The scan measured the ${r.data.view} view, but ${problem}` : syscallErrorText(r));
+    } else {
+        syscallState.scan = r.data;
+        syscallState.states = new Map(Object.entries(r.data.states || {}).map(([name, s]) => [name, s && s.state]));
+        const counts = r.data.counts || {};
+        const quiet = SYSCALL_STATES.every(s => s === 'intact' || !Number(counts[s]));
+        syscallSetScanNote(quiet && !r.data.partial ? 'ok' : 'warn', syscallScanSummary(r.data));
+    }
+    syscallApplyFilter();
+    syscallRenderAll();
+}
+
+// --- The detail panel, the deviation list, the rule draft and the known hooks ---------------------------------
+
+// The syscall of the detail panel as renderSyscallDetail wants it: its lookup, and what the last scan measured of
+// it. A scan that did not cover it (win32u is left out unless asked for) is told apart from one that found nothing.
+function syscallDetailModel() {
+    const detail = syscallState.detail, baseline = syscallState.baseline, scan = syscallState.scan;
+    if (!detail.data) return null;
+    const model = { ...detail.data };
+    if (baseline) model.symbols = baseline.symbols;
+    if (scan) {
+        const measured = scan.states && Object.prototype.hasOwnProperty.call(scan.states, detail.name) ? scan.states[detail.name] : null;
+        if (measured && typeof measured === 'object') {
+            for (const key of ['state', 'pattern', 'target_owner', 'expected', 'actual', 'number_matches', 'allowlisted']) {
+                if (key in measured) model[key] = measured[key];
+            }
+        } else {
+            model.scanned = false;
+        }
+    }
+    const rizin = syscallRizinTarget();
+    if (rizin && rizin.path) model.rizin = true;
+    else if (rizin) model.rizin_note = rizin.note;
+    return model;
+}
+
+// Where Rizin can open the module of the chosen syscall: the module on this host, but only for the view that file
+// shows by itself. An ARM64X file is two views, and Rizin shows the native one: for the emulated x64 view of an
+// arm64 host it would show other bytes at other addresses, so it is not offered.
+function syscallRizinTarget() {
+    const data = syscallState.detail.data, baseline = syscallState.baseline, status = syscallState.status;
+    if (!data || !baseline || !status || !status.default_view || !/^[A-Za-z0-9_]+\.dll$/.test(String(data.module || ''))) return null;
+    if (baseline.view !== status.default_view) {
+        return { path: null, note: `Rizin shows the native view of ${data.module} (${status.default_view}), not the ${baseline.view} view of this syscall.` };
+    }
+    return { path: SYSCALL_SYSTEM_DIR + data.module, note: '' };
+}
+
+function renderSyscallDetailPanel() {
+    const host = document.getElementById('syscall-detail-body');
+    if (!host) return;
+    const detail = syscallState.detail;
+    const graphItem = binaryGraphDetailItem();
+    let html;
+    if (binaryGraphMetricShown()) html = binaryGraphMetricHtml(binaryGraphState.metric);
+    else if (graphItem) html = binaryGraphDetailHtml(graphItem);
+    else if (!syscallState.selected || !detail.name) html = renderSyscallDetail(null);
+    else if (detail.loading) html = `<p class="syscall-empty">Loading ${escapeHtml(detail.name)}…</p>`;
+    else if (detail.error) html = `<p class="syscall-empty syscall-empty-error">${escapeHtml(detail.error)}</p>`;
+    else html = renderSyscallDetail(syscallDetailModel());
+    const top = host.scrollTop;
+    host.innerHTML = html;
+    host.scrollTop = top;
+}
+
+// The lookup of one syscall in the view of the map. A newer choice overtakes the answer of an older one.
+async function syscallLoadDetail(name) {
+    const seq = ++syscallState.detailSeq;
+    if (!name) {
+        syscallState.detail = { name: '', data: null, error: '', loading: false };
+        renderSyscallDetailPanel();
+        return false;
+    }
+    syscallState.detail = { name, data: null, error: '', loading: true };
+    renderSyscallDetailPanel();
+    const view = syscallState.baseline ? syscallState.baseline.view : '';
+    const r = await syscallApi(`/api/syscalls/${encodeURIComponent(name)}${view ? `?view=${encodeURIComponent(view)}` : ''}`);
+    if (seq !== syscallState.detailSeq) return false;
+    syscallState.detail = r.ok ? { name, data: r.data, error: '', loading: false } : { name, data: null, error: syscallErrorText(r), loading: false };
+    renderSyscallDetailPanel();
+    return r.ok;
+}
+
+// The panel follows the map: a syscall that is gone from the baseline leaves it, and one that was read in another
+// view than the baseline now shows is read again in this one (its address and its bytes are the view's)
+function syscallSyncDetail() {
+    const detail = syscallState.detail, baseline = syscallState.baseline;
+    if (!syscallState.selected) {
+        if (detail.name) {
+            syscallState.detailSeq++;
+            syscallState.detail = { name: '', data: null, error: '', loading: false };
+        }
+    } else if (detail.data && baseline && detail.data.view && detail.data.view !== baseline.view) {
+        syscallLoadDetail(syscallState.selected);
+    }
+}
+
+function syscallCopyText(text) {
+    if (typeof navigator === 'undefined' || !navigator.clipboard) return false;
+    const value = String(text ?? '');
+    navigator.clipboard.writeText(value).then(() => showToast('info', 'Copied', `${value.length.toLocaleString('en-US')} characters`),
+                                              () => showToast('error', 'Not copied', 'The browser refused the clipboard.'));
+    return true;
+}
+
+function syscallCopySignature() {
+    const model = syscallDetailModel();
+    return model ? syscallCopyText(syscallSignature(model)) : false;
+}
+
+function syscallCopyDraft() {
+    const st = syscallState.draft;
+    return st && st.draft ? syscallCopyText(st.draft.text) : false;
+}
+
+// Open in Rizin: the module of the syscall in the RIZIN tab, then the syscall's name as the place to go to. Rizin
+// resolves the name (or says it cannot, in its own note).
+async function syscallOpenRizin() {
+    const target = syscallRizinTarget(), name = syscallState.selected;
+    if (!target || !target.path || !name) return false;
+    if (!(await openInRizin(target.path))) return false;
+    return rizinSeek(name, 'syscalls');
+}
+
+// What each stub of the scan added to the evidence score, by syscall name (a syscall that is not in it was not scored)
+function syscallScores(scan) {
+    const scores = Object.create(null);
+    const findings = scan && scan.evidence && Array.isArray(scan.evidence.findings) ? scan.evidence.findings : [];
+    for (const f of findings) {
+        if (f && typeof f.kind === 'string' && f.kind.startsWith('syscall_stub_') && typeof f.syscall === 'string' && Number.isFinite(f.score)) {
+            scores[f.syscall] = (scores[f.syscall] || 0) + f.score;
+        }
+    }
+    return scores;
+}
+
+function renderSyscallDeviationPanel() {
+    const host = document.getElementById('syscall-deviations');
+    const head = document.getElementById('syscall-deviations-head');
+    const scan = syscallState.scan;
+    const list = scan && Array.isArray(scan.deviations) ? scan.deviations : [];
+    if (head) {
+        const total = scan ? SYSCALL_STATES.reduce((sum, s) => sum + (Number((scan.counts || {})[s]) || 0), 0) : 0;
+        head.textContent = scan ? `${list.length.toLocaleString('en-US')} of ${total.toLocaleString('en-US')} measured` : '';
+    }
+    if (!host) return;
+    const top = host.scrollTop;
+    host.innerHTML = renderSyscallDeviations(list, { scanned: !!scan, selected: syscallState.selected, scores: syscallScores(scan) });
+    host.scrollTop = top;
+}
+
+function renderSyscallDraft() {
+    const host = document.getElementById('syscall-draft');
+    if (!host) return;
+    const st = syscallState.draft;
+    if (!st) {
+        host.innerHTML = '';
+        host.hidden = true;
+        return;
+    }
+    host.hidden = false;
+    host.innerHTML = st.error
+        ? '<section class="syscall-draft-card" aria-label="Rule draft"><div class="syscall-panel-head"><h3 class="syscall-panel-title">RULE DRAFT</h3>' +
+          '<button type="button" class="btn btn-xs" onclick="syscallCloseDraft()" title="Close the draft">Close</button></div>' +
+          `<div class="syscall-draft-result syscall-draft-result-error" role="alert">${escapeHtml(st.error)}</div></section>`
+        : showSyscallRuleDraft(st.draft, { busy: st.busy, note: st.note });
+}
+
+// A draft is on the page: it replaces the one before, and where the panes are one at a time the detail comes up
+function syscallShowDraft(draft) {
+    syscallState.draft = { draft, note: null, busy: false };
+    renderSyscallDraft();
+    if (typeof window.matchMedia === 'function' && window.matchMedia(SYSCALL_NARROW).matches) syscallSetPane('detail');
+    const host = document.getElementById('syscall-draft');
+    if (host && typeof host.scrollIntoView === 'function') host.scrollIntoView({ block: 'nearest' });
+}
+
+function syscallCloseDraft() {
+    syscallState.draftSeq++;
+    syscallState.draft = null;
+    renderSyscallDraft();
+}
+
+// Draft rule: the deviation as the scan returned it goes to the server, which drafts a signature entry and writes
+// nothing. A refusal (a hook the allowlist knows, a stub without bytes) is shown where the draft would be.
+async function syscallDraftRule(name) {
+    const scan = syscallState.scan;
+    const deviation = scan && Array.isArray(scan.deviations) ? scan.deviations.find(d => d && d.name === name) : null;
+    if (!deviation) return false;
+    return syscallRequestDraft({ deviation, view: scan.view, build: scan.build });
+}
+
+// The draft of a rule from `body` ({ deviation, view, build } or { hit, view, build, source }). A refusal is shown
+// where the draft would be, and replaces the draft before it; a newer request overtakes an older one.
+async function syscallRequestDraft(body) {
+    const seq = ++syscallState.draftSeq;
+    const r = await syscallApi('/api/syscalls/rule', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    if (seq !== syscallState.draftSeq) return false;
+    if (!r.ok) {
+        syscallState.draft = { error: syscallErrorText(r) };
+        renderSyscallDraft();
+        return false;
+    }
+    syscallShowDraft(r.data);
+    return true;
+}
+
+// STUBS: the process in `pid` (its private, executable memory) and then its image file, each by a request of its own.
+// The process search skips the sample's own mapped image, so a sample that unpacks in place is caught by the file
+// alone. The file is searched in the view the process search reports, or the view of the map when the process cannot
+// be searched (it has exited), and not at all without an image path. The path of a process that has exited is still
+// the path of the sample, so its file is searched.
+function syscallTargetProcess(pid) {
+    for (const proc of Object.values(syscallState.targets && typeof syscallState.targets === 'object' ? syscallState.targets : {})) {
+        if (proc && !String(proc.key === undefined ? '' : proc.key).includes('@') && String(proc.pid) === String(pid)) {
+            return { name: String(proc.name || proc.image || ''), image: typeof proc.image === 'string' ? proc.image : '', exited: !!proc.exit_time };
+        }
+    }
+    return { name: '', image: '', exited: false };
+}
+
+// What the two searches found, as renderSyscallStubs wants it: the hits of both in one list (each with where it came
+// from, the sample it was found in and the build it was numbered for), what to tell besides, and whether the search
+// covered all it set out to
+function syscallStubsModel() {
+    const st = syscallState.stubs;
+    const hits = [], notes = [];
+    let partial = false;
+    const counts = {};
+    for (const source of ['process', 'file']) {
+        const part = st.sources[source];
+        if (!part) continue;
+        const label = source === 'process' ? 'Process memory' : 'File';
+        if (part.skipped) {
+            notes.push({ tone: 'info', title: `${label} not searched`, text: part.skipped });
+            partial = true;
+        } else if (!part.ok) {
+            notes.push({ tone: 'error', title: `${label} not searched`, text: part.error });
+            partial = true;
+        } else {
+            const found = Array.isArray(part.data.hits) ? part.data.hits : [];
+            counts[source] = found.length;
+            for (const h of found) hits.push({ ...h, view: h.view || part.data.view, source, sample: part.sample, build: part.data.build });
+            if (part.data.partial) {
+                partial = true;
+                notes.push({ tone: 'warn', title: `${label} search partial`, text: part.data.note || 'Not all of it could be searched.' });
+            } else if (part.data.note) {
+                notes.push({ tone: 'info', title: label, text: part.data.note });
+            }
+            if (found.length && part.data.doors_complete === false && part.data.doors_note) {
+                notes.push({ tone: 'info', title: `${label}: no proof`, text: `A stub found here stays a hint, as not every door of the process is known: ${part.data.doors_note}.` });
+            }
+        }
+    }
+    const view = (st.sources.process && st.sources.process.ok && st.sources.process.data.view)
+        || (st.sources.file && st.sources.file.ok && st.sources.file.data.view) || '';
+    const where = Object.entries(counts).map(([source, n]) => `${n} in ${source === 'process' ? 'process memory' : 'the file'}`).join(', ');
+    const summary = `PID ${st.pid}${st.name ? ` (${st.name})` : ''}${view ? ` · ${view}` : ''} · ${hits.length} hit${hits.length === 1 ? '' : 's'}${where ? ` (${where})` : ''}`;
+    return { hits, notes, partial, summary };
+}
+
+function renderSyscallStubsPanel() {
+    const st = syscallState.stubs;
+    const panel = document.getElementById('syscall-stubs');
+    const body = document.getElementById('syscall-stubs-body');
+    const head = document.getElementById('syscall-stubs-head');
+    const lower = document.getElementById('syscall-lower');
+    if (lower && lower.classList) lower.classList.toggle('with-stubs', st.searched);
+    if (panel) panel.hidden = !st.searched;
+    if (st.searched) {
+        const model = syscallStubsModel();
+        if (head) head.textContent = st.running ? `Searching PID ${st.pid}…` : `PID ${st.pid} · ${model.hits.length} hit${model.hits.length === 1 ? '' : 's'}`;
+        if (body) {
+            const top = body.scrollTop;
+            body.innerHTML = st.running ? `<p class="syscall-empty">Searching PID ${escapeHtml(st.pid)}…</p>` : renderSyscallStubs(model);
+            body.scrollTop = top;
+        }
+    }
+    // in the graph view this row is folded and the bar over it is the only trace of this panel
+    syscallApplyLower();
+}
+
+async function runSyscallStubs() {
+    const st = syscallState.stubs;
+    if (st.running) return false;
+    const select = document.getElementById('syscall-target');
+    const pid = parseInt(select ? select.value : syscallState.target, 10);
+    if (!(pid > 0)) {
+        syscallSetScanNote('warn', 'Choose a process to search first.');
+        return false;
+    }
+    const target = syscallTargetProcess(pid);
+    Object.assign(st, { searched: true, running: true, pid, name: target.name, sources: {} });
+    renderSyscallToolbar();
+    renderSyscallStubsPanel();
+    const post = body => syscallApi('/api/syscalls/stubs', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+    });
+    // a process that has exited is not measured: its memory is gone, and its PID may be another process's by now
+    let proc = null;
+    if (target.exited) {
+        st.sources.process = { skipped: `PID ${pid} has exited: its memory is gone, and the PID may belong to another process by now, so only its file was searched.` };
+    } else {
+        proc = await post({ pid });
+        st.sources.process = proc.ok ? { ok: true, data: proc.data, sample: target.name } : { ok: false, error: syscallErrorText(proc) };
+    }
+    const view = (proc && proc.ok && proc.data.view) || (syscallState.baseline && syscallState.baseline.view) || '';
+    if (!target.image) {
+        st.sources.file = { skipped: 'No image path is known for this process, so its file was not searched.' };
+    } else if (!view) {
+        st.sources.file = { skipped: 'The view to search the file in is not known, so its file was not searched.' };
+    } else {
+        const file = await post({ path: target.image, view });
+        st.sources.file = file.ok ? { ok: true, data: file.data, sample: target.image.split(/[\\/]/).pop() } : { ok: false, error: syscallErrorText(file) };
+    }
+    st.running = false;
+    renderSyscallToolbar();
+    renderSyscallStubsPanel();
+    return true;
+}
+
+// Draft rule on a hit: the stub goes to the server, which drafts a YARA rule for its bytes and writes nothing; apply
+// and download follow from the draft
+async function syscallDraftStubRule(index) {
+    const item = syscallStubsModel().hits[index];
+    if (!item) return false;
+    const { source, build, ...hit } = item;
+    return syscallRequestDraft({ hit, view: hit.view, build, source: source === 'file' ? 'stub search of a file' : 'stub search of a process' });
+}
+
+// APPLY TO THIS VM: the draft goes back to the server as it came, which writes it where Rustinel reads its rules. Only
+// the draft that is on the page, and only a YARA rule, and not while another apply is under way. A rule that is there
+// already is an answer, not a failure.
+async function applySyscallRule(name) {
+    const st = syscallState.draft;
+    if (!st || !st.draft || st.busy || st.draft.kind === 'signature' || st.draft.name !== name) return false;
+    st.busy = true;
+    st.note = null;
+    renderSyscallDraft();
+    const r = await syscallApi('/api/syscalls/rule/apply', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(st.draft),
+    });
+    st.busy = false;
+    const path = typeof r.data.path === 'string' ? r.data.path : '';
+    if (r.ok) {
+        const seconds = Number(r.data.reload_seconds) > 0 ? Number(r.data.reload_seconds) : 2;
+        st.note = { tone: 'ok', text: `Written${path ? ` to ${path}` : ''}. Rustinel should load it within about ${seconds} seconds, which is not yet verified on a VM: check its log. ` +
+                    'This copy lives on this VM only; a rebuilt VM does not have it. ' +
+                    'Download the rule as well and commit it under rules/yara/ to keep it in version control. ' +
+                    'Whether a committed rule is loaded again after a rebuild is not yet verified.' };
+    } else if (r.status === 409 && r.data.status === 'exists') {
+        st.note = { tone: 'info', text: `A rule of this name is there already${path ? ` (${path})` : ''}: it is the same stub, build and view. It was left alone. Nothing was written.` };
+    } else {
+        st.note = { tone: 'error', text: syscallErrorText(r) };
+    }
+    if (syscallState.draft === st) renderSyscallDraft();
+    return r.ok;
+}
+
+// The known hooks and the scan on the map, as renderHookAllowlist wants them. pairs are the hooks that recording would
+// add (the hooked ntdll stubs of the scan that a module owns and the list does not know), hookable their number.
+function syscallHooksModel() {
+    const h = syscallState.hooks, baseline = syscallState.baseline, scan = syscallState.scan;
+    const model = {
+        entries: h.entries, loaded: h.loaded, problem: h.problem, error: h.error, note: h.note, busy: h.busy, scan: null,
+        scope: baseline && baseline.build && baseline.view ? { build: String(baseline.build), view: String(baseline.view) } : null,
+    };
+    if (scan) {
+        const hooked = (Array.isArray(scan.deviations) ? scan.deviations : [])
+            .filter(d => d && d.state === 'hooked' && typeof d.target_owner === 'string' && d.target_owner && d.target_owner !== 'private');
+        const pairs = syscallHookPairs(scan);
+        const hookable = pairs.length;
+        model.scan = { pid: scan.pid, name: String(scan.process || '').split(/[\\/]/).pop(), hookable, pairs,
+                       known: hooked.filter(d => d.allowlisted === true).length, allowlist: scan.allowlist || null };
+    }
+    return model;
+}
+
+function renderSyscallHooks() {
+    const host = document.getElementById('syscall-hooks');
+    const head = document.getElementById('syscall-hooks-head');
+    const h = syscallState.hooks;
+    if (head) head.textContent = h.loaded ? `${h.entries.length.toLocaleString('en-US')} known` : '';
+    if (!host) return;
+    const top = host.scrollTop;
+    host.innerHTML = renderHookAllowlist(syscallHooksModel());
+    host.scrollTop = top;
+    syscallApplyLower();
+}
+
+async function syscallLoadHooks() {
+    const r = await syscallApi('/api/syscalls/hook-baseline');
+    const h = syscallState.hooks;
+    if (r.ok) {
+        h.entries = Array.isArray(r.data.entries) ? r.data.entries : [];
+        h.problem = typeof r.data.problem === 'string' ? r.data.problem : '';
+        h.error = '';
+        h.loaded = true;
+    } else {
+        h.error = syscallErrorText(r);
+    }
+    renderSyscallHooks();
+    return r.ok;
+}
+
+// RECORD THE HOOKS OF THIS RUN AS KNOWN. The server records the hooks it measures in the process when the request
+// arrives, not the ones the analyst looked at, so the label would not be true by itself. Before anything is sent the
+// process is measured again and compared with the scan that was reviewed (the build and view, the process behind the
+// PID, the hooks); if they differ nothing is recorded and the difference is said. After the recording the entries that
+// are new in the list are compared once more with the reviewed ones, because the server measured again. It asks first
+// and says what it costs on a host that is not clean.
+async function syscallCaptureHooks() {
+    const h = syscallState.hooks, model = syscallHooksModel(), reviewed = syscallState.scan;
+    if (h.busy || !model.scan || !(model.scan.hookable > 0)) return false;
+    // what is new in the list afterwards is told from what was there by the list as it is now: without it every known
+    // hook would look like one the analyst did not review
+    if (!h.loaded && !(await syscallLoadHooks())) {
+        h.note = { tone: 'error', text: 'Nothing was recorded: the list of known hooks has not been read, so what is new in it could not be told from what was there. ' +
+                   `Try again when it can be read${h.error ? ` (${h.error})` : ''}.` };
+        renderSyscallHooks();
+        return false;
+    }
+    if (typeof confirm !== 'function' || !confirm(syscallCaptureQuestion(model.scan))) return false;
+    const pid = model.scan.pid, expected = model.scan.pairs.map(p => syscallHookKey(p.name, p.owner));
+    const stop = text => {
+        h.busy = false;
+        h.note = { tone: 'error', text };
+        renderSyscallHooks();
+        return false;
+    };
+    h.busy = true;
+    h.note = { tone: 'info', text: `Measuring PID ${pid} again, to check that its hooks are still those you reviewed…` };
+    renderSyscallHooks();
+    const now = await syscallApi('/api/syscalls/scan', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pid, modules: ['ntdll.dll'] }),
+    });
+    if (!now.ok) return stop(`Nothing was recorded: PID ${pid} could not be measured again (${syscallErrorText(now)}). Scan it again and review the result.`);
+    const drift = syscallHookDrift(reviewed, now.data);
+    if (drift) return stop(`Nothing was recorded. ${drift} Scan it again and review the new result.`);
+    const known = new Set(h.entries.map(e => `${syscallHookKey(e.syscall, e.owner)}|${e.build}|${e.view}`));
+    const r = await syscallApi('/api/syscalls/hook-baseline', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ pid }),
+    });
+    if (!r.ok) return stop(syscallErrorText(r));
+    const loaded = await syscallLoadHooks();
+    h.busy = false;
+    const label = key => key.replace('|', ' → ');
+    const recorded = h.entries.filter(e => e.build === r.data.build && e.view === r.data.view
+        && !known.has(`${syscallHookKey(e.syscall, e.owner)}|${e.build}|${e.view}`)).map(e => syscallHookKey(e.syscall, e.owner));
+    const diff = syscallHookDifference(expected, recorded);
+    const where = `PID ${pid}, build ${r.data.build}, ${r.data.view} view`;
+    if (!loaded) {
+        h.note = { tone: 'error', text: `The server recorded ${Number(r.data.added) || 0} hook(s) of ${where}, but the list could not be read again to check them against the scan you reviewed.` };
+    } else if (diff.extra.length) {
+        h.note = { tone: 'error', text: `Recorded hooks that you did not review: ${diff.extra.map(label).join(', ')} (${where}). The server measured the process again and found them; ` +
+                   'they are not in the scan you looked at. FORGET THIS BUILD AND VIEW undoes it (the whole set of that build and view, earlier entries too).' };
+    } else if (diff.missing.length) {
+        h.note = { tone: 'warn', text: `Not recorded, although the scan showed them: ${diff.missing.map(label).join(', ')} (${where}). The server did not find them when it measured again.` };
+    } else if (!recorded.length) {
+        h.note = { tone: 'ok', text: `No new hook: those of ${where} were known already.` };
+    } else {
+        const added = recorded.length;
+        h.note = { tone: 'ok', text: `Recorded ${added} new hook${added === 1 ? '' : 's'} of ${where}: ${recorded.map(label).join(', ')}. ` +
+                   `The list holds ${Number(r.data.entries) || 0} for it. Scan again: the stubs on the map are not marked as known yet.` +
+                   (r.data.partial ? ' The measurement was partial.' : '') };
+    }
+    renderSyscallHooks();
+    return true;
+}
+
+// FORGET: the known hooks of the build and view on the map ('this') or all of them ('all'), after a question
+async function syscallClearHooks(scope) {
+    const h = syscallState.hooks, baseline = syscallState.baseline;
+    if ((scope !== 'this' && scope !== 'all') || h.busy) return false;
+    if (scope === 'this' && !(baseline && baseline.build && baseline.view)) return false;
+    const question = scope === 'this'
+        ? `Forget the known hooks of build ${baseline.build}, ${baseline.view} view?\n\nEvery hook of that set counts as evidence again.`
+        : 'Forget every known hook, of every build and view?\n\nEvery hook counts as evidence again.';
+    if (typeof confirm !== 'function' || !confirm(question)) return false;
+    h.busy = true;
+    h.note = null;
+    renderSyscallHooks();
+    const query = scope === 'this' ? `?build=${encodeURIComponent(baseline.build)}&view=${encodeURIComponent(baseline.view)}` : '';
+    const r = await syscallApi(`/api/syscalls/hook-baseline${query}`, { method: 'DELETE' });
+    h.busy = false;
+    h.note = r.ok ? { tone: 'ok', text: 'Forgotten. Scan again: the stubs on the map are marked as known by the list as it was.' }
+                  : { tone: 'error', text: syscallErrorText(r) };
+    await syscallLoadHooks();
+    return r.ok;
+}
+
+// MAP | DETAIL below SYSCALL_NARROW, where the map and the detail panel take turns on one place; above it both are
+// shown and this changes nothing. A map that was out of sight has no width and is drawn when it comes back.
+function syscallSetPane(name) {
+    if (!SYSCALL_PANE_NAMES.includes(name)) return false;
+    syscallState.pane = name;
+    const work = document.getElementById('syscall-work');
+    if (work) work.dataset.pane = name;
+    for (const other of SYSCALL_PANE_NAMES) {
+        const button = document.getElementById(`syscall-pane-${other}`);
+        if (button) button.setAttribute('aria-pressed', other === name ? 'true' : 'false');
+    }
+    if (name === 'map') {
+        renderSyscallMap();
+        renderBinaryGraph();
+    }
+    return true;
+}
+
+// MAP / GRAPH: the surface that is on; a view whose button is missing or disabled is not switched to. The detail
+// panel follows: a node or an edge chosen in the graph is described only while the graph shows.
+function syscallSetView(name) {
+    if (!SYSCALL_VIEW_NAMES.includes(name)) return false;
+    const button = document.getElementById(`syscall-view-${name}`);
+    if (!button || button.disabled) return false;
+    syscallState.view = name;
+    for (const other of SYSCALL_VIEW_NAMES) {
+        const surface = document.getElementById(`syscall-surface-${other}`);
+        if (surface) surface.hidden = other !== name;
+    }
+    if (!syscallState.lowerByHand) syscallState.lowerFolded = name === 'graph';
+    syscallApplyLower();
+    renderSyscallToolbar();
+    if (name === 'map') {
+        renderSyscallMap();
+    } else {
+        renderBinaryGraph();
+        binaryGraphApplyMax();
+        binaryGraphMetricsLoad();
+    }
+    renderSyscallDetailPanel();
+    return true;
+}
+
+// The map's box changed size: its cells are laid out again, but only while it is on screen
+function syscallResized() {
+    if (state.activeTab === 'syscalls') renderSyscallMap();
+}
+
+function initSyscalls() {
+    if (syscallState.ready) return;
+    syscallState.ready = true;
+    const host = document.getElementById('syscall-map');
+    if (host) {
+        host.addEventListener('pointermove', syscallOnMapMove);
+        host.addEventListener('pointerleave', syscallOnMapLeave);
+        host.addEventListener('click', syscallOnMapClick);
+        if (typeof ResizeObserver !== 'undefined') new ResizeObserver(() => requestAnimationFrame(syscallResized)).observe(host);
+    }
+    binaryGraphOnQuery();
+    syscallRenderAll();
+}
+
+// The tab is shown: the targets and the status are asked for again (processes come and go, an extraction may be
+// done), the baseline only if there is none, and the map is drawn at the size it has now
+function syscallsTabShown() {
+    initSyscalls();
+    renderSyscallMap();
+    syscallLoadTargets();
+    syscallLoadHooks();
+    syscallRefresh();
+}
+
+// --- GRAPH: the binary graph's answers as layered paths ------------------------------------------------------------
+// One question to /api/binary-graph/query, drawn left to right with one layer per hop. An edge's origin is its claim:
+// "derived" is read from the binaries, "curated" is the word of the hand-curated Win32 to Nt table. The curated hop
+// is drawn dashed, in its own colour and tagged in words, named in the legend and said in the detail panel: a reader
+// who takes it for a derived edge draws wrong conclusions from the graph.
+// Red stays the map's: a syscall whose stub deviated in the last scan is drawn in the map's colour of its state, and so
+// is every edge on a path into it. A filter match gets a ring of its own (--graph-match), never a deviation tone.
+
+// The box of a node and the room between layers and rows, in px; the dash of a curated edge; how many characters of
+// a label fit in a box
+// a dash for an edge whose origin the answer does not name as derived or curated
+const BINARY_GRAPH = { boxW: 176, boxH: 40, gapX: 76, gapY: 14, pad: 16, curatedDash: '6 4', unknownDash: '1 4', labelMax: 24, subMax: 28 };
+const BINARY_GRAPH_SYSCALL = 'syscall:';
+// node kind -> its colour and what the legend calls it; a function has no colour of its own and takes the text's
+const BINARY_GRAPH_KINDS = {
+    dll: { color: '--graph-node-dll', name: 'DLL' },
+    exe: { color: '--graph-node-exe', name: 'EXE' },
+    'api-set': { color: '--graph-node-apiset', name: 'api set' },
+    function: { color: '--text-secondary', name: 'function' },
+    syscall: { color: '--graph-node-syscall', name: 'syscall' },
+};
+// query -> the parameter the start field and the function field are sent as ('' where the query reads none), with
+// their placeholders
+const BINARY_GRAPH_QUERIES = {
+    'path-to-syscall': { first: 'module', second: 'function', firstHint: 'Module, such as kernel32.dll', secondHint: 'Function, such as OpenProcess' },
+    importers: { first: 'module', second: 'function', firstHint: 'Module that is imported', secondHint: 'Only this function (optional)' },
+    imports: { first: 'module', second: '', firstHint: 'Module whose imports to draw', secondHint: '' },
+    'syscall-callers': { first: 'syscall', second: '', firstHint: 'Syscall, such as NtOpenProcess', secondHint: '' },
+    forwarders: { first: 'module', second: '', firstHint: 'Module whose forwarders to follow', secondHint: '' },
+    shared: { first: 'module', second: 'other', firstHint: 'One module', secondHint: 'The other module' },
+};
+const BINARY_GRAPH_EDGE_WORDS = {
+    imports: 'imports', forwards_to: 'forwards to', resolves_to: 'resolves to', reaches_syscall: 'reaches syscall',
+};
+
+// An entry of one of the tables above by a key from the answer, never a member every object inherits ('constructor')
+function binaryGraphOwn(table, key) {
+    return typeof key === 'string' && Object.prototype.hasOwnProperty.call(table, key) ? table[key] : undefined;
+}
+
+// What an edge claims: 'derived' only when the answer says exactly that, 'curated', and 'unknown' for anything else.
+// A missing or unexpected origin must never read as read from a binary.
+function binaryGraphOrigin(edge) {
+    const origin = edge && edge.origin;
+    return origin === 'derived' || origin === 'curated' ? origin : 'unknown';
+}
+
+// `module` is what the start field holds, whichever parameter the query sends it as; `function` the second field's
+// figures: the table of the whole stock (null until it was read), figuresNote why it could not be; metric: the list of a figure the detail panel shows
+const binaryGraphState = { answer: null, query: 'path-to-syscall', module: '', function: '', depth: 1, loading: false, selected: null, note: '', nodes: [], edges: [],
+    figures: null, figuresNote: '', figuresLoading: false, metric: null, maxed: false, maxedByHand: false };
+// numbers the queries, of which only the last answer counts
+const binaryGraphRequests = { seq: 0, metric: 0 };
+
+// The layers: a node one layer right of the deepest node that has an edge into it, so a path runs left to right in
+// the order of its hops. In a layer, the nodes keep the answer's order, then move toward the middle of those that
+// lead to them. A node of a cycle is put right of what of it was placed. { boxes: [{ id, node, layer, x, y, w, h, root }],
+// edges (as given: an edge is known by its index in them), width, height }
+function binaryGraphLayout(nodes, edges, roots) {
+    const g = BINARY_GRAPH;
+    const ids = [], byId = new Map();
+    for (const node of Array.isArray(nodes) ? nodes : []) {
+        if (node && typeof node.id === 'string' && !byId.has(node.id)) {
+            ids.push(node.id);
+            byId.set(node.id, node);
+        }
+    }
+    const known = new Set(ids);
+    const list = Array.isArray(edges) ? edges : [];
+    const links = list.filter(e => e && known.has(e.source) && known.has(e.target) && e.source !== e.target);
+    const into = new Map(ids.map(id => [id, 0])), out = new Map(ids.map(id => [id, []]));
+    for (const e of links) {
+        into.set(e.target, into.get(e.target) + 1);
+        out.get(e.source).push(e.target);
+    }
+    const layer = new Map(), left = new Map(into);
+    const queue = ids.filter(id => into.get(id) === 0);
+    for (const id of queue) layer.set(id, 0);
+    for (let i = 0; i < queue.length; i++) {
+        const id = queue[i];
+        for (const target of out.get(id)) {
+            layer.set(target, Math.max(layer.get(target) || 0, layer.get(id) + 1));
+            left.set(target, left.get(target) - 1);
+            if (left.get(target) === 0) queue.push(target);
+        }
+    }
+    for (const id of ids) if (!layer.has(id)) layer.set(id, 0);
+    const count = ids.length ? Math.max(...layer.values()) + 1 : 0;
+    const columns = Array.from({ length: count }, () => []);
+    for (const id of ids) columns[layer.get(id)].push(id);
+    const row = new Map();
+    columns.forEach((column, i) => {
+        if (i > 0) {
+            const centre = id => {
+                const from = links.filter(e => e.target === id && row.has(e.source)).map(e => row.get(e.source));
+                return from.length ? from.reduce((a, b) => a + b, 0) / from.length : Infinity;
+            };
+            const at = new Map(column.map((id, k) => [id, [centre(id), k]]));
+            column.sort((a, b) => (at.get(a)[0] - at.get(b)[0]) || (at.get(a)[1] - at.get(b)[1]));
+        }
+        column.forEach((id, k) => row.set(id, k));
+    });
+    const tallest = columns.reduce((most, column) => Math.max(most, column.length), 0);
+    const pitch = g.boxH + g.gapY;
+    const boxes = [];
+    columns.forEach((column, i) => {
+        const offset = (tallest - column.length) * pitch / 2;
+        column.forEach((id, k) => boxes.push({ id, node: byId.get(id), layer: i, x: g.pad + i * (g.boxW + g.gapX), y: g.pad + offset + k * pitch, w: g.boxW, h: g.boxH }));
+    });
+    const rootSet = new Set(Array.isArray(roots) ? roots : []);
+    for (const box of boxes) box.root = rootSet.has(box.id);
+    return {
+        boxes, edges: list,
+        width: count ? 2 * g.pad + count * g.boxW + (count - 1) * g.gapX : 0,
+        height: tallest ? 2 * g.pad + tallest * g.boxH + (tallest - 1) * g.gapY : 0,
+    };
+}
+
+// How an edge is drawn: a derived edge solid in the muted line colour, the curated one dashed in its own, one of an
+// unknown origin dotted in the secondary text colour. A tone (the state of a deviating syscall it leads to) takes the
+// colour; the dash stays, the curated hop is still curated.
+function binaryGraphEdgeLook(edge, tone) {
+    const origin = binaryGraphOrigin(edge);
+    const look = origin === 'curated' ? { color: themeColor('--graph-edge-curated'), width: 2, dash: BINARY_GRAPH.curatedDash }
+        : origin === 'derived' ? { color: themeColor('--text-muted'), width: 1.5, dash: '' }
+        : { color: themeColor('--text-secondary'), width: 1.5, dash: BINARY_GRAPH.unknownDash };
+    if (tone && SYSCALL_STATE_COLORS[tone]) {
+        look.color = themeColor(SYSCALL_STATE_COLORS[tone]);
+        look.width += 0.5;
+    }
+    return look;
+}
+
+// How a node's box is drawn: the colour of its kind, or of the state its stub deviated to
+function binaryGraphNodeLook(node, tone) {
+    const kind = binaryGraphOwn(BINARY_GRAPH_KINDS, node && node.kind);
+    if (tone && SYSCALL_STATE_COLORS[tone]) {
+        return { stroke: themeColor(SYSCALL_STATE_COLORS[tone]), fill: themeColor(SYSCALL_STATE_COLORS[tone], 0.18), width: 2.5 };
+    }
+    return { stroke: themeColor(kind ? kind.color : '--text-muted'), fill: themeColor('--bg-secondary'), width: 1.5 };
+}
+
+// The deviations of a scan on the answer: the state of each syscall node whose stub is not intact, and for each edge
+// the state of a deviating syscall it leads to (the most severe, where it leads to several). `states` is the scan's
+// name -> state, or null without one. { nodes: Map id -> state, edges: Map index -> state }
+function binaryGraphTones(nodes, edges, states) {
+    const tones = { nodes: new Map(), edges: new Map() };
+    if (!states) return tones;
+    const list = Array.isArray(edges) ? edges : [];
+    const worse = (a, b) => (SYSCALL_SEVERITY_RANK[a] ?? 2) <= (SYSCALL_SEVERITY_RANK[b] ?? 2) ? a : b;
+    for (const node of Array.isArray(nodes) ? nodes : []) {
+        if (!node || node.kind !== 'syscall' || typeof node.id !== 'string' || !node.id.startsWith(BINARY_GRAPH_SYSCALL)) continue;
+        const state = states.get(node.id.slice(BINARY_GRAPH_SYSCALL.length));
+        if (!state || state === 'intact' || !SYSCALL_STATE_COLORS[state]) continue;
+        tones.nodes.set(node.id, state);
+        // back along the edges from the syscall: every edge on a path into it
+        const seen = new Set([node.id]), queue = [node.id];
+        for (let i = 0; i < queue.length; i++) {
+            list.forEach((e, k) => {
+                if (!e || e.target !== queue[i]) return;
+                tones.edges.set(k, tones.edges.has(k) ? worse(tones.edges.get(k), state) : state);
+                if (!seen.has(e.source)) {
+                    seen.add(e.source);
+                    queue.push(e.source);
+                }
+            });
+        }
+    }
+    return tones;
+}
+
+// The nodes the filter of the tab matches: a syscall node as its cell on the map does, any other node by its name.
+// `match` is the map's set of matching names (null without a filter), `query` the filter's text.
+function binaryGraphMatches(nodes, match, query) {
+    const found = new Set();
+    if (!match) return found;
+    const text = String(query || '').trim().toLowerCase();
+    for (const node of Array.isArray(nodes) ? nodes : []) {
+        if (!node || typeof node.id !== 'string') continue;
+        if (node.kind === 'syscall') {
+            if (node.id.startsWith(BINARY_GRAPH_SYSCALL) && match.has(node.id.slice(BINARY_GRAPH_SYSCALL.length))) found.add(node.id);
+        } else if (text && node.id.toLowerCase().includes(text)) {
+            found.add(node.id);
+        }
+    }
+    return found;
+}
+
+// A text cut to `max` characters
+function binaryGraphCut(text, max) {
+    const value = String(text ?? '');
+    return value.length > max ? value.slice(0, max - 1) + '…' : value;
+}
+
+// The SVG of a layout. model: { tones (binaryGraphTones), match (a set of node ids), selected (an id or null) }
+function binaryGraphSvg(layout, model) {
+    if (!layout || !Array.isArray(layout.boxes) || !layout.boxes.length) return '';
+    const g = BINARY_GRAPH;
+    const m = model || {};
+    const tones = m.tones || { nodes: new Map(), edges: new Map() };
+    const match = m.match || new Set();
+    const c = v => String(Math.round(v * 10) / 10);
+    const at = new Map(layout.boxes.map(box => [box.id, box]));
+    let svg = `<svg class="binary-graph-svg" xmlns="http://www.w3.org/2000/svg" width="${c(layout.width)}" height="${c(layout.height)}" `
+        + `viewBox="0 0 ${c(layout.width)} ${c(layout.height)}" role="img" aria-label="${escapeHtml(`${layout.boxes.length} nodes of the binary graph, one layer per hop`)}"><g class="binary-graph-edges">`;
+    (Array.isArray(layout.edges) ? layout.edges : []).forEach((edge, index) => {
+        const from = edge && at.get(edge.source), to = edge && at.get(edge.target);
+        if (!from || !to || from === to) return;
+        const tone = tones.edges.get(index) || '';
+        const look = binaryGraphEdgeLook(edge, tone);
+        const x1 = from.x + from.w, y1 = from.y + from.h / 2, x2 = to.x, y2 = to.y + to.h / 2;
+        const bend = Math.max(24, Math.abs(x2 - x1) / 2);
+        const d = `M${c(x1)} ${c(y1)}C${c(x1 + bend)} ${c(y1)} ${c(x2 - bend)} ${c(y2)} ${c(x2)} ${c(y2)}`;
+        const origin = binaryGraphOrigin(edge);
+        const id = `edge:${index}`;
+        const claim = { curated: edge.label === 'curated: zw-alias' ? 'curated: a naming convention, not read from any binary'
+                                                                    : 'curated: from the Win32 to Nt table, not read from any binary',
+                        derived: 'derived: read from the binaries',
+                        unknown: 'origin unknown: the answer does not say where this edge comes from' }[origin];
+        const words = `${edge.source} ${binaryGraphOwn(BINARY_GRAPH_EDGE_WORDS, edge.kind) || edge.kind} ${edge.target} · ${claim}${edge.label ? ` · ${edge.label}` : ''}`;
+        svg += `<g class="binary-graph-edge binary-graph-edge-${origin}${m.selected === id ? ' selected' : ''}" onclick="binaryGraphSelect(${jsArg(id)})">`
+            + `<title>${escapeHtml(words)}</title>`
+            + `<path class="binary-graph-edge-hit" d="${d}"></path>`
+            + `<path class="binary-graph-edge-line binary-graph-edge-${origin}" data-edge="${jsInt(index)}" data-origin="${origin}" `
+            + `data-source="${escapeHtml(edge.source)}" data-target="${escapeHtml(edge.target)}"${tone ? ` data-tone="${cssToken(tone)}"` : ''} d="${d}" fill="none" `
+            + `stroke="${look.color}" stroke-width="${c(m.selected === id ? look.width + 1.5 : look.width)}"${look.dash ? ` stroke-dasharray="${look.dash}"` : ''}></path>`
+            + `<path class="binary-graph-arrow" d="M${c(x2 - 8)} ${c(y2 - 4)}L${c(x2)} ${c(y2)}L${c(x2 - 8)} ${c(y2 + 4)}Z" fill="${look.color}"></path>`;
+        // the word stays in the curated colour on a path in a deviation tone: the tone says "deviated", the tag "curated"
+        if (origin === 'curated') {
+            svg += `<text class="binary-graph-edge-tag" x="${c((x1 + x2) / 2)}" y="${c((y1 + y2) / 2 - 6)}" text-anchor="middle" fill="${themeColor('--graph-edge-curated')}">curated</text>`;
+        }
+        svg += '</g>';
+    });
+    svg += '</g><g class="binary-graph-nodes">';
+    for (const box of layout.boxes) {
+        const node = box.node || { id: box.id, label: box.id, kind: '' };
+        const tone = tones.nodes.get(box.id) || '';
+        const look = binaryGraphNodeLook(node, tone);
+        const bang = box.id.indexOf('!');
+        let sub = '';
+        if (node.kind === 'function' && bang > 0) sub = box.id.slice(0, bang);
+        else if (Number(node.in_degree) > 0) sub = `imported by ${Number(node.in_degree).toLocaleString('en-US')}`;
+        else sub = (binaryGraphOwn(BINARY_GRAPH_KINDS, node.kind) || { name: String(node.kind || '') }).name;
+        // a syscall's label is "NtClose (ntdll.dll, 0xf)": the name on the first line, the module and number under it
+        let label = String(node.label ?? box.id);
+        const paren = node.kind === 'syscall' ? label.indexOf(' (') : -1;
+        if (paren > 0) {
+            sub = label.slice(paren + 2).replace(/\)$/, '');
+            label = label.slice(0, paren);
+        }
+        const flags = (m.selected === box.id ? ' selected' : '') + (match.has(box.id) ? ' match' : '') + (box.root ? ' root' : '');
+        const words = [box.id, node.label && node.label !== box.id ? node.label : '', node.category ? `suspicious import: ${node.category}` : ''].filter(Boolean).join(' · ');
+        svg += `<g class="binary-graph-node binary-graph-node-${cssToken(node.kind)}${flags}" data-id="${escapeHtml(box.id)}" data-layer="${jsInt(box.layer)}"`
+            + `${tone ? ` data-tone="${cssToken(tone)}"` : ''} onclick="binaryGraphSelect(${jsArg(box.id)})"><title>${escapeHtml(words)}</title>`;
+        if (match.has(box.id)) {
+            svg += `<rect class="binary-graph-match-ring" x="${c(box.x - 5)}" y="${c(box.y - 5)}" width="${c(box.w + 10)}" height="${c(box.h + 10)}" rx="6" `
+                + `fill="none" stroke="${themeColor('--graph-match')}" stroke-width="2"></rect>`;
+        }
+        if (m.selected === box.id) {
+            svg += `<rect class="binary-graph-selected-ring" x="${c(box.x - 2.5)}" y="${c(box.y - 2.5)}" width="${c(box.w + 5)}" height="${c(box.h + 5)}" rx="5" `
+                + `fill="none" stroke="${themeColor('--text-primary')}" stroke-width="1.5"></rect>`;
+        }
+        svg += `<rect class="binary-graph-box" x="${c(box.x)}" y="${c(box.y)}" width="${c(box.w)}" height="${c(box.h)}" rx="4" `
+            + `fill="${look.fill}" stroke="${look.stroke}" stroke-width="${c(look.width)}"></rect>`
+            + `<text class="binary-graph-label" x="${c(box.x + 8)}" y="${c(box.y + 16)}" fill="${themeColor('--text-primary')}">${escapeHtml(binaryGraphCut(label, g.labelMax))}</text>`
+            + `<text class="binary-graph-sub" x="${c(box.x + 8)}" y="${c(box.y + 31)}" fill="${themeColor('--text-muted')}">${escapeHtml(binaryGraphCut(sub, g.subMax))}</text>`
+            + '</g>';
+    }
+    return svg + '</g></svg>';
+}
+
+// The legend under the graph: the kinds of node, the two origins of an edge with the stroke each is drawn in, a
+// deviation and a filter match. It names only what the drawing in front of the reader can show: the explore view
+// (mode 'explore', with the edges it draws) has no syscall, deviation or filter match, and a curated or unknown edge
+// only where one is drawn.
+function binaryGraphLegend(mode, edges) {
+    const explore = mode === 'explore';
+    const drawn = new Set((Array.isArray(edges) ? edges : []).map(e => binaryGraphOrigin(e)));
+    const item = (key, mark, text, help) =>
+        `<span class="syscall-legend-item binary-graph-legend-item" data-legend="${cssToken(key)}" title="${escapeHtml(help)}">${mark}<span>${escapeHtml(text)}</span></span>`;
+    const box = (stroke, fill, extra) => `<svg class="binary-graph-legend-mark" width="18" height="12" viewBox="0 0 18 12" aria-hidden="true">${extra || ''}`
+        + `<rect x="2" y="2" width="14" height="8" rx="2" fill="${fill}" stroke="${stroke}" stroke-width="1.5"></rect></svg>`;
+    const line = (origin, look) => `<svg class="binary-graph-legend-mark" width="30" height="12" viewBox="0 0 30 12" aria-hidden="true">`
+        + `<line data-origin="${origin}" x1="1" y1="6" x2="29" y2="6" stroke="${look.color}" stroke-width="${look.width}"${look.dash ? ` stroke-dasharray="${look.dash}"` : ''}></line></svg>`;
+    const parts = Object.entries(BINARY_GRAPH_KINDS).filter(([kind]) => !explore || kind !== 'syscall').map(([kind, k]) =>
+        item(`node-${kind}`, box(themeColor(k.color), themeColor('--bg-secondary')), k.name, `A node of the kind ${k.name}.`));
+    parts.push(item('edge-derived', line('derived', binaryGraphEdgeLook({ origin: 'derived' })), 'derived: read from the binaries',
+        'An import, a forwarder or an api-set resolution that the import and export tables of the binaries themselves say.'));
+    if (!explore || drawn.has('curated')) {
+        parts.push(item('edge-curated', line('curated', binaryGraphEdgeLook({ origin: 'curated' })),
+            'curated: the hand-curated Win32 to Nt table or the Zw naming convention, not read from any binary',
+            'The step from a Win32 function to its Nt syscall is the word of a hand-curated table, and the step from a Zw name of ntdll to its Nt syscall a naming convention. No binary of this system was read to draw either.'));
+    }
+    if (!explore || drawn.has('unknown')) {
+        parts.push(item('edge-unknown', line('unknown', binaryGraphEdgeLook({ origin: '' })), 'origin unknown: neither derived nor curated',
+            'An edge whose answer names neither origin. It is not claimed to be read from a binary.'));
+    }
+    if (explore) return parts.join('');
+    parts.push(item('deviation', box(themeColor(SYSCALL_STATE_COLORS.patched), themeColor(SYSCALL_STATE_COLORS.patched, 0.18)),
+        'deviated in the last scan, and the path to it, in the colour of its state on the map',
+        'A syscall whose stub the last scan of this view did not find intact, coloured as on the map, and every edge on a path into it.'));
+    parts.push(item('match', box(themeColor('--text-muted'), themeColor('--bg-secondary'),
+        `<rect x="0.5" y="0.5" width="17" height="11" rx="3" fill="none" stroke="${themeColor('--graph-match')}" stroke-width="1"></rect>`),
+        'filter match', 'A node the filter of the tab matches: its name, or for a syscall its name or number as on the map.'));
+    return parts.join('');
+}
+
+// What an answer read over a table cut short says, whatever its note says: a negative or a count over it is not
+// certain. It points at the figure rather than warning on its own, as the exploration does (Ruling 58).
+const BINARY_GRAPH_PARTIAL = 'A table (import, delay-load or export) this answer read was cut short when it was read, '
+    + 'so a negative or a count here is not certain; the figures say how many.';
+
+// What the line above the graph says: the note of an answer that has nodes, that it was cut, if it was, and that a
+// table it read was cut short. { tone, html } with html '' when there is nothing to say.
+function binaryGraphStatus() {
+    const st = binaryGraphState, a = st.answer;
+    // a cut answer says so whether or not it kept a node; the note stands in the canvas when it kept none
+    if (st.loading || !a || (!st.nodes.length && !a.truncated)) return { tone: 'info', html: '' };
+    let html = '';
+    if (a.truncated) {
+        // the numbers are the answer's: the backend's cap is not copied here, where it could go stale
+        const total = Number(a.total) || 0, drawn = st.nodes.length;
+        html += `<strong class="binary-graph-cut">Not the whole answer: it had ${escapeHtml(total.toLocaleString('en-US'))} parts and was cut, `
+            + `${escapeHtml(drawn.toLocaleString('en-US'))} node${drawn === 1 ? ' is' : 's are'} drawn. Whole parts were dropped, never half a path: `
+            + 'a node that is missing here is not shown, which does not mean it is not imported.</strong> ';
+    }
+    if (st.note && st.nodes.length) html += `<span class="binary-graph-note">${escapeHtml(st.note)}</span>`;
+    if (a.partial === true && st.nodes.length) html += ` <span class="binary-graph-partial">${escapeHtml(BINARY_GRAPH_PARTIAL)}</span>`;
+    const stamp = [a.build ? `build ${a.build}` : '', a.arch || ''].filter(Boolean).join(' · ');
+    if (stamp) html += ` <span class="syscall-muted">${escapeHtml(stamp)}</span>`;
+    return { tone: a.truncated ? 'warn' : 'info', html };
+}
+
+// What the graph draws besides the layout: the deviations of the last scan (only of the view the graph was built
+// for: a scan of another view says nothing about these syscalls), the filter's matches and the selection
+function binaryGraphModel() {
+    const st = binaryGraphState, scan = syscallState.scan, a = st.answer;
+    const fits = scan && a && String(scan.view || '').toLowerCase() === String(a.arch || '').toLowerCase();
+    return {
+        tones: binaryGraphTones(st.nodes, st.edges, fits ? syscallState.states : null),
+        match: binaryGraphMatches(st.nodes, syscallState.match, syscallState.query),
+        selected: st.selected,
+    };
+}
+
+function renderBinaryGraph() {
+    const st = binaryGraphState;
+    const status = document.getElementById('binary-graph-status');
+    if (status) {
+        const s = binaryGraphStatus();
+        status.innerHTML = s.html;
+        status.className = `binary-graph-status binary-graph-status-${cssToken(s.tone)}`;
+        status.hidden = !s.html;
+    }
+    const legend = document.getElementById('binary-graph-legend');
+    if (legend) legend.innerHTML = binaryGraphLegend();
+    const host = document.getElementById('binary-graph-canvas');
+    if (!host) return;
+    if (st.loading || !st.nodes.length) {
+        const text = st.loading ? 'Asking the binary graph…'
+            : st.note || 'Choose a query and its start, then QUERY: the answer is drawn here, one layer per hop.';
+        const error = !st.loading && !st.answer && st.note;
+        const cut = !st.loading && st.answer && st.answer.partial === true ? ` ${BINARY_GRAPH_PARTIAL}` : '';
+        host.innerHTML = `<p class="syscall-empty${error ? ' syscall-empty-error' : ''}">${escapeHtml(text + cut)}</p>`;
+        return;
+    }
+    host.innerHTML = binaryGraphSvg(binaryGraphLayout(st.nodes, st.edges, st.answer ? st.answer.roots : []), binaryGraphModel());
+}
+
+// The fields of the query bar: their placeholders, and the second one only where the query reads it
+function binaryGraphOnQuery() {
+    const select = document.getElementById('binary-graph-query');
+    const name = select && BINARY_GRAPH_QUERIES[select.value] ? select.value : 'path-to-syscall';
+    binaryGraphState.query = name;
+    const q = BINARY_GRAPH_QUERIES[name];
+    const first = document.getElementById('binary-graph-module'), second = document.getElementById('binary-graph-function');
+    if (first) first.setAttribute('placeholder', q.firstHint);
+    if (second) {
+        second.setAttribute('placeholder', q.secondHint);
+        second.disabled = !q.second;
+        second.hidden = !q.second;
+    }
+}
+
+function binaryGraphSubmit(event) {
+    if (event && typeof event.preventDefault === 'function') event.preventDefault();
+    binaryGraphRun();
+}
+
+// QUERY: the bar's fields as the query's parameters. A newer query overtakes the answer of an older one.
+async function binaryGraphRun() {
+    const st = binaryGraphState;
+    const read = id => {
+        const el = document.getElementById(id);
+        return el ? String(el.value || '').trim() : '';
+    };
+    const select = read('binary-graph-query');
+    st.query = BINARY_GRAPH_QUERIES[select] ? select : st.query;
+    st.module = read('binary-graph-module');
+    st.function = read('binary-graph-function');
+    const q = BINARY_GRAPH_QUERIES[st.query];
+    const params = new URLSearchParams({ q: st.query });
+    if (st.module) params.set(q.first, st.module);
+    if (q.second && st.function) params.set(q.second, st.function);
+    const seq = ++binaryGraphRequests.seq;
+    st.loading = true;
+    renderBinaryGraph();
+    const r = await syscallApi(`/api/binary-graph/query?${params}`);
+    if (seq !== binaryGraphRequests.seq) return false;
+    st.loading = false;
+    const keep = st.selected && st.selected.startsWith(BINARY_GRAPH_SYSCALL) ? st.selected : null;
+    if (r.ok) {
+        st.answer = r.data;
+        st.nodes = Array.isArray(r.data.nodes) ? r.data.nodes.filter(n => n && typeof n.id === 'string') : [];
+        st.edges = Array.isArray(r.data.edges) ? r.data.edges.filter(e => e && typeof e.source === 'string' && typeof e.target === 'string') : [];
+        st.note = typeof r.data.note === 'string' ? r.data.note : '';
+    } else {
+        st.answer = null;
+        st.nodes = [];
+        st.edges = [];
+        st.note = syscallErrorText(r);
+    }
+    st.selected = keep;
+    renderBinaryGraph();
+    renderSyscallDetailPanel();
+    return r.ok;
+}
+
+// What a graph id names: { node } or { edge, index, source, target } (an edge is 'edge:<index>'), or null
+function binaryGraphItem(id) {
+    const st = binaryGraphState, key = String(id || '');
+    const node = st.nodes.find(n => n.id === key);
+    if (node) return { node };
+    const edge = /^edge:(\d+)$/.exec(key);
+    const e = edge ? st.edges[Number(edge[1])] : null;
+    if (!e) return null;
+    return { edge: e, index: Number(edge[1]), source: st.nodes.find(n => n.id === e.source) || null, target: st.nodes.find(n => n.id === e.target) || null };
+}
+
+// A node or an edge is chosen in the graph. A syscall is chosen as on the map (and the map marks its cell); anything
+// else is described in the shared detail panel.
+function binaryGraphSelect(id) {
+    const item = binaryGraphItem(id);
+    if (!item) return false;
+    if (item.node && item.node.kind === 'syscall' && item.node.id.startsWith(BINARY_GRAPH_SYSCALL)) {
+        syscallSelect(item.node.id.slice(BINARY_GRAPH_SYSCALL.length));
+        return true;
+    }
+    binaryGraphMetricForget();
+    binaryGraphState.selected = String(id);
+    renderBinaryGraph();
+    renderSyscallDetailPanel();
+    const body = document.getElementById('syscall-detail-body');
+    if (body) body.scrollTop = 0;
+    if (typeof window.matchMedia === 'function' && window.matchMedia(SYSCALL_NARROW).matches) syscallSetPane('detail');
+    return true;
+}
+
+// The map chose a syscall (or let go of one): the graph marks its node, if it draws one
+function binaryGraphFollowMap(name) {
+    const st = binaryGraphState;
+    if (name) {
+        st.selected = BINARY_GRAPH_SYSCALL + name;
+        binaryGraphMetricForget();
+    } else if (st.selected && st.selected.startsWith(BINARY_GRAPH_SYSCALL)) st.selected = null;
+    renderBinaryGraph();
+}
+
+// The item the detail panel describes for the graph: what is chosen there, unless it is a syscall (the panel's own)
+// or the map is showing
+function binaryGraphDetailItem() {
+    const st = binaryGraphState;
+    if (syscallState.view !== 'graph' || !st.selected || st.selected.startsWith(BINARY_GRAPH_SYSCALL)) return null;
+    return binaryGraphItem(st.selected);
+}
+
+// The detail of a node or an edge of the graph, as the answer has it. An edge says where its claim comes from: a
+// curated one that it is the table's word and not read from any binary.
+function binaryGraphDetailHtml(item) {
+    if (!item) return '';
+    const facts = rows => `<dl class="syscall-facts">${rows.map(([k, v]) => `<dt>${escapeHtml(k)}</dt><dd>${escapeHtml(v)}</dd>`).join('')}</dl>`;
+    const title = text => `<div class="syscall-detail-name"><span class="syscall-detail-sc">${escapeHtml(text)}</span></div>`;
+    if (item.node) {
+        const n = item.node, bang = n.id.indexOf('!');
+        const rows = [['Kind', (binaryGraphOwn(BINARY_GRAPH_KINDS, n.kind) || { name: String(n.kind || 'unknown') }).name], ['Id', n.id]];
+        let note = '';
+        if (n.kind === 'function' && bang > 0) {
+            rows.push(['Module', n.id.slice(0, bang)]);
+            note = '<p class="syscall-detail-note">A function is drawn as module!function, with the module as the importer or forwarder wrote it. '
+                + 'The graph draws no edge from a module to its functions: an edge is an import, a forwarder, an api-set resolution or the step to a syscall.</p>';
+        } else {
+            rows.push(['Imported by', `${(Number(n.in_degree) || 0).toLocaleString('en-US')} binaries of System32`]);
+        }
+        if (n.category) rows.push(['Suspicious import', n.category]);
+        return title(n.label || n.id) + facts(rows) + note;
+    }
+    const e = item.edge;
+    const name = node => node ? node.label || node.id : '';
+    const rows = [['From', item.source ? `${name(item.source)} (${item.source.id})` : e.source],
+                  ['To', item.target ? `${name(item.target)} (${item.target.id})` : e.target]];
+    let note;
+    const origin = binaryGraphOrigin(e);
+    if (origin === 'curated') {
+        rows.push(['Origin', 'curated, not derived']);
+        const from = escapeHtml(name(item.source) || e.source), to = escapeHtml(name(item.target) || e.target);
+        // a Zw name of ntdll is its Nt name by convention, which the table calls zw-alias (its own row of that source,
+        // ZwUnmapViewOfSection, says no more). The edge is that convention's word, so the panel names the convention and
+        // not "the table's word that the function ends in this syscall", which reads as a Win32 row someone looked up
+        note = e.label === 'curated: zw-alias'
+            ? '<p class="binary-graph-curated-note"><strong>Curated, not derived.</strong> This step is not read from any binary: that '
+                + `${from} is ${to} is a naming convention, a Zw name of ntdll being its Nt name, which the curated table calls zw-alias. `
+                + 'Both names are exports of ntdll; that they are one syscall is not an import, export or forwarder of a file on this system.</p>'
+            : '<p class="binary-graph-curated-note"><strong>Curated, not derived.</strong> This step is not read from any binary: the mapping from '
+                + `${from} to ${to} comes from the hand-curated Win32 to Nt table. `
+                + 'It is that table\'s word that the function ends in this syscall, not an import, export or forwarder of a file on this system.</p>';
+    } else if (origin === 'derived') {
+        rows.push(['Origin', 'derived']);
+        note = '<p class="syscall-detail-note">Derived: read from the binaries themselves, from their import and export tables and the api-set map of this system.</p>';
+    } else {
+        rows.push(['Origin', 'unknown']);
+        note = '<p class="syscall-detail-note">Origin unknown: the answer names this edge neither as read from a binary nor as taken from the curated table. '
+            + 'Treat it as unverified.</p>';
+    }
+    if (e.label) rows.push(['Label', e.label]);
+    return title(binaryGraphOwn(BINARY_GRAPH_EDGE_WORDS, e.kind) || String(e.kind ?? '')) + facts(rows) + note;
+}
+
+// --- GRAPH, EXPLORE: the same graph, opened one node at a time -------------------------------------------------------
+// The whole stock (3,999 binaries on the build this was measured on) is never drawn. This is the level of the binaries: the nodes are modules and
+// the number of functions one imports from another is carried on the edge between them. An entry point, one binary, is
+// drawn alone; EXPAND opens the neighbours of the chosen module in both directions and keeps what is drawn: the modules
+// it imports from (q=imports, grouped by module, see binaryGraphExploreParts) and the modules that import it
+// (q=importers). FUNCTIONS opens the level deeper: the functions the module imports, one node each, which is what the
+// PATH view draws. A function is opened by who imports it. Both are queries of the PATH view, so the importers come with
+// their in-degree and kind; an imported module is read once for its own (/api/binary-graph/node), as many reads as
+// there are new modules, never one per function.
+// DEPTH is how many hops EXPAND walks, over modules. The canvas holds at most `cap` nodes: what could not be drawn is
+// counted and said, never dropped quietly, and the neighbours that are kept are the first in name order, whole, as the
+// server cuts its own answers. A node's size is how many binaries import it (the cache's in-degree), its colour its kind.
+// cap: the backend's MAX_NODES (tests/test_binary_graph_ui.py holds the two equal); reads: the most requests one walk
+// sends, so a deep walk over a busy module stops and says so; batch: how many modules are read at once; drag: the px a
+// press moves before it is a drag, not a click
+const BINARY_GRAPH_EXPLORE = { cap: 400, depths: [1, 2, 3], radius: { min: 6, max: 38, step: 2.4 }, reads: 60, batch: 16, drag: 3 };
+const binaryGraphExplore = { mode: 'path', nodes: [], edges: [], camera: { x: 0, y: 0, zoom: 1 }, selected: null, hovered: null,
+    dragging: null, panning: false, panStart: { x: 0, y: 0 }, down: { x: 0, y: 0 }, moved: false, loading: false, note: '', seq: 0,
+    ready: false, cut: new Map(), modules: new Map() };
+
+// The disc of a node: the larger the more binaries import it, on a log scale so 4,000 and 400 are both readable
+function binaryGraphNodeRadius(node) {
+    const r = BINARY_GRAPH_EXPLORE.radius;
+    const degree = Math.max(0, Number(node && node.in_degree) || 0);
+    return Math.min(r.max, r.min + r.step * Math.log2(1 + degree));
+}
+
+// What a module is called until the graph says: the loader's reading of the name
+function binaryGraphGuessKind(name) {
+    const lower = String(name || '').toLowerCase();
+    if (lower.startsWith('api-') || lower.startsWith('ext-')) return 'api-set';
+    return lower.endsWith('.exe') ? 'exe' : 'dll';
+}
+
+// The kind of a binary as /api/binary-graph/node names it
+function binaryGraphDetailKind(detail, name) {
+    if (detail && detail.is === 'api-set') return 'api-set';
+    if (detail && detail.is === 'binary' && (detail.kind === 'dll' || detail.kind === 'exe')) return detail.kind;
+    return binaryGraphGuessKind(name);
+}
+
+// The queries that open a node: [{ dir, params, module, via, level }]. A module is read both ways (an api set imports
+// nothing of its own): level 'modules' (EXPAND) asks what it imports, to be grouped by module, and who imports it;
+// level 'functions' (FUNCTIONS) asks only what it imports, to be drawn function by function. A function asks who imports
+// it, and the edges of that answer end at the function (`via`). Anything else has nothing to open.
+function binaryGraphExploreRequests(node, level) {
+    const id = node && typeof node.id === 'string' ? node.id : '';
+    if (!id) return [];
+    const into = { dir: 'in', params: { q: 'importers', module: id }, module: id, via: '', level: 'modules' };
+    const out = { dir: 'out', params: { q: 'imports', module: id }, module: id, via: '', level: level === 'functions' ? 'functions' : 'modules' };
+    if (node.kind === 'dll' || node.kind === 'exe') return level === 'functions' ? [out] : [out, into];
+    if (node.kind === 'api-set') return level === 'functions' ? [] : [into];
+    const bang = id.indexOf('!');
+    if (node.kind === 'function' && bang > 0 && level !== 'functions') {
+        const module = id.slice(0, bang);
+        return [{ dir: 'in', params: { q: 'importers', module, function: id.slice(bang + 1) }, module, via: id, level: 'modules' }];
+    }
+    return [];
+}
+
+// An edge that stands for several is derived only if every one of them is: a missing, curated or unexpected origin among
+// them makes the whole unknown, so grouping never lends an edge a claim that one of its parts did not make.
+function binaryGraphCombineOrigin(a, b) {
+    const x = binaryGraphOrigin({ origin: a }), y = binaryGraphOrigin({ origin: b });
+    return x === y ? x : 'unknown';
+}
+
+// An answer as the parts the server cuts it in. { parts: [{ head, nodes, edges }], server, functions }: `server` is how
+// many parts the server dropped of its own answer (its total less the parts it kept), and `functions` how many imported
+// functions it dropped from a list that is grouped by module instead of kept as parts.
+// One part is one importer of an `importers` answer (with the api set it imports through) and, at level 'functions', one
+// function of an `imports` answer. At level 'modules' the functions of an `imports` answer are grouped by the module
+// each belongs to (the part of its id before "!"), and the part is that module with one edge from the opened one that
+// carries how many functions it imports from it. That is aggregation, not invention: an `imports` edge from app.exe to
+// kernel32.dll!CreateFileW *is* the datum that app.exe imports from kernel32.dll, and counting those reads the answer
+// without adding to it. The origin of the edge is derived only if every edge it stands for is (binaryGraphCombineOrigin).
+// When the server cut the list, the last module's count is a lower bound and the modules after it are missing: the edge
+// says "at least", `functions` of the result says how many functions were cut and `last` which module is the lower bound.
+// When a table the answer read was cut short when the graph was built (`partial` of the answer: for an `imports` answer any
+// table (import, delay-load or export) of the module itself, for an `importers` answer any table of the graph, which it reads whole), every count of it is
+// a lower bound and modules may be missing: `tableCut`.
+function binaryGraphExploreParts(request, answer) {
+    const a = answer && typeof answer === 'object' ? answer : {};
+    const known = new Map((Array.isArray(a.nodes) ? a.nodes : []).filter(n => n && typeof n.id === 'string').map(n => [n.id, n]));
+    const edges = (Array.isArray(a.edges) ? a.edges : []).filter(e => e && typeof e.source === 'string' && typeof e.target === 'string');
+    const root = request.module, total = Math.max(0, Number(a.total) || 0), cutShort = a.truncated === true;
+    if (request.dir === 'out' && request.level === 'modules') {
+        const by = new Map();
+        let shown = 0;
+        for (const e of edges) {
+            if (e.kind !== 'imports' || e.source !== root) continue;
+            shown++;
+            const bang = e.target.indexOf('!'), module = bang > 0 ? e.target.slice(0, bang).toLowerCase() : '';
+            if (!module || module === root) continue;
+            if (!by.has(module)) by.set(module, { functions: new Set(), origin: 'derived' });
+            const group = by.get(module);
+            group.functions.add(e.target);
+            if (binaryGraphOrigin(e) !== 'derived') group.origin = 'unknown';
+        }
+        const last = cutShort && by.size ? [...by.keys()][by.size - 1] : '';
+        const parts = [...by.keys()].sort().map(module => {
+            const n = by.get(module).functions.size, partial = module === last || a.partial === true;
+            const label = `${partial ? 'at least ' : ''}${n.toLocaleString('en-US')} function${n === 1 ? '' : 's'}`;
+            return { head: module, nodes: [{ id: module, label: module, kind: binaryGraphGuessKind(module), in_degree: 0, category: '', guess: true }],
+                     edges: [{ source: root, target: module, kind: 'imports', origin: by.get(module).origin, label, functions: n, partial }] };
+        });
+        return { parts, server: 0, functions: cutShort ? Math.max(0, total - shown) : 0, last, tableCut: a.partial === true };
+    }
+    const end = e => (request.via && e.target === root ? { ...e, target: request.via } : e);
+    const grouped = new Map();
+    for (const e of edges) {
+        if (e.kind !== 'imports') continue;
+        const head = request.dir === 'out' ? (e.source === root ? e.target : '') : (e.source !== root ? e.source : '');
+        if (!head) continue;
+        if (!grouped.has(head)) grouped.set(head, { head, ids: new Set([head]), edges: [] });
+        const part = grouped.get(head);
+        part.edges.push(end(e));
+        if (request.dir === 'in' && e.target !== root) {
+            part.ids.add(e.target);
+            for (const hop of edges) if (hop.source === e.target && hop.target === root && hop.kind === 'resolves_to') part.edges.push(end(hop));
+        }
+    }
+    const parts = [...grouped.values()].filter(p => known.has(p.head))
+        .map(p => ({ head: p.head, nodes: [...p.ids].map(id => known.get(id)).filter(Boolean), edges: p.edges }));
+    return { parts, server: cutShort ? Math.max(0, total - parts.length) : 0, functions: 0, last: '', tableCut: a.partial === true };
+}
+
+// How many nodes of these parts are not drawn yet
+function binaryGraphExploreFresh(st, parts) {
+    const have = new Set(st.nodes.map(n => n.id)), fresh = new Set();
+    for (const p of parts) for (const n of p.nodes) if (!have.has(n.id)) fresh.add(n.id);
+    return fresh.size;
+}
+
+// An edge into the drawing: a new one is added; one that is drawn already keeps its place, gains a count it lacked, and
+// keeps its origin only where both say the same. `seen` maps the key of each drawn edge to it.
+function binaryGraphExploreAddEdge(st, seen, e) {
+    const key = `${e.source}\n${e.target}\n${e.kind}`, old = seen.get(key);
+    if (old) {
+        old.origin = binaryGraphCombineOrigin(old.origin, e.origin);
+        if (old.functions === undefined && e.functions !== undefined) Object.assign(old, { functions: e.functions, label: e.label, partial: e.partial });
+        return;
+    }
+    const edge = { source: e.source, target: e.target, kind: e.kind, origin: e.origin, label: typeof e.label === 'string' ? e.label : '' };
+    if (e.functions !== undefined) Object.assign(edge, { functions: e.functions, partial: e.partial === true });
+    seen.set(key, edge);
+    st.edges.push(edge);
+}
+
+// The parts drawn, whole and in order, until one needs a node that does not fit: the cap, or `limit` new nodes of this
+// answer. That part and every later part that needs a new node is held back (the drawn ones stay the first in name order);
+// a part that needs none costs nothing and is drawn whatever came before it. A held part still draws the edges whose two
+// ends are drawn (the edge from an api set to the opened module is real once both are on the canvas) and comes back whole
+// when the nodes it needs are drawn: both are binaryGraphExploreRelease, which the walk runs after every merge. A node that is drawn already takes the answer's in-degree
+// and kind, unless the answer only guessed them. { added, held }: the ids of the nodes drawn and the parts held back.
+function binaryGraphExploreMerge(st, parts, limit) {
+    const cap = BINARY_GRAPH_EXPLORE.cap, have = new Map(st.nodes.map(n => [n.id, n]));
+    const seen = new Map(st.edges.map(e => [`${e.source}\n${e.target}\n${e.kind}`, e]));
+    const added = [], held = [];
+    let fresh = 0, full = false;
+    for (const part of parts) {
+        const news = part.nodes.filter(n => !have.has(n.id));
+        if (news.length && (full || st.nodes.length + news.length > cap || fresh + news.length > limit)) {
+            full = true;
+            held.push(part);
+            continue;
+        }
+        for (const n of part.nodes) {
+            let node = have.get(n.id);
+            const isNew = !node;
+            if (isNew) {
+                node = { id: n.id, label: typeof n.label === 'string' ? n.label : n.id, kind: n.kind, in_degree: 0, category: '', x: 0, y: 0, placed: false };
+                st.nodes.push(node);
+                have.set(n.id, node);
+                added.push(n.id);
+                fresh++;
+            }
+            if (isNew || !n.guess) {
+                node.kind = n.kind;
+                node.in_degree = Math.max(0, Number(n.in_degree) || 0);
+                node.degreeKnown = !n.guess;
+                node.category = typeof n.category === 'string' ? n.category : '';
+                if (typeof n.machine === 'string' && n.machine) node.machine = n.machine;
+            }
+            node.radius = binaryGraphNodeRadius(node);
+        }
+        for (const e of part.edges) binaryGraphExploreAddEdge(st, seen, e);
+    }
+    return { added, held };
+}
+
+// What was held back comes back when it can: every edge of a held part whose two ends are drawn is drawn, and a part all
+// of whose nodes are drawn is no longer held. Without this a neighbour that is drawn later, by another expansion, would
+// sit beside the node it imports with no edge between them, which reads as "does not import it".
+function binaryGraphExploreRelease(st) {
+    const have = new Set(st.nodes.map(n => n.id)), seen = new Map(st.edges.map(e => [`${e.source}\n${e.target}\n${e.kind}`, e]));
+    for (const record of st.cut.values()) {
+        for (const [head, part] of record.held) {
+            for (const e of part.edges) if (have.has(e.source) && have.has(e.target)) binaryGraphExploreAddEdge(st, seen, e);
+            if (part.nodes.every(n => have.has(n.id))) record.held.delete(head);
+        }
+    }
+}
+
+// What is cut now, per opened node and level: the parts the server dropped of its own answer, the imported functions it
+// dropped from a list grouped by module (and the module whose count is a lower bound), the nodes with a table (import, delay-load or
+// export) that was cut short when the graph was read, the nodes whose importers were read over a cut table, and what the
+// parts held back because they did not fit still miss: the head of each, or where the head is drawn, the nodes of its path
+// that are not, each counted once. { hidden (neighbours known to be
+// missing), server, functions, tables, importers, dropped, any, parents, of, ofFunctions, ofTable, ofImporters, lastDrawn,
+// tableEdges }
+function binaryGraphExploreCut(st) {
+    const drawn = new Set(st.nodes.map(n => n.id)), heads = new Set(), of = new Map(), ofFunctions = new Map(), ofTable = new Set(), ofImporters = new Set(), parents = new Set();
+    let server = 0, functions = 0, lastDrawn = false, tableEdges = false;
+    for (const record of st.cut.values()) {
+        // what a held part still misses: its head while that is not drawn, and once another expansion drew the head,
+        // the nodes of its path that are not (an api set), counted once however many parts miss the same one
+        const held = new Set();
+        for (const [head, part] of record.held) {
+            if (!drawn.has(head)) held.add(head);
+            else part.nodes.forEach(n => { if (!drawn.has(n.id)) held.add(n.id); });
+        }
+        if (!record.server && !record.functions && !record.table && !record.tableIn && !held.size) continue;
+        server += record.server;
+        functions += record.functions;
+        held.forEach(id => heads.add(id));
+        parents.add(record.from);
+        of.set(record.from, (of.get(record.from) || 0) + record.server + held.size);
+        if (record.functions) {
+            ofFunctions.set(record.from, (ofFunctions.get(record.from) || 0) + record.functions);
+            if (record.last && drawn.has(record.last)) lastDrawn = true;
+        }
+        if (record.table) {
+            ofTable.add(record.from);
+            if (st.edges.some(e => e.source === record.from && e.partial)) tableEdges = true;
+        }
+        if (record.tableIn) ofImporters.add(record.from);
+    }
+    return { hidden: server + heads.size, server, functions, tables: ofTable.size, importers: ofImporters.size, dropped: heads.size, any: parents.size > 0,
+             parents: parents.size, of, ofFunctions, ofTable, ofImporters, lastDrawn, tableEdges };
+}
+
+// The line above the canvas: that the picture is cut, in words, and the note of the last step. { tone, html }
+function binaryGraphExploreStatus(st) {
+    if (st.loading) return { tone: 'info', html: '' };
+    const cut = binaryGraphExploreCut(st);
+    const n = (count, one, many) => `${escapeHtml(count.toLocaleString('en-US'))} ${count === 1 ? one : many}`;
+    let html = '';
+    if (cut.any) {
+        const why = [];
+        if (cut.server) why.push(`${n(cut.server, 'was', 'were')} cut by the server from its own answer`);
+        if (cut.functions) {
+            why.push(`${n(cut.functions, 'imported function was', 'imported functions were')} cut by the server from a list of imports, so the modules after the last one it kept are missing`
+                + `${cut.lastDrawn ? ' and the count on that edge is at least what it says' : ''}`);
+        }
+        if (cut.tables) {
+            why.push(`${n(cut.tables, 'opened node has', 'opened nodes have')} a table (import, delay-load or export) that was cut short when it was read, so modules may be missing`
+                + `${cut.tableEdges ? ' and the counts on its edges are at least what they say' : ''}`);
+        }
+        if (cut.importers) {
+            // a fact about the graph, not about this node: the sentence points at the figure that says how big it is
+            why.push(`who imports ${n(cut.importers, 'opened node', 'opened nodes')} may be incomplete: some tables (import, delay-load or export) of the graph were cut short when the graph was read, `
+                + 'and a binary whose table was cut may be one that imports it; the figures say how many');
+        }
+        if (cut.dropped) why.push(`${n(cut.dropped, 'did', 'did')} not fit on this canvas, which holds at most ${escapeHtml(String(BINARY_GRAPH_EXPLORE.cap))} nodes`);
+        html += `<strong class="binary-graph-cut">Not the whole neighbourhood${cut.hidden ? `: ${n(cut.hidden, 'neighbour is', 'neighbours are')} not shown, ` : ', '}`
+            + `of ${n(cut.parents, 'opened node', 'opened nodes')}: ${why.join(' and ')}. Whole neighbours were dropped, in name order: `
+            + 'a node that is missing here is not shown, which does not mean it is not imported.</strong> ';
+    }
+    if (st.note) html += `<span class="binary-graph-note">${escapeHtml(st.note)}</span>`;
+    return { tone: cut.any ? 'warn' : 'info', html };
+}
+
+// What a node says of how many binaries import it: not a number it was not given (a module whose read failed is "not
+// read", not zero), and for a function the module it is of
+function binaryGraphExploreDegree(node) {
+    const bang = node.id.indexOf('!');
+    if (node.kind === 'function' && bang > 0) return `of ${node.id.slice(0, bang)}`;
+    if (node.degreeKnown === false) return 'in-degree not read';
+    return `imported by ${(Number(node.in_degree) || 0).toLocaleString('en-US')} binaries of System32`;
+}
+
+// The line under the canvas: the chosen node, or how much is drawn. Everything from a binary is escaped.
+// What the controls around a chosen node do. START chooses the binary it draws at once, so without this the line
+// that guides a reader ("Choose a node, then EXPAND…") never appears: it only shows while nothing is chosen. A
+// function or an api set has no functions to open, and naming a button that is disabled for it would mislead.
+// DEPTH belongs to EXPAND alone: FUNCTIONS is one hop whatever DEPTH says (binaryGraphOpenFunctions).
+function binaryGraphExploreNextStep(node) {
+    const opens = node && (node.kind === 'dll' || node.kind === 'exe');
+    return 'EXPAND opens the modules around it, as many hops as DEPTH says'
+        + (opens ? '; FUNCTIONS draws the functions it imports, always one hop.' : '.');
+}
+
+function binaryGraphExploreInfo(st) {
+    const node = st.selected ? st.nodes.find(n => n.id === st.selected) : null;
+    if (!node) {
+        if (!st.nodes.length) return '';
+        return `${escapeHtml(st.nodes.length.toLocaleString('en-US'))} nodes, ${escapeHtml(st.edges.length.toLocaleString('en-US'))} edges. `
+            + 'Choose a node, then EXPAND opens its neighbours (a double click does both) and FUNCTIONS the functions it imports.';
+    }
+    const kind = (binaryGraphOwn(BINARY_GRAPH_KINDS, node.kind) || { name: String(node.kind || 'unknown') }).name;
+    let html = `<strong>${escapeHtml(node.label)}</strong> · ${escapeHtml(kind)}${node.machine ? ` · ${escapeHtml(node.machine)}` : ''} · ${escapeHtml(binaryGraphExploreDegree(node))}`;
+    const cut = binaryGraphExploreCut(st), left = cut.of.get(node.id), lost = cut.ofFunctions.get(node.id);
+    if (left) html += ` · ${escapeHtml(left.toLocaleString('en-US'))} of its neighbours are not shown`;
+    if (lost) html += ` · ${escapeHtml(lost.toLocaleString('en-US'))} of its imported functions are not shown`;
+    if (cut.ofTable.has(node.id)) html += ' · it has a table (import, delay-load or export) that was cut short when it was read: modules may be missing';
+    if (cut.ofImporters.has(node.id)) html += ' · the list of its importers may be incomplete: some tables (import, delay-load or export) were cut short when the graph was read (the figures say how many)';
+    return `${html} · ${escapeHtml(binaryGraphExploreNextStep(node))}`;
+}
+
+// New neighbours of `parentId` are laid out around it with the process graph's force layout (applyForceLayout, used as
+// it is: it takes its nodes and edges as arguments), on copies of the parent and the new nodes, then moved to the
+// parent and away from the rest of the picture, so nothing that is drawn moves
+function binaryGraphExploreLayout(st, parentId, added) {
+    if (!added.length) return;
+    const byId = new Map(st.nodes.map(n => [n.id, n])), parent = byId.get(parentId);
+    const fresh = added.map(id => byId.get(id));
+    const copies = [{ id: parent.id, x: 0, y: 0 }, ...fresh.map(n => ({ id: n.id, x: 0, y: 0 }))];
+    const names = new Set(copies.map(c => c.id));
+    applyForceLayout(copies, st.edges.filter(e => names.has(e.source) && names.has(e.target)));
+    const dx = parent.x - copies[0].x, dy = parent.y - copies[0].y;
+    let reach = 0;
+    for (const c of copies.slice(1)) reach = Math.max(reach, Math.hypot(c.x - copies[0].x, c.y - copies[0].y));
+    const others = st.nodes.filter(n => n.placed && n !== parent);
+    let px = 0, py = 0;
+    if (others.length) {
+        const cx = others.reduce((sum, n) => sum + n.x, 0) / others.length, cy = others.reduce((sum, n) => sum + n.y, 0) / others.length;
+        const length = Math.hypot(parent.x - cx, parent.y - cy) || 1;
+        px = (parent.x - cx) / length * reach * 0.6;
+        py = (parent.y - cy) / length * reach * 0.6;
+    }
+    fresh.forEach((n, i) => {
+        n.x = copies[i + 1].x + dx + px;
+        n.y = copies[i + 1].y + dy + py;
+        n.placed = true;
+    });
+}
+
+// One query of the binary graph: { ok, answer } or { ok: false, status, error }
+async function binaryGraphExploreAsk(params) {
+    const r = await syscallApi(`/api/binary-graph/query?${new URLSearchParams(params)}`);
+    return r.ok ? { ok: true, answer: r.data } : { ok: false, status: r.status, error: syscallErrorText(r) };
+}
+
+// START: the binary asked for, drawn alone. A function as the path view names it (module!function) opens its module.
+// A name the graph does not have leaves the picture as it was.
+async function binaryGraphExploreStart(name) {
+    const st = binaryGraphExplore;
+    let text = String(name ?? '').trim();
+    const bang = text.indexOf('!');
+    if (bang > 0) text = text.slice(0, bang);
+    if (!text) {
+        st.note = 'Name a binary to start from, such as kernel32.dll.';
+        binaryGraphExploreRender();
+        return false;
+    }
+    const seq = ++st.seq;
+    st.loading = true;
+    st.note = '';
+    binaryGraphExploreRender();
+    const r = await syscallApi(`/api/binary-graph/node?${new URLSearchParams({ name: text })}`);
+    if (seq !== st.seq) return false;
+    st.loading = false;
+    const d = r.data && typeof r.data === 'object' ? r.data : {};
+    if (!r.ok || typeof d.name !== 'string' || !d.name || (d.is !== 'binary' && d.is !== 'api-set')) {
+        st.note = r.ok ? `${text} is not in the binary graph of this system.` : syscallErrorText(r);
+        binaryGraphExploreRender();
+        return false;
+    }
+    const id = d.name.toLowerCase();
+    const node = { id, label: id, kind: binaryGraphDetailKind(d, id), in_degree: Math.max(0, Number(d.in_degree) || 0), category: '',
+                   machine: typeof d.machine === 'string' ? d.machine : '', degreeKnown: true, x: 0, y: 0, placed: true };
+    node.radius = binaryGraphNodeRadius(node);
+    st.nodes = [node];
+    st.edges = [];
+    st.cut = new Map();
+    st.modules = new Map([[id, { kind: node.kind, in_degree: node.in_degree, machine: node.machine }]]);
+    st.selected = id;
+    st.hovered = null;
+    st.dragging = null;
+    st.panning = false;
+    Object.assign(st.camera, { x: 0, y: 0, zoom: 1 });
+    if (!binaryGraphFit()) binaryGraphExploreRender();
+    return true;
+}
+
+function binaryGraphExploreSubmit(event) {
+    if (event && typeof event.preventDefault === 'function') event.preventDefault();
+    const input = document.getElementById('binary-explore-start');
+    return binaryGraphExploreStart(input ? input.value : '');
+}
+
+// The kind and in-degree of modules, read once each from /api/binary-graph/node and remembered until the next START:
+// `q=imports` names the functions a module imports, not the modules, so a module that EXPAND draws from it has no size
+// of its own yet. A name the graph does not have still says how many binaries import it. Returns how many were read.
+async function binaryGraphExploreModules(st, names) {
+    const todo = [...new Set(names)].filter(name => !st.modules.has(name));
+    for (let i = 0; i < todo.length; i += BINARY_GRAPH_EXPLORE.batch) {
+        await Promise.all(todo.slice(i, i + BINARY_GRAPH_EXPLORE.batch).map(async name => {
+            const r = await syscallApi(`/api/binary-graph/node?${new URLSearchParams({ name })}`);
+            const d = r.data && typeof r.data === 'object' ? r.data : {};
+            if (r.ok) st.modules.set(name, { kind: binaryGraphDetailKind(d, name), in_degree: Math.max(0, Number(d.in_degree) || 0), machine: typeof d.machine === 'string' ? d.machine : '' });
+            else if (r.status === 404) st.modules.set(name, { kind: binaryGraphGuessKind(name), in_degree: Math.max(0, Number(d.in_degree) || 0), machine: '' });
+        }));
+    }
+    return todo.length;
+}
+
+// The modules of these parts that were read take their kind and in-degree
+function binaryGraphExploreFill(st, parts) {
+    for (const part of parts) {
+        for (const n of part.nodes) {
+            const read = n.guess ? st.modules.get(n.id) : null;
+            if (!read) continue;
+            Object.assign(n, { kind: read.kind, in_degree: read.in_degree, machine: read.machine, guess: false });
+        }
+    }
+}
+
+// EXPAND: the neighbours of a node, in both directions, as many hops as DEPTH says, added to what is drawn. Where the
+// canvas has room for only some of both directions each gets its share. A walk stops where the canvas is full or after
+// `reads` requests, and says how many nodes of its last ring it did not open. A newer START or EXPAND overtakes it.
+function binaryGraphExpand(id) {
+    return binaryGraphExploreWalk(id, 'modules');
+}
+
+// FUNCTIONS: the functions a module imports, one node each, the level deeper. One hop, whatever DEPTH says: a function
+// has no neighbours of its own to walk on.
+function binaryGraphOpenFunctions(id) {
+    return binaryGraphExploreWalk(id, 'functions');
+}
+
+async function binaryGraphExploreWalk(id, level) {
+    const st = binaryGraphExplore, g = BINARY_GRAPH_EXPLORE, node = st.nodes.find(n => n.id === id);
+    if (!node || st.loading) return false;
+    const seq = ++st.seq, depth = level === 'functions' ? 1 : binaryGraphState.depth, failed = [], notes = [];
+    st.loading = true;
+    st.note = '';
+    binaryGraphExploreRender();
+    let current = [node.id], reads = 0, unopened = 0, opened = false, grew = false;
+    for (let hop = 0; hop < depth && current.length; hop++) {
+        const next = [];
+        for (let i = 0; i < current.length; i++) {
+            const from = st.nodes.find(n => n.id === current[i]), requests = from ? binaryGraphExploreRequests(from, level) : [];
+            if (!requests.length) continue;
+            if (hop > 0 && (st.nodes.length >= g.cap || reads + requests.length > g.reads)) {
+                unopened = current.length - i;
+                break;
+            }
+            reads += requests.length;
+            const answers = await Promise.all(requests.map(r => binaryGraphExploreAsk(r.params)));
+            if (seq !== st.seq) return false;
+            const results = [];
+            answers.forEach((a, k) => {
+                if (!a.ok) {
+                    if (hop === 0) notes.push(a.error);
+                    else failed.push(from.id);
+                    return;
+                }
+                if (hop === 0) opened = true;
+                const found = binaryGraphExploreParts(requests[k], a.answer);
+                results.push({ request: requests[k], found, note: typeof a.answer.note === 'string' ? a.answer.note : '' });
+            });
+            // the direction with fewer new nodes first, held to its share of the room
+            const room = g.cap - st.nodes.length;
+            results.forEach(r => { r.fresh = binaryGraphExploreFresh(st, r.found.parts); });
+            results.sort((a, b) => a.fresh - b.fresh);
+            const added = [];
+            for (let k = 0; k < results.length; k++) {
+                const r = results[k], other = results.length > 1 ? results[1 - k].fresh : 0;
+                const limit = results.length > 1 && k === 0 ? Math.min(r.fresh, Math.max(Math.floor(room / 2), room - other)) : Infinity;
+                if (r.request.dir === 'out' && r.request.level === 'modules') {
+                    // only the modules that will be drawn are read
+                    const drawn = new Set(st.nodes.map(n => n.id));
+                    const wanted = r.found.parts.filter(p => !drawn.has(p.head)).slice(0, Math.max(0, Math.min(limit, g.cap - st.nodes.length))).map(p => p.head);
+                    reads += await binaryGraphExploreModules(st, wanted);
+                    if (seq !== st.seq) return false;
+                    binaryGraphExploreFill(st, r.found.parts);
+                }
+                const merged = binaryGraphExploreMerge(st, r.found.parts, limit);
+                const key = `${from.id}\n${r.request.dir}\n${r.request.level}`;
+                if (r.found.server || r.found.functions || r.found.tableCut || merged.held.length) {
+                    st.cut.set(key, { from: from.id, server: r.found.server, functions: r.found.functions, last: r.found.last, table: r.found.tableCut && r.request.dir === 'out', tableIn: r.found.tableCut && r.request.dir === 'in',
+                                      held: new Map(merged.held.map(part => [part.head, part])) });
+                } else {
+                    st.cut.delete(key);
+                }
+                binaryGraphExploreLayout(st, from.id, merged.added);
+                binaryGraphExploreRelease(st);
+                added.push(...merged.added);
+                if (hop === 0 && !merged.added.length && r.note) notes.push(r.note);
+            }
+            if (added.length) grew = true;
+            next.push(...added.filter(a => { const n = st.nodes.find(x => x.id === a); return n && (n.kind === 'dll' || n.kind === 'exe' || n.kind === 'api-set'); }));
+        }
+        current = next;
+        binaryGraphExploreRender();
+        if (unopened) break;
+    }
+    const said = [];
+    if (unopened) {
+        said.push(`The walk of depth ${depth} stopped ${st.nodes.length >= g.cap ? 'because the canvas is full' : `after ${reads} requests`}: ${unopened.toLocaleString('en-US')} ${unopened === 1 ? 'node' : 'nodes'} of its last ring ${unopened === 1 ? 'was' : 'were'} not opened.`);
+    }
+    if (failed.length) {
+        said.push(`${failed.length.toLocaleString('en-US')} ${failed.length === 1 ? 'node' : 'nodes'} could not be read just now, so ${failed.length === 1 ? 'its' : 'their'} neighbours may be missing.`);
+    }
+    if (!grew) said.push(...notes);
+    st.note = said.join(' ');
+    st.loading = false;
+    binaryGraphExploreRender();
+    return opened;
+}
+
+// Every node laid out again, and the view fitted
+function binaryGraphRelayout() {
+    const st = binaryGraphExplore;
+    if (!st.nodes.length) return false;
+    applyForceLayout(st.nodes, st.edges);
+    st.nodes.forEach(n => { n.placed = true; });
+    return binaryGraphFit();
+}
+
+// DEPTH: 1 to 3 hops, and no number outside them; nothing is rounded or clamped into range
+function binaryGraphSetDepth(n) {
+    if (typeof n !== 'number' || !BINARY_GRAPH_EXPLORE.depths.includes(n)) return false;
+    binaryGraphState.depth = n;
+    binaryGraphExploreRender();
+    return true;
+}
+
+// PATH / EXPLORE: the view that is on. The path's query bar and canvas and the explorer's are separate elements.
+// ⇱ gives the graph the height of the figures table, the way the RIZIN tab's ⇱ gives one half the width. It folds
+// the rows and nothing above them: the caveat that a binary's table was cut short when the graph was read sits in
+// the figures' own status line, and every path and explore answer points the reader at that line. A folded pointer
+// would dangle, so the bar, RELOAD and that line stay.
+function binaryGraphApplyMax() {
+    const surface = document.getElementById('syscall-surface-graph');
+    if (!surface) return false;
+    const maxed = !!binaryGraphState.maxed;
+    surface.classList.toggle('binary-graph-maxed', maxed);
+    const button = document.getElementById('binary-graph-max');
+    if (button) {
+        button.setAttribute('aria-pressed', String(maxed));
+        button.title = maxed ? 'Give the figures their rows back' : 'Give the graph the height of the figures table';
+        button.setAttribute('aria-label', button.title);
+    }
+    // the stage's own ResizeObserver resizes the canvas when it grows, so nothing is redrawn from here
+    return true;
+}
+
+// A fold or unfold by hand wins over the view's default from then on, the same rule the scan panels follow: a view
+// that keeps reclosing what the reader opened is worse than one that never folded.
+function binaryGraphToggleMax() {
+    binaryGraphState.maxed = !binaryGraphState.maxed;
+    binaryGraphState.maxedByHand = true;
+    return binaryGraphApplyMax();
+}
+
+function binaryGraphSetMode(mode) {
+    if (mode !== 'path' && mode !== 'explore') return false;
+    binaryGraphExplore.mode = mode;
+    const path = document.getElementById('binary-graph-path'), explore = document.getElementById('binary-explore');
+    if (path) path.hidden = mode !== 'path';
+    if (explore) explore.hidden = mode !== 'explore';
+    for (const name of ['path', 'explore']) {
+        const button = document.getElementById(`binary-graph-mode-${name}`);
+        if (button) button.setAttribute('aria-pressed', String(name === mode));
+    }
+    // EXPLORE works on the canvas and wants the height; PATH draws a short answer and its reader wants the figures
+    // beside it. At 1280x900 that is the difference between 254px of canvas and 438.
+    if (!binaryGraphState.maxedByHand) binaryGraphState.maxed = mode === 'explore';
+    binaryGraphApplyMax();
+    if (mode === 'explore') {
+        initBinaryGraphExplore();
+        binaryGraphExploreRender();
+    } else {
+        renderBinaryGraph();
+    }
+    return true;
+}
+
+// The elements around the canvas, then the canvas
+function binaryGraphExploreRender() {
+    const st = binaryGraphExplore, el = id => document.getElementById(id);
+    const status = el('binary-explore-status');
+    if (status) {
+        const s = binaryGraphExploreStatus(st);
+        status.innerHTML = s.html;
+        status.className = `binary-graph-status binary-graph-status-${cssToken(s.tone)}`;
+        status.hidden = !s.html;
+    }
+    const info = el('binary-explore-info');
+    if (info) info.innerHTML = binaryGraphExploreInfo(st);
+    const legend = el('binary-explore-legend');
+    if (legend) legend.innerHTML = binaryGraphLegend('explore', st.edges);
+    const expand = el('binary-explore-expand');
+    if (expand) {
+        expand.disabled = st.loading || !st.selected;
+        // a disabled button says what to do first, the way SCAN says "Choose a process first"
+        expand.title = !expand.disabled ? 'Open the neighbours of the chosen node'
+            : st.loading ? 'Wait for what is being opened' : 'Choose a node first: click one on the canvas';
+    }
+    const functions = el('binary-explore-functions'), chosen = st.selected ? st.nodes.find(n => n.id === st.selected) : null;
+    if (functions) {
+        functions.disabled = st.loading || !chosen || (chosen.kind !== 'dll' && chosen.kind !== 'exe');
+        functions.title = !functions.disabled ? 'Draw the functions the chosen module imports, one node each'
+            : st.loading ? 'Wait for what is being opened'
+            : !chosen ? 'Choose a module first: click one on the canvas'
+            : 'Only a module imports functions: this node is not one';
+    }
+    for (const n of BINARY_GRAPH_EXPLORE.depths) {
+        const button = el(`binary-explore-depth-${n}`);
+        if (button) button.setAttribute('aria-pressed', String(binaryGraphState.depth === n));
+    }
+    const zoom = el('binary-explore-zoom');
+    if (zoom) zoom.textContent = `${Math.round(st.camera.zoom * 100)}%`;
+    binaryGraphDraw();
+}
+
+function binaryGraphDraw() {
+    const st = binaryGraphExplore, canvas = document.getElementById('binary-explore-canvas');
+    if (!canvas || typeof canvas.getContext !== 'function') return false;
+    const ctx = canvas.getContext('2d');
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    if (!st.nodes.length) {
+        ctx.save();
+        ctx.fillStyle = themeColor('--text-muted');
+        ctx.font = '14px monospace';
+        ctx.textAlign = 'center';
+        ctx.textBaseline = 'middle';
+        ctx.fillText(st.loading ? 'Opening…' : st.note || 'Name a binary and START: it is drawn alone, and EXPAND opens its neighbours one node at a time.',
+                     canvas.width / 2, canvas.height / 2);
+        ctx.restore();
+        return true;
+    }
+    const camera = st.camera, byId = new Map(st.nodes.map(n => [n.id, n]));
+    ctx.save();
+    ctx.translate(camera.x, camera.y);
+    ctx.scale(camera.zoom, camera.zoom);
+    // an edge of the chosen node is drawn heavier and in full, the others step back. Edges between the same two nodes
+    // (an import and a forwarder) are drawn side by side.
+    const lanes = new Map();
+    for (const e of st.edges) {
+        const a = byId.get(e.source), b = byId.get(e.target);
+        if (!a || !b || a === b) continue;
+        const hot = !!st.selected && (e.source === st.selected || e.target === st.selected);
+        const look = binaryGraphEdgeLook(e);
+        const pair = e.source < e.target ? `${e.source}\n${e.target}` : `${e.target}\n${e.source}`;
+        const lane = lanes.get(pair) || 0;
+        lanes.set(pair, lane + 1);
+        const length = Math.hypot(b.x - a.x, b.y - a.y) || 1, ux = (b.x - a.x) / length, uy = (b.y - a.y) / length;
+        const ox = -uy * lane * 5, oy = ux * lane * 5;
+        ctx.globalAlpha = !st.selected || hot ? 1 : 0.25;
+        ctx.strokeStyle = look.color;
+        ctx.fillStyle = look.color;
+        ctx.lineWidth = hot ? look.width + 1.5 : look.width;
+        ctx.setLineDash(look.dash ? look.dash.split(' ').map(Number) : []);
+        ctx.beginPath();
+        ctx.moveTo(a.x + ox, a.y + oy);
+        ctx.lineTo(b.x + ox, b.y + oy);
+        ctx.stroke();
+        const tipX = b.x + ox - ux * b.radius, tipY = b.y + oy - uy * b.radius;
+        ctx.setLineDash([]);
+        ctx.beginPath();
+        ctx.moveTo(tipX, tipY);
+        ctx.lineTo(tipX - ux * 9 - uy * 4, tipY - uy * 9 + ux * 4);
+        ctx.lineTo(tipX - ux * 9 + uy * 4, tipY - uy * 9 - ux * 4);
+        ctx.closePath();
+        ctx.fill();
+        // the number of functions an edge stands for, on the edges of the chosen node, or on all of a small picture
+        if (e.functions !== undefined && camera.zoom >= 0.5 && (hot || (!st.selected && st.edges.length <= 40))) {
+            ctx.fillStyle = themeColor('--text-secondary');
+            ctx.font = '10px monospace';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'alphabetic';
+            ctx.fillText(e.label, (a.x + b.x) / 2 + ox, (a.y + b.y) / 2 + oy - 4);
+        }
+    }
+    ctx.globalAlpha = 1;
+    ctx.setLineDash([]);
+    for (const n of st.nodes) {
+        const look = binaryGraphNodeLook(n, '');
+        ctx.beginPath();
+        ctx.arc(n.x, n.y, n.radius, 0, Math.PI * 2);
+        ctx.fillStyle = look.fill;
+        ctx.fill();
+        ctx.strokeStyle = look.stroke;
+        ctx.lineWidth = look.width;
+        ctx.stroke();
+        if (n.id === st.selected) {
+            ctx.beginPath();
+            ctx.arc(n.x, n.y, n.radius + 4, 0, Math.PI * 2);
+            ctx.strokeStyle = themeColor('--text-primary');
+            ctx.lineWidth = 2;
+            ctx.stroke();
+        }
+        if (camera.zoom >= 0.7 || n.radius >= 16 || n.id === st.selected || n === st.hovered) {
+            ctx.fillStyle = themeColor('--text-primary');
+            ctx.font = '11px monospace';
+            ctx.textAlign = 'center';
+            ctx.textBaseline = 'alphabetic';
+            ctx.fillText(binaryGraphCut(n.label, 28), n.x, n.y + n.radius + 13);
+        }
+    }
+    ctx.restore();
+    const cut = binaryGraphExploreCut(st);
+    ctx.save();
+    ctx.font = '12px monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'top';
+    if (cut.any) {
+        const pieces = [];
+        if (cut.hidden) pieces.push(`${cut.hidden.toLocaleString('en-US')} not shown`);
+        if (cut.functions) pieces.push(`${cut.functions.toLocaleString('en-US')} imported functions not shown`);
+        if (cut.tables) pieces.push(`${cut.tables.toLocaleString('en-US')} ${cut.tables === 1 ? 'opened node has' : 'opened nodes have'} a table cut short`);
+        if (cut.importers) pieces.push('importers may be incomplete (some tables cut short, the figures say how many)');
+        ctx.fillStyle = themeColor('--severity-medium');
+        ctx.fillText(`Not the whole neighbourhood: ${pieces.join(', ')} (the canvas holds ${BINARY_GRAPH_EXPLORE.cap} nodes)`, 12, 10);
+    }
+    if (st.loading) {
+        ctx.fillStyle = themeColor('--text-muted');
+        ctx.fillText('Opening…', 12, canvas.height - 22);
+    }
+    ctx.restore();
+    return true;
+}
+
+// The camera of this view: four small functions over `binaryGraphExplore.camera` and #binary-explore-canvas. They exist
+// because the process graph's own (screenToWorld, worldToScreen, findNodeAt, graphFitView, graphZoomIn, graphZoomOut)
+// bind `graphState` and #graph-canvas directly, and making them take a state would mean editing a working tab to serve
+// a second caller. Both views share applyForceLayout, which takes its data as arguments, and no state.
+function binaryGraphToWorld(sx, sy) {
+    const c = binaryGraphExplore.camera;
+    return { x: (sx - c.x) / c.zoom, y: (sy - c.y) / c.zoom };
+}
+
+// The node under a point of the world; a small node on a zoomed-out canvas can still be hit
+function binaryGraphNodeAt(wx, wy) {
+    const st = binaryGraphExplore, reach = 8 / st.camera.zoom;
+    for (let i = st.nodes.length - 1; i >= 0; i--) {
+        const n = st.nodes[i], r = Math.max(n.radius, reach);
+        if ((wx - n.x) ** 2 + (wy - n.y) ** 2 < r * r) return n;
+    }
+    return null;
+}
+
+// Every node in view
+function binaryGraphFit() {
+    const st = binaryGraphExplore, canvas = document.getElementById('binary-explore-canvas');
+    if (!canvas || !st.nodes.length) return false;
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (const n of st.nodes) {
+        minX = Math.min(minX, n.x - n.radius);
+        maxX = Math.max(maxX, n.x + n.radius);
+        minY = Math.min(minY, n.y - n.radius);
+        maxY = Math.max(maxY, n.y + n.radius + 14);
+    }
+    const w = maxX - minX + 120, h = maxY - minY + 120;
+    const zoom = Math.max(0.1, Math.min(canvas.width / w, canvas.height / h, 2));
+    st.camera.zoom = zoom;
+    st.camera.x = canvas.width / 2 - (minX + maxX) / 2 * zoom;
+    st.camera.y = canvas.height / 2 - (minY + maxY) / 2 * zoom;
+    binaryGraphExploreRender();
+    return true;
+}
+
+// Zoom by a factor toward a point of the canvas (its middle without one)
+function binaryGraphZoom(factor, sx, sy) {
+    const st = binaryGraphExplore, canvas = document.getElementById('binary-explore-canvas');
+    if (!canvas || !(factor > 0)) return false;
+    const c = st.camera, old = c.zoom;
+    c.zoom = Math.max(0.1, Math.min(5, old * factor));
+    const x = sx === undefined ? canvas.width / 2 : sx, y = sy === undefined ? canvas.height / 2 : sy;
+    c.x = x - (x - c.x) * (c.zoom / old);
+    c.y = y - (y - c.y) * (c.zoom / old);
+    binaryGraphExploreRender();
+    return true;
+}
+
+// The stage changed size: the camera holds a screen offset, so without moving it the drawing stays anchored to the
+// old corner and slides out of view - after ⇱ gave the figures their rows back, the node sat half outside with its
+// label cut off. Moving the camera by half the change keeps the world point that was in the middle in the middle,
+// at the same zoom. A first size (no canvas yet) moves nothing: there was no middle to keep.
+function binaryGraphCanvasResized(canvas, w, h) {
+    if (!canvas || !(w > 0) || !(h > 0)) return false;
+    const c = binaryGraphExplore.camera;
+    if (canvas.width > 0 && canvas.height > 0) {
+        c.x += (w - canvas.width) / 2;
+        c.y += (h - canvas.height) / 2;
+    }
+    canvas.width = w;
+    canvas.height = h;
+    return true;
+}
+
+function binaryGraphOnCanvasDown(ev) {
+    const st = binaryGraphExplore, w = binaryGraphToWorld(ev.offsetX, ev.offsetY), node = binaryGraphNodeAt(w.x, w.y);
+    st.moved = false;
+    st.down = { x: ev.offsetX, y: ev.offsetY };
+    if (node) {
+        st.dragging = node;
+    } else {
+        st.panning = true;
+        st.panStart = { x: ev.offsetX, y: ev.offsetY };
+    }
+}
+
+function binaryGraphOnCanvasMove(ev) {
+    const st = binaryGraphExplore;
+    if (st.dragging || st.panning) {
+        if (!st.moved && Math.hypot(ev.offsetX - st.down.x, ev.offsetY - st.down.y) < BINARY_GRAPH_EXPLORE.drag) return;
+        st.moved = true;
+        if (st.dragging) {
+            const w = binaryGraphToWorld(ev.offsetX, ev.offsetY);
+            st.dragging.x = w.x;
+            st.dragging.y = w.y;
+        } else {
+            st.camera.x += ev.offsetX - st.panStart.x;
+            st.camera.y += ev.offsetY - st.panStart.y;
+            st.panStart = { x: ev.offsetX, y: ev.offsetY };
+        }
+        binaryGraphDraw();
+        return;
+    }
+    const w = binaryGraphToWorld(ev.offsetX, ev.offsetY), node = binaryGraphNodeAt(w.x, w.y);
+    if (node === st.hovered) return;
+    st.hovered = node;
+    const canvas = document.getElementById('binary-explore-canvas');
+    if (canvas) canvas.title = node ? `${node.id} · ${binaryGraphExploreDegree(node)}` : '';
+    binaryGraphDraw();
+}
+
+function binaryGraphOnCanvasUp() {
+    const st = binaryGraphExplore;
+    st.dragging = null;
+    st.panning = false;
+}
+
+function binaryGraphOnCanvasLeave() {
+    const st = binaryGraphExplore;
+    st.dragging = null;
+    st.panning = false;
+    if (st.hovered) {
+        st.hovered = null;
+        binaryGraphDraw();
+    }
+}
+
+function binaryGraphOnCanvasWheel(ev) {
+    if (typeof ev.preventDefault === 'function') ev.preventDefault();
+    binaryGraphZoom(ev.deltaY > 0 ? 0.9 : 1.1, ev.offsetX, ev.offsetY);
+}
+
+// A click chooses the node under it, or lets go of the choice on empty ground. The click that ends a drag is no choice.
+function binaryGraphOnCanvasClick(ev) {
+    const st = binaryGraphExplore;
+    if (st.moved) {
+        st.moved = false;
+        return false;
+    }
+    const w = binaryGraphToWorld(ev.offsetX, ev.offsetY), node = binaryGraphNodeAt(w.x, w.y);
+    st.selected = node ? node.id : null;
+    binaryGraphExploreRender();
+    return !!node;
+}
+
+// A double click chooses the node and opens its neighbours
+function binaryGraphOnCanvasDblClick(ev) {
+    const st = binaryGraphExplore, w = binaryGraphToWorld(ev.offsetX, ev.offsetY), node = binaryGraphNodeAt(w.x, w.y);
+    if (!node) return false;
+    st.selected = node.id;
+    return binaryGraphExpand(node.id);
+}
+
+// The canvas follows the box it is in, and the pointer is read from the canvas
+function initBinaryGraphExplore() {
+    const st = binaryGraphExplore, canvas = document.getElementById('binary-explore-canvas'), stage = document.getElementById('binary-explore-stage');
+    if (st.ready || !canvas || !stage) return;
+    st.ready = true;
+    const resize = () => {
+        const w = stage.clientWidth, h = stage.clientHeight;
+        if (!w || !h || (canvas.width === w && canvas.height === h)) return;
+        binaryGraphCanvasResized(canvas, w, h);
+        binaryGraphDraw();
+    };
+    resize();
+    if (typeof ResizeObserver !== 'undefined') new ResizeObserver(resize).observe(stage);
+    else window.addEventListener('resize', resize);
+    canvas.addEventListener('mousedown', binaryGraphOnCanvasDown);
+    canvas.addEventListener('mousemove', binaryGraphOnCanvasMove);
+    canvas.addEventListener('mouseup', binaryGraphOnCanvasUp);
+    canvas.addEventListener('mouseleave', binaryGraphOnCanvasLeave);
+    canvas.addEventListener('wheel', binaryGraphOnCanvasWheel, { passive: false });
+    canvas.addEventListener('click', binaryGraphOnCanvasClick);
+    canvas.addEventListener('dblclick', binaryGraphOnCanvasDblClick);
+}
+
+// --- GRAPH, FIGURES: the whole stock as a table, each number opening its list --------------------------------------------
+// Figures over the whole of System32 do not belong in a cloud of nodes, where they would be unreadable: they are a table
+// under the canvases, one row per figure (/api/binary-graph/metrics). A number opens the list behind it in the shared
+// detail panel (/api/binary-graph/query?q=metric), and a row of that list starts an exploration from that binary. A figure
+// of zero is a row without a link, because an empty list is a dead end the reader had to click to find; a figure the server
+// could not give says n/a, which is not 0.
+// figure -> its name in the table, what it counts, and where a row of its list leads: 'binary' (EXPLORE from it), 'syscall'
+// (who reaches the syscall the row leads to), '' (nowhere: a file that is not in the graph has no neighbours to open)
+const BINARY_GRAPH_METRICS = {
+    binaries: { name: 'Binaries', means: 'The DLLs and EXEs of System32 that the graph read.', jump: 'binary' },
+    edges: { name: 'Import edges', means: 'A binary and a module it imports, by the name the importer wrote: an api set counts as itself.', jump: 'binary' },
+    api_sets_resolved: { name: 'Api sets resolved', means: 'Api sets that binaries import and the map of this system has a host for.', jump: 'binary' },
+    forwarders: { name: 'Forwarded exports', means: 'Exports that name a function of another module instead of holding its code.', jump: 'binary' },
+    isolated: { name: 'Isolated binaries', means: 'Nothing imports them, and they import nothing else of System32.', jump: 'binary' },
+    circular_pairs: { name: 'Circular pairs', means: 'Two binaries that import each other, counted as one pair.', jump: 'binary' },
+    curated_transitions: { name: 'Curated transitions', means: 'Rows of the Win32 to Nt table: its word, not read from any binary.', jump: 'syscall' },
+    most_imported: { name: 'Most imported', means: 'The modules most binaries import.', jump: 'binary' },
+    skipped: { name: 'Skipped files', means: 'Files of System32 that could not be read and are not in the graph.', jump: '' },
+    partial: { name: 'Binaries with a cut table', means: 'Binaries with a table (import, delay-load or export) that was cut short when it was read.', jump: 'binary' },
+};
+// how many neighbours a row of a list names before it says how many more there are
+const BINARY_GRAPH_MEMBER_LINKS = 6;
+
+// The figures as rows, in the order of the table: { key, name, means, value (a number, or null where the server gave none),
+// open (there is a list to open: a figure above zero) }
+function binaryGraphMetricRows(figures) {
+    if (!figures || typeof figures !== 'object') return [];
+    return Object.keys(BINARY_GRAPH_METRICS).map(key => {
+        const meta = BINARY_GRAPH_METRICS[key], raw = figures[key];
+        let value = null, means = meta.means;
+        if (key === 'most_imported') {
+            // an empty top is a zero (nothing is imported); only a list that is not there is not known
+            const top = Array.isArray(raw) && raw.length && raw[0] && typeof raw[0] === 'object' ? raw[0] : null;
+            const degree = top ? Number(top.in_degree) : NaN;
+            if (top && typeof top.name === 'string' && Number.isFinite(degree) && degree >= 0) {
+                value = degree;
+                means += ` The first is ${top.name}, imported by ${degree.toLocaleString('en-US')} ${degree === 1 ? 'binary' : 'binaries'}.`;
+            } else if (Array.isArray(raw) && !raw.length) {
+                value = 0;
+            }
+        } else if (typeof raw === 'number' && Number.isFinite(raw) && raw >= 0) {
+            value = raw;
+        }
+        return { key, name: meta.name, means, value, open: value !== null && value > 0 };
+    });
+}
+
+function binaryGraphMetricRowHtml(row) {
+    const shown = row.value === null ? 'n/a' : row.value.toLocaleString('en-US');
+    const cell = row.open
+        ? `<button type="button" class="binary-graph-figure" title="List what it counts" onclick="binaryGraphMetricOpen(${jsArg(row.key)})">${escapeHtml(shown)}</button>`
+        : escapeHtml(shown);
+    const sort = row.value === null ? '' : ` data-sort-value="${row.value}"`;
+    return `<tr><td>${escapeHtml(row.name)}</td><td class="view-table-num"${sort}>${cell}</td><td class="binary-graph-means">${escapeHtml(row.means)}</td></tr>`;
+}
+
+// The line above the table: what is being read or why it could not be, and otherwise the caveat of the figures and the stamp
+// of the graph they are of. { tone, html } with html '' when there is nothing to say.
+function binaryGraphMetricsStatus() {
+    const st = binaryGraphState, f = st.figures;
+    if (!f) return { tone: st.figuresNote ? 'warn' : 'info', html: st.figuresLoading ? 'Reading the figures…' : escapeHtml(st.figuresNote) };
+    let html = '';
+    const cut = typeof f.partial === 'number' && f.partial > 0 ? f.partial : 0;
+    if (cut) {
+        html += `<strong class="binary-graph-cut">${escapeHtml(cut.toLocaleString('en-US'))} ${cut === 1 ? 'binary has' : 'binaries have'} a table (import, delay-load or export) that was cut short when the graph was read: `
+            + 'the counts that read tables are lower bounds, and the number of isolated binaries is an upper one.</strong> ';
+    }
+    // `skipped` is of the same class as `partial` and belongs beside it: the figures table, its only other home, is
+    // what EXPLORE folds away. What is missing is the skipped file's own imports and exports; a binary that imports
+    // one is still counted, because _reach deliberately links to a file nobody could read rather than claim an
+    // absence over it. And `skipped` also counts a name that is a duplicate in another case, which was passed over
+    // rather than unreadable - hence "not read", not "could not be read".
+    const lost = typeof f.skipped === 'number' && f.skipped > 0 ? f.skipped : 0;
+    if (lost) {
+        html += `<strong class="binary-graph-cut">${escapeHtml(lost.toLocaleString('en-US'))} ${lost === 1 ? 'file of System32 was' : 'files of System32 were'} not read when the graph was built: `
+            + `what ${lost === 1 ? 'it imports and exports is' : 'they import and export is'} in no count and in no answer, though a binary that imports `
+            + `${lost === 1 ? 'it' : 'one of them'} still is.</strong> `;
+    }
+    const stamp = [f.build ? `build ${f.build}` : '', f.arch || ''].filter(Boolean).join(' · ');
+    if (stamp) html += `<span class="syscall-muted">${escapeHtml(stamp)}</span>`;
+    return { tone: cut || lost ? 'warn' : 'info', html };
+}
+
+function renderBinaryGraphMetrics() {
+    const st = binaryGraphState, el = id => document.getElementById(id);
+    const status = el('binary-graph-metrics-status');
+    if (status) {
+        const s = binaryGraphMetricsStatus();
+        status.innerHTML = s.html;
+        status.className = `binary-graph-status binary-graph-status-${cssToken(s.tone)}`;
+        status.hidden = !s.html;
+    }
+    const body = el('binary-graph-metrics-body');
+    if (!body) return false;
+    const rows = binaryGraphMetricRows(st.figures);
+    body.innerHTML = rows.length ? rows.map(row => binaryGraphMetricRowHtml(row)).join('')
+        : `<tr data-sort-skip><td colspan="3" class="view-table-empty">${escapeHtml(st.figuresLoading ? 'Reading the figures…' : st.figuresNote || 'The figures have not been read yet.')}</td></tr>`;
+    return true;
+}
+
+// The figures, read when the surface is shown and still not had (a graph that was not there yet is asked for again the next
+// time), or on RELOAD
+async function binaryGraphMetricsLoad(force) {
+    const st = binaryGraphState;
+    if (st.figuresLoading || (st.figures && !force)) return false;
+    st.figuresLoading = true;
+    renderBinaryGraphMetrics();
+    const r = await syscallApi('/api/binary-graph/metrics');
+    st.figuresLoading = false;
+    st.figures = r.ok ? r.data : null;
+    st.figuresNote = r.ok ? '' : syscallErrorText(r);
+    renderBinaryGraphMetrics();
+    return r.ok;
+}
+
+// What the panel shows: the list of a figure, while the graph is the surface and nothing else was chosen since
+function binaryGraphMetricShown() {
+    return syscallState.view === 'graph' && !!binaryGraphState.metric;
+}
+
+// A choice of something else lets go of the list, and an answer still on its way is not shown when it comes
+function binaryGraphMetricForget() {
+    binaryGraphRequests.metric++;
+    if (!binaryGraphState.metric) return false;
+    binaryGraphState.metric = null;
+    return true;
+}
+
+function binaryGraphMetricClose() {
+    binaryGraphMetricForget();
+    renderSyscallDetailPanel();
+    return true;
+}
+
+// A number was clicked: the list behind it, in the shared detail panel. A figure of zero, one that is not there and a name
+// that is no figure have no list, and none is asked for.
+async function binaryGraphMetricOpen(key) {
+    const st = binaryGraphState;
+    const row = binaryGraphOwn(BINARY_GRAPH_METRICS, key) ? binaryGraphMetricRows(st.figures).find(r => r.key === key) : null;
+    if (!row || !row.open) return false;
+    const seq = ++binaryGraphRequests.metric;
+    st.metric = { key, loading: true, answer: null, error: '' };
+    renderSyscallDetailPanel();
+    const body = document.getElementById('syscall-detail-body');
+    if (body) body.scrollTop = 0;
+    if (typeof window.matchMedia === 'function' && window.matchMedia(SYSCALL_NARROW).matches) syscallSetPane('detail');
+    const r = await syscallApi(`/api/binary-graph/query?${new URLSearchParams({ q: 'metric', metric: key })}`);
+    if (seq !== binaryGraphRequests.metric) return false;
+    st.metric = r.ok ? { key, loading: false, answer: r.data, error: '' } : { key, loading: false, answer: null, error: syscallErrorText(r) };
+    renderSyscallDetailPanel();
+    return r.ok;
+}
+
+// Where a row of the list leads in the graph, or null: { mode: 'explore', name } starts an exploration from the binary,
+// { mode: 'syscall', name } asks who reaches the syscall the row leads to (a Win32 function of the table is no module,
+// there is nothing to explore from), each with the hint of its button
+function binaryGraphMetricJump(key, node, edges) {
+    const meta = binaryGraphOwn(BINARY_GRAPH_METRICS, key);
+    if (!meta || !node || typeof node.id !== 'string') return null;
+    if (meta.jump === 'binary') {
+        // START opens the module of a function (module!function): the name given is the one it would show
+        const bang = node.id.indexOf('!');
+        return { mode: 'explore', name: bang > 0 ? node.id.slice(0, bang) : node.id, hint: 'Start an exploration from it' };
+    }
+    if (meta.jump === 'syscall') {
+        const edge = edges.find(e => e && e.source === node.id && typeof e.target === 'string' && e.target.startsWith(BINARY_GRAPH_SYSCALL));
+        return edge ? { mode: 'syscall', name: edge.target.slice(BINARY_GRAPH_SYSCALL.length), hint: 'Show the binaries that reach the syscall it leads to' } : null;
+    }
+    return null;
+}
+
+// The neighbours of a row, as the answer's edges give them: the other end of each edge with its direction, and what the edge
+// claims. An edge the table drew says so, an edge that names no origin says that, and one read from the binaries names only the
+// api set it goes through: a claim is stated where it is not the default, and never lent.
+function binaryGraphMetricLinks(id, byId, edges) {
+    const others = new Map();
+    for (const e of edges) {
+        if (!e || typeof e.source !== 'string' || typeof e.target !== 'string') continue;
+        const out = e.source === id, into = e.target === id;
+        if (!out && !into) continue;
+        const other = out ? e.target : e.source;
+        const entry = others.get(other) || { out: false, into: false, tags: [] };
+        entry.out = entry.out || out;
+        entry.into = entry.into || into;
+        const origin = binaryGraphOrigin(e), label = typeof e.label === 'string' ? e.label : '';
+        let tag = '';
+        if (origin === 'curated') tag = /^curated\b/i.test(label) ? label : `curated${label ? `: ${label}` : ''}`;
+        else if (origin === 'unknown') tag = 'origin unknown';
+        else if (label) tag = `via ${label}`;
+        if (tag && !entry.tags.includes(tag)) entry.tags.push(tag);
+        others.set(other, entry);
+    }
+    const shown = [...others].slice(0, BINARY_GRAPH_MEMBER_LINKS).map(([other, entry]) => {
+        const node = byId.get(other), name = node && node.kind === 'syscall' ? node.label || other : other;
+        const arrow = entry.out && entry.into ? '⇄' : entry.out ? '→' : '←';
+        return `<span class="binary-graph-link">${arrow} ${escapeHtml(name)}${entry.tags.length ? ` <span class="binary-graph-link-tag">(${escapeHtml(entry.tags.join(', '))})</span>` : ''}</span>`;
+    });
+    const more = others.size - shown.length;
+    if (more > 0) shown.push(`<span class="syscall-muted">and ${escapeHtml(more.toLocaleString('en-US'))} more</span>`);
+    return shown.join(' ');
+}
+
+// The list behind a figure, as the detail panel shows it: one row per root of the answer, a button where the row leads into the graph
+function binaryGraphMetricHtml(metric) {
+    const meta = binaryGraphOwn(BINARY_GRAPH_METRICS, metric.key) || { name: String(metric.key || ''), jump: '' };
+    const head = `<div class="syscall-detail-name"><span class="syscall-detail-sc">${escapeHtml(meta.name)}</span>`
+        + '<button type="button" class="btn btn-sm binary-graph-close" onclick="binaryGraphMetricClose()">CLOSE</button></div>';
+    if (metric.loading) return head + '<p class="syscall-empty">Asking the binary graph…</p>';
+    if (!metric.answer) return head + `<p class="syscall-empty syscall-empty-error">${escapeHtml(metric.error)}</p>`;
+    const a = metric.answer;
+    const nodes = Array.isArray(a.nodes) ? a.nodes.filter(n => n && typeof n.id === 'string') : [];
+    const edges = Array.isArray(a.edges) ? a.edges : [];
+    const byId = new Map(nodes.map(n => [n.id, n]));
+    const roots = (Array.isArray(a.roots) ? a.roots : []).filter(id => byId.has(id));
+    let html = head;
+    if (a.truncated) {
+        html += `<p class="binary-graph-cut">Not the whole list: ${escapeHtml(roots.length.toLocaleString('en-US'))} of ${escapeHtml((Number(a.total) || 0).toLocaleString('en-US'))} are shown, `
+            + 'whole parts of it, and what is not shown is not absent.</p>';
+    }
+    if (typeof a.note === 'string' && a.note) html += `<p class="syscall-detail-note">${escapeHtml(a.note)}</p>`;
+    html += '<ul class="binary-graph-members">' + roots.map(id => {
+        const node = byId.get(id), jump = binaryGraphMetricJump(metric.key, node, edges);
+        const text = node.kind === 'function' ? node.id : String(node.label || node.id);
+        const name = jump
+            ? `<button type="button" class="binary-graph-member-name" title="${escapeHtml(jump.hint)}" onclick="binaryGraphMetricGo(${jsArg(node.id)})">${escapeHtml(text)}</button>`
+            : `<span class="binary-graph-member-name">${escapeHtml(text)}</span>`;
+        const kind = (binaryGraphOwn(BINARY_GRAPH_KINDS, node.kind) || { name: '' }).name;
+        const degree = meta.jump === 'binary' && node.kind !== 'function' ? ` · imported by ${(Number(node.in_degree) || 0).toLocaleString('en-US')}` : '';
+        const links = binaryGraphMetricLinks(node.id, byId, edges);
+        return `<li class="binary-graph-member">${name} <span class="syscall-muted">${escapeHtml(kind)}${escapeHtml(degree)}</span>${links ? `<div class="binary-graph-links">${links}</div>` : ''}</li>`;
+    }).join('') + '</ul>';
+    return html;
+}
+
+// A row of the list was clicked: into the graph. A row that leads nowhere, or is not in the list, does nothing. The list stays,
+// to be walked down; on a narrow screen the graph comes back to the front.
+function binaryGraphMetricGo(id) {
+    const m = binaryGraphState.metric, a = m && m.answer;
+    if (!a || !Array.isArray(a.nodes)) return false;
+    const edges = Array.isArray(a.edges) ? a.edges : [];
+    const jump = binaryGraphMetricJump(m.key, a.nodes.find(n => n && n.id === id), edges);
+    if (!jump) return false;
+    const el = name => document.getElementById(name);
+    if (typeof window.matchMedia === 'function' && window.matchMedia(SYSCALL_NARROW).matches) syscallSetPane('map');
+    if (jump.mode === 'explore') {
+        binaryGraphSetMode('explore');
+        const input = el('binary-explore-start');
+        if (input) input.value = jump.name;
+        return binaryGraphExploreStart(jump.name);
+    }
+    binaryGraphSetMode('path');
+    const select = el('binary-graph-query'), first = el('binary-graph-module'), second = el('binary-graph-function');
+    if (select) select.value = 'syscall-callers';
+    if (first) first.value = jump.name;
+    if (second) second.value = '';
+    binaryGraphOnQuery();
+    return binaryGraphRun();
 }

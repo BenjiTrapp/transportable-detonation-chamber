@@ -39,6 +39,14 @@ WIKI_FILE = "webui/static/wiki.html"
 FILES = {
     "webui/app.py": r"C:\DetonationChamberUI\app.py",
     "webui/memory_evidence.py": r"C:\DetonationChamberUI\memory_evidence.py",
+    "webui/syscall_baseline.py": r"C:\DetonationChamberUI\syscall_baseline.py",
+    "webui/syscall_scan.py": r"C:\DetonationChamberUI\syscall_scan.py",
+    "webui/syscall_rules.py": r"C:\DetonationChamberUI\syscall_rules.py",
+    "webui/syscall_signatures.json": r"C:\DetonationChamberUI\syscall_signatures.json",
+    "webui/win32_to_nt.py": r"C:\DetonationChamberUI\win32_to_nt.py",
+    "webui/win32_to_nt.json": r"C:\DetonationChamberUI\win32_to_nt.json",
+    "webui/binary_graph.py": r"C:\DetonationChamberUI\binary_graph.py",
+    "webui/binary_graph_query.py": r"C:\DetonationChamberUI\binary_graph_query.py",
     "webui/minidump_analysis.py": r"C:\DetonationChamberUI\minidump_analysis.py",
     "webui/pipe_analysis.py": r"C:\DetonationChamberUI\pipe_analysis.py",
     "webui/pipe_signatures.json": r"C:\DetonationChamberUI\pipe_signatures.json",
@@ -84,12 +92,14 @@ DATA_FILES = {
 # The install scripts the tool updates re-run, kept next to the provisioning copy
 SCRIPTS_REMOTE_DIR = r"C:\tdc\scripts"
 # (plus configure-logging.ps1, which an existing VM runs once to turn on the logs of the LOGS and FIREWALL tabs,
-# and tdc-unisolate.ps1, the way out of ISOLATED when the web UI cannot be reached)
+# tdc-unisolate.ps1, the way out of ISOLATED when the web UI cannot be reached, and build-binary-graph.ps1, which
+# builds the binary graph cache)
 SCRIPT_FILES = {
     f"scripts/{os.path.basename(path)}": SCRIPTS_REMOTE_DIR + "\\" + os.path.basename(path)
     for path in sorted(glob.glob(os.path.join(REPO, "scripts", "install-*.ps1"))
                        + [os.path.join(REPO, "scripts", "configure-logging.ps1"),
-                          os.path.join(REPO, "scripts", "tdc-unisolate.ps1")])
+                          os.path.join(REPO, "scripts", "tdc-unisolate.ps1"),
+                          os.path.join(REPO, "scripts", "build-binary-graph.ps1")])
 }
 
 RESTART_PS = (

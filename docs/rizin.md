@@ -181,7 +181,7 @@ A call the table does not know is named all the same; SKIP then leaves the
 return register as it is and the field waits for a value. At 32-bit stdcall,
 the convention of the Win32 API, the callee would have popped its arguments,
 so SKIP raises the stack pointer itself by four bytes per argument (the table
-knows each API's argument count; `POST …/call` in the [API](api.md#rizin) takes
+knows each API's argument count; `POST …/call` in the [API](api-rizin.md) takes
 another correction); `cdecl` imports
 such as `memcpy` are not corrected, because there the caller pops them. What a
 SKIP writes (a copy, an out-parameter) is the run's, and ends with the session
@@ -264,7 +264,7 @@ screenshot of [Rizin (Reverse Engineering)](web-ui.md#rizin-reverse-engineering)
 - ✕ takes it out of the project, as for any other patch, and it does not come back when the file is opened again. Taking back a patch that the timeline makes drops the timeline too, because a replay would write the patch again and the SHA-256 would not notice (below).
 - Apply now writes the patch into the cache now. Apply now appears only where a run's bytes cover the address again, and the server decides that, not the pane: the server says it with each waiting entry (`apply_now`), and the server checks it again when it is pressed, and refuses with its reason where no run's bytes lie under the address by then. That is the case when you have decrypted again yourself and the patch makes sense again. It is a patch like any other afterwards.
 
-There is no other exit, on purpose: an Apply now that is always there would be the harm above with a button in front of it. A waiting patch at an address the browser cannot hold exactly (above 2^53) has a ✕ that is off, titled "This address cannot be sent exactly, so this patch cannot be removed from here"; the way out is `DELETE /patch` with `waiting` in the [API](api.md#rizin).
+There is no other exit, on purpose: an Apply now that is always there would be the harm above with a button in front of it. A waiting patch at an address the browser cannot hold exactly (above 2^53) has a ✕ that is off, titled "This address cannot be sent exactly, so this patch cannot be removed from here"; the way out is `DELETE /patch` with `waiting` in the [API](api-rizin.md).
 
 **The button.** Restore the run, at the head of the right column of the EMULATION pane, replays the timeline the project keeps and proves the result. It is one button press, and never on its own when a file is opened, because it runs the file's code in the emulator again and a run can take as long as `esil.timeout` (5 s). Nothing starts on the VM, but it is the sample's code. Done by opening a file, it would execute sample code because a file was looked at, and a timeout would block the tab while it opens.
 
@@ -540,7 +540,7 @@ development; without rz-ghidra DECOMPILER says "Decompiler not available
   keeps it off until the cache is cleared or the file is opened again. Its
   SHA-256 proves a run's bytes and not a patch of yours.
 - After the emulation is restarted, the stack view can show words the previous
-  run wrote into the old ESIL map. `GET /patches` ([API](api.md#rizin)) lists
+  run wrote into the old ESIL map. `GET /patches` ([API](api-rizin.md)) lists
   them as `mine: false`, and **Clear rizin's whole cache** removes them.
 - In a kernel or a complete memory dump (a user-mode process dump's addresses
   all fit), a breakpoint or patch row whose address is above 2^53 shows `?` and

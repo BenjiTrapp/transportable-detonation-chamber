@@ -33,7 +33,7 @@ for this; without it the rows say "No internet access from the VM" (`offline`).
 | Chocolatey | every package `choco outdated` reports (git, python312, dotnet-8.0-sdk, 7zip, php, ...); a `<x>.install` row is dropped when `<x>` is listed too | `choco outdated` | `choco upgrade <package>` |
 | winget | WinDbg | `winget list --upgrade-available` | `winget upgrade` |
 | git | Rustinel rules, Elastic YARA rules, DetonatorAgent, Detonator, LitterBox, theZoo WebUI, theZoo, Hunt-Sleeping-Beacons, EMBER2024, Aether | `git fetch`, commits behind upstream | `git pull --ff-only --autostash`, then the install script rebuilds |
-| GitHub release | capa, BeaconEye, Process Dump, ThreatCheck, DefenderCheck, Rustinel, Fibratus, Rizin (Cutter) | latest release against the installed version | the `install-*.ps1` script with `-Force` |
+| GitHub release | capa, BeaconEye, Process Dump, ThreatCheck, DefenderCheck, Rustinel, Fibratus, Rizin (Cutter), NTSleuth | latest release against the installed version | the `install-*.ps1` script with `-Force` |
 | Sysinternals | Sysmon, Sysmon config | `ETag` of the download against the one recorded at install | `install-sysmon.ps1` |
 
 Not covered: the web UI itself and its pip packages (update them with

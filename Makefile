@@ -320,6 +320,14 @@ deploy:
 		vagrant upload webui/static/js/app.js C:\\DetonationChamberUI\\static\\js\\app.js; \
 		vagrant upload webui/app.py C:\\DetonationChamberUI\\app.py; \
 		vagrant upload webui/memory_evidence.py C:\\DetonationChamberUI\\memory_evidence.py; \
+		vagrant upload webui/syscall_baseline.py C:\\DetonationChamberUI\\syscall_baseline.py; \
+		vagrant upload webui/syscall_scan.py C:\\DetonationChamberUI\\syscall_scan.py; \
+		vagrant upload webui/syscall_rules.py C:\\DetonationChamberUI\\syscall_rules.py; \
+		vagrant upload webui/syscall_signatures.json C:\\DetonationChamberUI\\syscall_signatures.json; \
+		vagrant upload webui/win32_to_nt.py C:\\DetonationChamberUI\\win32_to_nt.py; \
+		vagrant upload webui/win32_to_nt.json C:\\DetonationChamberUI\\win32_to_nt.json; \
+		vagrant upload webui/binary_graph.py C:\\DetonationChamberUI\\binary_graph.py; \
+		vagrant upload webui/binary_graph_query.py C:\\DetonationChamberUI\\binary_graph_query.py; \
 		vagrant upload webui/minidump_analysis.py C:\\DetonationChamberUI\\minidump_analysis.py; \
 		vagrant upload webui/pipe_analysis.py C:\\DetonationChamberUI\\pipe_analysis.py; \
 		vagrant upload webui/pipe_signatures.json C:\\DetonationChamberUI\\pipe_signatures.json; \
@@ -345,7 +353,7 @@ deploy:
 		if [ -f webui/static/wiki.html ]; then \
 			vagrant upload webui/static/wiki.html C:\\DetonationChamberUI\\static\\wiki.html || echo "[deploy] the wiki did not upload; the rest is synced"; \
 		else echo "[deploy] no webui/static/wiki.html - build the wiki with: make docs"; fi; \
-		for f in scripts/install-*.ps1 scripts/configure-logging.ps1 scripts/tdc-unisolate.ps1; do \
+		for f in scripts/install-*.ps1 scripts/configure-logging.ps1 scripts/tdc-unisolate.ps1 scripts/build-binary-graph.ps1; do \
 			vagrant upload $$f C:\\tdc\\scripts\\$$(basename $$f); \
 		done; \
 		echo "[deploy] Done."; \
@@ -360,6 +368,14 @@ deploy-app:
 	else \
 		vagrant upload webui/app.py C:\\DetonationChamberUI\\app.py; \
 		vagrant upload webui/memory_evidence.py C:\\DetonationChamberUI\\memory_evidence.py; \
+		vagrant upload webui/syscall_baseline.py C:\\DetonationChamberUI\\syscall_baseline.py; \
+		vagrant upload webui/syscall_scan.py C:\\DetonationChamberUI\\syscall_scan.py; \
+		vagrant upload webui/syscall_rules.py C:\\DetonationChamberUI\\syscall_rules.py; \
+		vagrant upload webui/syscall_signatures.json C:\\DetonationChamberUI\\syscall_signatures.json; \
+		vagrant upload webui/win32_to_nt.py C:\\DetonationChamberUI\\win32_to_nt.py; \
+		vagrant upload webui/win32_to_nt.json C:\\DetonationChamberUI\\win32_to_nt.json; \
+		vagrant upload webui/binary_graph.py C:\\DetonationChamberUI\\binary_graph.py; \
+		vagrant upload webui/binary_graph_query.py C:\\DetonationChamberUI\\binary_graph_query.py; \
 		vagrant upload webui/minidump_analysis.py C:\\DetonationChamberUI\\minidump_analysis.py; \
 		vagrant upload webui/pipe_analysis.py C:\\DetonationChamberUI\\pipe_analysis.py; \
 		vagrant upload webui/pipe_signatures.json C:\\DetonationChamberUI\\pipe_signatures.json; \

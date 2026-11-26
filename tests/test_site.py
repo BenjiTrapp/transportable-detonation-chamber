@@ -2574,8 +2574,10 @@ def test_the_index_is_fetched_not_inlined(real_site):
         assert middle not in html, rel
         assert len(html) < 100000, (
             "%s is %d characters (len of the decoded page, not bytes) and the cap is 100000: a page carries the whole "
-            "text of its docs, and docs/api.md's one-row-per-route table is the one that grows -- shorten the row you "
-            "just wrote (the /export, /patches and /restore rows are long) rather than raise the cap" % (rel, len(html)))
+            "text of its docs, and the one-row-per-route tables of the API pages are the ones that grow. The RIZIN "
+            "tab's 37 rows left docs/api.md for docs/api-rizin.md when they were 59%% of that page; a tab that "
+            "outgrows its page the same way gets an API page of its own (tests/test_docs.py, API_PAGES) -- shorten "
+            "the row you just wrote, or move a section, rather than raise the cap" % (rel, len(html)))
     js = real_site.read(site.SITE_SCRIPT)
     assert site.SITE_SEARCH in js, "assets/site.js does not name the index"
     assert "fetch(" in js, "assets/site.js does not fetch anything"

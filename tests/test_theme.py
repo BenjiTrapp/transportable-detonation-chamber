@@ -766,6 +766,28 @@ def test_graph_node_kinds_are_distinguishable():
     assert not problems, "\n".join(problems)
 
 
+# The kinds of node the binary graph of the SYSCALLS tab draws (a function takes the text's colour)
+BINARY_GRAPH_KINDS = ["--graph-node-dll", "--graph-node-exe", "--graph-node-apiset", "--graph-node-syscall"]
+
+
+def test_binary_graph_node_kinds_are_distinguishable():
+    """Each kind of node of the binary graph keeps a colour of its own and stands out from the canvas, in each theme;
+    the curated edge and a filter match each have a colour, with the -rgb triplet a drawing with alpha reads."""
+    def distance(a, b):
+        return sum((x - y) ** 2 for x, y in zip(a, b)) ** 0.5
+    problems = []
+    for theme, values in (("Telemetry", _root_values()), ("Cyberpunk", _cyberpunk_palette())):
+        rgb = {kind: _hex_rgb(values[kind]) for kind in BINARY_GRAPH_KINDS}
+        background = _hex_rgb(values["--bg-primary"])
+        problems += [f"{theme}: {a} and {b} look alike" for i, a in enumerate(BINARY_GRAPH_KINDS)
+                     for b in BINARY_GRAPH_KINDS[i + 1:] if distance(rgb[a], rgb[b]) < 48]
+        problems += [f"{theme}: {kind} is too close to the background" for kind in BINARY_GRAPH_KINDS
+                     if distance(rgb[kind], background) < 150]
+        problems += [f"{theme}: {name} has no -rgb" for name in BINARY_GRAPH_KINDS + ["--graph-edge-curated", "--graph-match"]
+                     if not values.get(name + "-rgb")]
+    assert not problems, "\n".join(problems)
+
+
 # --- Telemetry (the theme with the id classic) -----------------------------------
 
 # The palette of docs/superpowers/specs/2026-11-16-classic-telemetry-design.md
@@ -3125,13 +3147,13 @@ def test_info_texts_cover_every_tab():
         return lambda e: name in e["attrs"].get("class", "").split()
 
     headers = find(elements.root, with_class("content-header"))
-    assert len(headers) == 13, "a tab head is missing or the pattern is out of date"
+    assert len(headers) == 14, "a tab head is missing or the pattern is out of date"
     rows = find(elements.root, with_class("rtrace-header")) + find(elements.root, with_class("graph-toolbar"))
     assert len(rows) == 2, "the head rows of Tracing and Graph"
     assert [h["children"][0]["text"] if h["children"] else "" for h in headers if not has_info(h)] == []
     assert all(has_info(row) for row in rows), "Tracing or Graph without (i)"
     tabs = find(elements.root, with_class("tab-content"))
-    assert len(tabs) == 15 and all(has_info(tab) for tab in tabs)
+    assert len(tabs) == 16 and all(has_info(tab) for tab in tabs)
     texts = INFO_ATTR.findall(html) + INFO_ATTR.findall(_read(APP_JS))
     assert len(texts) >= 30
     for text in texts:

@@ -7516,7 +7516,7 @@ VERDICT_FLOW_CONSTS = ["VERDICT_FLOW_KINDS", "VERDICT_FLOW_LITTERBOX_MIN", "VERD
                        "_verdictFlowDrawn", "SUBMISSION_VERDICT_GROUPS", "cardViewState"] + CHART_CONSTS
 # The two results views around the card: the panels of the Submit tab, the detail panel
 RESULT_VIEW_FUNCTIONS = list(dict.fromkeys(VERDICT_FLOW_FUNCTIONS + [
-    "renderDetonationPanels", "viewDetonationResult", "_detRawButton", "renderMemoryEvidence", "evidenceClassLabel",
+    "renderDetonationPanels", "detHasMemoryResults", "viewDetonationResult", "_detRawButton", "renderMemoryEvidence", "evidenceClassLabel",
     "confidenceClass", "renderExitCaptureBlock", "renderNetworkBeaconingBlock", "renderNamedPipesBlock", "pipesIsGone",
     "pipesCanonical", "pipeProcLabel", "formatTime", "formatSize", "cssToken", "severitySortValue", "sortTimeValue",
     "sortNumberValue", "pushDetailHistory", "setDetailHeader", "setDetailBody", "showDetail"]))

@@ -202,6 +202,18 @@
     --graph-pipe-rgb: var(--cp-cyan-rgb);
     --graph-detonated: var(--cp-gold);
     --graph-detonated-rgb: var(--cp-gold-rgb);
+    --graph-node-dll: var(--cp-violet);
+    --graph-node-dll-rgb: var(--cp-violet-rgb);
+    --graph-node-exe: var(--cp-teal);
+    --graph-node-exe-rgb: var(--cp-teal-rgb);
+    --graph-node-apiset: var(--cp-blue);
+    --graph-node-apiset-rgb: var(--cp-blue-rgb);
+    --graph-node-syscall: #f3eefc;
+    --graph-node-syscall-rgb: 243, 238, 252;
+    --graph-edge-curated: var(--cp-magenta);
+    --graph-edge-curated-rgb: var(--cp-magenta-rgb);
+    --graph-match: var(--cp-green);
+    --graph-match-rgb: var(--cp-green-rgb);
     --pe-code: var(--cp-blue);
     --pe-data: var(--cp-green);
     --pe-readonly: var(--cp-text-dim);
@@ -225,6 +237,17 @@
     --assess-protected-tint-rgb: var(--cp-amber-light-rgb);
     --assess-suspicious: var(--cp-amber-light);
     --assess-suspicious-rgb: var(--cp-amber-light-rgb);
+    /* The SYSCALLS map: the quiet intact violet, and each deviation in a neon of its own */
+    --syscall-intact: #41346f;
+    --syscall-intact-rgb: 65, 52, 111;
+    --syscall-hooked: var(--cp-amber);
+    --syscall-hooked-rgb: var(--cp-amber-rgb);
+    --syscall-patched: var(--cp-red);
+    --syscall-patched-rgb: var(--cp-red-rgb);
+    --syscall-diverged: var(--cp-cyan);
+    --syscall-diverged-rgb: var(--cp-cyan-rgb);
+    --syscall-unreadable: var(--cp-text-dim);
+    --syscall-unreadable-rgb: var(--cp-text-dim-rgb);
     --font-mono: var(--cp-font-label);
     --font-sans: var(--cp-font-text);
     --radius-lg: 6px;

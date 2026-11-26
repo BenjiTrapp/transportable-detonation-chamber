@@ -181,7 +181,7 @@ flowchart TB
         SYSMON["Sysmon"]
         SOURCES["Rustinel's NDJSON log files and<br/>Fibratus' events in the Windows event log"]
         EVTX["Sysmon's own event log"]
-        MEMORY["Live memory against the PID, in this order:<br/>Hunt-Sleeping-Beacons, BeaconEye,<br/>Aether, Process Dump"]
+        MEMORY["Live memory against the PID, in this order:<br/>Hunt-Sleeping-Beacons, BeaconEye,<br/>Aether, Syscalls, Process Dump"]
         EXIT["Exit Capture: Windows dumps<br/>the process as it exits"]
     end
     BROWSER -->|"HTTP :9000"| WEBUI
@@ -252,6 +252,7 @@ each of them can see is in [the guide's index](docs/README.md#detection-engines)
 | **Hex** | Hex editor with data inspector, structure minimap, PE/ELF analysis and section inspection |
 | **FileMap** | Byteplot / entropy / PE-ELF structure planes side by side, import/export trees, click-to-offset |
 | **Rizin** | Reverse engineering with rizin and rz-ghidra on the VM, one session per browser tab (see [Rizin](docs/rizin.md)): OPEN a submitted sample, a dump, an upload or a VM path; FUNCTIONS, DISASSEMBLY, DECOMPILER and HEX beside the control flow GRAPH (tabs below 1400 px), all at one current address that a click, SEEK + GO, ◀ ▶ or a seek in the console moves; below, a CONSOLE for rizin commands (an allowlist on the server: no programs, no writing to the file, no real debugging), XREFS, STRINGS, IMPORTS and an EMULATION pane; **EMULATE** runs the code in rizin's ESIL emulator (no process, the file untouched) with a run strip, breakpoints in the gutter, an API-call assistant, byte patches from the right-click menu, re-analysis of what a run decrypted, and an export of the patched copy that can be handed to Submit; a right-click also renames a function or comments an address, kept in a project with the patches and breakpoints; `aaa` up to 20 MB, `aa` and a Full analysis button above; Rizin buttons in the Submit history, Process Dump, Exit Capture, ThreatScan (result and history) and the Hex tab open a file here |
+| **SYSCALLS** | The map of every syscall of `ntdll.dll` and `win32u.dll` (why it exists and how to read it: [Syscall integrity](docs/memory.md#syscall-integrity); the routes are under [Syscalls](docs/api.md#syscalls)): one cell each in the order of its number, a band per module, from the NTSleuth baseline of this build and view; without a scan the baseline in one quiet tone, after SCAN of a chosen process each cell takes the state its stub was measured in (intact, hooked, patched, diverged, unreadable), counted in the legend, a single deviation standing out by its colour and a ring; a filter by name, number and module that dims what does not match, hover and click on a cell, the catalog under the map, notices for NTSleuth missing, no baseline and an x64 view that cannot be told from arm64; MAP / GRAPH, where GRAPH draws the import graph of `C:\Windows\System32` (3,999 binaries on the build this was measured on; read from the VM's own files and cached, offline) instead of the map: a layered path from an import down to a syscall number, an exploration node by node, and a table of figures over the whole stock. Every edge is derived from a binary except the curated ones, drawn dashed and marked `curated`: the last hop from a Win32 function to its Nt counterpart (from a hand-curated table; at most one per path) and the step from a `Zw` name of `ntdll` to its `Nt` name (a naming convention), in a path and in the syscall callers alike; a path that ends in an `Nt` name `ntdll` or `win32u` exports is derived throughout. More in [The binary graph](docs/memory.md#the-binary-graph) |
 | **LitterBox** | Files in the LitterBox sandbox with their static/dynamic/EDR results |
 | **Submit** | Detonation with stage-by-stage progress and combined verdict (EDR alerts, live memory, exit capture, network beaconing, LitterBox) with its VERDICT FLOW; the submission history with VERDICT HISTORY |
 
@@ -337,6 +338,7 @@ is built from `main` on every push - one address per page, and a search.
 | [Tool updates](docs/updates.md) | How do the tools on the VM stay current? |
 | [Web UI](docs/web-ui.md) | What do the themes, the charts and every tab look like? |
 | [API](docs/api.md) | Which routes and MCP tools can I call? |
+| [API — Rizin](docs/api-rizin.md) | Which routes does the RIZIN tab serve? |
 | [Development](docs/development.md) | How do I run the tests and change the code? |
 | [Troubleshooting](docs/troubleshooting.md) | Nothing works - where do I look? |
 
@@ -379,6 +381,8 @@ writes outside the detonation paths — is in
 | [thefLink/Hunt-Sleeping-Beacons](https://github.com/thefLink/Hunt-Sleeping-Beacons) | Sleeping beacon callstack scanner |
 | [0xsp-SRD/aether](https://github.com/0xsp-SRD/aether) | Live-process memory forensics (GPL-3.0; invoked as a separate binary) |
 | [glmcdona/Process-Dump](https://github.com/glmcdona/Process-Dump) | Memory component dumper (MIT) |
+| [xaitax/NTSleuth](https://github.com/xaitax/NTSleuth) | Extracts the syscall baseline of the SYSCALLS tab from `ntdll.dll` and `win32u.dll` (BSD-3-Clause; downloaded by `scripts/install-ntsleuth.ps1`, run as a separate binary) |
+| [WinGraph](https://wingraph.m0n1x90.dev/) | Dependency graph of the System32 binaries by m0n1x90, linked from the SYSCALLS detail panel; only a link: the chamber never queries it and fetches nothing from it, takes no code or data from it, and the site states no licence |
 | [ytisf/theZoo](https://github.com/ytisf/theZoo) | Malware sample repository |
 | [kawaiipantsu/theZoo-WebUI](https://github.com/kawaiipantsu/theZoo-WebUI) | theZoo web frontend |
 | [horsicq/DIE-engine](https://github.com/horsicq/DIE-engine) | Detect It Easy |
@@ -396,8 +400,8 @@ writes outside the detonation paths — is in
 This repository is [MIT licensed](LICENSE). Every tool the chamber installs or
 calls keeps the licence of its own project; the ones whose terms reach the way
 they are used are named in [Credits](#credits) — Aether (GPL-3.0) and rizin
-(LGPL-3.0) run as separate processes, Process Dump is MIT, and the vendored
-Mermaid copy is MIT with its licence beside it.
+(LGPL-3.0) run as separate processes, Process Dump is MIT, NTSleuth
+BSD-3-Clause, and the vendored Mermaid copy is MIT with its licence beside it.
 
 ---
 
