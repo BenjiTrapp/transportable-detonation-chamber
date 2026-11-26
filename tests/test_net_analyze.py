@@ -83,6 +83,10 @@ Regressions covered:
     no secret; a value that is a credential by its text keeps the text with
     the secrets masked, one found under a secret name is still masked whole
     (follow-up F3)
+  * one DNS answer the C2 served about itself (``ocsp.digicert.com A <C2>``)
+    made forty uploads to it known to the baseline, its address quiet and its
+    beacon the OCSP host's; only the answers of the capture's resolvers count,
+    never a self-answer or one from where traffic went (follow-up F4)
 """
 
 import base64
@@ -1228,3 +1232,55 @@ def test_a_value_under_a_secret_name_is_still_masked_whole(tmp_path):
     d = [e for e in r["events"] if e["type"] == "decoded"][0]
     assert d["credential"] is True and d["text"] == "***" and d["encoded"] == "***"
     assert value not in json.dumps(r) and "evil-c2.top/a and more" not in json.dumps(r)
+
+
+# --- a self-served DNS answer is no resolution (follow-up F4) ----------------------------------
+
+def _fake_lookup(cap, ts, name, server, address=C2):
+    import socket
+    q = dpkt.dns.DNS(id=7, qr=dpkt.dns.DNS_Q, qd=[dpkt.dns.DNS.Q(name=name, type=1, cls=1)])
+    a = dpkt.dns.DNS(id=7, qr=dpkt.dns.DNS_R, qd=[dpkt.dns.DNS.Q(name=name, type=1, cls=1)],
+                     an=[dpkt.dns.DNS.RR(name=name, type=1, ttl=60, ip=socket.inet_aton(address))])
+    cap.udp(ts, server, 53, bytes(q), bytes(a))
+
+
+def _spoofed_uploads(cap, count=40):
+    for i in range(count):
+        _ocsp(cap, 10.0 + i * 30, 1000, C2)
+
+
+def test_a_self_served_answer_does_not_make_spoofed_uploads_known(tmp_path):
+    # the reviewer's probe: 40/40 known, no findings, 41 suppressed
+    bl = _ocsp_baseline(tmp_path)
+    for name, others in (("alone", 0), ("beside the resolver", 6)):
+        cap = Capture()
+        _fake_lookup(cap, 9.0, "ocsp.digicert.com", C2)
+        for i in range(others):
+            cap.dns(1.0 + i, "name%d.example.org" % i)
+        _spoofed_uploads(cap)
+        for baseline in (bl, None):
+            r = net_analyze.analyze_pcap(_write(tmp_path, cap, "fake.pcap"), baseline=baseline)
+            assert _uploads(r) == [(1000, None)] * 40, name
+            found = {(f["kind"], f["dest"]) for f in r["evidence_findings"]}
+            assert found == {("c2_checkin", C2), ("exfil_upload", "ocsp.digicert.com")}, (name, found)
+            assert C2 in [i["value"] for i in r["iocs"]], name
+
+
+def test_an_answer_from_a_server_the_capture_also_talked_to_is_not_believed(tmp_path):
+    bl = _ocsp_baseline(tmp_path)
+    cap = Capture()
+    _fake_lookup(cap, 9.0, "ocsp.digicert.com", "203.0.113.67")
+    _spoofed_uploads(cap, 3)
+    cap.tcp(5.0, "203.0.113.67", 443, [("c", b"\x00" * 20), ("s", b"\x00" * 20)])
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap), baseline=bl)
+    assert _uploads(r) == [(1000, None)] * 3
+
+
+def test_the_resolvers_answers_still_absorb_the_clean_machine(tmp_path):
+    # the clean machine's own OCSP request beside a sample's own server for another name
+    bl = _ocsp_baseline(tmp_path)
+    cap = Capture()
+    _ocsp(cap, 10.0, 640)
+    _fake_lookup(cap, 3.0, "evil.top", C2)
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap), baseline=bl)
+    assert _uploads(r) == [(640, "known")] and "exfil_upload" not in _kinds(r)

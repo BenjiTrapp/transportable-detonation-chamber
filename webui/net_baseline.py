@@ -44,7 +44,10 @@ Two further points:
     match 400 to 2,400, 200 KB do not), and ``net_analyze`` lets the baseline
     know an upload only when every address it went to is one a DNS answer in
     the same capture gave for its name (``upload_resolved``): a claimed name
-    is not where the data went.
+    is not where the data went. Nor is a claimed answer: one reply the C2
+    served about itself (``ocsp.digicert.com A <C2>``) made forty uploads to it
+    known, so only the answers of the capture's resolvers count
+    (``net_dns.trusted_lookups``), never a self-answer.
   * A masked value in a path hides the file after it. ``/dl;token=abc/update.bin``
     and ``/dl;token=abc/stage.exe`` were both ``/dl;token=***`` and had one
     key; a path is masked segment by segment (``net_decode.mask_credentials``
@@ -64,6 +67,7 @@ import threading
 import time
 
 import net_decode
+import net_dns
 
 # 1: first scheme. 2: an upload's key holds its size bucket, and a path's
 #    masked value ends at "/" (net_decode.mask_credentials path mode).
@@ -320,11 +324,11 @@ class NetBaseline:
 
 
 def resolved_addresses(events):
-    """Name -> the addresses the A/AAAA answers of a capture gave for it."""
+    """Name -> the addresses the A/AAAA answers of a capture gave for it: the
+    answers of its resolvers only (``net_dns.trusted_lookups``), never one a
+    server gave about itself or one from where an upload went."""
     table = {}
-    for e in events:
-        if not isinstance(e, dict) or e.get("type") != "dns":
-            continue
+    for e in net_dns.trusted_lookups(events):
         if e.get("query_type") not in (None, "A", "AAAA"):
             continue
         for answer in e.get("answers") or ():

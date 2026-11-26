@@ -54,6 +54,10 @@ Regressions covered:
     in twenty such series lost its tight Sysmon finding
   * a test's docstring gave 3.7-7.5 % where its own counts are 7.2-11.8 %
     (final review M4)
+  * a DNS answer the C2 served about itself renamed its beacon after the
+    known-good name it claimed, so ``known_good`` hid it; only the answers of
+    the capture's resolvers (``net_dns.trusted_lookups``) name an address
+    (follow-up F4)
 """
 
 import json
@@ -1415,3 +1419,13 @@ def test_a_huge_single_group_is_analysed_from_a_bounded_window():
     p = net_behavior.periodicity([t * 30.0 for t in range(n)])
     assert p["periodic"] is True and p["interval"] == 30.0
     assert p["connections"] == n
+
+
+def test_a_self_served_answer_does_not_rename_a_beacon():
+    """Follow-up F4: the C2 answering ``ocsp.digicert.com A <itself>``."""
+    evs = [lookup(-0.2, "ocsp.digicert.com", IP, server=IP)] + check_ins(dest_ip=IP)
+    b = of_type(net_behavior.analyze(evs), "beacon")
+    assert len(b) == 1 and b[0]["dest"] == IP
+    # the same answer from the capture's resolver still names it
+    evs = [lookup(-0.2, "ocsp.digicert.com", IP, server="198.51.100.53")] + check_ins(dest_ip=IP)
+    assert of_type(net_behavior.analyze(evs), "beacon")[0]["dest"] == "ocsp.digicert.com"

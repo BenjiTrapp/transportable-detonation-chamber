@@ -94,6 +94,7 @@ from collections.abc import Iterable, Mapping
 
 import memory_evidence
 import net_behavior
+import net_dns
 import net_rules
 
 SOURCE = memory_evidence.NETWORK_SOURCE
@@ -524,12 +525,13 @@ def _answers(events):
 
     A check-in over HTTP names its host by the Host header and Sysmon by the
     address it connected to; without these the two findings of one loop share
-    no endpoint and supersede cannot see that they are one.
+    no endpoint and supersede cannot see that they are one. Only the answers
+    of the capture's resolvers (``net_dns.trusted_lookups``): one the sample's
+    own server gave would tie its C2 to a known-good name, and the fold would
+    hand the C2's finding to that name.
     """
     table = {}
-    for e in events:
-        if not isinstance(e, dict) or e.get("type") != "dns":
-            continue
+    for e in net_dns.trusted_lookups(events):
         if e.get("query_type") not in (None, "A", "AAAA"):
             continue
         name = _dest_key(e.get("dest"))

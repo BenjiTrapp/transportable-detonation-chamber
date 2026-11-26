@@ -78,9 +78,10 @@ module is that order, in ``analyze_pcap``. The false assumptions it avoids:
     every Windows machine does. Events the ``net_baseline.NetBaseline`` knows
     are suppressed: kept in the report and counted (``suppressed_count``,
     ``baseline`` "known" on the event) but invisible to the rules and the
-    findings. An upload is suppressed only when it went to an address a DNS
-    answer in this capture gave for its name: a sample's ``Host:
-    ocsp.digicert.com`` sent to its own address is no OCSP request. The rhythm of a check-in is measured over every event first, so
+    findings. An upload is suppressed only when it went to an address an
+    answer of this capture's resolvers gave for its name: a sample's ``Host:
+    ocsp.digicert.com`` sent to its own address is no OCSP request, and its own
+    DNS server's answer for that name is no resolution (``net_dns.trusted_lookups``). The rhythm of a check-in is measured over every event first, so
     a beacon whose requests the baseline knows is still measured, and is
     suppressed only when the baseline knows that rhythm too.
   * An event may be serialized as it is. ``ftp`` and ``smtp`` events hold a
@@ -694,16 +695,17 @@ def _quiet_addresses(events, claimed, known_good):
     """Addresses that are a known-good server, not an indicator.
 
     A claimed name (a Host header, a server name) is not corroboration: the
-    sample writes it. An address is quiet only when a DNS answer in this
-    capture mapped a known-good name to it, no answer mapped another name to
+    sample writes it, and so is an answer of its own DNS server. An address
+    is quiet only when an answer of the capture's resolvers
+    (``net_dns.trusted_lookups``) mapped a known-good name to it, no answer mapped another name to
     it, and no connection to it claimed a name that such an answer does not
     cover (a name that is not known-good, or a known-good name that was
     resolved elsewhere or not at all). A known-good Host header sent to an
     address no known-good lookup returned keeps that address as an IOC.
     """
     names = {}
-    for e in events:
-        if e.get("type") != "dns" or e.get("query_type") not in ("A", "AAAA"):
+    for e in net_dns.trusted_lookups(events):
+        if e.get("query_type") not in ("A", "AAAA"):
             continue
         for answer in e.get("answers") or ():
             ip = _ip(answer)

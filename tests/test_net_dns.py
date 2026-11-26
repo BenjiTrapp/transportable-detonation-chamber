@@ -33,6 +33,10 @@ Regressions covered:
     characters: sixty such replies were 61 MB of report and 12 s; a message
     keeps ``MAX_ANSWERS`` records and ``answers_capped`` says more existed
     (follow-up F1)
+  * any answer in a capture was believed: one reply the C2 served about itself
+    (``ocsp.digicert.com A <C2>``) made forty uploads to it the clean machine's
+    OCSP requests; ``trusted_lookups`` keeps only the answers of the capture's
+    resolvers, never a self-answer nor one from where traffic went (follow-up F4)
 """
 
 import os
@@ -449,3 +453,40 @@ def test_a_reply_within_the_bound_is_not_marked_cut():
     assert len(e["answers"]) == net_dns.MAX_ANSWERS and e["answers_capped"] is False
     plain = net_dns.events_from_flow(_dns_flow("evil.top", "A", ["203.0.113.9"]))[0]
     assert plain["answers_capped"] is False
+
+
+# --- which answers a capture may believe (follow-up F4) ---------------------------
+
+def _lookup(name, answers, server=RESOLVER, ts=1.0):
+    return net_events.NetEvent("dns", ts, dest=name, server=server, query_type="A", answers=answers)
+
+
+def test_a_self_answer_is_not_believed():
+    events = [_lookup("ocsp.digicert.com", ["203.0.113.66"], server="203.0.113.66")]
+    assert [e["answers"] for e in net_dns.trusted_lookups(events)] == [[]]
+
+
+def test_a_server_that_traffic_went_to_is_no_resolver():
+    events = [_lookup("ocsp.digicert.com", ["203.0.113.70"], server="203.0.113.66"),
+              net_events.NetEvent("upload", 2.0, dest="ocsp.digicert.com", addresses=["203.0.113.66"])]
+    assert net_dns.trusted_lookups(events) == []
+    conn = [events[0], net_events.NetEvent("conn", 2.0, dest="203.0.113.66")]
+    assert net_dns.trusted_lookups(conn) == []
+
+
+def test_a_server_that_answered_few_of_the_lookups_is_no_resolver():
+    events = [_lookup("n%d.example.org" % i, ["198.51.100.%d" % i]) for i in range(7)]
+    events.append(_lookup("ocsp.digicert.com", ["203.0.113.66"], server="203.0.113.67"))
+    trusted = net_dns.trusted_lookups(events)
+    assert len(trusted) == 7 and all(e["server"] == RESOLVER for e in trusted)
+
+
+def test_the_resolvers_of_a_capture_are_believed_and_events_are_not_changed():
+    events = [_lookup("a.example", ["198.51.100.1"]), _lookup("b.example", ["198.51.100.2"]),
+              _lookup("c.example", ["198.51.100.3"], server="192.0.2.53"),
+              _lookup("gone.example", [])]
+    trusted = net_dns.trusted_lookups(events)
+    assert [e["dest"] for e in trusted] == ["a.example", "b.example", "c.example"]
+    assert events[0]["answers"] == ["198.51.100.1"] and trusted[0] is not events[0]
+    # a lookup without a server (an event built by hand) counts as one server
+    assert len(net_dns.trusted_lookups([{"type": "dns", "dest": "x", "answers": ["1.2.3.4"]}])) == 1

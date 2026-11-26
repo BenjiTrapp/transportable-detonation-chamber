@@ -134,6 +134,7 @@ import ipaddress
 import math
 import statistics
 
+import net_dns
 import net_events
 
 # The one definition of a beacon's minimum and spread; memory_evidence uses these.
@@ -465,11 +466,14 @@ def _resolutions(events):
     The name is None when the address was answered for more than one name, in
     any order, anywhere in the list: that is a shared host and no name is
     right. The time is that of the query (the time a ``dns`` event carries),
-    the earliest instant at which anything could have used the answer.
+    the earliest instant at which anything could have used the answer. Only
+    the answers of the capture's resolvers count (``net_dns.trusted_lookups``):
+    an answer the sample's own server gave would rename its C2 beacon after a
+    known-good host.
     """
     table = {}
-    for e in events:
-        if e.get("type") != "dns" or not _usable(e.get("ts")):
+    for e in net_dns.trusted_lookups(events):
+        if not _usable(e.get("ts")):
             continue
         name = e.get("dest")
         answers = e.get("answers")

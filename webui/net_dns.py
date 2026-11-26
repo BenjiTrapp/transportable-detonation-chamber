@@ -53,8 +53,13 @@ to the generic parser rather than invent timestamps.
 
 The event's ``dest`` is the name that was asked about (what rules and the
 behaviour analysis group by); the resolver that answered is ``server``.
+
+Which answers to believe is ``trusted_lookups``: a capture holds the
+sample's own DNS too, and one reply it served itself (``ocsp.digicert.com A
+<its C2>``) made forty uploads to the C2 the clean machine's OCSP requests.
 """
 
+import ipaddress
 import socket
 import struct
 
@@ -269,3 +274,67 @@ def events_from_flow(flow):
             seen.add((txid, name, qtype))
             events.append(make(ts, name, qtype, rcode, answers, capped))
     return events
+
+
+# --- which answers a capture's resolution rests on ---------------------------------
+
+RESOLVER_SHARE = 0.25           # of the answered lookups a resolver answered at least
+_ENDPOINT_TYPES = frozenset(("conn", "conn_failed"))
+
+
+def _address(text):
+    try:
+        return str(ipaddress.ip_address(text))
+    except (ValueError, TypeError):
+        return None
+
+
+def trusted_lookups(events):
+    """The ``dns`` events of a capture whose answers it may believe, with only
+    the answers it may believe.
+
+    A DNS answer is the sample's to write when the sample talks to a DNS
+    server of its own. An answer counts only when it came from one of the
+    capture's resolvers, defined as a server that answered at least
+    ``RESOLVER_SHARE`` of the capture's answered lookups (the machine's one
+    or two configured resolvers answer nearly all of them; a sample's own
+    server answers its few) and to which the capture made no TCP connection
+    and sent no HTTP exchange (a resolver is not where an upload goes). And
+    never an answer that names the server that gave it (a self-answer: the
+    C2 vouching for itself). Events without a ``server`` count as one server.
+
+    Not required: that a resolver answered several names. The capture of a
+    short detonation may hold one lookup, the C2's, and that answer is what
+    ties the name of a check-in to the address of its connections. What this
+    leaves open: a sample whose own DNS server, at an address it does not
+    otherwise contact, answers a quarter or more of a capture's lookups (in a
+    capture with few lookups, one) is believed; the event still names the
+    server that answered (``server``).
+    """
+    lookups = [e for e in events if isinstance(e, dict) and e.get("type") == "dns"]
+    counts = {}
+    for e in lookups:
+        if e.get("answers"):
+            server = _address(e.get("server")) or ""
+            counts[server] = counts.get(server, 0) + 1
+    total = sum(counts.values())
+    if not total:
+        return []
+    endpoints = set()
+    for e in events:
+        if not isinstance(e, dict) or e.get("type") == "dns":
+            continue
+        if e.get("type") in _ENDPOINT_TYPES:
+            endpoints.add(_address(e.get("dest")))
+        for address in e.get("addresses") or ():
+            endpoints.add(_address(address))
+    resolvers = {server for server, count in counts.items()
+                 if count >= RESOLVER_SHARE * total and server not in endpoints}
+    out = []
+    for e in lookups:
+        server = _address(e.get("server")) or ""
+        if server not in resolvers or not e.get("answers"):
+            continue
+        answers = [a for a in e["answers"] if not server or _address(a) != server]
+        out.append(dict(e, answers=answers))
+    return out
