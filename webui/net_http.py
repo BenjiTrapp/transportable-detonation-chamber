@@ -599,6 +599,8 @@ def _body_text(body, encoding, budget=None):
     if failed and not data:
         text = None
     text, spent = _charge_text(text, budget)
+    # an inflate the budget stopped is a cut by the budget too, though the text then fits it
+    spent = spent or (inflate_capped and limit < MAX_INFLATED)
     return text, capped or inflate_capped or spent, failed, decoded, spent
 
 

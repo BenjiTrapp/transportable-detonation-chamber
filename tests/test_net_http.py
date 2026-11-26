@@ -63,6 +63,9 @@ Regressions covered:
   * a body was inflated to ``MAX_INFLATED`` although the text budget was long
     spent and nothing of it could be kept; past the budget only the first
     ``KIND_PEEK`` bytes are inflated, for the kind (follow-up F1)
+  * a body whose inflating the text budget stopped kept exactly what was left
+    and was not marked ``text_budget_spent``, so its unread tail looked
+    analysed (follow-up review, Important 2)
 """
 
 import gzip
@@ -1362,3 +1365,15 @@ def test_a_spent_text_budget_inflates_only_the_kind_peek(monkeypatch):
     limits.clear()
     net_http.events_from_flow(flow, text_budget=net_http.TextBudget(10 ** 9))
     assert limits[0] == net_http.MAX_INFLATED
+
+
+def test_a_body_cut_by_the_inflate_limit_of_the_budget_is_marked_spent():
+    body = b"B" * 100000 + b" http://evil-c2.top/tail"
+    flow = _http_flow(_get(), _encoded(gzip.compress(body, 9), b"gzip"))
+    budget = net_http.TextBudget(60000)
+    http = [e for e in net_http.events_from_flow(flow, text_budget=budget) if e["type"] == "http"][0]
+    assert len(http["resp_text"]) == 60000 and http["resp_capped"] is True
+    assert http["text_budget_spent"] is True
+    whole = [e for e in net_http.events_from_flow(flow, text_budget=net_http.TextBudget(10 ** 6))
+             if e["type"] == "http"][0]
+    assert "text_budget_spent" not in whole and whole["resp_text"].endswith("evil-c2.top/tail")
