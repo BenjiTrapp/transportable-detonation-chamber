@@ -66,3 +66,6 @@ webui/tool-updates.log
 # The offline wiki, built by `make docs` / `.\make.ps1 docs` from docs/
 webui/static/wiki.html
 webui/static/wiki.html.tmp
+# The documentation website, built by `make site` / `.\make.ps1 site` from
+# docs/ and README.md; the workflow builds it again and publishes that
+/site/

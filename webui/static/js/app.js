@@ -20977,6 +20977,37 @@ const RIZIN_C_WORDS = new Set([
     'uchar', 'ushort', 'uint', 'ulong', 'longlong', 'ulonglong', 'code', 'undefined', 'undefined1', 'undefined2',
     'undefined4', 'undefined8', 'wchar_t', 'size_t',
 ]);
+// The emulation's run line (the strip above the work area): the runs it offers (the server also knows until,
+// which needs an address: the right-click menu's, not a button; there is no step back, rizin's aesb restores no
+// memory), the words for a run that did what it was asked and for each reason the server gives for a stop,
+// and how many changed registers the strip shows (the EMULATION pane has them all)
+const RIZIN_EMU = {
+    kinds: ['cont', 'step', 'over', 'skip', 'to_call'],
+    labels: { cont: 'CONT', step: 'STEP', over: 'OVER', skip: 'SKIP', to_call: 'TO CALL' },
+    done: {
+        cont: 'Ran until it stopped', step: 'Stepped one instruction', over: 'Stepped over the instruction',
+        skip: 'Skipped the instruction', to_call: 'Ran to the next call and stopped before it', until: 'Ran to the address',
+    },
+    stops: {
+        breakpoint: 'Stopped at a breakpoint',
+        timeout: 'Stopped by esil.timeout: the run took too long',
+        invalid: 'Stopped: rizin cannot decode the instruction here',
+        trap: 'Stopped: an invalid memory access, or the PC is in memory that cannot be executed',
+    },
+    regs: 6,
+};
+// The EMULATION pane of the dock: the rows each group of patches shows (the rest is counted, not hidden), and the
+// one sentence of the session's note that cannot wait: rizin_sessions._WAITING_NOTE, which the server appends last
+// to a note that may be long, so the pane puts it first (a test holds the two to the same words)
+const RIZIN_EMU_PANE = {
+    rows: 100,
+    urgent: 'A patch, a breakpoint or the timeline of the emulation is waiting to be saved; the project is written when the analysis has finished.',
+};
+// The patches of the right-click menu: the kinds that act on one instruction (rizin_emulation.PATCH_KINDS), the
+// most bytes the field takes (rizin_emulation.MAX_PATCH_BYTES: a patch is one write, one command line, and rizin's
+// stdin reader keeps 4094 characters of a line and cuts what is longer, without a word) and the arch whose bytes
+// the kinds are (the server refuses all others: 0x90 is a nop on x86 and nowhere else)
+const RIZIN_PATCH = { kinds: ['nop', 'flip', 'always', 'nocall'], maxBytes: 2000, arch: 'x86' };
 // The views that follow the current place. load(force) brings a view to it:
 // it asks rizin when what the view shows is of another place, and always with
 // force (a finished analysis step may have changed it). The requests go out
@@ -20988,6 +21019,17 @@ const RIZIN_C_WORDS = new Set([
 const RIZIN_VIEWS = {
     disasm: force => rizinLoadDisasm(force),
     graph: force => rizinLoadGraph(force),
+    // The emulation's state: asked for only when forced (a run's answer is the state; see rizinLoadEmulation)
+    emulation: force => rizinLoadEmulation(force),
+    // The EMULATION pane's lists (patches and breakpoints; the pane draws the state from the entry above, it never asks
+    // for it): asked for while the pane is shown, wanted again after a run or a finished analysis step. The entry is
+    // also what keeps a promise: a list that found rizin busy says "the patches and breakpoints follow", and only a view
+    // registered here is asked for again (rizinRetryViews, rizinReloadViews); without it that sentence would stay for good
+    emuPane: force => rizinLoadEmuPane(force),
+    // The marks of the gutter and of the patched lines (rizinState.marks): asked for once for each file, and again
+    // when forced; a click in the gutter or a patch of the menu brings the answer's list itself
+    // (not while the EMULATION pane is on screen: it reads the same two routes, and what it reads is the marks' too)
+    marks: force => (rizinDockOnScreen('emulation') ? Promise.resolve(true) : rizinLoadMarks(force)),
     hex: force => rizinLoadHex(force),
     strings: force => rizinLoadList('strings', force),
     imports: force => rizinLoadList('imports', force),
@@ -21090,6 +21132,30 @@ const rizinState = {
     // Decompiles that ended a session (rizin stopped during pdgj), {path, func}: kept over Reopen and other
     // files (rizinReset leaves it), so DECOMPILER does not run them again on its own (rizinDecompileSlow)
     decompileSlow: [],
+    // The emulation: null outside it, else the server's state (running, pc, registers [{name, value}] in rizin's
+    // order, changed [names], stack [{addr, value, hint}], stopped, arch, bits; every word of it, the PC, the
+    // registers' values and the stack's addresses and values, a "0x…" string) with what only the tab knows: ran
+    // (the run that answered), summary (what a skipped call applied) and assist (the offer for the call at the
+    // PC, or null). The run strip and the EMULATION pane draw from this one state; neither asks the route again
+    emu: null,
+    emuWait: '',        // what waits for its answer: start, stop, or the kind of run; one at a time
+    emuNote: '',        // why the last run did not happen (shown in the strip, until the next one)
+    emuSeq: 0,          // the newest action on the state: a late answer of an older one is dropped
+    emuShown: {},       // what the strip's parts show (markup by id), so that only a change writes
+    // The EMULATION pane's lists: the session they are of (at), patches [{addr, size, before, after, mine}] and
+    // breakpoints [{addr, enabled}] as the routes answer them (integers: they are bounded by the file's layout),
+    // why they could not be read (problem), wanted again when the pane is shown (stale), the newest request (seq),
+    // the words of the last action ({kind, text}), the export's answer (exported) and what waits (busy). waiting is what
+    // /patches lists as held back ([{addr, after, reason}]) and restore the offer of the restore button ({actions, reason,
+    // digests, refused}); both come in the answer that brings patches, and null (not read) means no button
+    emuPane: { at: '', patches: null, waiting: null, restore: null, breakpoints: null, problem: '', stale: false, seq: 0, notice: null, exported: null, busy: '' },
+    emuPaneShown: '',   // the markup the pane shows, so that only a change writes
+    // What DISASSEMBLY marks: the breakpoints (their addresses) and the ranges patched by hand ([addr, size]), integers
+    // as the routes answer them (bounded by the file's layout), null until the file's lists are known; seq: the
+    // newest request for both; busy: a click in the gutter waits for its answer
+    // stamp: how many times each list was set, so that a read that was asked for before a newer list took its place
+    // does not put the older one back (rizinLoadMarks)
+    marks: { breakpoints: null, patched: null, seq: 0, busy: false, stamp: { patches: 0, breakpoints: 0 } },
 };
 
 // This browser tab's ID: random and kept in sessionStorage, so a reload of the
@@ -21188,6 +21254,8 @@ function rizinSetUi(state, extra) {
     if (state === 'moved' || state === 'ended') {
         rizinStopPoll();
         rizinState.retry.clear();
+        // The session is gone, and its emulation with it: the strip goes
+        if (rizinState.emu || rizinState.emuWait) rizinEmuLeave();
     }
     rizinRenderState();
     // Without a session DISASSEMBLY says how rizin gets installed
@@ -21289,13 +21357,19 @@ function rizinFunctionsHtml(funcs, options) {
     return html;
 }
 
-// The lines of DISASSEMBLY: address, the mnemonic in the colour of its kind,
-// operands and comment. Each line carries its address in data-addr; the one
-// that holds current (an address) is marked.
+// The lines of DISASSEMBLY: a gutter (a ● where a breakpoint is set, one click sets or removes it) and a cell for
+// the mark of a patch by hand (≠: these bytes were written here by hand; what a run wrote is not marked), then the address, the mnemonic in the colour of its
+// kind, operands and comment. Each line carries its address in data-addr; the one that holds current (an address)
+// is marked, and the one that holds pc (the emulation's) with a mark of its own. breakpoints: the addresses of the
+// ones set, patched: [address, size] of each patch by hand (integers, as the routes answer them); a line that
+// starts at a breakpoint is .bp, one that overlaps a patch .patched. The three marks (the breakpoint's ● in
+// the gutter, the PC's ▶ and dashed edge, the current line's solid bar) are never one thing: a line may carry all.
 function rizinDisasmHtml(ops, options) {
-    const { current = null } = options || {};
-    const at = rizinNum(rizinHex(current));
-    let marked = false;
+    const { current = null, pc = null, breakpoints = [], patched = [] } = options || {};
+    const at = rizinNum(rizinHex(current)), pcAt = rizinNum(rizinHex(pc));
+    const stops = new Set(Array.isArray(breakpoints) ? breakpoints : []);
+    const edits = Array.isArray(patched) ? patched.filter(p => Array.isArray(p) && Number.isSafeInteger(p[0]) && Number.isSafeInteger(p[1])) : [];
+    let marked = false, pcMarked = false;
     let html = '';
     for (const op of Array.isArray(ops) ? ops : []) {
         const addr = rizinHex(op && op.offset);
@@ -21303,9 +21377,17 @@ function rizinDisasmHtml(ops, options) {
         const size = Number.isInteger(op.size) && op.size > 0 ? op.size : 1;
         const here = !marked && at >= op.offset && at < op.offset + size;
         marked = marked || here;
+        const there = !pcMarked && pcAt >= op.offset && pcAt < op.offset + size;
+        pcMarked = pcMarked || there;
+        const stop = stops.has(op.offset);
+        const edited = edits.some(([from, length]) => op.offset < from + length && from < op.offset + size);
         const [, mnemonic, operands] = /^(\S*)\s*([\s\S]*)$/.exec(String(op.text ?? ''));
         const kind = rizinOpClass(op.type);
-        html += `<div class="rizin-op${here ? ' current' : ''}" data-addr="${addr}"><span class="rz-addr">${addr}</span> `
+        html += `<div class="rizin-op${here ? ' current' : ''}${there ? ' pc' : ''}${stop ? ' bp' : ''}${edited ? ' patched' : ''}" data-addr="${addr}">`
+            + `<span class="rizin-gutter${stop ? ' on' : ''}" data-rizin-gutter="${addr}" title="${stop ? 'Breakpoint set: click to remove it' : 'Click to set a breakpoint here'}"`
+            + `${stop ? ' aria-label="breakpoint"' : ''}>${stop ? '●' : ''}</span>`
+            + `<span class="rz-pm${edited ? ' on' : ''}"${edited ? ' title="Patched by hand: these bytes were written here"' : ''}>${edited ? '≠' : ''}</span>`
+            + `<span class="rz-addr">${addr}</span> `
             + `<span class="rz-mnem${kind ? ' ' + kind : ''}">${escapeHtml(mnemonic)}</span>`
             + (operands ? ' ' + rizinOperandsHtml(operands, rizinHex(op.jump)) : '')
             + (op.comment ? '  ' + rizinCommentHtml(op.comment) : '') + '</div>';
@@ -21367,7 +21449,14 @@ function rizinReset(described) {
         graphDrag: null, graphDragged: false, xrefs: null, xrefsPending: null, xrefsShown: '', placeName: null,
         decompiler: null, decompilerAsk: null, decompilerPending: null, decompilerShown: '', decompilerAt: '',
         decompilerClick: null, hex: null, hexAsk: null, hexPending: null, hexShown: '', backTo: null,
+        emu: null, emuWait: '', emuNote: '', emuShown: {}, emuPaneShown: '',
     });
+    rizinState.emuSeq++;            // an answer of the old session's emulation is dropped
+    Object.assign(rizinState.emuPane, { at: '', patches: null, waiting: null, restore: null, breakpoints: null, problem: '', stale: false,
+                                        notice: null, exported: null, busy: '' });
+    rizinState.emuPane.seq++;       // a late list of the old session is dropped
+    Object.assign(rizinState.marks, { breakpoints: null, patched: null, busy: false });
+    rizinState.marks.seq++;         // so is a late list of the marks
     for (const list of Object.values(rizinState.lists)) {
         if (list.timer !== null) clearTimeout(list.timer);
         Object.assign(list, { offset: 0, total: 0, items: null, truncated: false, at: '', stale: false, problem: '', shown: '', shownAt: '', timer: null });
@@ -21764,7 +21853,10 @@ async function rizinSeek(addr, source = '') {
     // A newer jump draws the views itself. The place drawn is where rizin is now: this jump's, or (if it did
     // not happen) that of a jump it replaced whose answer moved rizin
     if (ticket === rizinState.seekSeq) {
-        if (source !== 'history' && rizinState.seek) rizinPushHistory(rizinState.seek);
+        // ◀ ▶ walk the places the user went to: the views following a run of the emulation ('emulation') are
+        // no navigation of theirs (the PC is where they are; GO TO PC is a jump and does push), and a push
+        // would evict their places from the list and cut off what ▶ holds
+        if (source !== 'history' && source !== 'emulation' && rizinState.seek) rizinPushHistory(rizinState.seek);
         await rizinRefreshViews();
     }
     return !!seek;
@@ -21780,9 +21872,12 @@ function rizinPushHistory(addr) {
 }
 
 // ◀ ▶: the next place in the history at once (so that another click goes on
-// from there); a step that did not happen (rizin busy) is taken back.
+// from there); a step that did not happen (rizin busy) is taken back. At a place that is no entry of the
+// history (the views followed the emulation's PC there) ◀ goes to the entry the user left, not past it.
 async function rizinHistoryStep(delta) {
-    const from = rizinState.historyAt, at = from + delta;
+    const from = rizinState.historyAt;
+    const off = !!rizinState.seek && rizinState.history[from] !== rizinState.seek;
+    const at = off && delta < 0 ? from : from + delta;
     if (!rizinState.session || at < 0 || at >= rizinState.history.length) return false;
     rizinState.historyAt = at;
     rizinRenderLocation();
@@ -21906,6 +22001,9 @@ function rizinRenderState() {
     // A state or its buttons need the room: the file's details give way (style.css .rizin-crowded)
     const bar = document.getElementById('rizin-toolbar');
     if (bar) bar.classList.toggle('rizin-crowded', !!text || !!again || (!!full && !full.hidden));
+    // The one place the run strip and START follow the session's state (opening, moved, ended, not installed)
+    // from: everything that changes them renders this
+    rizinRenderRunStrip();
 }
 
 // SEEK shows where the views are: the name of the function at its start, else
@@ -21934,7 +22032,8 @@ function rizinRenderLocation() {
     if (input) input.title = seek ? `${seek}${rizinState.func ? ' in ' + rizinState.func : ''}` : '';
     const back = document.getElementById('rizin-back');
     const forward = document.getElementById('rizin-forward');
-    if (back) back.disabled = !seek || rizinState.historyAt <= 0;
+    const off = !!seek && rizinState.history[rizinState.historyAt] !== seek;
+    if (back) back.disabled = !seek || (off ? rizinState.historyAt < 0 : rizinState.historyAt <= 0);
     if (forward) forward.disabled = !seek || rizinState.historyAt >= rizinState.history.length - 1;
     rizinRenderPrompt();
 }
@@ -22018,10 +22117,13 @@ function rizinRenderDisasm(problem) {
         return;
     }
     if (title) title.textContent = page.function || rizinState.seek;
-    const at = JSON.stringify([rizinState.session, rizinState.seek]);
+    const pc = rizinEmuPc();
+    const at = JSON.stringify([rizinState.session, rizinState.seek, pc]);
     // The lines as JSON, once for each list of them (a page that loads on gets a new one)
     if (page.linesOf !== page.ops) Object.assign(page, { lines: JSON.stringify(page.ops), linesOf: page.ops });
-    const shown = JSON.stringify([rizinState.session, page.function, page.more, !!page.capped]) + page.lines;
+    // The marks of the gutter and of the patched lines are part of what is shown: another list draws the lines again
+    const marks = rizinState.marks;
+    const shown = JSON.stringify([rizinState.session, page.function, page.more, !!page.capped, marks.breakpoints, marks.patched]) + page.lines;
     const jumped = rizinState.disasmJump !== rizinState.jumpSeq;
     // Without a size (another code view chosen, GRAPH below 1400 px, the RIZIN tab in the background) the
     // place cannot be scrolled into sight: rizinCodeShown does it once DISASSEMBLY is in sight again
@@ -22029,9 +22131,13 @@ function rizinRenderDisasm(problem) {
     if (shown === rizinState.disasmShown) {
         if (at !== rizinState.disasmAt) {
             rizinState.disasmAt = at;
-            const seek = rizinNum(rizinState.seek);
-            const op = page.ops.find(o => seek >= o.offset && seek < o.offset + (Number.isInteger(o.size) && o.size > 0 ? o.size : 1));
+            const holder = place => {
+                const n = rizinNum(place);
+                return page.ops.find(o => n >= o.offset && n < o.offset + (Number.isInteger(o.size) && o.size > 0 ? o.size : 1));
+            };
+            const op = holder(rizinState.seek), pcOp = pc ? holder(pc) : null;
             rizinMoveMark(pane, '.rizin-op', op ? [rizinHex(op.offset)].filter(Boolean) : []);
+            rizinMovePc(pane, '.rizin-op', pcOp ? [rizinHex(pcOp.offset)].filter(Boolean) : []);
         } else if (jumped) {
             rizinReveal(pane, pane.querySelector('.rizin-op.current'));
         }
@@ -22041,7 +22147,7 @@ function rizinRenderDisasm(problem) {
     rizinState.disasmShown = shown;
     rizinState.disasmAt = at;
     const end = `The linear disassembly stops here, after ${RIZIN_MORE.linear} instructions: enter a later address in SEEK to read on.`;
-    pane.innerHTML = (page.ops.length ? rizinDisasmHtml(page.ops, { current: rizinState.seek })
+    pane.innerHTML = (page.ops.length ? rizinDisasmHtml(page.ops, { current: rizinState.seek, pc, breakpoints: marks.breakpoints || [], patched: marks.patched || [] })
         : '<div class="rizin-empty">No instructions at this address.</div>')
         + (page.more ? `<div class="rizin-more" title="The instructions go on below">${escapeHtml(rizinMoreText(page))}</div>`
             : page.capped ? `<div class="rizin-disasm-end">${escapeHtml(end)}</div>` : '');
@@ -22058,8 +22164,9 @@ function rizinOnFunctionClick(event) {
 }
 
 // A click on an instruction moves there, on a jump or call target jumps to it;
-// not when the click ends a selection of text. A click on the line under the
-// last one asks for the next page at once.
+// not when the click ends a selection of text. A click in the gutter, left of the
+// address, sets or removes the breakpoint there and moves nowhere. A click on the
+// line under the last one asks for the next page at once.
 function rizinOnDisasmClick(event) {
     const more = event.target && event.target.closest ? event.target.closest('.rizin-more') : null;
     if (more) {
@@ -22068,6 +22175,11 @@ function rizinOnDisasmClick(event) {
         return;
     }
     if (typeof window.getSelection === 'function' && String(window.getSelection())) return;
+    const gutter = event.target && event.target.closest ? event.target.closest('[data-rizin-gutter]') : null;
+    if (gutter) {
+        rizinToggleBreakpoint(gutter.getAttribute('data-rizin-gutter'));
+        return;
+    }
     const el = event.target && event.target.closest ? event.target.closest('[data-addr]') : null;
     if (el) rizinSeek(el.getAttribute('data-addr'), el.classList.contains('rz-target') ? 'target' : 'disasm');
 }
@@ -22135,25 +22247,44 @@ function rizinMoveMark(container, selector, addrs) {
     rizinReveal(container, container.querySelector(`${selector}.current`));
 }
 
+// The mark of the emulation's PC (.pc) of a list drawn already moves to its rows (selector) of the addresses
+// addrs (data-addr); unlike rizinMoveMark it scrolls nothing: the PC is where the user is not always looking
+function rizinMovePc(container, selector, addrs) {
+    for (const el of container.querySelectorAll(`${selector}.pc`)) {
+        if (!addrs.includes(el.getAttribute('data-addr'))) el.classList.remove('pc');
+    }
+    for (const addr of addrs) container.querySelector(`${selector}[data-addr="${addr}"]`)?.classList.add('pc');
+}
+
 // What a scrolled list shows at its top: the first row in sight (its
-// data-addr) and how far it is from the top, to put it back there when the
-// list is drawn again. At the top the list stays at the top.
+// data-addr, and its place among the rows) and how far it is from the top, to
+// put it back there when the list is drawn again. At the top the list stays at
+// the top.
 function rizinScrollAnchor(container) {
     const top = container.scrollTop;
-    if (!Number.isFinite(top) || top <= 0) return { top: 0, addr: null, delta: 0 };
-    for (const row of Array.from(container.children)) {
-        const addr = row.getAttribute('data-addr');
+    if (!Number.isFinite(top) || top <= 0) return { top: 0, addr: null, delta: 0, index: 0 };
+    const rows = Array.from(container.children);
+    for (let index = 0; index < rows.length; index++) {
+        const row = rows[index], addr = row.getAttribute('data-addr');
         if (addr && Number.isFinite(row.offsetTop) && row.offsetTop + row.offsetHeight > top) {
-            return { top, addr, delta: row.offsetTop - top };
+            return { top, addr, delta: row.offsetTop - top, index };
         }
     }
-    return { top, addr: null, delta: 0 };
+    return { top, addr: null, delta: 0, index: 0 };
 }
 
 // The list drawn again: the same row at the same height, else the same scroll
-// position (rows that came in above the ones in sight push the list on)
+// position (rows that came in above the ones in sight push the list on). Of
+// several rows with the address (lines of C that share an instruction) the one
+// nearest the place the row had, or the list would creep up with each redraw.
 function rizinRestoreScroll(container, anchor) {
-    const row = anchor.addr ? Array.from(container.children).find(r => r.getAttribute('data-addr') === anchor.addr) : null;
+    const rows = Array.from(container.children);
+    let row = null, gap = Infinity;
+    if (anchor.addr) {
+        rows.forEach((r, i) => {
+            if (r.getAttribute('data-addr') === anchor.addr && Math.abs(i - (anchor.index || 0)) < gap) [row, gap] = [r, Math.abs(i - (anchor.index || 0))];
+        });
+    }
     const top = row && Number.isFinite(row.offsetTop) ? row.offsetTop - anchor.delta : anchor.top;
     container.scrollTop = Math.max(0, top);
 }
@@ -22626,17 +22757,18 @@ function rizinGraphBoxAt(layout, nodes, at) {
 
 // The graph as SVG: the edges in the colour of their kind (a class each),
 // then the blocks, each a group with its address in data-addr and a title;
-// the block of current (an address) is marked. overview: no instructions
+// the block of current (an address) is marked, and the block of pc (the emulation's) with a mark of its own. overview: no instructions
 // and no arrow heads; section {x, y, w, h}: only the blocks that reach into
 // it have their text. Every text of the file is escaped.
 function rizinGraphSvg(layout, graph, options) {
-    const { current = null, overview = false, section = null } = options || {};
+    const { current = null, pc = null, overview = false, section = null } = options || {};
     if (!layout || !Array.isArray(layout.boxes) || !layout.boxes.length) return '';
     const g = RIZIN_GRAPH;
     const nodes = graph && Array.isArray(graph.nodes) ? graph.nodes : [];
     const byOffset = new Map();
     for (const node of nodes) if (node && Number.isFinite(node.offset) && !byOffset.has(node.offset)) byOffset.set(node.offset, node);
     const here = rizinGraphBoxAt(layout, nodes, rizinNum(rizinHex(current)));
+    const there = rizinGraphBoxAt(layout, nodes, rizinNum(rizinHex(pc)));
     const c = v => String(Math.round(v * 10) / 10);
     const cut = line => {
         const text = String(line ?? '');
@@ -22659,7 +22791,7 @@ function rizinGraphSvg(layout, graph, options) {
         const lines = node && Array.isArray(node.lines) ? node.lines : [];
         const addr = rizinHex(box.offset);
         const count = `${addr} · ${lines.length} instruction${lines.length === 1 ? '' : 's'}`;
-        svg += `<g class="rizin-block${box === here ? ' current' : ''}" data-addr="${addr}"><title>${escapeHtml(count)}</title>`
+        svg += `<g class="rizin-block${box === here ? ' current' : ''}${box === there ? ' pc' : ''}" data-addr="${addr}"><title>${escapeHtml(count)}</title>`
             + `<rect class="rizin-block-box" x="${c(box.x)}" y="${c(box.y)}" width="${c(box.w)}" height="${c(box.h)}" rx="3"></rect>`;
         const reaches = !section || (box.x < section.x + section.w && box.x + box.w > section.x
             && box.y < section.y + section.h && box.y + box.h > section.y);
@@ -22847,6 +22979,8 @@ function rizinRenderGraph(problem) {
     if (title) title.textContent = graph.function ? `GRAPH · ${graph.function}` : 'GRAPH';
     const layout = graph.layout;
     const box = rizinGraphBoxAt(layout, graph.nodes, rizinNum(rizinState.seek));
+    const pc = rizinEmuPc();
+    const pcBox = pc ? rizinGraphBoxAt(layout, graph.nodes, rizinNum(pc)) : null;
     // The view is the function's, by its entry: a rename keeps it
     const place = JSON.stringify([graph.session, graph.entry ?? layout.boxes[0].offset]);
     if (place !== rizinState.graphPlace) {
@@ -22880,10 +23014,10 @@ function rizinRenderGraph(problem) {
     }
     const shown = JSON.stringify([graph.session, graph.gen, mode, section]);
     if (shown !== rizinState.graphShown) {
-        pane.innerHTML = rizinGraphSvg(layout, graph, { current: rizinState.seek, overview: mode === 'overview', section });
+        pane.innerHTML = rizinGraphSvg(layout, graph, { current: rizinState.seek, pc, overview: mode === 'overview', section });
         rizinState.graphShown = shown;
     } else {
-        rizinGraphMark(pane, box);
+        rizinGraphMark(pane, box, pcBox);
     }
     rizinState.graphMode = mode;
     rizinState.graphSection = section;
@@ -22898,13 +23032,17 @@ function rizinRenderGraph(problem) {
     }
 }
 
-// The mark on the block of the current address, without drawing the graph again
-function rizinGraphMark(pane, box) {
-    const addr = box ? rizinHex(box.offset) : null;
+// The marks on the block of the current address and of the emulation's PC, without drawing the graph again
+function rizinGraphMark(pane, box, pcBox) {
+    const addr = box ? rizinHex(box.offset) : null, pcAddr = pcBox ? rizinHex(pcBox.offset) : null;
     pane.querySelectorAll('.rizin-block.current').forEach(el => {
         if (el.getAttribute('data-addr') !== addr) el.classList.remove('current');
     });
     if (addr) pane.querySelector(`.rizin-block[data-addr="${addr}"]`)?.classList.add('current');
+    pane.querySelectorAll('.rizin-block.pc').forEach(el => {
+        if (el.getAttribute('data-addr') !== pcAddr) el.classList.remove('pc');
+    });
+    if (pcAddr) pane.querySelector(`.rizin-block[data-addr="${pcAddr}"]`)?.classList.add('pc');
 }
 
 // The view's zoom and place on the SVG (a CSS transform); lines and edges
@@ -23571,11 +23709,11 @@ function rizinFunctionRenamed(addr, name) {
     return true;
 }
 
-// After a rename or a comment (the menu, or a console command that changed something): every view
-// again, also at the same place
-async function rizinAnnotated() {
+// After a rename, a comment or a patch (the menu, or a console command that changed something): every view
+// (but skip) again, also at the same place
+async function rizinAnnotated(skip) {
     rizinRenderToolbar();
-    await rizinReloadViews();
+    await rizinReloadViews(skip);
 }
 
 // --- XREFS, STRINGS and IMPORTS: the dock's lists ---
@@ -23840,6 +23978,7 @@ function rizinDockShown(name) {
         return rizinLoadXrefs(pending === true);
     }
     if (name === 'strings' || name === 'imports') return rizinLoadList(name, false);
+    if (name === 'emulation') return rizinLoadEmuPane(false);
     return Promise.resolve(true);
 }
 
@@ -23849,7 +23988,10 @@ function rizinDockOnScreen(name) {
 
 function rizinRenderDockNote() {
     const note = document.getElementById('rizin-dock-note');
-    if (note) note.textContent = { console: 'follows the views', imports: 'a click shows its references' }[rizinState.views.dock] || 'a click jumps there';
+    if (note) {
+        note.textContent = { console: 'follows the views', imports: 'a click shows its references',
+                             emulation: 'type in a register to set it · a click jumps there' }[rizinState.views.dock] || 'a click jumps there';
+    }
 }
 
 // ▾ folds the dock to its head, ▴ brings it back with the pane it showed
@@ -23933,11 +24075,15 @@ function rizinOnDockGripKey(event) {
     rizinSetDockHeight((rizinState.layout.dock ?? (Number(dock && dock.getBoundingClientRect().height) || 0)) + step);
 }
 
-// --- Rename and Comment: the right-click menu ---
+// --- The right-click menu: Rename, Comment, the patches and Run to here ---
 // A right-click on a function, a line of the disassembly or a block of the
 // graph opens it for that address; Rename names the function there (afn on
 // the server), Comment sets or, empty, removes the comment there. Both are
-// kept in the file's project, and every view is drawn again.
+// kept in the file's project, and every view is drawn again. On a line of the
+// disassembly it also holds what acts on that one instruction (DISASSEMBLY has
+// no selection): NOP out, Flip the jump, Always jump, Kill the call, Bytes… (as
+// many bytes as the field takes, over as many instructions as they cover) and,
+// while the emulation runs, Run to here.
 
 // source: functions, disasm or graph; elsewhere the browser's own menu shows
 function rizinOnContextMenu(event, source) {
@@ -23957,13 +24103,42 @@ function rizinOnContextMenu(event, source) {
     }
     const page = rizinState.disasm;
     const op = page && page.session === rizinState.session ? page.ops.find(o => o && rizinHex(o.offset) === addr) : null;
-    // The comment there, if the page shown has the address; else null: Comment… reads it first
-    rizinOpenMenu({ addr, source, name: name || null, comment: op ? (typeof op.comment === 'string' ? op.comment : '') : null },
+    // The comment there, if the page shown has the address; else null: Comment… reads it first. The type is what the
+    // patch entries are chosen from (rizin's op type, '' where the page does not have the address)
+    rizinOpenMenu({ addr, source, name: name || null, comment: op ? (typeof op.comment === 'string' ? op.comment : '') : null,
+                    type: op && typeof op.type === 'string' ? op.type : '' },
                   Number(event.clientX) || 0, Number(event.clientY) || 0);
 }
 
+// What the menu offers for info (see rizinOpenMenu): the patch entries only on a line of the disassembly, each
+// of the four only where its kind applies to the instruction's type (the ones that do not are hidden, as there is
+// nothing to say about them), and all four off, with the reason, where the file is not x86: the server refuses them
+// there, and Bytes… stays; Run to here only while the emulation runs, and off while a run is in flight.
+function rizinMenuEntries(info) {
+    const disasm = info.source === 'disasm';
+    const file = rizinState.file, arch = file && file.arch ? String(file.arch) : '';
+    const x86 = arch === RIZIN_PATCH.arch;
+    const kinds = disasm ? rizinPatchKinds(info.type) : [];
+    const reason = `The patch buttons write x86 bytes, and this file is ${arch || 'of an arch rizin did not name'}: use Bytes… to write the bytes by hand.`;
+    const entry = (name, hidden, off, why) => {
+        const el = document.getElementById(`rizin-menu-${name}`);
+        if (!el) return;
+        el.hidden = hidden;
+        el.disabled = !hidden && off;
+        if (!hidden && off) el.title = why;
+        else el.removeAttribute('title');
+    };
+    const sep = document.getElementById('rizin-menu-sep');
+    if (sep) sep.hidden = !disasm;
+    for (const kind of RIZIN_PATCH.kinds) entry(kind, !kinds.includes(kind), !x86, reason);
+    entry('bytes', !disasm, false, '');
+    const running = !!rizinState.emu && rizinState.emu.running === true;
+    entry('until', !(disasm && running), !!rizinState.emuWait, 'A run is in flight; it cannot be interrupted, and the next one waits for it.');
+    return !x86 && kinds.length ? reason : '';
+}
+
 // The menu at x, y (inside the window) for info (addr, source, name of the function, comment there or
-// null when it is not known here)
+// null when it is not known here, type: rizin's op type of the instruction there, for a line of the disassembly)
 function rizinOpenMenu(info, x, y) {
     const menu = document.getElementById('rizin-menu');
     if (!menu) return;
@@ -23978,9 +24153,13 @@ function rizinOpenMenu(info, x, y) {
     }
     const items = document.getElementById('rizin-menu-items'), form = document.getElementById('rizin-menu-form');
     const note = document.getElementById('rizin-menu-note');
+    const why = rizinMenuEntries(info);
     if (items) items.hidden = false;
     if (form) form.hidden = true;
-    if (note) note.textContent = '';
+    if (note) {
+        note.className = 'rizin-menu-note' + (why ? ' rizin-menu-hint' : '');
+        note.textContent = why;
+    }
     menu.hidden = false;
     rizinPlaceMenu();
     (rename && !rename.disabled ? rename : document.getElementById('rizin-menu-comment'))?.focus();
@@ -24027,12 +24206,13 @@ function rizinMenuNote(text, waiting) {
     rizinPlaceMenu();
 }
 
-// Rename…, Comment…, Save and Cancel in the menu
+// The menu's entries, Save and Cancel: Rename…, Comment… and Bytes… open the field, the four patches and Run to here act
 function rizinOnMenuClick(event) {
     const button = event.target && event.target.closest ? event.target.closest('[data-action]') : null;
     if (!button || button.disabled) return;
     const action = button.getAttribute('data-action');
-    if (action === 'rename' || action === 'comment') rizinMenuForm(action);
+    if (action === 'rename' || action === 'comment' || action === 'bytes') rizinMenuForm(action);
+    else if (RIZIN_PATCH.kinds.includes(action) || action === 'until') rizinMenuAct(action);
     else if (action === 'save') rizinMenuSubmit();
     else if (action === 'cancel') rizinCloseMenu(true);
 }
@@ -24047,7 +24227,7 @@ function rizinOnMenuKey(event) {
         event.preventDefault();
         rizinMenuSubmit();
     } else if ((event.key === 'ArrowDown' || event.key === 'ArrowUp') && document.getElementById('rizin-menu-items')?.hidden === false) {
-        const items = [...document.querySelectorAll('#rizin-menu .rizin-menu-item')].filter(b => !b.disabled);
+        const items = [...document.querySelectorAll('#rizin-menu .rizin-menu-item')].filter(b => !b.disabled && !b.hidden);
         if (!items.length) return;
         event.preventDefault();
         const at = items.indexOf(document.activeElement);
@@ -24055,8 +24235,9 @@ function rizinOnMenuKey(event) {
     }
 }
 
-// The menu's field for the new name (filled with the old one) or the comment (with the one there, read
-// from rizin first when the page shown does not have it); the menu stays inside the window
+// The menu's field for the new name (filled with the old one), the comment (with the one there, read
+// from rizin first when the page shown does not have it) or the bytes to write (empty, and it says how many
+// it takes); the menu stays inside the window
 function rizinMenuForm(action) {
     const menu = rizinState.menu;
     const input = document.getElementById('rizin-menu-input');
@@ -24065,10 +24246,15 @@ function rizinMenuForm(action) {
     document.getElementById('rizin-menu-items').hidden = true;
     document.getElementById('rizin-menu-form').hidden = false;
     document.getElementById('rizin-menu-label').textContent = action === 'rename' ? `New name for ${menu.name}`
+        : action === 'bytes' ? `Bytes to write at ${menu.addr}: hex digits, an even number, at most ${RIZIN_PATCH.maxBytes} bytes (${2 * RIZIN_PATCH.maxBytes} digits)`
         : `Comment at ${menu.addr} (empty removes it)`;
     document.getElementById('rizin-menu-note').textContent = '';
-    input.value = action === 'rename' ? menu.name || '' : menu.comment || '';
-    input.setAttribute('maxlength', action === 'rename' ? '128' : '500');
+    input.value = action === 'rename' ? menu.name || '' : action === 'bytes' ? '' : menu.comment || '';
+    // The bytes field has no maxlength: a value that is too long is said so, in words, not cut off by the field
+    if (action === 'bytes') input.removeAttribute('maxlength');
+    else input.setAttribute('maxlength', action === 'rename' ? '128' : '500');
+    if (action === 'bytes') input.setAttribute('placeholder', '90 90 eb 05');
+    else input.removeAttribute('placeholder');
     rizinMenuWaits(false);
     rizinPlaceMenu();
     if (action === 'comment' && menu.comment === null) {
@@ -24107,9 +24293,10 @@ async function rizinMenuReadComment(menu) {
     return !!r.ok;
 }
 
-// Save: the name or the comment goes to rizin; the menu closes and every view is drawn again, or it
+// Save: the name, the comment or the bytes go to rizin; the menu closes and every view is drawn again, or it
 // stays and says why (a name rizin does not take; renames and comments wait for the analysis; an empty
-// comment where the one there could not be read, which it would remove unseen)
+// comment where the one there could not be read, which it would remove unseen; bytes that are odd in number, too
+// many or no hex, which are said before anything goes out)
 async function rizinMenuSubmit() {
     const menu = rizinState.menu;
     const input = document.getElementById('rizin-menu-input');
@@ -24122,14 +24309,44 @@ async function rizinMenuSubmit() {
         rizinMenuNote('Not saved: the comment here could not be read, and an empty field would remove it.');
         return false;
     }
+    if (menu.action === 'bytes') {
+        const parsed = rizinPatchHex(input.value);
+        if (!parsed.bytes) {
+            rizinMenuNote(parsed.error);
+            return false;
+        }
+    }
     const sid = rizinState.session;
     menu.saving = true;
     rizinMenuNote('Saving…', true);
-    const r = menu.action === 'rename' ? await rizinRename(menu.addr, input.value.trim()) : await rizinComment(menu.addr, input.value);
+    const r = menu.action === 'rename' ? await rizinRename(menu.addr, input.value.trim())
+        : menu.action === 'bytes' ? await rizinPatchBytes(menu.addr, input.value) : await rizinComment(menu.addr, input.value);
+    return rizinMenuFinish(menu, sid, r);
+}
+
+// NOP out, Flip the jump, Always jump, Kill the call (the kind is the entry's data-action) patch the one instruction
+// at the menu's address and close the menu; Run to here closes it and starts the run. A patch that the server
+// refuses (no such jump there, no instruction decoded) says why in the menu, which stays.
+async function rizinMenuAct(action) {
+    const menu = rizinState.menu, sid = rizinState.session;
+    if (!menu || menu.saving || !sid) return false;
+    if (action === 'until') {
+        rizinCloseMenu();
+        return rizinRunToHere(menu.addr);
+    }
+    menu.saving = true;
+    rizinMenuNote('Patching…', true);
+    return rizinMenuFinish(menu, sid, await rizinPatchOp(menu.addr, action));
+}
+
+// The end of a menu action r (an answer of rizinApi): done, the menu closes and every view is drawn again (not the
+// marks: the answer of a patch brought its list, and a rename or a comment changes none); else the menu stays and
+// says why
+async function rizinMenuFinish(menu, sid, r) {
     if (sid !== rizinState.session) return false;
     if (r.ok) {
         if (rizinState.menu === menu) rizinCloseMenu();
-        await rizinAnnotated();
+        await rizinAnnotated(['marks']);
         return true;
     }
     if (rizinState.menu !== menu) return false;
@@ -24229,6 +24446,23 @@ function rizinDecompilerMark(lines, current, prefer) {
     return best;
 }
 
+// What a click in the gutter of each line of C acts on (null for a line without an address): the lowest
+// address of the line that carries a breakpoint, else its lowest address, and whether one sits there. The
+// lowest because a breakpoint on a line of C stops before the line, and its offset is only the first of
+// rizin's annotations (pdgo's address), which can be past the call the line is about; one that is set
+// already wins, so that a second click removes it instead of setting another. An instruction may belong to
+// several lines (unlike rizinDecompilerMark, which picks the one line that is "here"): each carries the
+// mark, and a click on any of them removes the same breakpoint.
+function rizinDecompilerStops(lines, breakpoints) {
+    const set = new Set(Array.isArray(breakpoints) ? breakpoints : []);
+    return (Array.isArray(lines) ? lines : []).map(line => {
+        const offsets = rizinLineOffsets(line).sort((a, b) => a - b);
+        if (!offsets.length) return null;
+        const at = offsets.find(o => set.has(o));
+        return { addr: rizinHex(at ?? offsets[0]), set: at !== undefined };
+    });
+}
+
 // A line of rz-ghidra's C as markup: keywords and types, the names of the functions it calls (rizin's names
 // have dots: sym.imp.KERNEL32.dll_Sleep), strings and comments in their colours, everything else as text.
 // Linear: every try at a quote or a comment matches (one that nothing closes takes the rest of the line),
@@ -24256,19 +24490,30 @@ function rizinCHtml(text) {
 
 // The lines of DECOMPILER: rz-ghidra's C, each with its index in data-line; a line with an address (its
 // offset, as pdgo shows it) carries it in data-addr and all its addresses on hover. current (an address)
-// marks its line (rizinDecompilerMark), line is the line clicked.
+// marks its line (rizinDecompilerMark), line is the line clicked. Before the text of each line stands the
+// gutter, as in DISASSEMBLY: a cell with data-rizin-gutter (the address a click acts on, which its hover
+// text names) where the line has an address, and where it has none (the signature, a brace) an empty cell
+// of the same width, so that the C of every line starts on the same column. breakpoints are the addresses
+// of the list the marks hold (numbers): a line shows one when any of its addresses carries one.
 function rizinDecompilerHtml(lines, options) {
-    const { current = null, line = null } = options || {};
+    const { current = null, line = null, breakpoints = [] } = options || {};
     const list = Array.isArray(lines) ? lines : [];
     const mark = rizinDecompilerMark(list, current, line);
+    const stops = rizinDecompilerStops(list, breakpoints);
     let html = '';
     list.forEach((item, i) => {
         const text = item && item.text !== null && item.text !== undefined ? String(item.text) : '';
         const addr = rizinHex(item && item.offset);
         const all = rizinLineOffsets(item).sort((a, b) => a - b).map(rizinHex).filter(Boolean);
+        const stop = stops[i] && stops[i].addr ? stops[i] : null;
+        const gutter = stop
+            ? `<span class="rizin-dec-gutter${stop.set ? ' on' : ''}" data-rizin-gutter="${escapeHtml(stop.addr)}" title="${escapeHtml(stop.set
+                ? `Breakpoint at ${stop.addr}: click to remove it` : `Click to set a breakpoint before this line, at ${stop.addr}`)}"`
+                + `${stop.set ? ' aria-label="breakpoint"' : ''}>${stop.set ? '●' : ''}</span>`
+            : '<span class="rizin-dec-pad"></span>';
         html += `<div class="rizin-dec-line${i === mark ? ' current' : ''}${addr ? ' rizin-dec-jump' : ''}" data-line="${i}"`
             + (addr ? ` data-addr="${addr}" title="${escapeHtml(all.join(' '))}"` : '')
-            + `>${text ? rizinCHtml(text) : ' '}</div>`;
+            + `>${gutter}${text ? rizinCHtml(text) : ' '}</div>`;
     });
     return html;
 }
@@ -24381,7 +24626,8 @@ async function rizinLoadDecompiler(force) {
 // DECOMPILER: the C when it holds the current place, else why not (problem: busy or an error; else it is
 // on its way). The same C at another place in it only moves the mark (a selection stays); a jump brings
 // the marked line into sight, and C drawn again for the same function keeps the lines in sight where they
-// are.
+// are. The same holds when the list of breakpoints changed (rizinSetLists): the gutter's marks are drawn
+// with the lines.
 function rizinRenderDecompiler(problem) {
     const pane = document.getElementById('rizin-decompiler');
     if (!pane) return;
@@ -24411,11 +24657,14 @@ function rizinRenderDecompiler(problem) {
     const prefer = rizinState.jumpFrom === 'decompiler' && click && click.addr === seek ? click.line : null;
     const jumped = rizinState.decompilerJump !== rizinState.jumpSeq;
     rizinState.decompilerJump = rizinState.jumpSeq;
-    const shown = JSON.stringify([sid, dec.gen]);
+    // The breakpoints are part of what is shown, as in DISASSEMBLY: another list draws the lines again (a toggle
+    // changes neither the C nor its generation), and the anchor below keeps the lines in sight where they are
+    const breakpoints = rizinState.marks.breakpoints || [];
+    const shown = JSON.stringify([sid, dec.gen, breakpoints]);
     if (shown !== rizinState.decompilerShown) {
         const place = JSON.stringify([sid, dec.function]);
         const anchor = place === rizinState.decompilerAt && !jumped ? rizinScrollAnchor(pane) : null;
-        pane.innerHTML = rizinDecompilerHtml(dec.lines, { current: seek, line: prefer });
+        pane.innerHTML = rizinDecompilerHtml(dec.lines, { current: seek, line: prefer, breakpoints });
         rizinState.decompilerShown = shown;
         if (anchor) {
             rizinRestoreScroll(pane, anchor);
@@ -24434,7 +24683,8 @@ function rizinRenderDecompiler(problem) {
     if (jumped) rizinReveal(pane, pane.querySelector('.rizin-dec-line.current'));
 }
 
-// A click on a line of C with an address jumps there (not when it ends a selection of text); Reopen opens
+// A click on a line of C with an address jumps there (not when it ends a selection of text), a click in the
+// gutter before it sets or removes the breakpoint at the address of its cell and moves nowhere; Reopen opens
 // the file again, Decompile again asks for the function whose decompile ended a session
 function rizinOnDecompilerClick(event) {
     const el = event.target && event.target.closest ? event.target : null;
@@ -24442,6 +24692,8 @@ function rizinOnDecompilerClick(event) {
     if (el.closest('[data-action="reopen"]')) return rizinReopen();
     if (el.closest('[data-action="decompile-again"]')) return rizinDecompileAgain();
     if (typeof window.getSelection === 'function' && String(window.getSelection())) return false;
+    const gutter = el.closest('[data-rizin-gutter]');
+    if (gutter) return rizinToggleBreakpoint(gutter.getAttribute('data-rizin-gutter'));
     const line = el.closest('[data-addr]');
     const addr = line ? rizinHex(line.getAttribute('data-addr')) : null;
     if (!addr) return false;
@@ -24685,6 +24937,1302 @@ function rizinOnPageHide() {
     const sent = navigator.sendBeacon(`/api/rizin/${encodeURIComponent(sid)}/close`, '');
     rizinSetUi('ended');
     return sent;
+}
+
+// --- The emulation: the run strip ---
+// START (the toolbar) enters the emulation; the strip between the toolbar and the work area shows while it
+// runs: the runs, the PC, the registers the last step or edit changed, why it stood, and the offer for a call at the PC.
+// The state (rizinState.emu) is the server's answer to the last start, run or skip: a run is one request, the
+// views follow the PC through rizinSeek, and nothing asks for the state again unless a view is forced (an
+// analysis step ended, a busy answer is retried). STOP leaves the emulation; it aborts nothing (rizin cannot
+// interrupt a command: a run ends by itself at esil.timeout). Addresses are "0x…" strings; rizin's register
+// names, the API behind a call and its summary come out of the file and are only ever set as text.
+
+// A word of the state as it is shown: the server sends every machine word as an exact "0x…" string (a JSON
+// number would reach the browser as a double, which cannot hold a 64-bit register), so this only normalises it;
+// a value that is no word shows as "?", never as an empty cell
+function rizinEmuHex(value) {
+    return rizinHex(value) || '?';
+}
+
+// The emulation's PC as "0x…", or null outside the emulation
+function rizinEmuPc() {
+    const emu = rizinState.emu;
+    return emu && emu.running ? rizinHex(emu.pc) : null;
+}
+
+// Why the emulation stands, in words, never none: a run in flight (it cannot be interrupted), why the last one
+// did not happen, else the reason of the last stop (a run that did what was asked says which run it was).
+// {kind, text}: kind names the class of the line.
+function rizinEmuWhy(emu, options) {
+    const { wait = '', note = '' } = options || {};
+    if (wait) {
+        const label = RIZIN_EMU.labels[wait] || wait.toUpperCase();
+        return { kind: 'wait', text: wait === 'start' ? 'Starting the emulation…' : wait === 'stop' ? 'Leaving the emulation…'
+            : wait === 'register' ? 'Setting a register…'
+            : wait === 'restore' ? 'Replaying the saved timeline: it runs the file\'s code again, and each run ends by itself (esil.timeout).'
+            : `Running ${label}: a run ends by itself (esil.timeout) and cannot be interrupted.` };
+    }
+    if (note) return { kind: 'note', text: note };
+    const stopped = emu && typeof emu.stopped === 'string' ? emu.stopped : '';
+    const summary = emu && typeof emu.summary === 'string' && emu.summary ? ` · ${emu.summary}` : '';
+    if (stopped === 'step') return { kind: 'step', text: (RIZIN_EMU.done[emu.ran] || 'Stopped after the step asked for') + summary };
+    if (RIZIN_EMU.stops[stopped]) return { kind: stopped, text: RIZIN_EMU.stops[stopped] + summary };
+    if (stopped) return { kind: 'stopped', text: `Stopped: ${stopped}${summary}` };
+    return { kind: 'ready', text: `Ready at ${rizinHex(emu && emu.pc) || 'the PC'}: no run has stopped here yet` };
+}
+
+// The offer for a call at the PC (rizinEmuAssist): the sentence of what SKIP will do, and the field for the
+// value that goes into the return register, with the offered one in it. Where the assistant is off, its reason
+// and no field: SKIP is the plain skip then.
+function rizinRunAssistHtml(assist) {
+    if (!assist || typeof assist !== 'object') return '';
+    if (!assist.supported) {
+        const reason = assist.reason || 'no answer is offered for this call';
+        return `<span class="rizin-run-assist-text" title="${escapeHtml(reason)}">; ${escapeHtml(reason)}</span>`;
+    }
+    const text = assist.summary || `skip ${assist.api || 'the call'}`;
+    const value = typeof assist.value === 'string' ? rizinHex(assist.value) || '' : '';
+    const reg = assist.ret_reg || 'value';
+    return `<span class="rizin-run-assist-text" title="${escapeHtml(text)}">; ${escapeHtml(text)}</span>`
+        + `<label class="rizin-run-assist-label" for="rizin-run-assist-value">${escapeHtml(reg)} =</label>`
+        + `<input type="text" id="rizin-run-assist-value" class="filter-input rizin-run-value" value="${escapeHtml(value)}" `
+        + `placeholder="${value ? '' : 'keep'}" aria-label="The value SKIP puts into ${escapeHtml(reg)}" autocomplete="off" spellcheck="false">`;
+}
+
+// The strip's parts from the state: {pc, regs, assist} as markup and {why} as {kind, text}. The registers are
+// those in emu.changed, in rizin's order (all of them are in the state for the EMULATION pane), marked with a
+// delta and a bar, so that the colour does not carry it alone; at most RIZIN_EMU.regs, then "+n more".
+function rizinRunStripHtml(emu, options) {
+    const pc = emu && emu.running ? rizinHex(emu.pc) : null;
+    const changed = new Set(emu && Array.isArray(emu.changed) ? emu.changed.map(String) : []);
+    const all = (emu && Array.isArray(emu.registers) ? emu.registers : []).filter(reg => reg && changed.has(String(reg.name)));
+    const shown = all.slice(0, RIZIN_EMU.regs);
+    const regs = shown.map(reg => `<span class="rizin-run-reg" title="${escapeHtml(reg.name)} changed by the last step or edit">`
+        + `<span class="rizin-run-delta" aria-hidden="true">Δ</span><span class="rizin-run-reg-name">${escapeHtml(reg.name)}</span> `
+        + `<span class="rizin-run-reg-value">${escapeHtml(rizinEmuHex(reg.value))}</span></span>`).join(' ');
+    const rest = all.slice(shown.length);
+    return {
+        pc: pc ? `<span class="rizin-run-pc-label">▶ PC</span> <span class="rizin-run-pc-value">${escapeHtml(pc)}</span>`
+            : '<span class="rizin-run-pc-label">▶ PC</span> <span class="rizin-run-pc-value">unknown</span>',
+        regs: (regs || '<span class="rizin-run-none">no register changed</span>')
+            + (rest.length ? ` <span class="rizin-run-more" title="${escapeHtml(rest.map(reg => reg.name).join(' '))}">+${rest.length} more</span>` : ''),
+        why: rizinEmuWhy(emu, options),
+        assist: rizinRunAssistHtml(emu && emu.assist),
+    };
+}
+
+// The strip, and START: the strip is there while the emulation runs; only a part that changed is written
+// (the offered value being edited stays while the rest moves). A run in flight puts the runs and STOP off.
+function rizinRenderRunStrip() {
+    rizinRenderEmuPane();       // the pane draws from the same state
+    const emu = rizinState.session ? rizinState.emu : null;
+    const running = !!emu && emu.running === true;
+    const start = document.getElementById('rizin-emu-start');
+    if (start) {
+        start.disabled = !rizinState.session || running || !!rizinState.emuWait || rizinState.opening
+            || ['moved', 'ended', 'not-installed'].includes(rizinState.ui.state);
+    }
+    const strip = document.getElementById('rizin-run');
+    if (!strip) return;
+    if (!running) {
+        if (!strip.hidden) strip.hidden = true;
+        rizinState.emuShown = {};
+        return;
+    }
+    if (strip.hidden) strip.hidden = false;
+    const wait = rizinState.emuWait, parts = rizinRunStripHtml(emu, { wait, note: rizinState.emuNote });
+    const shown = rizinState.emuShown;
+    for (const [id, html] of [['rizin-run-pc', parts.pc], ['rizin-run-regs', parts.regs], ['rizin-run-assist', parts.assist]]) {
+        const el = document.getElementById(id);
+        if (!el) continue;
+        if (shown[id] !== html) {
+            el.innerHTML = html;
+            shown[id] = html;
+        }
+        if (id === 'rizin-run-assist') el.hidden = !html;
+    }
+    const why = document.getElementById('rizin-run-why');
+    const key = JSON.stringify(parts.why);
+    if (why && shown['rizin-run-why'] !== key) {
+        why.textContent = parts.why.text;
+        why.title = parts.why.text;
+        why.className = `rizin-run-why rizin-run-why-${cssToken(parts.why.kind)}`;
+        shown['rizin-run-why'] = key;
+    }
+    const pc = rizinEmuPc();
+    for (const button of strip.querySelectorAll('button')) {
+        button.disabled = !!wait || (button.getAttribute('data-rizin-act') === 'gotopc' && !pc);
+    }
+    const stop = document.getElementById('rizin-run-stop');
+    if (stop) stop.title = wait ? 'A run in flight ends by itself; STOP is there again once it has' : 'Leave the emulation';
+}
+
+// The marks of the PC in DISASSEMBLY and GRAPH drawn again (the PC moved, or the emulation ended): only where
+// the view holds its place now, so that a message of the view (busy, loading) stays
+function rizinRenderPcMarks() {
+    if (rizinPageHolds(rizinState.disasm)) rizinRenderDisasm();
+    if (rizinGraphHolds(rizinState.graph)) rizinRenderGraph();
+}
+
+// Out of the emulation: the state, what waits and its note go, the strip and the marks of the PC with them
+function rizinEmuLeave() {
+    Object.assign(rizinState, { emu: null, emuWait: '', emuNote: '', emuShown: {} });
+    rizinState.emuSeq++;
+    rizinRenderRunStrip();
+    rizinRenderPcMarks();
+}
+
+// Whether the instruction at pc is a call, from the page DISASSEMBLY shows; true where the page does not
+// hold it (the offer is then asked for, and the server says whether there is a call)
+function rizinEmuAtCall(pc) {
+    const page = rizinState.disasm, at = rizinNum(pc);
+    const op = page && page.session === rizinState.session && Array.isArray(page.ops)
+        ? page.ops.find(o => o && o.offset === at) : null;
+    return op ? String(op.type || '').includes('call') : true;
+}
+
+// The offer for the call at the PC (GET call changes nothing, so it may be asked after every run): kept in
+// emu.assist for the strip. Not asked at an instruction that is no call, nor again at the PC it has been asked
+// at. A busy answer is retried with the other views; any other answer leaves no offer (SKIP is the plain skip).
+async function rizinEmuAssist() {
+    const sid = rizinState.session, emu = rizinState.emu, pc = rizinEmuPc();
+    if (!sid || !emu || !pc) return false;
+    if (!rizinEmuAtCall(pc)) return true;
+    if (emu.assist && emu.assist.addr === pc) return true;
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/call?addr=${encodeURIComponent(pc)}`);
+    if (sid !== rizinState.session || rizinState.emu !== emu || rizinEmuPc() !== pc) return false;
+    if (!r.ok) {
+        if (r.state === 'busy') rizinViewBusy('emulation', true);
+        emu.assist = null;
+        rizinRenderRunStrip();
+        return false;
+    }
+    const d = r.data;
+    emu.assist = {
+        addr: pc, supported: d.supported === true, reason: typeof d.reason === 'string' ? d.reason : '',
+        api: typeof d.api === 'string' ? d.api : '', ret_reg: typeof d.ret_reg === 'string' ? d.ret_reg : '',
+        value: typeof d.value === 'string' ? rizinHex(d.value) : null, stack_fix: Number.isInteger(d.stack_fix) ? d.stack_fix : 0,
+        summary: typeof d.summary === 'string' ? d.summary : '',
+    };
+    rizinRenderRunStrip();
+    return true;
+}
+
+// The emulation's state for the views registered in RIZIN_VIEWS: nothing outside the emulation, nothing unless
+// forced (the state of the last run is current, and a step must not cost another request), and forced (an
+// analysis step ended, the console changed something, a busy answer is retried) it is read again. Reading
+// gives no reason for a stop, so the one of the run stays while the PC does. A busy answer waits for the poll,
+// a refusal that the emulation is not started (rizin restarted) leaves the mode, and a 404 ends it with the session.
+async function rizinLoadEmulation(force) {
+    const sid = rizinState.session, emu = rizinState.emu;
+    if (!sid || !emu || !emu.running) {
+        rizinRenderRunStrip();
+        return true;
+    }
+    if (force && !rizinState.emuWait) {
+        const seq = ++rizinState.emuSeq;
+        const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/emulation`);
+        if (sid !== rizinState.session || seq !== rizinState.emuSeq || rizinState.emu !== emu) return false;
+        if (!r.ok) {
+            if (r.state === 'busy') {
+                rizinViewBusy('emulation', true);
+            } else if (r.state === 'refused' && /not started/.test(r.error)) {
+                rizinEmuLeave();
+                rizinState.note = r.error;
+                rizinRenderState();
+            } else {
+                rizinState.emuNote = `The emulation's state could not be read: ${r.error}`;
+            }
+            rizinRenderRunStrip();
+            return false;
+        }
+        rizinState.retry.delete('emulation');
+        if (r.data.running !== true) {
+            rizinEmuLeave();
+            return true;
+        }
+        const same = rizinHex(emu.pc) === rizinHex(r.data.pc);
+        const kept = same ? { stopped: emu.stopped, ran: emu.ran, summary: emu.summary, assist: emu.assist } : { ran: '', assist: null };
+        rizinState.emu = { ...kept, ...r.data, stopped: r.data.stopped || kept.stopped || null };
+        rizinState.emuNote = '';
+        rizinRenderRunStrip();
+        rizinRenderPcMarks();
+        await rizinEmuAssist();
+        return true;
+    }
+    rizinRenderRunStrip();
+    return true;
+}
+
+// One request that changes the state (a run, or a skip of a call): the answer is the new state, the views
+// follow its PC, and the offer for the call there is asked for. One at a time (rizin answers one request at a
+// time, a run blocks up to its timeout); a refusal or a busy answer leaves the state, with its reason in the
+// strip; the end of the session and a rizin that lost the emulation leave the mode.
+async function rizinEmuPost(wait, path, body, ran) {
+    const sid = rizinState.session, emu = rizinState.emu;
+    if (!sid || !emu || !emu.running || rizinState.emuWait) return false;
+    const seq = ++rizinState.emuSeq;
+    rizinState.emuWait = wait;
+    rizinState.emuNote = '';
+    rizinRenderRunStrip();
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/${path}`, { method: 'POST', body });
+    // The session ended (rizinSetUi left the mode) or another one took the tab: nothing of it is left to change
+    if (sid !== rizinState.session || seq !== rizinState.emuSeq) return false;
+    rizinState.emuWait = '';
+    if (!r.ok || r.data.running !== true) {
+        if (r.state === 'refused' && /not started/.test(r.error)) {
+            rizinEmuLeave();
+            rizinState.note = r.error;
+            rizinRenderState();
+            return false;
+        }
+        rizinState.emuNote = r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); nothing ran. Try again once it is free.`
+            : r.ok ? 'the server answered without a state' : r.error;
+        rizinRenderRunStrip();
+        if (r.state === 'busy') rizinPollSoon();        // the toolbar's busy goes once rizin is free
+        return false;
+    }
+    rizinState.emu = { ...r.data, ran, assist: null };
+    rizinRenderRunStrip();
+    const pc = rizinEmuPc();
+    // The jump draws every view, with the PC's marks (also where it found rizin busy); no PC: its marks go
+    if (pc) await rizinSeek(pc, 'emulation');
+    else rizinRenderPcMarks();
+    await rizinEmuAssist();
+    // What a run wrote is in the pane's patches (a run cannot change the breakpoints, and the registers and the stack are
+    // in the answer: not asked for)
+    await rizinLoadEmuPane(true, 'patches');
+    return true;
+}
+
+// START: the emulation at the current address (rizin sets io.cache and the guards, and maps its stack). Its
+// refusal shows in the toolbar's state, where the strip is not yet.
+async function rizinEmuStart() {
+    const sid = rizinState.session;
+    if (!sid || rizinState.emuWait || rizinState.opening || (rizinState.emu && rizinState.emu.running)) return false;
+    const seq = ++rizinState.emuSeq;
+    rizinState.emuWait = 'start';
+    rizinState.note = '';
+    rizinRenderState();
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/emulation/start`,
+                             { method: 'POST', body: rizinState.seek ? { addr: rizinState.seek } : {} });
+    if (sid !== rizinState.session || seq !== rizinState.emuSeq) return false;
+    rizinState.emuWait = '';
+    if (!r.ok || r.data.running !== true) {
+        if (r.state === 'refused' || r.state === 'error' || r.ok) rizinState.note = r.ok ? 'the server answered without a state' : r.error;
+        rizinRenderState();
+        if (r.state === 'busy') rizinPollSoon();
+        return false;
+    }
+    rizinState.emu = { ...r.data, ran: '', assist: null };
+    rizinState.emuNote = '';
+    rizinRenderRunStrip();
+    const pc = rizinEmuPc();
+    if (pc && pc !== rizinState.seek) await rizinSeek(pc, 'emulation');
+    rizinRenderPcMarks();
+    await rizinEmuAssist();
+    await rizinLoadEmuPane(true, 'patches');       // a running emulation changes what the restore button may do
+    return true;
+}
+
+// STOP: leaves the emulation mode (the patches stay). It is no abort: while a run is in flight nothing goes out.
+async function rizinEmuStop() {
+    const sid = rizinState.session;
+    if (!sid || !rizinState.emu || rizinState.emuWait) return false;
+    const seq = ++rizinState.emuSeq;
+    rizinState.emuWait = 'stop';
+    rizinState.emuNote = '';
+    rizinRenderRunStrip();
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/emulation/stop`, { method: 'POST' });
+    if (sid !== rizinState.session || seq !== rizinState.emuSeq) return false;
+    rizinState.emuWait = '';
+    if (!r.ok) {
+        rizinState.emuNote = r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); the emulation was not left. Try again once it is free.`
+            : r.error;
+        rizinRenderRunStrip();
+        if (r.state === 'busy') rizinPollSoon();
+        return false;
+    }
+    rizinEmuLeave();
+    await rizinLoadEmuPane(true, 'patches');       // and so does leaving it
+    return true;
+}
+
+// A run: one of the strip's kinds, or until with the address that the right-click menu gives. Anything else
+// (there is no step back) goes nowhere.
+function rizinEmuRun(kind, addr) {
+    const body = { kind: String(kind) };
+    if (kind === 'until') {
+        const at = rizinHex(addr);
+        if (!at) return Promise.resolve(false);
+        body.addr = at;
+    } else if (!RIZIN_EMU.kinds.includes(kind)) {
+        return Promise.resolve(false);
+    }
+    return rizinEmuPost(body.kind, 'emulation/run', body, body.kind);
+}
+
+// SKIP at a call the assistant answers for: the call is skipped with the value in the field (the offered one
+// unless it was edited; none leaves the return register as it is) and the stack correction the offer named.
+// Anywhere else, and where the assistant is off, it is the plain skip.
+function rizinEmuSkipCall() {
+    const emu = rizinState.emu, pc = rizinEmuPc();
+    if (!rizinState.session || !emu || !emu.running || rizinState.emuWait || !pc) return Promise.resolve(false);
+    const assist = emu.assist;
+    if (!assist || assist.addr !== pc || !assist.supported) return rizinEmuRun('skip');
+    const field = document.getElementById('rizin-run-assist-value');
+    const typed = field ? String(field.value).trim() : '';
+    const value = typed ? rizinHex(typed) : null;
+    if (typed && !value) {
+        rizinState.emuNote = `"${typed}" is no number: the value is decimal or 0x…`;
+        rizinRenderRunStrip();
+        return Promise.resolve(false);
+    }
+    return rizinEmuPost('skip', 'call', { addr: pc, value, stack_fix: assist.stack_fix }, 'skip');
+}
+
+// GO TO PC: every view at the PC, after the user went elsewhere. A jump of the user's, so it enters the history
+// (the views following a run do not)
+function rizinEmuGoToPc() {
+    const pc = rizinEmuPc();
+    return pc && !rizinState.emuWait ? rizinSeek(pc, 'pc') : Promise.resolve(false);
+}
+
+// One click handler for the strip: a run (SKIP goes through the call assistant), GO TO PC or STOP. It does not
+// look at the button being off: every action refuses by itself while a run waits (a browser sends no click of an
+// off button anyway), so there is one rule, in the actions
+function rizinOnRunClick(event) {
+    const button = event.target && event.target.closest ? event.target.closest('button') : null;
+    if (!button) return false;
+    const kind = button.getAttribute('data-rizin-run'), action = button.getAttribute('data-rizin-act');
+    if (kind === 'skip') return rizinEmuSkipCall();
+    if (kind) return rizinEmuRun(kind);
+    if (action === 'gotopc') return rizinEmuGoToPc();
+    if (action === 'stop') return rizinEmuStop();
+    return false;
+}
+
+// --- The emulation: the EMULATION pane ---
+// The dock's pane for the full state: every register (each field takes a new value), the stack from the stack
+// pointer, the breakpoints, and the patches in the two groups that decide what survives the session. The registers,
+// the stack and the PC come from rizinState.emu, the state that the run strip draws from too (the pane never asks the
+// route for it); the pane fetches only /patches and /breakpoints, itself, while it is shown and after what changes them.
+// Every machine word is the server's exact "0x…" string, set as text and sent back as typed (rizinHex), never parsed
+// into a number; the rows of /patches and /breakpoints carry integers, which the file's layout bounds. The names of
+// registers, functions, hints and the notes come out of the file: only ever set as text.
+
+// The address of a row of /patches or /breakpoints as "0x…": one that a double cannot hold exactly is no address
+// here, rather than a wrong one
+function rizinEmuRowAddr(value) {
+    return Number.isSafeInteger(value) && value >= 0 ? rizinHex(value) : null;
+}
+
+// The name of the function of the file that holds a row's address; '' where none does or the list is not loaded
+function rizinEmuFunctionAt(functions, addr) {
+    if (!Array.isArray(functions) || !Number.isSafeInteger(addr)) return '';
+    const fn = functions.find(f => f && Number.isSafeInteger(f.offset) && addr >= f.offset
+        && addr < f.offset + (Number.isSafeInteger(f.size) && f.size > 0 ? f.size : 1));
+    return fn && typeof fn.name === 'string' ? fn.name : '';
+}
+
+// The bytes of a patch as hex, cut after 16 of them
+function rizinEmuBytes(hex) {
+    const text = String(hex ?? '');
+    return text.length > 32 ? `${text.slice(0, 32)}…` : text;
+}
+
+// The session's note as the pane shows it: the sentence that cannot wait (RIZIN_EMU_PANE.urgent: the server appends
+// it last) first, then the rest; [{urgent, text}]
+function rizinEmuNotes(note) {
+    const text = typeof note === 'string' ? note.trim() : '';
+    if (!text) return [];
+    const at = text.indexOf(RIZIN_EMU_PANE.urgent);
+    if (at < 0) return [{ urgent: false, text }];
+    const rest = `${text.slice(0, at)} ${text.slice(at + RIZIN_EMU_PANE.urgent.length)}`.replace(/\s+/g, ' ').trim();
+    return [{ urgent: true, text: RIZIN_EMU_PANE.urgent }, ...(rest ? [{ urgent: false, text: rest }] : [])];
+}
+
+// A section that has nothing to show says why, in words (never a blank)
+function rizinEmuEmpty(text) {
+    return `<div class="rizin-empty rizin-emu-empty">${escapeHtml(text)}</div>`;
+}
+
+// What the hand-made patches are, as one string: an export is of these, and is out of date once they differ
+function rizinEmuHandSignature(patches) {
+    return (Array.isArray(patches) ? patches : []).filter(row => row && row.mine === true).map(row => `${row.addr}:${row.after}`).join(',');
+}
+
+// Every register of the state in an editable field, in rizin's order. A register the last step or edit changed has a
+// sign (Δ), a bar and a heavier name, and says so to assistive technology: the colour does not carry it alone.
+function rizinEmuRegistersHtml(emu) {
+    if (!emu || emu.running !== true) return rizinEmuEmpty('No emulation is running: EMULATE in the toolbar begins one at the current address.');
+    const regs = (Array.isArray(emu.registers) ? emu.registers : []).filter(reg => reg && typeof reg === 'object' && reg.name !== undefined && reg.name !== null);
+    if (!regs.length) return rizinEmuEmpty('rizin listed no registers.');
+    const changed = new Set(Array.isArray(emu.changed) ? emu.changed.map(String) : []);
+    return '<div class="rizin-emu-regs">' + regs.map(reg => {
+        const name = escapeHtml(String(reg.name)), mark = changed.has(String(reg.name));
+        return `<label class="rizin-emu-reg${mark ? ' changed' : ''}" title="${name}${mark ? ' changed by the last step or edit' : ''}">`
+            + `<span class="rizin-emu-delta" aria-hidden="true">${mark ? 'Δ' : ''}</span><span class="rizin-emu-reg-name">${name}</span>`
+            + `<input type="text" class="filter-input rizin-emu-reg-input" data-rizin-reg="${name}" value="${escapeHtml(rizinEmuHex(reg.value))}" `
+            + `aria-label="${name}${mark ? ' (changed by the last step or edit)' : ''}" autocomplete="off" spellcheck="false"></label>`;
+    }).join('') + '</div>';
+}
+
+// The stack words from the stack pointer: slot address, value, and where the value points when it is a function or
+// a flag (the hint). A click on the row goes to the slot, on a value that has a hint to the function. An empty stack of
+// a running emulation says why: the server answers [] both where the stack pointer has left the mapped stack and where
+// the map is gone, and the state cannot tell the two apart.
+function rizinEmuStackHtml(emu) {
+    if (!emu || emu.running !== true) return rizinEmuEmpty('No emulation is running, so there is no stack to show.');
+    const stack = (Array.isArray(emu.stack) ? emu.stack : []).filter(row => row && typeof row === 'object');
+    if (!stack.length) {
+        return rizinEmuEmpty('No stack words to show: the stack pointer is outside the stack the emulation mapped, or that map is gone. '
+            + 'Restarting the emulation (STOP, then EMULATE) maps it again.');
+    }
+    return stack.map(row => {
+        const addr = rizinHex(row.addr), value = rizinHex(row.value);
+        const hint = typeof row.hint === 'string' ? row.hint : '';
+        const title = `${addr || '?'} holds ${rizinEmuHex(row.value)}${hint ? ` · ${hint}` : ''}`;
+        return `<div class="rizin-row rizin-emu-row rizin-emu-stack${addr ? '' : ' rizin-row-none'}"${addr ? ` data-addr="${addr}"` : ''} title="${escapeHtml(title)}">`
+            + `<span class="rz-addr">${escapeHtml(addr || '?')}</span>`
+            + `<span class="rizin-emu-value"${hint && value ? ` data-addr="${value}"` : ''}>${escapeHtml(rizinEmuHex(row.value))}</span>`
+            + `<span class="rizin-emu-hint">${escapeHtml(hint)}</span></div>`;
+    }).join('');
+}
+
+// The breakpoints: address, the function it is in, and ✕ to remove it. There is no on/off: rizin 0.9.1 stops a run at
+// a breakpoint that is listed as disabled all the same, and a row says so rather than looking switched off.
+function rizinEmuBreakpointsHtml(breakpoints, functions) {
+    const rows = (Array.isArray(breakpoints) ? breakpoints : []).filter(bp => bp && typeof bp === 'object');
+    if (!rows.length) return rizinEmuEmpty('No breakpoints set.');
+    return rows.map(bp => {
+        const addr = rizinEmuRowAddr(bp.addr), fn = rizinEmuFunctionAt(functions, bp.addr), off = bp.enabled === false;
+        const title = `${addr || 'an address that cannot be shown exactly'}${fn ? ` · ${fn}` : ''}`
+            + `${off ? ' · rizin lists it as disabled, but a run stops there all the same' : ''}`;
+        return `<div class="rizin-row rizin-emu-row rizin-emu-bp${addr ? '' : ' rizin-row-none'}"${addr ? ` data-addr="${addr}"` : ''} title="${escapeHtml(title)}">`
+            + `<span class="rz-addr">${escapeHtml(addr || '?')}</span><span class="rizin-emu-fn">${escapeHtml(fn || '—')}</span>`
+            + `<span class="rizin-emu-hint">${off ? 'off, still stops a run' : ''}</span>`
+            + (addr ? `<button type="button" class="rizin-tool rizin-emu-del" data-rizin-act="unbreak" title="Remove this breakpoint" `
+                + `aria-label="Remove the breakpoint at ${addr}">✕</button>` : '<span></span>')
+            + '</div>';
+    }).join('');
+}
+
+// The head of PATCHES: the one button that belongs to neither group. rizin has one write cache for what was set by hand
+// and for what a run wrote, so this clears all of it (wc-*): it is not "take back mine", and it is disabled only for an
+// empty cache, which its title says.
+function rizinEmuPatchesHeadHtml(patches, busy) {
+    const count = Array.isArray(patches) ? patches.filter(row => row && typeof row === 'object').length : 0;
+    const title = count ? "Clear everything in rizin's write cache: the patches set by hand and every write a run made. rizin has one cache for both."
+        : "rizin's write cache is empty: nothing to clear";
+    return `<div class="rizin-emu-head rizin-emu-head-row"><span>PATCHES</span><span class="rizin-emu-actions">`
+        + `<button type="button" class="rizin-tool" data-rizin-act="unpatch-all"${count && !busy ? '' : ' disabled'} title="${escapeHtml(title)}">`
+        + `Clear rizin's whole cache</button></span></div>`;
+}
+
+// The patches in three groups, apart on the page: what was set by hand (kept with the project, exported, taken back one
+// by one), what waits (kept with the project, but not in the cache: rizinEmuWaitingHtml, only where something waits)
+// and what a run wrote (it ends with the session: the group says so before it hurts, and carries Re-analyse).
+// rizin has one write cache for the first and the last: the button that clears all of it is in the head of PATCHES,
+// outside the groups.
+function rizinEmuPatchesHtml(patches, functions, options) {
+    const { exported = null, busy = '', waiting = null } = options || {};
+    const rows = (Array.isArray(patches) ? patches : []).filter(row => row && typeof row === 'object');
+    const hand = rows.filter(row => row.mine === true), run = rows.filter(row => row.mine !== true);
+    const off = on => (on ? ' disabled' : '');
+    const line = (patch, own) => {
+        const addr = rizinEmuRowAddr(patch.addr), fn = rizinEmuFunctionAt(functions, patch.addr);
+        const size = Number.isSafeInteger(patch.size) ? patch.size : 0;
+        const before = rizinEmuBytes(patch.before), after = rizinEmuBytes(patch.after);
+        const over = own && patch.over_run === true;
+        const title = `${addr || 'an address that cannot be shown exactly'} · ${size} byte${size === 1 ? '' : 's'}${fn ? ` · ${fn}` : ''} · ${before} → ${after}`
+            + (over ? ' · written over bytes a run wrote: the bytes on the left are the run\'s, which need not be the file\'s, and the export\'s note says what the file holds there' : '');
+        return `<div class="rizin-row rizin-emu-row rizin-emu-patch${addr ? '' : ' rizin-row-none'}"${addr ? ` data-addr="${addr}"` : ''} title="${escapeHtml(title)}">`
+            + `<span class="rz-addr">${escapeHtml(addr || '?')}</span><span class="rizin-emu-fn">${escapeHtml(fn || '—')}</span>`
+            + `<span class="rizin-emu-bytes">${size} B · ${over ? '<span class="rizin-emu-over-mark">⚠</span>' : ''}${escapeHtml(before)} → ${escapeHtml(after)}</span>`
+            + (own && addr ? `<button type="button" class="rizin-tool rizin-emu-del" data-rizin-act="unpatch" title="Take this patch back" `
+                + `aria-label="Take back the patch at ${addr}">✕</button>` : '<span></span>')
+            + '</div>';
+    };
+    const list = (group, own, none) => {
+        if (!group.length) return rizinEmuEmpty(none);
+        const more = group.length - RIZIN_EMU_PANE.rows;
+        return group.slice(0, RIZIN_EMU_PANE.rows).map(patch => line(patch, own)).join('')
+            + (more > 0 ? rizinEmuEmpty(`+${more} more writes, not shown here`) : '');
+    };
+    let result = '';
+    if (exported) {
+        const skipped = (Array.isArray(exported.skipped) ? exported.skipped : []).map(addr => rizinEmuRowAddr(addr) || '?');
+        const current = exported.sig === rizinEmuHandSignature(hand);
+        result = `<div class="rizin-emu-export" role="status"><b>${escapeHtml(exported.name)}</b> · ${escapeHtml(exported.patched)} bytes patched`
+            + (skipped.length ? `<div class="rizin-emu-note rizin-emu-note-error">Not placed in the file (no file offset there), so not in the copy: ${escapeHtml(skipped.join(', '))}</div>`
+                : '<div>Every patch was placed in the file.</div>')
+            + (current ? '' : '<div class="rizin-emu-note rizin-emu-note-error">The patches changed since this copy was made: export again.</div>')
+            + `<div><button type="button" class="rizin-tool" data-rizin-act="detonate"${current && !busy ? '' : ' disabled'} `
+            + `title="Choose this copy in the Submit tab; nothing is submitted until Detonate is pressed there">To the Submit tab`
+            + `${skipped.length ? ` (${skipped.length} patch${skipped.length === 1 ? '' : 'es'} not in it)` : ''}</button></div>`
+            + `<pre>${escapeHtml(exported.note)}</pre></div>`;
+    }
+    const written = run.reduce((sum, patch) => sum + (Number.isSafeInteger(patch.size) ? patch.size : 0), 0);
+    // A patch set over bytes a run wrote: rizin's "before" for such a row is the run's byte, which need not be the file's, so the
+    // row alone would read as if the file held it. The glyph marks the row, this line says what follows from it.
+    const over = hand.filter(patch => patch.over_run === true).length;
+    const overLine = over ? `<div class="rizin-emu-warn" role="note">${over === 1 ? 'One of these was' : `${over} of these were`}`
+        + ' set over bytes a run wrote: in the file those bytes may be different, and the export writes the file\'s own'
+        + ' bytes around the patch — so the copy has it inside bytes that may still be encrypted. The note names them.</div>' : '';
+    return `<div class="rizin-emu-group rizin-emu-hand" data-rizin-group="hand"><div class="rizin-emu-subhead">`
+        + `<span class="rizin-emu-group-title">SET BY HAND · ${hand.length}</span><span class="rizin-emu-fate">kept with the project</span>`
+        + `<span class="rizin-emu-actions"><button type="button" class="rizin-tool" data-rizin-act="export"${off(!hand.length || busy)} `
+        + `title="Write a copy of the file with these patches in it, and a note beside it">Export</button>`
+        + `</span></div>${overLine}${result}${list(hand, true, 'Nothing set by hand.')}</div>`
+        + rizinEmuWaitingHtml(waiting, functions, { busy })
+        + `<div class="rizin-emu-group rizin-emu-run" data-rizin-group="run"><div class="rizin-emu-subhead">`
+        + `<span class="rizin-emu-group-title">WRITTEN BY THE RUN · ${run.length}${run.length ? ` · ${written} B` : ''}</span>`
+        + `<span class="rizin-emu-fate">these end with the session</span>`
+        + `<span class="rizin-emu-actions"><button type="button" class="rizin-tool" data-rizin-act="reanalyze"${off(!run.length || busy)} `
+        + `title="Analyse the range the run wrote again, so FUNCTIONS and STRINGS see it. What it finds ends with the session too.">Re-analyse</button></span></div>`
+        + `<div class="rizin-emu-warn" role="note">These bytes end with the session: they are not saved with the project and not in an export.</div>`
+        + `${list(run, false, 'Nothing written by a run.')}</div>`;
+}
+
+// What waits: the patches the project holds that were set over bytes a run wrote and are not in the cache (the open ran
+// before any run, so they would have gone into the file's own, still encrypted bytes, and the next decryption would run
+// over them). A group of its own with the reason of each row and two ways out: ✕ takes it out of the project, Apply now
+// writes it -- drawn only where the server says `apply_now: true` for the entry (it asked run_covers over the rows of
+// the same answer; the pane keeps no copy of that rule), and the server decides again when it is pressed. Nothing waits:
+// no group. Every text here is the server's or the file's: escaped.
+function rizinEmuWaitingHtml(waiting, functions, options) {
+    const { busy = '' } = options || {};
+    const entries = (Array.isArray(waiting) ? waiting : []).filter(entry => entry && typeof entry === 'object');
+    if (!entries.length) return '';
+    const off = on => (on ? ' disabled' : '');
+    const line = entry => {
+        const addr = rizinEmuRowAddr(entry.addr), fn = rizinEmuFunctionAt(functions, entry.addr);
+        const bytes = typeof entry.after === 'string' ? entry.after : '';
+        const size = Math.floor(bytes.length / 2), why = typeof entry.reason === 'string' ? entry.reason : '';
+        const title = `${addr || 'an address that cannot be shown exactly'} · ${size} byte${size === 1 ? '' : 's'}${fn ? ` · ${fn}` : ''} · waiting: ${why}`;
+        const apply = !!addr && entry.apply_now === true;
+        return `<div class="rizin-row rizin-emu-row rizin-emu-wait${addr ? '' : ' rizin-row-none'}"${addr ? ` data-addr="${addr}"` : ''} title="${escapeHtml(title)}">`
+            + `<span class="rz-addr">${escapeHtml(addr || '?')}</span><span class="rizin-emu-fn">${escapeHtml(fn || '—')}</span>`
+            + `<span class="rizin-emu-bytes">${size} B · ${escapeHtml(rizinEmuBytes(bytes))}</span>`
+            + (apply ? `<button type="button" class="rizin-tool" data-rizin-act="apply-waiting"${off(busy)} title="The server says a run's bytes lie under this patch again: write it into the cache now. `
+                + `It checks once more." aria-label="Apply the waiting patch at ${addr} now">Apply now</button>` : '<span></span>')
+            + (addr ? `<button type="button" class="rizin-tool rizin-emu-del" data-rizin-act="drop-waiting"${off(busy)} title="Remove this patch from the project: it will not come back when the file is opened again" `
+                + `aria-label="Remove the waiting patch at ${addr} from the project">✕</button>`
+                // nothing else reaches a waiting patch (it is in no cache): a row that cannot be named exactly says it has no exit
+                : `<button type="button" class="rizin-tool rizin-emu-del" data-rizin-act="drop-waiting" disabled title="This address cannot be sent exactly, so this patch cannot be removed from here" `
+                + `aria-label="The waiting patch at an address that cannot be shown exactly cannot be removed from here">✕</button>`)
+            + `<span class="rizin-emu-note rizin-emu-wait-why">${escapeHtml(why)}</span></div>`;
+    };
+    const more = entries.length - RIZIN_EMU_PANE.rows;
+    return `<div class="rizin-emu-group rizin-emu-waiting" data-rizin-group="waiting"><div class="rizin-emu-subhead">`
+        + `<span class="rizin-emu-group-title">WAITING · ${entries.length}</span><span class="rizin-emu-fate">not applied · kept with the project</span></div>`
+        + `<div class="rizin-emu-warn" role="note">These are not in rizin's cache: written into the file's own bytes, which are still encrypted, the next decryption `
+        + `would run over them. Apply now is there once a run's bytes lie under a patch; ✕ removes one from the project.</div>`
+        + entries.slice(0, RIZIN_EMU_PANE.rows).map(line).join('')
+        + (more > 0 ? rizinEmuEmpty(`+${more} more waiting, not shown here`) : '') + '</div>';
+}
+
+// The offer of the restore button as /patches (and the routes that carry the same block) answer it: {refused, reason,
+// actions, digests} where `refused` says whether the button may run (null) or why not (a sentence); null where the
+// answer is none -- no block, no `refused`, or one that is neither null nor text: a button that cannot tell is off.
+// reason (why the timeline is not kept) is the notice's and is never read for the button.
+function rizinEmuOffer(restore) {
+    if (!restore || typeof restore !== 'object' || Array.isArray(restore)) return null;
+    if (restore.refused !== null && typeof restore.refused !== 'string') return null;
+    const count = n => (Number.isSafeInteger(n) && n >= 0 ? n : null);
+    return { refused: restore.refused, reason: typeof restore.reason === 'string' && restore.reason.trim() ? restore.reason.trim() : null,
+             actions: count(restore.actions), digests: count(restore.digests) };
+}
+
+// The restore button, and the notice of why the timeline is not kept. The button is on where the offer's `refused` is
+// null and no action of the pane is out, and off with the sentence of the refusal as its title everywhere else; the
+// reason is shown whenever there is one, whatever the button says. Both texts are the server's: escaped.
+function rizinEmuRestoreHtml(restore, options) {
+    const { busy = '', wait = '', sessionNote = '' } = options || {};
+    const offer = rizinEmuOffer(restore), plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
+    let title = 'The offer of the restore comes with the patches and was not in the answer: it is read again with the next one.';
+    let disabled = true;
+    if (offer && offer.refused !== null) {
+        title = offer.refused || 'The server refused the restore without saying why.';
+    } else if (offer && (busy || wait)) {
+        title = 'An action of the pane is out: the restore is there again once it has ended.';
+    } else if (offer) {
+        disabled = false;
+        title = 'Replay the saved timeline of the emulation'
+            + `${offer.actions === null ? '' : ` (${plural(offer.actions, 'action')})`} and check the bytes it leaves against the SHA-256 the project holds`
+            + `${offer.digests === null ? '' : ` (${plural(offer.digests, 'range')})`}. This runs the file's code in the emulator again.`;
+    }
+    // The status band says the same (the session's note, which the server makes while it is true): not twice in one pane. Where the
+    // button is on while the timeline is not kept, the project holds an earlier timeline and the button replays that one.
+    const said = offer && offer.reason ? `The way to this state is not kept in the project: ${offer.reason.replace(/[.\s]+$/, '')}.` : '';
+    const note = said && !String(sessionNote || '').includes(said)
+        ? `<div class="rizin-emu-note rizin-emu-warn rizin-emu-restore-note" role="note">${escapeHtml(said)}${offer.refused === null ? ' The project still holds an earlier timeline, which the restore button replays.' : ''}</div>` : '';
+    return `<div class="rizin-emu-restore"><button type="button" class="rizin-tool" data-rizin-act="restore"${disabled ? ' disabled' : ''} `
+        + `title="${escapeHtml(title)}">Restore the run</button></div>${note}`;
+}
+
+// What a POST restore that was answered says, as {kind, text} for the pane's notice: restored (the timeline replayed and
+// the SHA-256 held: how many actions and ranges where the answer's block says, which waiting patches were written, how
+// many still wait), or not (the reason the server gave, and that the waiting ones wait still), or neither where the
+// answer does not say. Nothing is counted from a block the answer does not have.
+function rizinEmuRestoreWords(data) {
+    const d = data && typeof data === 'object' ? data : {};
+    const list = d.patches && typeof d.patches === 'object' ? d.patches : null;
+    const waiting = list && Array.isArray(list.waiting) ? list.waiting.length : 0;
+    const offer = list ? rizinEmuOffer(list.restore) : null;
+    const count = (n, word, many = `${word}s`) => `${n} ${n === 1 ? word : many}`;
+    if (d.restored === true) {
+        const applied = (Array.isArray(d.applied) ? d.applied : []).map(addr => rizinEmuRowAddr(addr) || '?');
+        // how many actions ran is the answer's own count: the block's `actions` is the timeline the session holds afterwards, which
+        // is longer by the patches that were written after the proof
+        const replayed = Number.isSafeInteger(d.replayed) && d.replayed >= 0 ? d.replayed : null;
+        let text = `Session restored: the saved timeline was replayed${replayed !== null ? ` (${count(replayed, 'action')})` : ''}`
+            + ` and the bytes it left match the SHA-256 the project holds${offer && offer.digests !== null ? ` for ${count(offer.digests, 'range')}` : ''}.`;
+        if (applied.length) text += ` ${count(applied.length, 'patch', 'patches')} that waited ${applied.length === 1 ? 'was' : 'were'} written: ${applied.join(', ')}.`;
+        if (waiting) text += ` ${waiting} still ${waiting === 1 ? 'waits' : 'wait'}: no run's bytes lie under ${waiting === 1 ? 'it' : 'them'}.`;
+        return { kind: 'ok', text };
+    }
+    if (d.restored === false) {
+        const why = typeof d.reason === 'string' && d.reason.trim() ? d.reason.trim().replace(/[.\s]+$/, '') : 'the replay did not hold';
+        return { kind: 'error', text: `Not restored: ${why}.${waiting ? ' The patches that wait still wait.' : ''}` };
+    }
+    return { kind: 'error', text: 'The server answered without saying whether the run was restored.' };
+}
+
+// The pane: registers and stack on the left, breakpoints and patches on the right, each column scrolling in itself.
+// patches and breakpoints are null while they load (problem says why they could not be read instead).
+function rizinEmuPaneHtml(emu, patches, breakpoints, options) {
+    const { functions = null, note = '', notice = null, exported = null, problem = '', busy = '', wait = '', waiting = null, restore = null } = options || {};
+    const regs = emu && emu.running === true && Array.isArray(emu.registers) ? emu.registers.filter(reg => reg && reg.name !== undefined) : [];
+    const changed = new Set(emu && Array.isArray(emu.changed) ? emu.changed.map(String) : []);
+    const marked = regs.filter(reg => changed.has(String(reg.name))).length;
+    const sp = ['rsp', 'esp', 'sp'].find(name => regs.some(reg => String(reg.name) === name));
+    const head = (title, extra) => `<div class="rizin-emu-head">${title}${extra ? ` <b>${escapeHtml(extra)}</b>` : ''}</div>`;
+    const section = (name, title, body) => `<div class="rizin-emu-section" data-rizin-section="${name}">${title}${body}</div>`;
+    const ready = Array.isArray(patches) && Array.isArray(breakpoints) && !problem;
+    const notes = rizinEmuNotes(note).map(n => `<div class="rizin-emu-note rizin-emu-session-note${n.urgent ? ' rizin-emu-urgent' : ''}">${escapeHtml(n.text)}</div>`).join('');
+    const said = notice ? `<div class="rizin-emu-note rizin-emu-notice rizin-emu-note-${cssToken(notice.kind)}" role="status">${escapeHtml(notice.text)}</div>` : '';
+    return '<div class="rizin-emu-col">'
+        + section('registers', head('REGISTERS', regs.length ? `${regs.length}${marked ? ` · Δ ${marked} changed` : ''}` : ''), rizinEmuRegistersHtml(emu))
+        + section('stack', head('STACK', sp ? `from ${sp}` : ''), rizinEmuStackHtml(emu))
+        + '</div><div class="rizin-emu-col">'
+        + (ready ? rizinEmuRestoreHtml(restore, { busy, wait, sessionNote: note }) : '') + said + notes
+        + (ready
+            ? section('breakpoints', head('BREAKPOINTS', String(breakpoints.length)), rizinEmuBreakpointsHtml(breakpoints, functions))
+                + section('patches', rizinEmuPatchesHeadHtml(patches, busy), rizinEmuPatchesHtml(patches, functions, { exported, busy, waiting }))
+            : rizinEmuEmpty(problem || 'Loading…'))
+        + '</div>';
+}
+
+// The pane, drawn from the state and the lists when the dock shows it: only a change writes, a register being typed
+// into keeps its text and its focus, and each column keeps its scroll position
+function rizinRenderEmuPane() {
+    const el = document.getElementById('rizin-emulation');
+    if (!el || !rizinDockOnScreen('emulation')) return;
+    const sid = rizinState.session, ui = rizinState.emuPane;
+    const ready = !!sid && ui.at === sid && !ui.problem;
+    const html = !sid ? '<div class="rizin-empty">No file open.</div>'
+        : rizinEmuPaneHtml(rizinState.emu, ready ? ui.patches : null, ready ? ui.breakpoints : null, {
+            functions: rizinState.functions, note: rizinState.analysis ? rizinState.analysis.note : '', notice: ui.notice,
+            exported: ui.exported, problem: ui.problem, busy: ui.busy, wait: rizinState.emuWait, waiting: ready ? ui.waiting : null,
+            restore: ready ? ui.restore : null });
+    if (html === rizinState.emuPaneShown) return;
+    const active = document.activeElement;
+    const field = active && el.contains(active) && active.getAttribute ? active.getAttribute('data-rizin-reg') : null;
+    const typing = field === null ? null : { name: field, value: active.value, dirty: active.value !== active.getAttribute('value') };
+    const tops = Array.from(el.querySelectorAll('.rizin-emu-col'), col => col.scrollTop);
+    el.innerHTML = html;
+    rizinState.emuPaneShown = html;
+    Array.from(el.querySelectorAll('.rizin-emu-col')).forEach((col, i) => { if (tops[i]) col.scrollTop = tops[i]; });
+    const again = typing && Array.from(el.querySelectorAll('[data-rizin-reg]')).find(input => input.getAttribute('data-rizin-reg') === typing.name);
+    if (again) {
+        if (typing.dirty) again.value = typing.value;
+        again.focus();
+    }
+}
+
+// The lists of the pane (patches and breakpoints), only while the pane is shown, else when it is shown (stale); a
+// forced load is after a run, a patch or a take-back, a busy answer is retried by the poll like the other views. A late
+// answer (another one asked for since, or another file) is dropped. what 'patches' asks for the patches alone, where the
+// breakpoints held cannot have changed (a run); anything not loaded yet or stale is asked for whole.
+async function rizinLoadEmuPane(force, what) {
+    const sid = rizinState.session, pane = rizinState.emuPane;
+    if (!rizinDockOnScreen('emulation')) {
+        if (force) pane.stale = true;
+        return true;
+    }
+    if (!sid || (!force && !pane.stale && pane.at === sid)) {
+        rizinRenderEmuPane();
+        return true;
+    }
+    const seq = ++pane.seq, base = `/api/rizin/${encodeURIComponent(sid)}`;
+    const only = what === 'patches' && pane.at === sid && !pane.stale && !pane.problem && Array.isArray(pane.breakpoints);
+    // Not asked for: the breakpoints held stay as they are when the patches land (read then, not now: a ✕ that removed one
+    // while the patches were on their way is newer than anything this request could say)
+    const [patches, breakpoints] = await Promise.all([rizinApi(`${base}/patches`), only ? null : rizinApi(`${base}/breakpoints`)]);
+    if (sid !== rizinState.session || seq !== pane.seq) return false;
+    const failed = !patches.ok ? patches : breakpoints && !breakpoints.ok ? breakpoints : null;
+    if (failed) {
+        if (failed.state === 'busy') rizinViewBusy('emuPane', force);
+        pane.problem = failed.state === 'busy' ? `rizin is busy (${failed.data.step || 'rizin'}); the patches and breakpoints follow.`
+            : `The patches and breakpoints could not be loaded: ${failed.error}`;
+        rizinRenderEmuPane();
+        return false;
+    }
+    rizinState.retry.delete('emuPane');
+    // What waits and the offer of the restore button come in the answer of the patches: one read, one state
+    const list = patches.data && typeof patches.data === 'object' ? patches.data : {};
+    Object.assign(pane, { at: sid, patches: Array.isArray(list.patches) ? list.patches : [], waiting: Array.isArray(list.waiting) ? list.waiting : [],
+                          restore: list.restore ?? null, problem: '', stale: false });
+    if (breakpoints) pane.breakpoints = Array.isArray(breakpoints.data) ? breakpoints.data : [];
+    // The marks of DISASSEMBLY take what the pane read (the patches it holds are the same rows)
+    rizinSetLists({ patches: pane.patches, waiting: pane.waiting, restore: pane.restore, breakpoints: breakpoints ? pane.breakpoints : undefined });
+    rizinRenderEmuPane();
+    return true;
+}
+
+// What the last action of the pane did, in words (no text: nothing to say); kind: ok, wait or error
+function rizinEmuPaneSay(text, kind = 'ok') {
+    rizinState.emuPane.notice = text ? { kind, text } : null;
+    rizinRenderEmuPane();
+}
+
+// One delegated click handler: the buttons of the groups and ✕, else a row jumps to its data-addr (not where the click
+// ended a selection). A register field has no data-addr: a click in it only places the caret.
+function rizinOnEmuPaneClick(event) {
+    const target = event.target && event.target.closest ? event.target : null;
+    if (!target) return false;
+    const button = target.closest('button');
+    if (button) {
+        const act = button.getAttribute('data-rizin-act');
+        const row = button.closest('[data-addr]');
+        const addr = row ? row.getAttribute('data-addr') : null;
+        if (act === 'export') return rizinExportPatched();
+        if (act === 'detonate') {
+            const copy = rizinState.emuPane.exported;
+            return copy ? rizinDetonatePatched(copy.path, copy.name) : false;
+        }
+        if (act === 'restore') return rizinRestoreRun();
+        if (act === 'apply-waiting') return rizinApplyWaiting(addr);
+        if (act === 'drop-waiting') return rizinDropWaiting(addr);
+        if (act === 'unpatch-all') return rizinUnpatch();
+        if (act === 'unpatch') return rizinUnpatch(addr);
+        if (act === 'unbreak') return rizinUnbreak(addr);
+        if (act === 'reanalyze') return rizinReanalyze();
+        return false;
+    }
+    if (typeof window.getSelection === 'function' && String(window.getSelection())) return false;
+    const el = target.closest('[data-addr]');
+    const addr = el ? rizinHex(el.getAttribute('data-addr')) : null;
+    return addr ? rizinSeek(addr, 'emupane') : false;
+}
+
+// A register field changed (Enter, or leaving it): the register is set to what was typed
+function rizinOnEmuPaneChange(event) {
+    const input = event.target && event.target.closest ? event.target.closest('[data-rizin-reg]') : null;
+    return input ? rizinSetRegister(input.getAttribute('data-rizin-reg'), input.value) : false;
+}
+
+// A register set by hand: what was typed goes through rizinHex (exact for a 64-bit word: decimal takes BigInt) and
+// out as the string; the state is then read again (rizinLoadEmulation fills rizinState.emu), and the views follow a
+// PC that moved. Said where the user is looking (the pane) when it did not work.
+async function rizinSetRegister(name, value) {
+    const sid = rizinState.session, emu = rizinState.emu;
+    if (!sid || !emu || emu.running !== true || typeof name !== 'string' || !name) return false;
+    if (rizinState.emuWait) {
+        rizinEmuPaneSay(`${name} was not set: the emulation waits for another request.`, 'error');
+        return false;
+    }
+    const typed = String(value ?? '').trim(), word = rizinHex(typed);
+    if (!word) {
+        rizinEmuPaneSay(`"${typed}" is no number: ${name} takes a decimal or 0x… value.`, 'error');
+        return false;
+    }
+    const seq = ++rizinState.emuSeq;
+    rizinState.emuWait = 'register';
+    rizinState.emuPane.notice = null;
+    rizinRenderRunStrip();
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/emulation/register`, { method: 'POST', body: { name, value: word } });
+    if (sid !== rizinState.session || seq !== rizinState.emuSeq) return false;
+    rizinState.emuWait = '';
+    if (!r.ok) {
+        if (r.state === 'refused' && /not started/.test(r.error)) {
+            rizinEmuLeave();
+            rizinState.note = r.error;
+            rizinRenderState();
+            return false;
+        }
+        rizinEmuPaneSay(r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); ${name} was not set. Try again once it is free.`
+            : `${name} was not set: ${r.error}`, 'error');
+        if (r.state === 'busy') rizinPollSoon();
+        rizinRenderRunStrip();
+        return false;
+    }
+    const before = rizinEmuPc();
+    await rizinLoadEmulation(true);
+    const pc = rizinEmuPc();
+    if (pc && pc !== before) await rizinSeek(pc, 'emulation');
+    await rizinLoadEmuPane(true, 'patches');       // a register set by hand spoils the timeline: the notice says so now
+    return true;
+}
+
+// Take a patch back (addr, a "0x…" string: every write that overlaps it) or, called without one, clear every write in
+// the cache. rizin has one cache: the run's bytes go with the hand-made patches, so the user is always asked first. A bad
+// address takes nothing back. The answer is the new list; what the views show (bytes, the stack's words, functions)
+// is asked for again.
+async function rizinUnpatch(addr) {
+    const sid = rizinState.session, pane = rizinState.emuPane;
+    const all = addr === undefined, at = all ? null : rizinHex(addr);
+    if (!sid || pane.busy || (!all && !at)) return false;
+    if (all) {
+        const rows = (Array.isArray(pane.patches) ? pane.patches : []).filter(row => row && typeof row === 'object');
+        const hand = rows.filter(row => row.mine === true).length, run = rows.length - hand;
+        if (!rows.length) {
+            rizinEmuPaneSay("rizin's write cache is empty: there is nothing to clear.", 'error');
+            return false;
+        }
+        const plural = n => `${n} write${n === 1 ? '' : 's'}`;
+        if (typeof confirm !== 'function' || !confirm(`Clear rizin's whole cache? That drops ${plural(hand)} set by hand and ${plural(run)} the run made: `
+            + 'rizin has one cache, and what a run wrote is back only by running it again.')) return false;
+    }
+    pane.busy = 'unpatch';
+    rizinRenderEmuPane();
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/patch`, { method: 'DELETE', body: all ? {} : { addr: at } });
+    if (sid !== rizinState.session) return false;
+    pane.busy = '';
+    if (!r.ok) {
+        rizinEmuPaneSay(r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); nothing was taken back. Try again once it is free.`
+            : `Not taken back: ${r.error}`, 'error');
+        if (r.state === 'busy') rizinPollSoon();
+        return false;
+    }
+    Object.assign(pane, { at: sid, patches: Array.isArray(r.data.patches) ? r.data.patches : pane.patches, problem: '', stale: false });
+    rizinSetLists({ patches: r.data.patches });     // the answer has no offer: the pane reads the lists again (rizinSetLists)
+    // wc- <addr> <addr+1> removes every write that overlaps the address, so a patch set over bytes a run wrote takes
+    // the run's whole row with it -- up to a copied or decrypted stage. The server names those rows; saying only
+    // "took the patch back" would leave the pane claiming less than happened.
+    const gone = (Array.isArray(r.data.run_removed) ? r.data.run_removed : []).filter(row => row && typeof row === 'object');
+    const bytes = gone.reduce((sum, row) => sum + (Number.isSafeInteger(row.size) ? row.size : 0), 0);
+    // Only for one patch: clearing the whole cache asked first and said how many of the run's writes go with it.
+    const also = all || !gone.length ? '' : ` ${gone.length} write${gone.length === 1 ? '' : 's'} the run made went with it`
+        + ` (${bytes} byte${bytes === 1 ? '' : 's'}, from ${gone.map(row => rizinEmuRowAddr(row.addr) || '?').slice(0, 4).join(', ')}${gone.length > 4 ? ', …' : ''}):`
+        + ' rizin removes a write whole, and those bytes are back only by running again.';
+    rizinEmuPaneSay((all ? "Cleared rizin's whole cache." : `Took the patch at ${at} back.`) + also, also ? 'error' : 'ok');
+    await rizinReloadViews(['emuPane', 'marks']);       // the answer carried the list; the pane and the marks took it
+    return true;
+}
+
+// Remove the breakpoint at addr (a "0x…" string); the answer is the new list. There is no off switch: rizin 0.9.1 stops
+// at a disabled breakpoint all the same.
+async function rizinUnbreak(addr) {
+    const sid = rizinState.session, pane = rizinState.emuPane, at = rizinHex(addr);
+    if (!sid || !at || pane.busy) return false;
+    pane.busy = 'unbreak';
+    rizinRenderEmuPane();
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/breakpoints`, { method: 'DELETE', body: { addr: at } });
+    if (sid !== rizinState.session) return false;
+    pane.busy = '';
+    if (!r.ok) {
+        rizinEmuPaneSay(r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); the breakpoint stays. Try again once it is free.`
+            : `The breakpoint was not removed: ${r.error}`, 'error');
+        if (r.state === 'busy') rizinPollSoon();
+        return false;
+    }
+    Object.assign(pane, { at: sid, breakpoints: Array.isArray(r.data.breakpoints) ? r.data.breakpoints : pane.breakpoints, problem: '' });
+    rizinSetLists({ breakpoints: r.data.breakpoints });
+    rizinEmuPaneSay(`Removed the breakpoint at ${at}.`);
+    return true;
+}
+
+// Re-analyse: the range the run wrote is analysed again (the server knows it), so that FUNCTIONS and STRINGS see what
+// the run decrypted; then FUNCTIONS and the lists of the dock are asked for again. What it finds ends with the session.
+async function rizinReanalyze() {
+    const sid = rizinState.session, pane = rizinState.emuPane;
+    if (!sid || pane.busy) return false;
+    pane.busy = 'reanalyze';
+    rizinEmuPaneSay('Analysing the range the run wrote…', 'wait');
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/reanalyze`, { method: 'POST', body: {} });
+    if (sid !== rizinState.session) return false;
+    pane.busy = '';
+    if (!r.ok) {
+        rizinEmuPaneSay(r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); nothing was analysed. Try again once it is free.`
+            : `Not re-analysed: ${r.error}`, 'error');
+        if (r.state === 'busy') rizinPollSoon();
+        return false;
+    }
+    const count = (n, word) => `${Number.isSafeInteger(n) ? n : '?'} ${word}${n === 1 ? '' : 's'}`;
+    rizinEmuPaneSay(`Analysed ${rizinEmuRowAddr(r.data.start) || '?'}–${rizinEmuRowAddr(r.data.end) || '?'}: `
+        + `${count(r.data.functions, 'function')}, ${count(r.data.strings, 'string')}. They end with the session, like the bytes.`);
+    await rizinReloadViews(['emulation', 'emuPane']);
+    return true;
+}
+
+// Take what a route answered with the patches ({patches, waiting, restore}: GET /patches, the waiting variants of POST
+// and DELETE patch, and POST restore's `patches`) into the pane and DISASSEMBLY's marks, as the newest answer there is
+// (rizinSetLists drops the request of the pane that is still out). Without the rows -- null, as POST restore answers
+// where rizin would not list the cache -- there is nothing to take: the pane's offer is dropped and its lists are stale,
+// for whoever draws the views next (a jump asks for a stale pane) or, failing that, the caller, which reads them.
+function rizinEmuTakeLists(answer) {
+    const pane = rizinState.emuPane;
+    if (answer && typeof answer === 'object' && Array.isArray(answer.patches)) {
+        // The offer and what waits are taken together or not at all: an answer that has the rows and not both of them is
+        // one that cannot say what the pane shows beside them, and rizinSetLists reads the lists again for it
+        const whole = Array.isArray(answer.waiting) && answer.restore && typeof answer.restore === 'object';
+        return rizinSetLists({ patches: answer.patches, ...(whole ? { waiting: answer.waiting, restore: answer.restore } : {}) });
+    }
+    pane.restore = null;
+    pane.stale = true;
+    rizinRenderEmuPane();
+    return false;
+}
+
+// Apply now: the server writes the patches that wait at addr ("0x…") into the cache -- it decides whether a run's bytes
+// lie under it, and says why not in a sentence that is shown as it is. The press is sent whatever the row looked like:
+// the pane draws the button, the server answers it. The answer is the lists.
+async function rizinApplyWaiting(addr) {
+    const sid = rizinState.session, pane = rizinState.emuPane, at = rizinHex(addr);
+    if (!sid || !at || pane.busy) return false;
+    pane.busy = 'apply-waiting';
+    rizinEmuPaneSay(`Writing the waiting patch at ${at}…`, 'wait');
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/patch`, { method: 'POST', body: { addr: at, waiting: true } });
+    if (sid !== rizinState.session) return false;
+    pane.busy = '';
+    if (!r.ok) {
+        rizinEmuPaneSay(r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); the patch at ${at} was not written. Try again once it is free.`
+            : `Not applied: ${r.error}`, 'error');
+        if (r.state === 'busy') rizinPollSoon();
+        else if (r.state === 'refused') await rizinLoadEmuPane(true, 'patches');       // what was drawn is out of date
+        return false;
+    }
+    rizinEmuTakeLists(r.data);
+    rizinEmuPaneSay(`Applied the waiting patch at ${at}: it is in rizin's cache now, over the bytes the run wrote.`);
+    await rizinReloadViews(['emuPane', 'marks']);     // the bytes under it changed; the answer carried the lists
+    if (pane.stale) await rizinLoadEmuPane(true, 'patches');
+    return true;
+}
+
+// ✕ on a waiting patch: it goes out of the list and the project (the other way out of waiting; nothing in the cache is
+// touched). The request says `waiting`, so that it is never the take-back of a write at that address.
+async function rizinDropWaiting(addr) {
+    const sid = rizinState.session, pane = rizinState.emuPane, at = rizinHex(addr);
+    if (!sid || !at || pane.busy) return false;
+    pane.busy = 'drop-waiting';
+    rizinEmuPaneSay(`Removing the waiting patch at ${at}…`, 'wait');
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/patch`, { method: 'DELETE', body: { addr: at, waiting: true } });
+    if (sid !== rizinState.session) return false;
+    pane.busy = '';
+    if (!r.ok) {
+        rizinEmuPaneSay(r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); the patch at ${at} stays. Try again once it is free.`
+            : `Not removed: ${r.error}`, 'error');
+        if (r.state === 'busy') rizinPollSoon();
+        else if (r.state === 'refused') await rizinLoadEmuPane(true, 'patches');
+        return false;
+    }
+    rizinEmuTakeLists(r.data);
+    rizinEmuPaneSay(`Removed the waiting patch at ${at} from the project: it does not come back when the file is opened again.`);
+    if (pane.stale) await rizinLoadEmuPane(true, 'patches');
+    return true;
+}
+
+// Restore the run: the project's timeline is replayed (one request that holds rizin like a run, and a run in flight
+// holds the pane's other actions off until it is answered) and the server proves the bytes it left. The notice says
+// what happened (rizinEmuRestoreWords); the answer's lists are the pane's; the emulation the replay left running is the
+// answer's state, and the views follow its PC. Nothing is decided here: a refusal is the server's sentence.
+async function rizinRestoreRun() {
+    const sid = rizinState.session, pane = rizinState.emuPane;
+    if (!sid || pane.busy || rizinState.emuWait) return false;
+    const seq = ++rizinState.emuSeq;
+    pane.busy = 'restore';
+    rizinState.emuWait = 'restore';
+    rizinState.emuNote = '';
+    rizinEmuPaneSay('Replaying the saved timeline…', 'wait');
+    rizinRenderRunStrip();
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/restore`, { method: 'POST' });
+    if (sid !== rizinState.session) return false;
+    pane.busy = '';
+    if (seq !== rizinState.emuSeq) {                 // the emulation was left under the request: the session is gone
+        rizinEmuPaneSay('');
+        return false;
+    }
+    rizinState.emuWait = '';
+    if (!r.ok) {
+        rizinEmuPaneSay(r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); nothing was restored. Try again once it is free.`
+            : `Not restored: ${r.error}`, 'error');
+        rizinRenderRunStrip();
+        if (r.state === 'busy') rizinPollSoon();
+        else if (r.state === 'refused' || r.state === 'error') await rizinLoadEmuPane(true, 'patches');       // the offer that allowed it was out of date, or what broke left the pane's state unknown
+        return false;
+    }
+    const d = r.data, words = rizinEmuRestoreWords(d);
+    const state = d.state && typeof d.state === 'object' && d.state.running === true ? d.state : null;
+    if (d.restored === true) {
+        rizinState.emu = { ...(state || { running: true, pc: null, registers: [], changed: [], stack: [], stopped: null }), ran: '', assist: null };
+    }
+    rizinEmuTakeLists(d.patches);
+    rizinEmuPaneSay(words.text, words.kind);
+    rizinRenderRunStrip();
+    if (d.restored === true) {
+        if (!state) await rizinLoadEmulation(true);
+        const pc = rizinEmuPc();
+        if (pc) await rizinSeek(pc, 'emulation');       // every view at the PC, over the bytes the replay left
+        else rizinRenderPcMarks();
+        await rizinEmuAssist();
+    }
+    if (pane.stale) await rizinLoadEmuPane(true, 'patches');       // no lists in the answer, and no jump has read them
+    return d.restored === true;
+}
+
+// Export: the patched copy of the file with the patches set by hand (what a run wrote is not in it), built by the server;
+// its answer is shown in the hand-made group: the bytes patched, the addresses that have no place in the file (they are
+// not in the copy), and the note written beside it. Returns the answer kept in rizinState.emuPane.exported ({name, path,
+// sha256, patched, skipped [addresses], note, sig}), false where nothing was exported. The copy is handed on from there.
+async function rizinExportPatched() {
+    const sid = rizinState.session, pane = rizinState.emuPane;
+    if (!sid || pane.busy) return false;
+    const hand = (Array.isArray(pane.patches) ? pane.patches : []).filter(row => row && row.mine === true);
+    if (!hand.length) {
+        rizinEmuPaneSay('Nothing set by hand to export: only patches set by hand go into the copy, what a run wrote does not.', 'error');
+        return false;
+    }
+    pane.busy = 'export';
+    rizinEmuPaneSay('Building the patched copy…', 'wait');
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/export`, { method: 'POST' });
+    if (sid !== rizinState.session) return false;
+    pane.busy = '';
+    if (!r.ok) {
+        rizinEmuPaneSay(r.state === 'busy' ? `rizin is busy (${r.data.step || 'rizin'}); nothing was exported. Try again once it is free.`
+            : `Not exported: ${r.error}`, 'error');
+        if (r.state === 'busy') rizinPollSoon();
+        return false;
+    }
+    const d = r.data;
+    pane.exported = { name: String(d.name ?? ''), path: String(d.path ?? ''), sha256: String(d.sha256 ?? ''),
+                      patched: Number.isSafeInteger(d.patched) ? d.patched : 0, skipped: Array.isArray(d.skipped) ? d.skipped : [],
+                      note: String(d.note ?? ''), sig: rizinEmuHandSignature(hand) };
+    rizinEmuPaneSay('');
+    return pane.exported;
+}
+
+// The hand-off to the Submit tab: the copy at path (the server wrote it in the uploads folder) is fetched through
+// /api/file/download, wrapped in a File that carries the patched name, put into #file-input through a DataTransfer and
+// shown by handleFileSelect, and the Submit tab opens. NOTHING is submitted: the target and the press of Detonate are
+// the Submit tab's, and no route is asked to run a file by its path. Where patches had no place in the file the Submit
+// tab says so too, where the user is about to press Detonate. Returns true once the copy waits there, false (and says
+// why in the pane) when it does not: then the Submit tab is left as it was.
+async function rizinDetonatePatched(path, name) {
+    const sid = rizinState.session, pane = rizinState.emuPane;
+    if (!sid || pane.busy || typeof path !== 'string' || !path || typeof name !== 'string' || !name) return false;
+    const copy = pane.exported && pane.exported.path === path ? pane.exported : null;
+    const skipped = copy ? copy.skipped.map(addr => rizinEmuRowAddr(addr) || '?') : [];
+    const patched = copy ? copy.patched : 0;
+    pane.busy = 'detonate';
+    rizinEmuPaneSay('Fetching the patched copy…', 'wait');
+    let blob = null, why = '';
+    try {
+        const resp = await fetch(`/api/file/download?path=${encodeURIComponent(path)}`);
+        if (!resp.ok) why = `the web UI answered HTTP ${resp.status}`;
+        else blob = await resp.blob();
+    } catch (e) {
+        why = `the web UI did not answer (${e.message})`;
+    }
+    if (sid !== rizinState.session) return false;
+    pane.busy = '';
+    if (!why && !(blob && blob.size > 0)) why = 'the copy came back empty';
+    if (!why) {
+        try {
+            const input = document.getElementById('file-input'), chosen = input.files;
+            const transfer = new DataTransfer();
+            transfer.items.add(new File([blob], name, { type: blob.type || 'application/octet-stream' }));
+            input.files = transfer.files;
+            if (!input.files || input.files.length !== 1 || input.files[0].name !== name) {
+                why = 'the Submit tab did not take the file';
+                input.files = chosen;           // what was chosen there before stays chosen
+            } else {
+                handleFileSelect(input.files[0]);
+                const result = document.getElementById('submit-result');
+                result.className = `submit-result visible${skipped.length ? ' warning' : ''}`;
+                result.textContent = `Patched copy from the RIZIN tab: ${patched} byte${patched === 1 ? '' : 's'} patched. `
+                    + (skipped.length ? `Not in the copy (no place in the file): ${skipped.join(', ')}. ` : '') + 'Nothing has been submitted yet.';
+                switchTab('submit');
+            }
+        } catch (e) {
+            why = `the Submit tab did not take the file (${e.message})`;
+        }
+    }
+    if (why) {
+        rizinEmuPaneSay(`The copy was not handed to the Submit tab: ${why}.`, 'error');
+        return false;
+    }
+    rizinEmuPaneSay(`${name} waits in the Submit tab: nothing has been submitted yet.`);
+    return true;
+}
+
+// --- Breakpoints and patches in DISASSEMBLY (and the gutter of DECOMPILER) ---
+// The gutter (a click sets or removes a breakpoint, in DISASSEMBLY and in DECOMPILER) and the patch entries of the right-click menu (rizinMenuAct) act
+// on one address; what DISASSEMBLY marks (rizinState.marks) is the list each route answers: asked for once for each
+// file, again when forced, and taken from the answer of every change. A breakpoint is set or removed: rizin 0.9.1's
+// dbd does not stop a breakpoint from stopping a run, so there is no switch. Addresses go out as "0x…" strings; the
+// rows of /patches and /breakpoints carry integers, which the file's layout bounds (a row a double cannot hold exactly
+// marks nothing, rather than a wrong line).
+
+// The lists the tab has learned (an answer of /patches, /breakpoints, POST patch or breakpoints): DISASSEMBLY's marks
+// and, where the EMULATION pane holds the list already, its rows (a request of the pane that is still out is older
+// than this answer, so it is dropped). Either list may be missing: the other one stays.
+// The offer of the restore button and what waits come with the patches of the routes that answer them (/patches, the
+// waiting variants of patch, restore): lists with a `restore` key carry them, and the newest answer wins them with the
+// rows. An answer that changes the patches or the breakpoints and carries no offer (a plain patch, a take-back, a
+// breakpoint) leaves the pane's offer out of date: it is dropped, so that no button says what is no longer so, and the
+// pane reads the lists again.
+function rizinSetLists(lists) {
+    const sid = rizinState.session, marks = rizinState.marks, pane = rizinState.emuPane;
+    if (!sid || !lists) return false;
+    const safe = n => Number.isSafeInteger(n) && n >= 0;
+    const offered = 'restore' in lists;
+    let outdated = false;
+    if (Array.isArray(lists.breakpoints)) {
+        marks.stamp.breakpoints++;
+        marks.breakpoints = lists.breakpoints.filter(bp => bp && safe(bp.addr)).map(bp => bp.addr);
+        if (pane.at === sid && Array.isArray(pane.breakpoints)) {
+            Object.assign(pane, { breakpoints: lists.breakpoints, seq: pane.seq + 1 });
+            outdated = outdated || !offered;
+        }
+    }
+    if (Array.isArray(lists.patches)) {
+        marks.stamp.patches++;
+        marks.patched = lists.patches.filter(p => p && p.mine === true && safe(p.addr) && Number.isSafeInteger(p.size) && p.size > 0)
+            .map(p => [p.addr, p.size]);
+        if (pane.at === sid && Array.isArray(pane.patches)) {
+            Object.assign(pane, { patches: lists.patches, seq: pane.seq + 1 });
+            if (offered) Object.assign(pane, { waiting: Array.isArray(lists.waiting) ? lists.waiting : pane.waiting, restore: lists.restore ?? null });
+            else outdated = true;
+        }
+    }
+    if (outdated) pane.restore = null;
+    rizinRenderEmuPane();
+    if (rizinPageHolds(rizinState.disasm)) rizinRenderDisasm();
+    // The C in sight shows the breakpoints too (decompilerAt is empty while the pane says something instead of
+    // lines, which a list must not overwrite); hidden, it takes them once it is shown again
+    if (rizinState.decompilerAt && rizinCodeOnScreen('decompiler')) rizinRenderDecompiler();
+    if (outdated) rizinLoadEmuPane(true, 'patches');
+    return true;
+}
+
+// Both lists, for the marks: once for each file (unforced asks only while they are not known), and again when
+// forced (an analysis step ended, the console changed something). A busy answer is asked for again once rizin is
+// free; any other failure leaves the marks as they were (a click in the gutter then says why it cannot decide).
+async function rizinLoadMarks(force) {
+    const sid = rizinState.session, marks = rizinState.marks;
+    if (!sid || (!force && marks.breakpoints !== null && marks.patched !== null)) return true;
+    const seq = ++marks.seq, base = `/api/rizin/${encodeURIComponent(sid)}`, stamp = { ...marks.stamp };
+    const [patches, breakpoints] = await Promise.all([rizinApi(`${base}/patches`), rizinApi(`${base}/breakpoints`)]);
+    if (sid !== rizinState.session || seq !== marks.seq) return false;
+    const failed = !patches.ok ? patches : !breakpoints.ok ? breakpoints : null;
+    if (failed) {
+        if (failed.state === 'busy') rizinViewBusy('marks', force);
+        return false;
+    }
+    rizinState.retry.delete('marks');
+    // A list that something newer set while these were on their way (an answer to a click, to a patch) stays
+    const fresh = stamp.patches === marks.stamp.patches, list = patches.data && typeof patches.data === 'object' ? patches.data : {};
+    return rizinSetLists({ patches: fresh ? (Array.isArray(list.patches) ? list.patches : []) : undefined,
+                           ...(fresh ? { waiting: list.waiting, restore: list.restore } : {}),
+                           breakpoints: stamp.breakpoints === marks.stamp.breakpoints ? (Array.isArray(breakpoints.data) ? breakpoints.data : []) : undefined });
+}
+
+// A click in the gutter at addr ("0x…"): the breakpoint there is removed, or set where there is none. What is set is
+// known from the list the marks hold (asked for first if it is not known yet); one request at a time. The answer is
+// the new list. A refusal says why in the toolbar, as a jump that did not happen does.
+async function rizinToggleBreakpoint(addr) {
+    const sid = rizinState.session, at = rizinHex(addr), marks = rizinState.marks;
+    if (!sid || !at || marks.busy) return false;
+    marks.busy = true;
+    // One request at a time: while it is out a click in the gutter of any line is not taken, and the pointer says so
+    // in both views that have a gutter
+    const panes = ['rizin-disasm', 'rizin-decompiler'].map(id => document.getElementById(id)).filter(Boolean);
+    panes.forEach(pane => pane.classList.add('rizin-gutter-busy'));
+    try {
+        if (marks.breakpoints === null && !(await rizinLoadMarks(true))) {
+            if (sid === rizinState.session && rizinState.ui.state !== 'busy') {
+                rizinState.note = 'The breakpoints could not be read, so a click in the gutter cannot tell whether one is set.';
+                rizinRenderState();
+            }
+            return false;
+        }
+        if (sid !== rizinState.session) return false;
+        const set = marks.breakpoints.includes(rizinNum(at));
+        const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/breakpoints`, { method: set ? 'DELETE' : 'POST', body: { addr: at } });
+        if (sid !== rizinState.session) return false;
+        if (!r.ok) {
+            if (r.state === 'busy') rizinPollSoon();
+            else if (r.state === 'refused' || r.state === 'error') {
+                rizinState.note = `The breakpoint at ${at} was not ${set ? 'removed' : 'set'}: ${r.error}`;
+                rizinRenderState();
+            }
+            return false;
+        }
+        rizinSetLists({ breakpoints: r.data.breakpoints });
+        return true;
+    } finally {
+        if (sid === rizinState.session) marks.busy = false;
+        if (!marks.busy) panes.forEach(pane => pane.classList.remove('rizin-gutter-busy'));
+    }
+}
+
+// The bytes of a patch by hand as the server takes them, from what was typed: the hex digits, an even number of
+// them, at most RIZIN_PATCH.maxBytes bytes. White space is dropped (90 90 eb 05 is fine); nothing else is (no 0x).
+// {bytes} or {error}: the field says why, rather than the server refusing a value that was long or odd.
+function rizinPatchHex(text) {
+    const typed = String(text ?? '').replace(/\s+/g, '');
+    if (!typed) return { error: 'Type the bytes to write: hex digits, like 90 90 eb 05.' };
+    if (!/^[0-9a-fA-F]+$/.test(typed)) return { error: 'Only the hex digits 0-9 and a-f: no 0x, no other characters.' };
+    if (typed.length > 2 * RIZIN_PATCH.maxBytes) {
+        return { error: `That is ${Math.ceil(typed.length / 2)} bytes: a patch is at most ${RIZIN_PATCH.maxBytes} bytes (${2 * RIZIN_PATCH.maxBytes} hex digits).` };
+    }
+    if (typed.length % 2) return { error: `${typed.length} hex digits is an odd number: bytes are two digits each, so type one more or one fewer.` };
+    return { bytes: typed.toLowerCase() };
+}
+
+// The kinds of patch that apply to an instruction of rizin's op type: NOP out to any, Flip the jump and Always jump
+// to a conditional jump (cjmp), Kill the call to any call: rizin_emulation.is_call is "ends with call", which takes
+// ircall (call qword [import], 64 bit) and ucall (call dword [slot], 32 bit), the import calls an analyst knocks out
+function rizinPatchKinds(type) {
+    const t = typeof type === 'string' ? type : '';
+    return RIZIN_PATCH.kinds.filter(kind => kind === 'nop' || (t === 'cjmp' && (kind === 'flip' || kind === 'always'))
+        || (kind === 'nocall' && t.endsWith('call')));
+}
+
+// POST patch at addr with the body ({kind} or {bytes}); the answer is the list of what rizin's write cache holds,
+// which DISASSEMBLY and the pane take at once. Returns the answer of rizinApi, as rizinRename does.
+async function rizinPatchPost(addr, body) {
+    const sid = rizinState.session, at = rizinHex(addr);
+    if (!sid) return { ok: false, status: 0, data: {}, error: 'no file is open', state: 'error' };
+    if (!at) return { ok: false, status: 0, data: {}, error: `${String(addr)} is no address`, state: 'refused' };
+    const r = await rizinApi(`/api/rizin/${encodeURIComponent(sid)}/patch`, { method: 'POST', body: { addr: at, ...body } });
+    if (r.ok && sid === rizinState.session) rizinSetLists({ patches: r.data.patches });
+    return r;
+}
+
+// NOP out, Flip the jump, Always jump or Kill the call (kind: one of RIZIN_PATCH.kinds) for the instruction at addr:
+// the server computes the bytes from what rizin decoded there and writes them into the cache. It needs no emulation.
+function rizinPatchOp(addr, kind) {
+    if (!RIZIN_PATCH.kinds.includes(kind)) {
+        return Promise.resolve({ ok: false, status: 0, data: {}, error: `${String(kind)} is no kind of patch`, state: 'refused' });
+    }
+    return rizinPatchPost(addr, { kind });
+}
+
+// Bytes… : hex bytes written at addr (as rizinPatchHex takes them), over as many instructions as they cover
+function rizinPatchBytes(addr, text) {
+    const parsed = rizinPatchHex(text);
+    if (!parsed.bytes) return Promise.resolve({ ok: false, status: 0, data: {}, error: parsed.error, state: 'refused' });
+    return rizinPatchPost(addr, { bytes: parsed.bytes });
+}
+
+// Run to here: the emulation runs to the address (aesu), and stops at a breakpoint on the way
+function rizinRunToHere(addr) {
+    return rizinEmuRun('until', addr);
 }
 
 // Wired once at start-up: Upload, a file dropped on the tab, OPEN ▾ closing

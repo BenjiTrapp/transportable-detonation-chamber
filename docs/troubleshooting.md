@@ -197,7 +197,8 @@ transportable-detonation-chamber/
 │   ├── dashboards.py              # LOGS tab: the dashboards of your own and their tiles
 │   ├── dashboards.json            # Saved dashboards and tiles (git-ignored)
 │   ├── rizin_sessions.py          # RIZIN tab: rizin processes, console allowlist, analysis steps, projects
-│   ├── rizin_projects/            # Renames and comments per file, <sha256>.rzdb (git-ignored)
+│   ├── rizin_emulation.py         # RIZIN tab: the emulation's pure logic (registers, stack words, hints)
+│   ├── rizin_projects/            # Renames, comments, breakpoints and hand patches per file, <sha256>.rzdb (git-ignored)
 │   ├── tool_updates.py            # Tool Updates: tool catalog and update checks
 │   ├── firewall.py                # FIREWALL tab: bundling and tagging of connections (pure, no I/O)
 │   ├── firewall_store.py          # FIREWALL tab: connection ring, collector, download findings, decisions, settings
@@ -282,8 +283,8 @@ C:\ProgramData\chocolatey\lib\ghidra\   Ghidra 12.1.2
 C:\tools\cutter\                        rizin 0.9.1 + rz-ghidra (Cutter's Windows package; only rizin runs)
 C:\tools\ntsleuth\                      NTSleuth (ntsleuth-arm64.exe on ARM64, ntsleuth-x64.exe) + baseline\ntsleuth-<build>-<view>.json
                                         baseline\binary-graph-<build>-<arch>.json: the import graph of System32 (GRAPH view)
-C:\Windows\Temp\rizin_uploads\          Files uploaded in the RIZIN tab (newest 40)
-C:\DetonationChamberUI\rizin_projects\  RIZIN projects (renames and comments)
+C:\Windows\Temp\rizin_uploads\          Files uploaded in the RIZIN tab and its patched copies (newest 40)
+C:\DetonationChamberUI\rizin_projects\  RIZIN projects (renames, comments, breakpoints, hand patches)
 C:\tdc\samples\                         Samples the FIREWALL tab fetched (<sha256[:2]>\<sha256>; never executed, Defender-excluded)
 C:\tdc\scripts\                         Provisioning scripts; configure-logging.ps1, tdc-unisolate.ps1
 WinDbgX.exe                             WinDbg Preview (via winget)

@@ -13,6 +13,7 @@
   <a href="#what-it-does"><img src="https://img.shields.io/badge/Features-purple?style=for-the-badge" alt="Features"></a>
   <a href="docs/web-ui.md"><img src="https://img.shields.io/badge/Demo-green?style=for-the-badge" alt="Demo"></a>
   <a href="docs/api.md"><img src="https://img.shields.io/badge/API-orange?style=for-the-badge" alt="API"></a>
+  <a href="https://benjitrapp.github.io/transportable-detonation-chamber/"><img src="https://img.shields.io/badge/Documentation-teal?style=for-the-badge" alt="Documentation"></a>
 </p>
 
 <p align="center">
@@ -142,8 +143,10 @@ analysis, ELF analysis and rizin one button away
 </p>
 
 **Rizin** — rizin and rz-ghidra on the VM, driven from the browser: functions,
-disassembly, decompiler and control-flow graph at one current address, and a
-console whose commands pass an allowlist on the server ([Rizin](docs/rizin.md)).
+disassembly, decompiler and control-flow graph at one current address, a
+console whose commands pass an allowlist on the server, and an emulator that
+runs no process and never writes the original, with breakpoints, byte patches
+and a patched copy for the Submit tab ([Rizin](docs/rizin.md)).
 
 <p align="center">
   <img src="static/rizin.png" alt="The Rizin tab with pipesim.exe: the function list, the disassembly at the instruction that loads the pipe name, the control flow graph of that function and a console session that found the string and followed its reference" width="88%">
@@ -248,7 +251,7 @@ each of them can see is in [the guide's index](docs/README.md#detection-engines)
 | **ETW** | Multi-channel Event Log browser with live threat highlighting (see [ETW Browser](docs/web-ui.md#etw-browser)) |
 | **Hex** | Hex editor with data inspector, structure minimap, PE/ELF analysis and section inspection |
 | **FileMap** | Byteplot / entropy / PE-ELF structure planes side by side, import/export trees, click-to-offset |
-| **Rizin** | Reverse engineering with rizin and rz-ghidra on the VM, one session per browser tab (see [Rizin](docs/rizin.md)): OPEN a submitted sample, a dump, an upload or a VM path; FUNCTIONS, DISASSEMBLY, DECOMPILER and HEX beside the control flow GRAPH (tabs below 1400 px), all at one current address that a click, SEEK + GO, ◀ ▶ or a seek in the console moves; below, a CONSOLE for rizin commands (an allowlist on the server: no programs, no files), XREFS, STRINGS and IMPORTS; a right-click renames a function or comments an address, kept in a project; `aaa` up to 20 MB, `aa` and a Full analysis button above; Rizin buttons in the Submit history, Process Dump, Exit Capture, ThreatScan (result and history) and the Hex tab open a file here |
+| **Rizin** | Reverse engineering with rizin and rz-ghidra on the VM, one session per browser tab (see [Rizin](docs/rizin.md)): OPEN a submitted sample, a dump, an upload or a VM path; FUNCTIONS, DISASSEMBLY, DECOMPILER and HEX beside the control flow GRAPH (tabs below 1400 px), all at one current address that a click, SEEK + GO, ◀ ▶ or a seek in the console moves; below, a CONSOLE for rizin commands (an allowlist on the server: no programs, no writing to the file, no real debugging), XREFS, STRINGS, IMPORTS and an EMULATION pane; **EMULATE** runs the code in rizin's ESIL emulator (no process, the file untouched) with a run strip, breakpoints in the gutter, an API-call assistant, byte patches from the right-click menu, re-analysis of what a run decrypted, and an export of the patched copy that can be handed to Submit; a right-click also renames a function or comments an address, kept in a project with the patches and breakpoints; `aaa` up to 20 MB, `aa` and a Full analysis button above; Rizin buttons in the Submit history, Process Dump, Exit Capture, ThreatScan (result and history) and the Hex tab open a file here |
 | **SYSCALLS** | The map of every syscall of `ntdll.dll` and `win32u.dll` (why it exists and how to read it: [Syscall integrity](docs/memory.md#syscall-integrity); the routes are under [Syscalls](docs/api.md#syscalls)): one cell each in the order of its number, a band per module, from the NTSleuth baseline of this build and view; without a scan the baseline in one quiet tone, after SCAN of a chosen process each cell takes the state its stub was measured in (intact, hooked, patched, diverged, unreadable), counted in the legend, a single deviation standing out by its colour and a ring; a filter by name, number and module that dims what does not match, hover and click on a cell, the catalog under the map, notices for NTSleuth missing, no baseline and an x64 view that cannot be told from arm64; MAP / GRAPH, where GRAPH draws the import graph of `C:\Windows\System32` (3,999 binaries on the build this was measured on; read from the VM's own files and cached, offline) instead of the map: a layered path from an import down to a syscall number, an exploration node by node, and a table of figures over the whole stock. Every edge is derived from a binary except the curated ones, drawn dashed and marked `curated`: the last hop from a Win32 function to its Nt counterpart (from a hand-curated table; at most one per path) and the step from a `Zw` name of `ntdll` to its `Nt` name (a naming convention), in a path and in the syscall callers alike; a path that ends in an `Nt` name `ntdll` or `win32u` exports is derived throughout. More in [The binary graph](docs/memory.md#the-binary-graph) |
 | **LitterBox** | Files in the LitterBox sandbox with their static/dynamic/EDR results |
 | **Submit** | Detonation with stage-by-stage progress and combined verdict (EDR alerts, live memory, exit capture, network beaconing, LitterBox) with its VERDICT FLOW; the submission history with VERDICT HISTORY |
@@ -317,6 +320,9 @@ memory verdict in [Live memory](docs/memory.md#arm64-hosts).
 
 The guide lives in [`docs/`](docs/README.md): one page per topic, and two reading
 paths through them - set it up, or work with it.
+
+The same pages are on the web: [the documentation website](https://benjitrapp.github.io/transportable-detonation-chamber/)
+is built from `main` on every push - one address per page, and a search.
 
 | Page | What it answers |
 |---|---|
@@ -390,11 +396,11 @@ writes outside the detonation paths — is in
 
 ## License
 
-The repository carries no licence file of its own. Every tool the chamber
-installs or calls keeps the licence of its own project; the ones whose terms
-reach the way they are used are named in [Credits](#credits) — Aether
-(GPL-3.0) and rizin (LGPL-3.0) run as separate processes, Process Dump is MIT
-and NTSleuth BSD-3-Clause.
+This repository is [MIT licensed](LICENSE). Every tool the chamber installs or
+calls keeps the licence of its own project; the ones whose terms reach the way
+they are used are named in [Credits](#credits) — Aether (GPL-3.0) and rizin
+(LGPL-3.0) run as separate processes, Process Dump is MIT, NTSleuth
+BSD-3-Clause, and the vendored Mermaid copy is MIT with its licence beside it.
 
 ---
 

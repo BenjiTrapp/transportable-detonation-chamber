@@ -20,22 +20,126 @@ Environment:
   FAKE_RIZIN_STRINGS  this many more strings (text 0, ...) in ``izj``, after the others
   FAKE_RIZIN_FUNCTIONS  this many more functions (fcn.00000, ...) in ``afl``, ``aflj`` and ``flj``
   FAKE_RIZIN_AFL_NOISE  set: ``afl`` also prints a line that is no function row
+  FAKE_RIZIN_SCRAMBLED  set: three more maps of the file, side by side in memory (0x14000c000..0x14000c600, no
+                    zero-filled room between them) whose data are **out of order** in the file (delta 0x400, 0xa00,
+                    0x800), as a PE with SectionAlignment == FileAlignment and out-of-order raw pointers is mapped
+  FAKE_RIZIN_OVERLAP  set: two more maps of the file over the **same** addresses (0x14000e000..0x14000e200, delta
+                    0x400 listed first, delta 0xa00 after it); ``oml.j @ addr`` answers the later one, as rizin 0.9.1
+                    does (measured: the topmost map is what it and ``px`` read through, and ``omlj`` lists both)
+  FAKE_RIZIN_BITS   32: an x86-32 file (``ij`` bits, the ESIL VM's registers); default 64
+  FAKE_RIZIN_STACK  "<word>[,...]": the words ``aeim`` leaves at the stack pointer, upwards
+  FAKE_RIZIN_NO_IO_CACHE  set: ``e io.cache=true`` does not take, ``e io.cache`` stays false
+  FAKE_RIZIN_BP_ARMED  set: ``dbc``/``dbC`` do not clear a breakpoint's command (a rizin that keeps it)
+  FAKE_RIZIN_IO_CACHE_ONCE  set: only the first ``e io.cache=true`` takes (the console switched it off after)
+  FAKE_RIZIN_ESIL_FLOOD  "<n>": a run that runs into esil.timeout first prints n lines of "WARNING: $ returned 0",
+                    as every int3 does under esil.verbose=1 (148 000 a second measured), then the timeout line
+  FAKE_RIZIN_BAD_OMLJ  set: ``omlj`` answers text that is no JSON
+  FAKE_RIZIN_NO_SP  set: ``ar SP`` answers nothing (a file whose profile has no SP role)
+  FAKE_RIZIN_ESIL_RUNAWAY  set: ``aec`` and ``aesu`` run into esil.timeout (the warning on stderr, the PC where
+                    it was)
+  FAKE_RIZIN_EXTRA_FUNCTION  "<addr>:<name>[,...]": functions rizin only knows once something has
+                    analysed the bytes there. ``af`` reveals them, and with analysis.limits on only
+                    those inside [analysis.from, analysis.to) -- the way rizin bounds af's recursion
+  FAKE_RIZIN_ARCH   the arch ``ij`` and ``e asm.arch`` report (default x86); the API assistant covers
+                    x86 only and switches itself off for any other
+  FAKE_RIZIN_XOR_KEY  "<key>": the byte a decryption store really XORs with (``pdj`` still says 0x41): a run that
+                    writes **other bytes** than the one that was recorded, which is what a replay that does not hold
+                    looks like
+  FAKE_RIZIN_ARA0_IGNORED  set: ``ara0`` does nothing (a rizin that did not take the reset of the register arenas)
+  FAKE_RIZIN_ASSIST  set: the calls into the imports the API assistant answers for (see ASSIST_OPS),
+                    with their flags and import entries. They are behind a variable of their own
+                    because the flag and import lists of the default model are counted in tests
+
+``ara0`` zeroes every register, the PC and the stack pointer too, and forgets what ``ar`` set before ``aei``
+(measured on rizin 0.9.1: rcx=0x1234 survives aei and aeim, and is 0 after ara0; there is no ``ar0``).
+
+A command line longer than RIZIN_LINE_MAX characters is **cut**, as rizin's
+own stdin reader cuts it (see main()): a write on such a line does not go
+where it says.
 
 Like rizin 0.9.1 it dies on ``aflj`` once a project with DWARF variable
 origins has been loaded (see rizin_sessions._sanitize_project), and ``Poo``
 brings back the settings (/core/config) and hints that a project holds.
 ``-v`` prints the version and ``-qc <cmd>`` runs one command, without a file.
 
+The ESIL VM: ``aei`` arms it, ``aeim`` too and maps a stack (esil.stack.addr
+and esil.stack.size, or its arguments) with the stack pointer in its middle
+and the PC at the seek, ``aeim-`` unmaps it, ``aepc`` sets the PC. ``ar``
+shows, reads (by name or the roles PC and SP) and sets the registers.
+
+Before ``aei`` rizin 0.9.1 takes ``ar`` and ``aepc`` all the same, and a
+register set then is still there after ``aei``, ``aeim`` and a step -- **but
+not the PC, the stack pointer and the base pointer**: ``aepc 0x3; aei; ar PC``
+reads 0 (the seek), and so does ``aepc 0x3; aeim; ar PC`` with no ``aei`` at
+all; ``ar esp=0x1234; aei; aeim`` leaves esp in the middle of the new stack
+(all measured, and pinned by test_real_rizin_the_recorded_skip_value_is_what_was_applied).
+The fake does the same: what is set before ``aei`` is kept in ``esil["pre"]``,
+and arming sets the PC (and ``aeim`` the SP and BP) over it.
+
+**Known divergence:** rizin 0.9.1 arms itself for the step commands. ``e io.cache=true;
+aes`` with no ``aei`` at all runs (measured on a ``push 0x40``: ``eip`` 0 -> 2, ``esp = 0xfffffffc``
+and two cache rows -- 1 byte over the code at 0 and 3 bytes at 0xfffffffffffffffc, in no map), and
+so do ``aeso`` and ``aesu``. The fake answers "ESIL is not initialized" to every step command
+before ``aei``. It is left so: arming from a step would need a stack the model does not have, and
+a push that wraps round to the code, and nothing in the server steps before a start, so it only
+differs for a console ``aes`` typed first, whose effect on the timeline is decided by its name
+(rizin_sessions._console_spoils), not by what the fake does. ``pxj`` reads the stack, ``omlj``
+lists it with the file's maps. ``fd`` describes the
+closest flag below an address, ``fd.j`` lists the flags at it; like rizin's
+aei, an armed VM has a flag per register at its value.
+
+A second ``aeim`` with arguments maps that region **and moves the VM** into
+it: the PC goes to the seek and the stack and base pointer to the middle of
+the new map, while the map made before stays (all measured on rizin 0.9.1).
+That is why the API assistant reads those three registers before it maps a
+buffer and writes them back afterwards. Such a region is **rw-**, so code in
+it traps under esil.exectrap; ``omf rwx @ <addr>`` makes the region at the
+address executable, which is what the assistant sends after each ``aeim``
+(both measured).
+
+``aeim-`` and a plain ``aeim`` both go through the one piece of bookkeeping
+rizin keeps, the region the most recent ``aeim`` made: ``aeim-`` gives that
+one back and can then name nothing at all ("cannot deinitialize mem.…",
+measured), and a plain ``aeim`` gives it back and maps a stack at the next
+free address. So the emulation's memory is given back by closing the file
+descriptors of ``omlj``'s ``mem.*`` maps (``o- <fd>``, see esil_close_fd),
+which is what the server does.
+
+The write cache (``wx``, ``wcj``, ``wc-``, ``wc-*``; see write_cache) holds
+the patches *and* what the emulation writes, as rizin's one cache does, and
+every read of a byte goes through it. Without ``io.cache`` a write is lost.
+
+Stepping moves the PC through the code model below: a call pushes its return address and goes to its target
+(an indirect call goes to 0, where nothing is mapped: the callee is read from memory), a ret pops, a jmp
+follows, a conditional jmp falls through (no flags), and a store (``xor byte [<addr>], <key>``, which pdj
+reports as type "xor" with the target in "ptr") writes that byte through the write cache.
+``aes`` is one op, ``aeso`` runs a call to its return,
+``aess`` skips a call (but not an indirect one, like rizin: ``aeso`` neither), ``aesu``/``aecu`` run to an
+address, ``aecc`` to the next direct call (not before an indirect one), ``aec`` on. Like rizin 0.9.1 each
+stops at a breakpoint (also a disabled one) with
+"[ESIL] hit breakpoint at 0x..." on stdout, and a step at an address nothing is mapped at answers "Stopped
+execution in an invalid instruction" on stderr and stays. ``db @ addr`` (the one it already has there stays,
+with rizin's two ERROR lines; FAKE_RIZIN_BP_IGNORED sets none at all, as rizin does where another
+breakpoint's width covers the address), ``db- @ addr``, ``db-*``, ``dbd``, ``dbe``, ``dblj``,
+``dbc``/``dbC`` (the command and the condition rizin runs at a breakpoint, which ``dblj`` reports as
+``data`` and ``cond``, a project stores and ``dbc ""``/``dbC ""`` clear -- all measured).
+
 The views (afl, pdfj, afbj, pdj, axtj, axfj, afxj, izj, iij, flj, pxj, pdgj, ol.j, oml.j) answer
 from one model of the code: entry0 calls sym.main, whose blocks branch, run
 a long block, switch over two cases and leave by a tail call to
-sym.watchdog. ``cmd @@= a b ...`` runs cmd at each address and, like rizin,
-stops at an address ``pdj`` cannot read.
+sym.watchdog. ``af`` analyses the function at the seek (it answers nothing,
+and brings a function of the model that ``af-`` removed back), ``/zj``
+searches the bytes of the search range for strings. ``cmd @@= a b ...`` runs
+cmd at each address and, like rizin, stops at an address ``pdj`` cannot read.
+``cmd @e:k=v,...`` runs cmd with those settings and then puts the old ones
+back, as rizin's temporary eval does (the model takes it last, after any
+``~``, which is where the server writes it).
 """
 
 import base64
 import json
 import os
+import re
 import sys
 import time
 
@@ -47,6 +151,9 @@ for part in filter(None, os.environ.get("FAKE_RIZIN_SLOW", "").split(",")):
     SLOW[name] = float(seconds)
 CRASH = os.environ.get("FAKE_RIZIN_CRASH")
 GHIDRA = not os.environ.get("FAKE_RIZIN_NO_GHIDRA")
+BITS = 32 if os.environ.get("FAKE_RIZIN_BITS") == "32" else 64
+ARCH = os.environ.get("FAKE_RIZIN_ARCH") or "x86"
+ASSIST = bool(os.environ.get("FAKE_RIZIN_ASSIST"))
 
 FUNCTIONS = [] if os.environ.get("FAKE_RIZIN_NO_CODE") else [
     {"offset": 0x140001440, "name": "entry0", "size": 29, "nbbs": 1},
@@ -56,24 +163,56 @@ FUNCTIONS = [] if os.environ.get("FAKE_RIZIN_NO_CODE") else [
 # A big dump: that many more functions, far from the ones above (a dump's thousands of fcn.*)
 FUNCTIONS += [{"offset": 0x140010000 + i * 0x20, "name": f"fcn.{i:05d}", "size": 16, "nbbs": 1}
               for i in range(int(os.environ.get("FAKE_RIZIN_FUNCTIONS") or 0))]
+# The functions of the model, by address: `af` brings one that `af-` removed back, the way rizin builds it
+# from the bytes again. HELD are the ones rizin does not know yet (FAKE_RIZIN_EXTRA_FUNCTION): `af` reveals
+# them, which is what a run's decrypted bytes do.
+TEMPLATES = {fn["offset"]: dict(fn) for fn in FUNCTIONS}
+HELD = {}
+for _part in filter(None, os.environ.get("FAKE_RIZIN_EXTRA_FUNCTION", "").split(",")):
+    _addr, _, _name = _part.partition(":")
+    HELD[int(_addr, 0)] = {"offset": int(_addr, 0), "name": _name, "size": 16, "nbbs": 1}
 SLEEP, PIPE, THREAD = 0x1400093A8, 0x1400093B0, 0x140009340
 FLAGS = {"sym.imp.KERNEL32.dll_Sleep": SLEEP, "sym.imp.KERNEL32.dll_CreateNamedPipeA": PIPE,
          "str.child": 0x140005014}
 BASE, MAPPED_END = 0x140000000, 0x14000A000
+# A 32-bit island (FAKE_RIZIN_BITS=32): the model's addresses need 33 bits, which no 32-bit register
+# holds, so the x86-32 mode gets code and import slots of its own, at the addresses a PE32 uses. The
+# calls there are `call dword [<slot>]`, which rizin 0.9.1 types **ucall** (and skips with aess), while
+# the 64-bit `call qword [rip+..]` is an ircall -- both measured on mingw builds of tests/samples.
+BASE32, MAPPED32_END = 0x401000, 0x408000
 IMAGE = b"MZ\x90\x00\x03\x00\x00\x00\x04\x00\x00\x00\xff\xff\x00\x00" + bytes(range(256)) * 4
 # The maps as "oml.j @ addr" shows them: parts of the opened file (fd 3, at delta) and a zero-filled part
-# past .text's data (fd 4, like rizin's null:// maps); nothing else is mapped to the file
-MAPS = [{"map": i + 1, "fd": fd, "delta": delta, "from": start, "to": end, "perm": "r--", "name": name}
+# past .text's data (fd 4, like rizin's null:// maps); nothing else is mapped to the file.
+# This is NOT rizin's model of the gaps: it leaves 0x140004000-0x140005000 (and the page after .header, and
+# the one after .rdata) unmapped, where rizin 0.9.1 covers every page of a section with an fmap or an mmap
+# (measured on pipesim.exe). That only makes the fake stricter -- an address there answers "no map" -- so
+# do not read it as the shape of a real PE's maps; the real tests build one.
+MAPS = [{"map": i + 1, "fd": fd, "delta": delta, "from": start, "to": end,
+         "perm": "r-x" if ".text" in name else "r--", "name": name}
         for i, (fd, delta, start, end, name) in enumerate((
             (3, 0, BASE, BASE + 0x400, "fmap.header"),
             (3, 0x400, 0x140001000, 0x140003000, "fmap..text"),
             (4, 0, 0x140003000, 0x140004000, "mmap..text"),
             (3, 0x2400, 0x140005000, 0x140006000, "fmap..rdata"),
             (3, 0x3400, 0x140009000, MAPPED_END, "fmap..idata")))]
+if os.environ.get("FAKE_RIZIN_SCRAMBLED"):
+    MAPS += [{"map": len(MAPS) + 1 + i, "fd": 3, "delta": delta, "from": 0x14000C000 + 0x200 * i,
+              "to": 0x14000C200 + 0x200 * i, "perm": "r--", "name": f"fmap..s{i + 1}"}
+             for i, delta in enumerate((0x400, 0xA00, 0x800))]
+if os.environ.get("FAKE_RIZIN_OVERLAP"):
+    MAPS += [{"map": len(MAPS) + 1 + i, "fd": 3, "delta": delta, "from": 0x14000E000, "to": 0x14000E200,
+              "perm": "r--", "name": f"fmap..o{i + 1}"} for i, delta in enumerate((0x400, 0xA00))]
+if BITS == 32:
+    # the island's own maps, as a PE32's are: its code executes, its import table does not
+    MAPS += [{"map": len(MAPS) + 1, "fd": 3, "delta": 0x400, "from": BASE32, "to": 0x402000,
+              "perm": "r-x", "name": "fmap..text32"},
+             {"map": len(MAPS) + 2, "fd": 3, "delta": 0x1400, "from": 0x407000, "to": MAPPED32_END,
+              "perm": "r--", "name": "fmap..idata32"}]
 
 
-def _op(offset, size, text, kind, jump=None, fail=None, ptr=None):
-    op = {"offset": offset, "size": size, "opcode": text, "disasm": text, "bytes": "90" * size, "type": kind}
+def _op(offset, size, text, kind, jump=None, fail=None, ptr=None, data=None):
+    op = {"offset": offset, "size": size, "opcode": text, "disasm": text, "type": kind,
+          "bytes": data if data else "90" * size}
     for key, value in (("jump", jump), ("fail", fail), ("ptr", ptr)):
         if value is not None:
             op[key] = value
@@ -124,9 +263,62 @@ BLOCKS = {
                _op(0x14000164B, 5, "jmp sym.watchdog", "jmp", jump=0x140001490)),
     ],
 }
-# Code outside every function (a thunk).
-LOOSE_OPS = [_op(0x140003098, 6, "jmp qword [sym.imp.KERNEL32.dll_CreateNamedPipeA]", "ijmp", ptr=PIPE),
+# Code outside every function: a check whose bytes are the real x86 encodings (each one checked with
+# rz-asm -d -a x86 -b 64 at its address), so the patch kinds have an instruction to work on, and a thunk.
+LOOSE_OPS = [_op(0x140003080, 3, "cmp eax, 0x01", "cmp", data="83f801"),
+             _op(0x140003083, 2, "jz 0x140003090", "cjmp", jump=0x140003090, fail=0x140003085, data="740b"),
+             _op(0x140003085, 6, "jnz 0x140003097", "cjmp", jump=0x140003097, fail=0x14000308B,
+                 data="0f850c000000"),
+             _op(0x14000308B, 5, "call sym.watchdog", "call", jump=0x140001490, fail=0x140003090,
+                 data="e800e4ffff"),
+             _op(0x140003098, 6, "jmp qword [sym.imp.KERNEL32.dll_CreateNamedPipeA]", "ijmp", ptr=PIPE),
              _op(0x14000309E, 1, "int3", "trap")]
+# A decryption stub, also outside every function: eight unrolled stores over DECRYPT_TARGET.., then a
+# ret. Each one is a `xor byte [<abs>], 0x41`, which pdj reports as type "xor" with the target in "ptr",
+# and the step machine writes that byte through the write cache, as rizin's ESIL does. The bytes there are
+# zero, so the run leaves eight 0x41 ('A') -- a string where there was none, which is the point of the
+# whole feature. DECRYPT_END is the ret: a run `until` it writes the whole range and nothing else.
+DECRYPT_AT, DECRYPT_TARGET, DECRYPT_KEY, DECRYPT_SIZE = 0x140002800, 0x140002000, 0x41, 8
+DECRYPT_END = DECRYPT_AT + DECRYPT_SIZE * 7
+LOOSE_OPS += [_op(DECRYPT_AT + i * 7, 7, f"xor byte [{DECRYPT_TARGET + i:#x}], {DECRYPT_KEY:#x}", "xor",
+                  ptr=DECRYPT_TARGET + i) for i in range(DECRYPT_SIZE)]
+LOOSE_OPS.append(_op(DECRYPT_END, 1, "ret", "ret"))
+# A stub whose two stores **overlap**: a byte at ORDER_TARGET + 1, then four bytes from ORDER_TARGET. The later
+# write wins over the byte they share, which a list of the cache by address cannot say (it puts the four bytes
+# first), so a digest made over rows in the wrong order is another SHA-256 -- plausible, and not what the run left.
+# ORDER_END is the ret. The four-byte store is the only one in the model that is wider than a byte.
+ORDER_AT, ORDER_TARGET = 0x140002A00, 0x140002100
+ORDER_END = ORDER_AT + 14
+ORDER_WIDTH = {ORDER_AT + 7: 4}
+LOOSE_OPS += [_op(ORDER_AT, 7, f"xor byte [{ORDER_TARGET + 1:#x}], {DECRYPT_KEY:#x}", "xor", ptr=ORDER_TARGET + 1),
+              _op(ORDER_AT + 7, 7, f"xor dword [{ORDER_TARGET:#x}], {DECRYPT_KEY:#x}", "xor", ptr=ORDER_TARGET),
+              _op(ORDER_END, 1, "ret", "ret")]
+# what a store XORs with: DECRYPT_KEY, or the key of FAKE_RIZIN_XOR_KEY
+XOR_KEY = int(os.environ["FAKE_RIZIN_XOR_KEY"], 0) if os.environ.get("FAKE_RIZIN_XOR_KEY") else DECRYPT_KEY
+# The calls the API assistant answers for. One import per answer its table can give, each with its flag
+# and its import entry, so that a session can be stepped onto the call and skipped. They are behind
+# FAKE_RIZIN_ASSIST because the flag and import lists of the default model are counted in tests.
+# At 64 bits (ASSIST_AT upwards, inside .text, where the PC may execute) they are `call qword [slot]`,
+# which rizin types ircall; at 32 bits (the island) `call dword [slot]`, which it types ucall.
+ASSIST_AT, ASSIST_SLOT = 0x140002900, 0x1400093C0
+ASSIST_IMPORTS = ("VirtualAlloc", "memcpy", "GetTickCount", "IsDebuggerPresent", "GetProcAddress",
+                  "QueryPerformanceCounter", "GetComputerNameW")
+ASSIST32_AT, ASSIST32_SLOT = BASE32, 0x40723C
+ASSIST32_IMPORTS = ("Sleep", "VirtualAlloc", "CreateNamedPipeA", "LoadLibraryA", "VirtualProtect",
+                    "GetVolumeInformationA")
+ASSIST_OPS, ASSIST_TABLE = [], []
+if ASSIST or BITS == 32:
+    _at, _slot = (ASSIST32_AT, ASSIST32_SLOT) if BITS == 32 else (ASSIST_AT, ASSIST_SLOT)
+    _width, _kind = ("dword", "ucall") if BITS == 32 else ("qword", "ircall")
+    for _i, _name in enumerate(ASSIST32_IMPORTS if BITS == 32 else ASSIST_IMPORTS):
+        _lib = "msvcrt.dll" if _name == "memcpy" else "KERNEL32.dll"
+        _flag, _plt = f"sym.imp.{_lib}_{_name}", _slot + _i * 8
+        FLAGS[_flag] = _plt
+        ASSIST_TABLE.append((_name, _lib, _plt))
+        ASSIST_OPS.append(_op(_at + _i * 6, 6, f"call {_width} [{_flag}]", _kind, ptr=_plt))
+    ASSIST_OPS.append(_op(_at + len(ASSIST_TABLE) * 6, 1, "ret", "ret"))
+    LOOSE_OPS += ASSIST_OPS
+    del _at, _slot, _width, _kind, _i, _name, _lib, _flag, _plt
 XREFS = [{"from": src, "to": dst, "type": kind} for src, dst, kind in (
     (0x140001444, 0x1400014B7, "CALL"),
     (0x140001499, SLEEP, "CALL"),
@@ -157,6 +349,12 @@ IIJ = [{"ordinal": ordinal, "bind": "NONE", "type": "FUNC", "name": name, "libna
     (9, "Sleep", "KERNEL32.dll", SLEEP),
     (2, "strcmp", "msvcrt.dll", 0x1400094F0),
 )]
+# The imports the assistant's calls go to (see ASSIST_OPS), where the model has them: an import is in
+# the import table as well as in the flags, which is how GetProcAddress of a name the file imports can
+# be answered with the address the table gives for it.
+IIJ += [{"ordinal": 20 + i, "bind": "NONE", "type": "FUNC", "name": name, "libname": lib, "plt": plt}
+        for i, (name, lib, plt) in enumerate(ASSIST_TABLE)
+        if not any(entry["name"] == name for entry in IIJ)]
 # rz-ghidra's C for sym.main: (line, [(token, address)]) -> pdgj's code and offset annotations.
 CODE = [
     ("int sym.main(int argc, char **argv)", []),
@@ -169,10 +367,47 @@ CODE = [
     ("}", []),
 ]
 
-state = {"seek": 0x140001440, "names": {}, "comments": {}, "prj": "", "dwarf": False, "hints": {},
-         "config": {"asm.arch": "x86", "analysis.arch": "x86", "bin.lang": "c", "analysis.autoname": "false",
+state = {"seek": 0x140001440, "names": {}, "comments": {}, "prj": "", "dwarf": False, "hints": {}, "bps": {},
+         "cache": [], "hits": {},
+         "config": {"asm.arch": ARCH, "analysis.arch": ARCH, "bin.lang": "c", "analysis.autoname": "false",
                     "analysis.apply.signature": "true", "analysis.calls": "false",
-                    "scr.color": "0", "scr.pager": "", "scr.interactive": "false"}}
+                    "analysis.limits": "false", "analysis.from": "0xffffffffffffffff",
+                    "analysis.to": "0xffffffffffffffff",
+                    "search.in": "io.maps", "search.from": "0", "search.to": "0xffffffffffffffff",
+                    "scr.color": "0", "scr.pager": "", "scr.interactive": "false",
+                    "io.cache": "false", "esil.romem": "false", "esil.breakoninvalid": "false", "esil.stack.addr": "0x100000",
+                    "esil.stack.size": "0xf0000"}}
+
+if BITS == 64:
+    REG_NAMES = ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp"] + [f"r{i}" for i in range(8, 16)] + \
+        ["rip", "rflags"]
+    ROLES = {"PC": "rip", "SP": "rsp", "BP": "rbp"}
+else:
+    REG_NAMES = ["eax", "ebx", "ecx", "edx", "esi", "edi", "ebp", "esp", "eip", "eflags"]
+    ROLES = {"PC": "eip", "SP": "esp", "BP": "ebp"}
+# The ESIL VM: regs is None until aei; stack is (addr, bytearray, name) while aeim's map is there, and
+# mapped holds the regions a later ``aeim <addr> <size> <name>`` added beside it (the API assistant's
+# buffers), newest last, and last is the region the most recent ``aeim`` made -- the one piece of
+# bookkeeping rizin 0.9.1 keeps, which is why ``aeim-`` works once and then cannot name anything
+# (see esil_drop_last, all measured). ``exec`` holds the base addresses of the regions an ``omf rwx``
+# has made executable: ``aeim`` maps rw-, and code in such a region traps under esil.exectrap until
+# then (measured, see esil_executable).
+esil = {"regs": None, "stack": None, "mapped": [], "last": None, "exec": set(), "pre": {}}
+
+
+def esil_new_regs():
+    """The registers of a VM that aei or aeim arms: zero, and what ``ar`` or ``aepc`` set before it (rizin
+    0.9.1 takes both before aei, and keeps them through it, aeim, aepc and a step -- measured)."""
+    regs = dict.fromkeys(REG_NAMES, 0)
+    regs.update(esil["pre"])
+    return regs
+# Characters of one command line the fake keeps; see main(). rizin 0.9.1 itself keeps **4094** (measured:
+# a line of 4096 characters lost its last two), so this cut is deliberately one character later -- a test
+# only needs that a line at or over the wall does not do what it says.
+RIZIN_LINE_MAX = 4095
+ESIL_CAP = 200000  # steps of one run: past it the fake's code has run into nothing it models
+SEARCH_MAX = 0x10000  # bytes of a search range the model reads (a test's range is far smaller)
+ESIL_INVALID = "ERROR: core: esil: Stopped execution in an invalid instruction (see e??esil.breakoninvalid)\n"
 
 
 def log(text):
@@ -250,7 +485,7 @@ def linear(addr, count):
     known = {op["offset"]: op for fn in FUNCTIONS for op in function_ops(fn)}
     known.update((op["offset"], with_comment(dict(op, fcn_addr=0, fcn_last=0))) for op in LOOSE_OPS)
     ops = []
-    while len(ops) < count and BASE <= addr < MAPPED_END:
+    while len(ops) < count and (BASE <= addr < MAPPED_END or (BITS == 32 and BASE32 <= addr < MAPPED32_END)):
         op = known.get(addr) or {"offset": addr, "size": 1, "opcode": "invalid", "disasm": "invalid",
                                  "bytes": f"{byte_at(addr):02x}", "type": "invalid", "fcn_addr": 0, "fcn_last": 0}
         ops.append(op)
@@ -259,10 +494,515 @@ def linear(addr, count):
 
 
 def byte_at(addr):
+    for entry in reversed(state["cache"]):  # the cache sits above every map: the newest write wins
+        if entry["addr"] <= addr < entry["addr"] + entry["size"]:
+            return bytes.fromhex(entry["after"])[addr - entry["addr"]]
+    for base, memory, _name in esil_maps():
+        if base <= addr < base + len(memory):
+            return memory[addr - base]
+    if BITS == 32 and BASE32 <= addr < MAPPED32_END:
+        return 0  # the 32-bit island: mapped and zero-filled, like a PE32's import table here
     if not BASE <= addr < MAPPED_END:
         return 0xFF  # like rizin's io.unalloc
     i = addr - BASE
     return IMAGE[i] if i < len(IMAGE) else 0
+
+
+def cache_write(addr, data, shown=None):
+    """A write through rizin's write cache. Without io.cache it is lost, and rizin says so on stderr
+    only (measured: "ERROR: Could not write hexpair '9090' at e"), which the server's cmd never reads:
+    that is why the server sets io.cache and reads it back itself. UT64_MAX is refused outright
+    (measured: rz_core_write_at asserts addr != UT64_MAX and writes nothing)."""
+    if addr == 2 ** 64 - 1:
+        err("WARNING: rz_core_write_at: assertion 'core && buf && addr != UT64_MAX' failed "
+            "(line 153); returning false\n")
+        err(f"ERROR: Could not write hexpair '{shown or data.hex()}' at {addr:x}\n")
+        return
+    if state["config"].get("io.cache") != "true":
+        err(f"ERROR: Could not write hexpair '{shown or data.hex()}' at {addr:x}\n")
+        return
+    before = bytes(byte_at(addr + i) for i in range(len(data)))
+    state["cache"].append({"addr": addr, "size": len(data), "before": before.hex(), "after": data.hex()})
+
+
+def write_cache(word, rest, seek):
+    """``wx <hex>``, ``wcj``, ``wc- [<from> [<to>]]`` and ``wc-*``, measured on rizin 0.9.1.
+
+    One entry per write operation (a two-byte ``wx`` is one entry of size 2, four single-byte writes are
+    four entries), and a second write over the same address is another entry whose "before" is what the
+    first one wrote. ``wcj`` prints the entries comma separated **without** the brackets of an array,
+    and nothing at all for an empty cache. ``wc-`` drops every entry that overlaps [from, to); without
+    a ``to`` the range is one block (0x100) from ``from``, and without arguments it starts at the seek,
+    so taking exactly one entry back needs an explicit range.
+    """
+    cache = state["cache"]
+    if word == "wcj":
+        return ",".join(json.dumps({"idx": i, "addr": e["addr"], "size": e["size"], "before": e["before"],
+                                    "after": e["after"], "written": False})
+                        for i, e in enumerate(cache)) + "\n"
+    if word == "wc-*":
+        del cache[:]
+        return ""
+    if word == "wc-":
+        args = rest.split()
+        start = number(args[0]) if args else seek
+        if start is None:
+            err(f"ERROR: core: Invalid address ({args[0]})\n")
+            return ""
+        end = number(args[1]) if len(args) > 1 else start + 0x100
+        state["cache"] = [e for e in cache if e["addr"] + e["size"] <= start or e["addr"] >= end]
+        return ""
+    data = rest.strip()
+    try:
+        written = bytes.fromhex(data)
+    except ValueError:
+        written = b""
+    if not written:
+        err(f"ERROR: Could not write hexpair '{data}' at {seek:x}\n")
+        return ""
+    cache_write(seek, written, data)
+    return ""
+
+
+def esil_maps():
+    """Every region of the ESIL VM: the stack ``aeim`` mapped and the buffers a later one added."""
+    stack = esil["stack"]
+    return ([stack] if stack else []) + list(esil["mapped"])
+
+
+def esil_map_stack(args):
+    """``aeim [addr [size [name]]]``: arm the VM and map a region, as rizin 0.9.1 does (all measured).
+
+    With arguments the region is mapped **beside** the one mapped before, and the VM moves into it: the
+    PC goes to the seek and the stack and base pointer to the middle of the new map.
+
+    Without arguments it is the stack -- and a plain ``aeim`` first **destroys the ESIL map made last**,
+    whatever it is: after ``aeim; aeim <a> <s> assist; aeim`` the buffer is gone and a stack is mapped
+    at the next free address (measured, which is also why two plain ``aeim`` in a row look like one).
+    Where esil.stack.addr is free again the new stack goes there; rizin's own choice of a *different*
+    address when it is not (measured once: 0x100000 -> 0x10000000) is not modelled, and nothing in the
+    server reaches that case, because a start gives the ESIL memory back first (_emulation_unmap).
+    """
+    if esil["regs"] is None:
+        esil["regs"] = esil_new_regs()
+    addr = number(args[0]) if args else int(state["config"]["esil.stack.addr"], 0)
+    size = number(args[1]) if len(args) > 1 else int(state["config"]["esil.stack.size"], 0)
+    if not args:
+        if esil["last"] is not None:
+            esil_drop_last()
+        while any(base <= addr < base + len(memory) for base, memory, _name in esil_maps()):
+            addr += size
+    memory = bytearray(size)
+    sp = addr + size // 2
+    word = BITS // 8
+    if len(args) <= 2:  # the words of FAKE_RIZIN_STACK belong to the stack, not to a buffer
+        for i, text in enumerate(filter(None, os.environ.get("FAKE_RIZIN_STACK", "").split(","))):
+            value = int(text, 0) & (2 ** BITS - 1)
+            memory[size // 2 + i * word:size // 2 + (i + 1) * word] = value.to_bytes(word, "little")
+    name = f"mem.{args[2]}" if len(args) > 2 else f"mem.{addr:#x}_{size:#x}"  # like get_esil_stack_name
+    esil["exec"].discard(addr)  # a fresh region is rw-, whatever an omf did to the one that was here
+    if len(args) > 2:
+        esil["mapped"].append((addr, memory, name))
+        esil["last"] = esil["mapped"][-1]
+    else:
+        esil["stack"] = esil["last"] = (addr, memory, name)
+    regs = esil["regs"]
+    regs[ROLES["SP"]] = regs[ROLES["BP"]] = sp
+    regs[ROLES["PC"]] = state["seek"]
+
+
+def esil_drop_last(what="aeim-"):
+    """Give the region of the most recent ``aeim`` back, with its memory; False when its bookkeeping
+    holds none any more.
+
+    rizin 0.9.1 keeps exactly one such entry: ``aeim-`` works once after each ``aeim`` and then says
+    "cannot deinitialize mem.<a name it computed>" and drops nothing -- measured, with one buffer and
+    with two, and whether or not the buffers were unmapped another way first. That is why the server
+    closes the ESIL memory's file descriptors instead (see esil_close_fd).
+    """
+    region = esil["last"]
+    if region is None:
+        addr = int(state["config"]["esil.stack.addr"], 0)
+        size = int(state["config"]["esil.stack.size"], 0)
+        while any(base <= addr < base + len(memory) for base, memory, _name in esil_maps()):
+            addr += size
+        err(f"ERROR: core: cannot deinitialize mem.{addr:#x}_{size:#x}\n")
+        return False
+    if esil["stack"] is region:
+        esil["stack"] = None
+    elif region in esil["mapped"]:
+        esil["mapped"].remove(region)
+    esil["exec"].discard(region[0])
+    esil["last"] = None
+    return True
+
+
+def esil_close_fd(rest):
+    """``o- <fd>``: close a file descriptor. Only the ESIL VM's own are modelled, because they are the
+    only ones the server closes (the fds of ``omlj``'s mem.* rows); closing one removes its map **and**
+    frees its memory, which ``om-`` does not (measured: ``ol`` keeps the malloc:// entry after om-)."""
+    fd = number(rest)
+    for i, region in enumerate(esil_maps()):
+        if 5 + i == fd:
+            if esil["stack"] is region:
+                esil["stack"] = None
+            else:
+                esil["mapped"].remove(region)
+            esil["exec"].discard(region[0])
+            if esil["last"] is region:
+                esil["last"] = None
+            return ""
+    err(f"ERROR: Could not close the file descriptor {rest.strip()}\n")
+    return ""
+
+
+def esil_mapped(addr):
+    if any(base <= addr < base + len(memory) for base, memory, _name in esil_maps()):
+        return True
+    return any(m["from"] <= addr < m["to"] for m in MAPS)
+
+
+def esil_executable(addr):
+    for base, memory, _name in esil_maps():
+        if base <= addr < base + len(memory):
+            return base in esil["exec"]  # aeim maps rw-; an omf rwx on that map adds the x (measured)
+    return any(m["from"] <= addr < m["to"] and "x" in m["perm"] for m in MAPS)
+
+
+def esil_perm(base):
+    """The permissions ``omlj`` reports for an ESIL region: ``aeim`` maps rw-, ``omf rwx`` adds the x."""
+    return "rwx" if base in esil["exec"] else "rw-"
+
+
+def esil_set_perm(flags, addr):
+    """``omf <flags> @ <addr>``: the permissions of the map at the address.
+
+    rizin's ``omf <flags>`` without a map id takes the map at the current offset, and the topmost one
+    where several cover it (measured). Only the ESIL VM's own regions are modelled: the server changes
+    no other map, and the console cannot reach the ``o`` family at all. Nothing but the ``x`` bit is
+    modelled either -- that is the one the server sets, so the assistant's buffers can run code.
+    """
+    for base, memory, _name in reversed(esil_maps()):
+        if base <= addr < base + len(memory):
+            if "x" in flags:
+                esil["exec"].add(base)
+            else:
+                esil["exec"].discard(base)
+            return ""
+    if not any(m["from"] <= addr < m["to"] for m in MAPS):
+        err(f"ERROR: Cannot find any map at the current address {addr:x}\n")
+    return ""
+
+
+def esil_ops():
+    ops = {op["offset"]: op for fn in FUNCTIONS for op in function_ops(fn)}
+    ops.update((op["offset"], op) for op in LOOSE_OPS)
+    return ops
+
+
+def esil_push(value):
+    regs, (base, memory, _name) = esil["regs"], esil["stack"]
+    word = BITS // 8
+    regs[ROLES["SP"]] = (regs[ROLES["SP"]] - word) % 2 ** BITS
+    at = regs[ROLES["SP"]] - base
+    if 0 <= at <= len(memory) - word:
+        # like rizin: what the emulation writes goes through the write cache, the one the patches use too
+        cache_write(regs[ROLES["SP"]], value.to_bytes(word, "little"))
+
+
+def esil_pop():
+    regs, (base, memory, _name) = esil["regs"], esil["stack"]
+    word = BITS // 8
+    sp = regs[ROLES["SP"]]
+    at = sp - base
+    value = int.from_bytes(bytes(byte_at(sp + i) for i in range(word)), "little") \
+        if 0 <= at <= len(memory) - word else 0
+    regs[ROLES["SP"]] = (sp + word) % 2 ** BITS
+    return value
+
+
+def esil_is_call(op):
+    return op is not None and op["type"] in ("call", "ucall", "rcall", "ircall")
+
+
+def esil_step_one(execute=True):
+    """One instruction at the PC, as rizin's rz_core_esil_step does: "ok", "bp" (the new PC is a breakpoint:
+    announced on stdout), "trap" (esil.exectrap: the PC is not in executable memory) or "invalid" (nothing is
+    mapped at the PC and esil.breakoninvalid is on); both are announced on stderr and the PC stays."""
+    regs = esil["regs"]
+    pc = regs[ROLES["PC"]]
+    if state["config"].get("esil.exectrap") == "true" and not esil_executable(pc):
+        err("ERROR: core: esil: Trap, trying to execute on non-executable memory\n")
+        return "trap"
+    if not esil_mapped(pc):
+        if state["config"].get("esil.breakoninvalid") == "true":
+            err(ESIL_INVALID)
+            return "invalid"
+        regs[ROLES["PC"]] = pc + 1
+        return "ok"
+    op = esil_ops().get(pc)
+    nxt = pc + (op["size"] if op else 1)
+    kind = op["type"] if op else "nop"
+    if kind == "call":
+        esil_push(nxt)
+        nxt = op["jump"]
+    elif esil_is_call(op):
+        esil_push(nxt)
+        nxt = 0
+    elif kind == "jmp":
+        nxt = op["jump"]
+    elif kind == "cjmp":
+        nxt = op["fail"]
+    elif kind == "ret":
+        nxt = esil_pop()
+    elif kind == "ijmp":
+        nxt = 0
+    elif kind == "xor" and op.get("ptr") is not None:
+        # a store (`xor byte [<addr>], <key>`): the byte goes through the write cache, as rizin's ESIL does
+        cache_write(op["ptr"], bytes(byte_at(op["ptr"] + i) ^ XOR_KEY for i in range(ORDER_WIDTH.get(pc, 1))))
+    regs[ROLES["PC"]] = nxt % 2 ** BITS
+    return esil_stop_at_breakpoint()
+
+
+def esil_stop_at_breakpoint():
+    pc = esil["regs"][ROLES["PC"]]
+    if pc in state["bps"]:  # rizin 0.9.1 does not look at "enabled": a disabled breakpoint still stops
+        out(f"[ESIL] hit breakpoint at {pc:#x}\n")
+        return "bp"
+    return "ok"
+
+
+def esil_run(until=None, stop_at_call=False, over=None):
+    """aec, aecu, aesu, aecc, aeso's run: step until the PC is ``until`` (or at a call, or ``over``, the
+    address after a call), a breakpoint or an invalid instruction stops it."""
+    for _ in range(ESIL_CAP):
+        result = esil_step_one()
+        pc = esil["regs"][ROLES["PC"]]
+        if result != "ok" or pc == until or pc == over:
+            return
+        if stop_at_call and (esil_ops().get(pc) or {}).get("type") in ("call", "ucall"):  # like aecc: not an ircall
+            err(f"ERROR: call at {pc:#010x}\n")
+            return
+    err("WARNING: core: esil: timeout exceeded.\n")
+
+
+def esil_timeout():
+    """A run that ends at esil.timeout: the flood of warnings first (FAKE_RIZIN_ESIL_FLOOD), the timeout last."""
+    for _ in range(int(os.environ.get("FAKE_RIZIN_ESIL_FLOOD") or 0)):
+        err("WARNING: $ returned 0\n")
+    err("WARNING: core: esil: timeout exceeded.\n")
+
+
+def esil_command(word, rest, seek):
+    """The ESIL step commands; None for a word that is none."""
+    regs = esil["regs"]
+    if word not in ("aes", "aeso", "aess", "aesu", "aecu", "aecc", "aec"):
+        return None
+    if regs is None:
+        err("ERROR: ESIL is not initialized. Use `aei` first.\n")
+        return ""
+    pc = regs[ROLES["PC"]]
+    op = esil_ops().get(pc)
+    if word == "aes":
+        for _ in range(int(rest) if rest.isdigit() else 1):
+            if esil_step_one() != "ok":
+                break
+    elif word == "aeso":
+        # rizin 0.9.1 steps over a plain "call" only: any other call (ircall) it steps into
+        if op and op["type"] == "call" and esil_step_one() == "ok":
+            esil_run(over=pc + op["size"])
+        elif not op or op["type"] != "call":
+            esil_step_one()
+    elif word == "aess":
+        # rizin 0.9.1 skips these (rz_core_esil_step's stepOver switch); an ircall it runs
+        if op and op["type"] in ("call", "ucall", "rcall", "jmp", "cjmp", "ret"):
+            regs[ROLES["PC"]] = pc + op["size"]  # not run
+            esil_stop_at_breakpoint()
+        else:
+            esil_step_one()
+    elif word in ("aesu", "aecu"):
+        target = number(rest)
+        if target is not None and os.environ.get("FAKE_RIZIN_ESIL_RUNAWAY"):
+            esil_timeout()
+        elif target is not None:
+            esil_run(until=target)
+    elif word == "aecc":
+        esil_run(stop_at_call=True)
+    elif os.environ.get("FAKE_RIZIN_ESIL_RUNAWAY"):  # aec
+        esil_timeout()
+    else:
+        esil_run()
+    return ""
+
+
+def esil_breakpoints(word, rest, seek):
+    """``db @ addr`` and friends: rizin's db takes no address argument. ``dblj`` answers them in the
+    order they were set, not sorted (measured) -- the server is the one that sorts.
+
+    A breakpoint is {"enabled", "data", "cond"}: ``dbc <cmd>`` sets the command rizin runs when it hits
+    and ``dbC <expr>`` the condition, both reported by ``dblj`` and both emptied by an empty argument
+    (measured: ``dbc`` with no argument at all leaves them as they are).
+    """
+    bps = state["bps"]
+    if word == "dblj":
+        return json.dumps([{"addr": addr, "size": 1, "perm": "--x", "hw": False, "trace": False,
+                            "enabled": bp["enabled"], "valid": esil_mapped(addr), "data": bp["data"],
+                            "cond": bp["cond"]} for addr, bp in bps.items()]) + "\n"
+    if word == "db":
+        if seek in bps or os.environ.get("FAKE_RIZIN_BP_IGNORED"):
+            # rizin keeps the breakpoint it has there, disabled or not; FAKE_RIZIN_BP_IGNORED stands for
+            # the address another breakpoint's width covers already, where rizin sets none at all
+            err("ERROR: Breakpoint already set at this address.\n")
+            err(f"ERROR: Cannot set breakpoint at {seek:#x}\n")
+        else:
+            bps[seek] = {"enabled": True, "data": "", "cond": ""}
+    elif word == "db-":
+        if bps.pop(seek, None) is None:
+            err(f"ERROR: Failed to delete breakpoint at {seek:#x}\n")
+    elif word == "db-*":
+        bps.clear()
+    elif word in ("dbd", "dbe") and seek in bps:
+        bps[seek]["enabled"] = word == "dbe"
+    elif word in ("dbc", "dbC") and seek in bps:
+        if not rest.strip():
+            err("ERROR: Wrong number of arguments passed to `dbc`, see its help with `dbc?`\n")
+        elif not os.environ.get("FAKE_RIZIN_BP_ARMED"):
+            # rizin's parser takes a surrounding pair of quotes off, so `dbc ""` empties the field
+            # (measured) while `dbc` without an argument at all leaves it as it is.
+            # FAKE_RIZIN_BP_ARMED stands for a rizin that does not let the command go, which is why
+            # the server reads the list back instead of trusting the command.
+            value = rest.strip()
+            if len(value) >= 2 and value[0] == value[-1] in "\"'":
+                value = value[1:-1]
+            bps[seek]["data" if word == "dbc" else "cond"] = value
+    return ""
+
+
+
+def analysis_function(word, rest, seek):
+    """``af`` and ``af-``, as rizin 0.9.1 answers them.
+
+    ``af`` prints nothing. It analyses the function at the seek: a function of the model that ``af-``
+    removed comes back (rizin builds it from the bytes again), and the ones FAKE_RIZIN_EXTRA_FUNCTION
+    holds back are revealed -- a function rizin only knows once something has analysed the bytes there.
+    With ``analysis.limits`` on, only those inside [analysis.from, analysis.to) are, which is how rizin
+    bounds af's recursion: measured on rizin 0.9.1, without the limits ``af`` followed a call out of the
+    range and made a function at its target, and it did so with ``analysis.calls`` false as well.
+
+    ``af-`` removes the function the seek is **in**, not only one that starts there (measured).
+    """
+    if word == "af-":
+        fn = function_at(seek)
+        if fn is not None:
+            FUNCTIONS.remove(fn)
+        return ""
+    cfg, low, high = state["config"], None, None
+    if cfg.get("analysis.limits") == "true":
+        low, high = number(cfg.get("analysis.from")), number(cfg.get("analysis.to"))
+    for fn in [fn for fn in (TEMPLATES.get(seek),) if fn] + list(HELD.values()):
+        if low is not None and not low <= fn["offset"] < high:
+            continue
+        if function_at(fn["offset"]) is None:
+            FUNCTIONS.append(dict(fn))
+    return ""
+
+
+def string_search(rest):
+    """``/zj <pattern> <regex_flags> <encoding>``: rizin 0.9.1's string search.
+
+    It takes a **pattern** -- there is no "list the strings here" form, and without one it refuses
+    (measured) -- and answers [{"address", "size", "flag", "detail"}], an empty array for no hit. With
+    ``search.flags`` (on by default) every hit gets a flag ``hit.string.<encoding>.<n>``, numbered from 0
+    at every search, so a second search writes over the first one's flags (measured).
+
+    The search covers [search.from, search.to) when ``search.in`` is "range", and the file's maps
+    otherwise; a hit is cut off at the end of the range (measured). Of the patterns rizin takes, the model
+    reads only the printable run the server searches for, ``[[:print:]]{N,}``: N is its least length.
+    """
+    args = rest.split()
+    if not args:
+        err("ERROR: Wrong number of arguments passed to `/zj`, see its help with `/zj?`\n")
+        return ""
+    least = re.search(r"\{(\d+),\}", args[0])
+    least = int(least.group(1)) if least else 1
+    encoding = args[2] if len(args) > 2 else "ascii"
+    cfg = state["config"]
+    if cfg.get("search.in") == "range":
+        start, end = number(cfg.get("search.from")) or 0, number(cfg.get("search.to")) or 0
+    else:
+        start, end = BASE, MAPPED_END
+    end = min(end, start + SEARCH_MAX)  # the model reads at most SEARCH_MAX bytes of a range
+    hits, run = [], 0
+    for at in range(start, end + 1):  # one past the end, so that a run reaching it is written down
+        if at < end and 0x20 <= byte_at(at) <= 0x7E:
+            run += 1
+            continue
+        if run >= least:
+            hits.append({"address": at - run, "size": run,
+                         "flag": f"hit.string.{encoding}.{len(hits)}", "detail": run})
+        run = 0
+    state["hits"] = {hit["flag"]: hit["address"] for hit in hits}
+    return json.dumps(hits) + "\n"
+
+
+def esil_registers(rest):
+    """``ar``, ``ar <name|PC|SP>``, ``ar <name>=<value>``, like rizin 0.9.1's ``name = 0x%016x`` lines."""
+    armed = esil["regs"] is not None
+    regs = esil["regs"] if armed else esil_new_regs()  # before aei too, as rizin does (measured)
+    arg = rest.strip()
+    if "=" in arg:
+        name, _, value = arg.partition("=")
+        name = ROLES.get(name.strip(), name.strip())
+        if name not in regs or number(value) is None:
+            err(f"ERROR: core: Unknown register {name}\n")
+            return ""
+        regs[name] = number(value) & (2 ** BITS - 1)
+        if not armed:
+            esil["pre"][name] = regs[name]
+        return ""
+    if not arg:
+        return "".join(f"{name} = {value:#0{BITS // 4 + 2}x}\n" for name, value in regs.items())
+    if arg == "SP" and os.environ.get("FAKE_RIZIN_NO_SP"):
+        return ""
+    name = ROLES.get(arg, arg)
+    if name not in regs:
+        err(f"ERROR: core: No such register '{arg}'\n")
+        return ""
+    return f"{name} = {regs[name]:#0{BITS // 4 + 2}x}\n\n"  # rizin ends the answer of a filter with an empty line
+
+
+def all_flags():
+    """(offset, name) of every flag; once the VM is armed, like rizin's aei, also a flag per register at
+    its value (flagspace registers), and the hits of the last string search (see string_search)."""
+    flags = [(fn["offset"], name_of(fn)) for fn in FUNCTIONS] + [(a, n) for n, a in FLAGS.items()]
+    flags += [(addr, name) for name, addr in state["hits"].items()]
+    if esil["regs"] is not None:
+        flags += [(value, name) for name, value in esil["regs"].items()]
+    return flags
+
+
+def flag_describe(addr):
+    """``fd``: the closest flag at or below addr, however far, as "name" or "name + delta"."""
+    below = [(offset, name) for offset, name in all_flags() if offset <= addr]
+    if not below:
+        return ""
+    offset, name = max(below)
+    return f"{name}\n" if offset == addr else f"{name} + {addr - offset}\n"
+
+
+def flags_at(addr):
+    """``fd.j``: every flag exactly at addr (nothing at all where there is none)."""
+    found = [{"name": name, "realname": name} for offset, name in all_flags() if offset == addr]
+    return json.dumps(found) + "\n" if found else ""
+
+
+def maps_json():
+    """``omlj``: the file's maps and the ESIL VM's (the stack, and the buffers mapped beside it)."""
+    maps = list(MAPS)
+    for addr, memory, name in esil_maps():
+        maps.append({"map": len(maps) + 1, "fd": 5 + len(maps) - len(MAPS), "delta": 0, "from": addr,
+                     "to": addr + len(memory), "perm": esil_perm(addr), "name": name})
+    return json.dumps(maps) + "\n"
 
 
 def block_json(block):
@@ -295,6 +1035,15 @@ def code_json():
 
 
 def save_project(path):
+    """``Ps``: what rizin 0.9.1 writes into a project of the parts the server cares about.
+
+    Its breakpoints are in it (/core/debug/breakpoints) and its **write cache is not** -- both measured,
+    and together they are the reason the server keeps the patches in a /tdc namespace of its own.
+
+    Its functions (/core/analysis/functions) and flags (/core/flags/flags, each with the space it is in)
+    are in it as well, which is how what a range re-analysis found would come back in the next session
+    over bytes that are not in the file (measured; see rizin_sessions._run_only).
+    """
     functions = {}
     for fn in FUNCTIONS:
         functions[hex(fn["offset"])] = {"name": name_of(fn), "vars": [
@@ -306,6 +1055,18 @@ def save_project(path):
     lines = ["/", "type=rizin rz-db project", "version=25", "", "/core", f"offset={state['seek']:#x}",
              "", "/core/analysis/functions"]
     lines += [f"{k}={json.dumps(v, separators=(',', ':'))}" for k, v in functions.items()]
+    lines += ["", "/core/debug/breakpoints"]
+    lines += [f"{addr:#x}=" + json.dumps({"data": bp["data"], "cond": bp["cond"], "size": 1, "perm": 1,
+                                          "enabled": 1 if bp["enabled"] else 0, "name": f"{addr:#010x}"},
+                                         separators=(",", ":"))
+              for addr, bp in state["bps"].items()]
+    lines += ["", "/core/flags/flags"]
+    flags = [(name_of(fn), fn["offset"], fn["size"], "functions") for fn in FUNCTIONS]
+    flags += [(name, addr, 8, "symbols") for name, addr in FLAGS.items()]
+    flags += [(name, addr, 1, "search") for name, addr in state["hits"].items()]
+    lines += [f"{name}=" + json.dumps({"realname": name, "offset": addr, "size": size, "space": space},
+                                      separators=(",", ":"))
+              for name, addr, size, space in flags]
     lines += ["", "/core/fake", "comments=" + json.dumps({hex(k): v for k, v in state["comments"].items()})]
     with open(path, "w", encoding="utf-8") as fh:
         fh.write("\n".join(lines) + "\n")
@@ -323,6 +1084,11 @@ def load_project(path):
                 state["names"][int(key, 16)] = json.loads(value)["name"]
                 if '"DWARF"' in value:
                     state["dwarf"] = True
+            elif ns == "/core/debug/breakpoints" and "=" in line:  # like Poo: the breakpoints come back
+                key, value = line.split("=", 1)                    # with their command and condition
+                saved = json.loads(value)
+                state["bps"][int(key, 16)] = {"enabled": bool(saved.get("enabled")),
+                                              "data": saved.get("data") or "", "cond": saved.get("cond") or ""}
             elif ns == "/core/fake" and line.startswith("comments="):
                 state["comments"] = {int(k, 16): v for k, v in json.loads(line[9:]).items()}
             elif ns == "/core" and line.startswith("offset="):
@@ -337,6 +1103,17 @@ def load_project(path):
 
 
 def answer(cmd):
+    head, temporary, settings = cmd.partition(" @e:")
+    if temporary:
+        # rizin's temporary eval: the settings hold for this command and the old ones come back after it
+        saved = dict(state["config"])
+        for token in settings.split(","):
+            key, _, value = token.partition("=")
+            state["config"][key.strip()] = value.strip()
+        try:
+            return answer(head)
+        finally:
+            state["config"] = saved
     cmd, _, grep = cmd.partition("~")
     if grep == "?":
         return f"{len(answer(cmd).splitlines())}\n"
@@ -365,7 +1142,7 @@ def answer(cmd):
         fmt = os.environ.get("FAKE_RIZIN_FORMAT", "pe64")
         return json.dumps({"core": {"file": sys.argv[-1], "size": os.path.getsize(sys.argv[-1]),
                                     "format": fmt},
-                           "bin": {"arch": "x86", "bits": 64, "bintype": "pe", "lang": "c"}}) + "\n"
+                           "bin": {"arch": ARCH, "bits": BITS, "bintype": "pe", "lang": "c"}}) + "\n"
     if word == "afl":
         # rizin 0.9.1: "<offset> <nbbs> <size>[ -> <realsz>]  <name>", by address; realsz where there are gaps
         lines = []
@@ -422,6 +1199,7 @@ def answer(cmd):
         extra = int(os.environ.get("FAKE_RIZIN_FLAGS") or 0)
         flags = [(name_of(fn), fn["offset"], fn["size"]) for fn in FUNCTIONS]
         flags += [(name, addr, 8) for name, addr in FLAGS.items()]
+        flags += [(name, addr, 1) for name, addr in state["hits"].items()]
         flags += [(f"str.extra_{i:04d}", 0x140007000 + i * 16, 16) for i in range(extra)]
         return json.dumps([{"name": name, "realname": name.split(".")[-1], "size": size, "offset": addr}
                            for name, addr, size in reversed(flags)]) + "\n"
@@ -432,7 +1210,7 @@ def answer(cmd):
         return json.dumps({"raised": True, "fd": 3, "uri": sys.argv[-1], "from": 0, "writable": False,
                            "size": os.path.getsize(sys.argv[-1])}) + "\n"
     if word == "oml.j":
-        found = next((m for m in MAPS if m["from"] <= seek < m["to"]), None)
+        found = next((m for m in reversed(MAPS) if m["from"] <= seek < m["to"]), None)  # the topmost
         if found is None:
             err(f"ERROR: Cannot find any map at the current address {seek:x}\n")
             return ""
@@ -465,6 +1243,11 @@ def answer(cmd):
         if tokens and all("=" in token for token in tokens):
             for token in tokens:
                 key, _, value = token.partition("=")
+                if key == "io.cache" and value == "true":
+                    state["cache_sets"] = state.get("cache_sets", 0) + 1
+                    if os.environ.get("FAKE_RIZIN_NO_IO_CACHE") or (
+                            os.environ.get("FAKE_RIZIN_IO_CACHE_ONCE") and state["cache_sets"] > 1):
+                        continue
                 state["config"][key] = value
                 if key in ("asm.arch", "analysis.arch"):  # like rizin, one sets the other
                     state["config"]["asm.arch"] = state["config"]["analysis.arch"] = value
@@ -507,6 +1290,56 @@ def answer(cmd):
     if word.startswith("Z") or word == "xyzzy":
         err(f"ERROR: Command '{word}' does not exist.\n")
         return ""
+    if word in ("db", "db-", "db-*", "dbd", "dbe", "dblj", "dbc", "dbC"):
+        if word not in ("dblj", "db-*") and at is None:
+            err("ERROR: Wrong number of arguments passed to `db`, see its help with `db?`\n")
+            return ""
+        return esil_breakpoints(word, rest, seek)
+    if word == "o-":
+        return esil_close_fd(rest)
+    if word in ("wx", "wcj", "wc-", "wc-*"):
+        return write_cache(word, rest, seek)
+    if word in ("af", "af-"):
+        return analysis_function(word, rest, seek)
+    if word == "/zj":
+        return string_search(rest)
+    stepped = esil_command(word, rest, seek)
+    if stepped is not None:
+        return stepped
+    if word == "ara0":
+        # every register to zero, the PC and the stack pointer with them (measured), and what ar set before aei is gone
+        if os.environ.get("FAKE_RIZIN_ARA0_IGNORED"):
+            return ""
+        esil["pre"].clear()
+        if esil["regs"] is not None:
+            esil["regs"] = dict.fromkeys(REG_NAMES, 0)
+        return ""
+    if word == "aei":
+        # like rizin's reinit: a new VM, the registers stay, the PC goes to the seek
+        if esil["regs"] is None:
+            esil["regs"] = esil_new_regs()
+        esil["regs"][ROLES["PC"]] = seek
+        return ""
+    if word == "aeim":
+        esil_map_stack(rest.split())
+        return ""
+    if word == "aeim-":
+        esil_drop_last()
+        return ""
+    if word == "aepc":
+        if number(rest) is not None:
+            (esil["pre"] if esil["regs"] is None else esil["regs"])[ROLES["PC"]] = number(rest)
+        return ""
+    if word == "ar":
+        return esil_registers(rest)
+    if word == "fd":
+        return flag_describe(seek)
+    if word == "fd.j":
+        return flags_at(seek)
+    if word == "omlj":
+        return "no maps for you" if os.environ.get("FAKE_RIZIN_BAD_OMLJ") else maps_json()
+    if word == "omf":
+        return esil_set_perm(rest, seek)
     if word.startswith("a") or word in ("Fa",):
         return ""
     if word == "pd":
@@ -538,6 +1371,17 @@ def main():
         if not line:
             return
         cmd = line.decode("utf-8", "replace").rstrip("\r\n")
+        if len(cmd) > RIZIN_LINE_MAX:
+            # rizin 0.9.1 reads its stdin a line at a time and cuts one that is longer, without a word:
+            # measured, a `wx` of 2040 bytes on a line of exactly 4096 characters wrote them at the
+            # address of the **cut** line (0x500040 for a request at 0x50004000 -- rizin keeps 4094
+            # characters, so the two last ones of the address are gone) and said nothing at all, and a
+            # longer line said only "Could not convert hexpair" on stderr. rizin's own cut
+            # is a character or two shorter than this one, so what lands where is not the same byte for
+            # byte; what is the same, and all a test here needs, is that a command line at or over the
+            # wall does not do what it says. The server keeps every command it builds well inside it
+            # (rizin_emulation.MAX_PATCH_BYTES, ASSIST_WRITE_CHUNK, MAX_CONSOLE_COMMAND).
+            cmd = cmd[:RIZIN_LINE_MAX]
         log(cmd)
         if CRASH and cmd.split(" ", 1)[0] == CRASH:
             os._exit(139)

@@ -2008,6 +2008,48 @@
     font-family: var(--cp-font-label);
     letter-spacing: .04em;
 }
+[data-theme] .rizin-run {
+    font-family: var(--cp-font-label);
+    color: var(--cp-text-muted);
+    background: var(--cp-card);
+    border: var(--cp-card-border);
+    border-left: 3px solid var(--cp-orange);
+    border-radius: 6px;
+}
+[data-theme] .rizin-run-pc,
+[data-theme] .rizin-run-pc-value,
+[data-theme] .rizin-run-reg-name,
+[data-theme] .rizin-run-why {
+    color: var(--cp-text);
+}
+[data-theme] .rizin-run-pc-label,
+[data-theme] .rizin-run-delta {
+    color: var(--cp-orange);
+}
+[data-theme] .rizin-run-reg {
+    border-left-color: var(--cp-orange);
+}
+[data-theme] .rizin-run-reg-value {
+    color: var(--cp-cyan);
+}
+[data-theme] .rizin-run-none,
+[data-theme] .rizin-run-more,
+[data-theme] .rizin-run-assist-label {
+    color: var(--cp-text-dim);
+}
+[data-theme] .rizin-run-why-wait,
+[data-theme] .rizin-run-assist-text {
+    color: var(--cp-amber);
+}
+[data-theme] .rizin-run-why-note {
+    color: var(--cp-red);
+}
+[data-theme] .rizin-run-assist {
+    font-family: var(--cp-font-label);
+}
+[data-theme] .rizin-run-value {
+    font-family: var(--cp-font-label);
+}
 [data-theme] .rizin-seek-input {
     background-color: var(--cp-bg);
     border-color: rgba(var(--cp-magenta-rgb), .35);
@@ -2124,6 +2166,38 @@
     background: rgba(var(--cp-magenta-rgb), .12);
     box-shadow: inset 0 0 0 1px rgba(var(--cp-magenta-rgb), .35);
 }
+[data-theme] .rizin-op.pc {
+    outline-color: var(--cp-orange);
+}
+[data-theme] .rizin-op.pc::before {
+    color: var(--cp-orange);
+}
+[data-theme] .rizin-gutter,
+[data-theme] .rizin-dec-gutter {
+    color: var(--cp-red);
+}
+[data-theme] .rizin-gutter:not(.on)::before,
+[data-theme] .rizin-dec-gutter:not(.on)::before {
+    color: var(--cp-text-dim);
+}
+[data-theme] .rizin-gutter:not(.on):hover::before,
+[data-theme] .rizin-dec-gutter:not(.on):hover::before {
+    color: var(--cp-text-muted);
+}
+[data-theme] .rizin-gutter-busy .rizin-gutter,
+[data-theme] .rizin-gutter-busy .rizin-dec-gutter {
+    cursor: progress;
+}
+[data-theme] .rizin-gutter.on,
+[data-theme] .rizin-dec-gutter.on {
+    text-shadow: 0 0 6px rgba(var(--cp-red-rgb), .6);
+}
+[data-theme] .rz-pm {
+    color: var(--cp-gold);
+}
+[data-theme] .rizin-op.patched .rz-mnem {
+    text-decoration-color: var(--cp-gold);
+}
 [data-theme] .rizin-console {
     background: var(--c-navy-990);
     border-color: var(--cp-line);
@@ -2167,6 +2241,9 @@
 [data-theme] .rizin-block.current .rizin-block-box {
     fill: rgba(var(--cp-magenta-rgb), .08);
     stroke: var(--cp-magenta);
+}
+[data-theme] .rizin-block.pc .rizin-block-box {
+    stroke: var(--cp-orange);
 }
 [data-theme] .rizin-block-addr {
     fill: var(--cp-cyan);
@@ -2284,6 +2361,78 @@
 [data-theme] .rizin-xref-fn {
     color: var(--cp-text);
 }
+/* The EMULATION pane in the colours of the run strip (orange: the PC and what changed), the dock's cyan heads and the
+   rows of the lists; the hand-made group in green, the run's in orange */
+[data-theme] .rizin-emu-pane {
+    font-family: var(--cp-font-label);
+}
+[data-theme] .rizin-emu-head {
+    font-family: var(--cp-font-label);
+    color: var(--cp-cyan);
+}
+[data-theme] .rizin-emu-head b {
+    color: var(--cp-magenta);
+}
+[data-theme] .rizin-emu-reg {
+    color: var(--cp-text-muted);
+}
+[data-theme] .rizin-emu-reg.changed {
+    border-left-color: var(--cp-orange);
+}
+[data-theme] .rizin-emu-reg-name,
+[data-theme] .rizin-emu-fn,
+[data-theme] .rizin-emu-subhead {
+    color: var(--cp-text);
+}
+[data-theme] .rizin-emu-delta {
+    color: var(--cp-orange);
+}
+[data-theme] .rizin-emu-reg-input {
+    font-family: var(--cp-font-label);
+    color: var(--cp-cyan);
+    border-color: rgba(var(--cp-magenta-rgb), .22);
+}
+[data-theme] .rizin-emu-hint,
+[data-theme] .rizin-emu-warn,
+[data-theme] .rizin-emu-over-mark,
+[data-theme] .rizin-emu-urgent,
+[data-theme] .rizin-emu-note-wait {
+    color: var(--cp-amber);
+}
+[data-theme] .rizin-emu-bytes {
+    color: var(--cp-gold);
+}
+[data-theme] .rizin-emu-group {
+    border-left-color: var(--cp-line);
+}
+[data-theme] .rizin-emu-hand {
+    border-left-color: var(--cp-green);
+}
+[data-theme] .rizin-emu-run {
+    border-left-color: var(--cp-orange);
+}
+[data-theme] .rizin-emu-fate {
+    color: var(--cp-text-dim);
+}
+[data-theme] .rizin-emu-run .rizin-emu-fate {
+    color: var(--cp-orange);
+}
+[data-theme] .rizin-emu-waiting {
+    border-left-color: var(--cp-amber);
+}
+[data-theme] .rizin-emu-waiting .rizin-emu-fate {
+    color: var(--cp-amber);
+}
+[data-theme] .rizin-emu-note,
+[data-theme] .rizin-emu-export {
+    color: var(--cp-text-muted);
+}
+[data-theme] .rizin-emu-export {
+    border-color: var(--cp-line);
+}
+[data-theme] .rizin-emu-note-error {
+    color: var(--cp-red);
+}
 [data-theme] .rizin-menu {
     background: var(--cp-card);
     border: 1px solid rgba(var(--cp-magenta-rgb), .45);
@@ -2310,6 +2459,12 @@
     border-color: transparent;
 }
 [data-theme] .rizin-menu-label {
+    color: var(--cp-text-dim);
+}
+[data-theme] .rizin-menu-sep {
+    border-top-color: var(--cp-line);
+}
+[data-theme] .rizin-menu-note.rizin-menu-hint {
     color: var(--cp-text-dim);
 }
 /* DECOMPILER and HEX as the disassembly: on the panel, the lines in the

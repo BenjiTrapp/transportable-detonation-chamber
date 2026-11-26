@@ -480,6 +480,32 @@ programs that mimic implant behaviour).
 > reference (`fcn.140001000` at 0x1400010a7) and `s 0x1400010a7` follows it;
 > the prompt `[0x1400010a7]>` stands at the place the views show.
 
+![Rizin tab after reopening beaconsim.exe: the EMULATION pane offers Restore the run, and the WAITING group holds the patch at 0x14002f054 that was set over bytes an emulation run wrote](../static/rizin_emulation.png)
+
+> The same tab after a session was **reopened**, which is what the emulator's
+> patching is for. Earlier, `beaconsim.exe` was emulated from `entry0`, stepped
+> five times past `mov dword [rax], 0x00` at 0x1400016c1 — the write that puts
+> four bytes into `.data` at 0x14002f054 — and that address was then patched to
+> `90909090`. Here the file is open again: the toolbar reads *PE64 · x86-64 ·
+> 184.5 KB*, `200b246f…fcbb307e`, *analysed (aaa)*, and FUNCTIONS lists 119
+> functions with `entry0` (37 bytes) marked. DISASSEMBLY shows `entry0` with the
+> gutter down its left edge: a faint `○` on every line, so the column can be
+> seen and aimed at, and one click there sets a breakpoint. GRAPH draws the
+> function's single block.
+>
+> The **EMULATION** pane below carries the way back. **Restore the run** is
+> offered, because the project kept the recipe of that session — seven actions
+> and two ranges the SHA-256 covers — and the write cache holds nothing but
+> what the open applied. The notice says what the open did: *"Held back, not
+> applied: 1 saved patch over bytes an emulation run wrote (0x14002f054). The
+> file's own bytes there are still encrypted, and a patch written into them
+> would be decrypted over by the next run."* PATCHES has the three groups:
+> **SET BY HAND · 0**, because nothing was written into the cache; **WAITING ·
+> 1**, the patch itself (`0x14002f054`, 4 B · `90909090`) with its reason and
+> the `✕` that takes it out of the project — *Apply now* is absent, since no
+> run's bytes lie under it yet; and **WRITTEN BY THE RUN · 0**, the bytes that
+> end with the session.
+
 ---
 
 ### Live Process Memory
