@@ -28,11 +28,17 @@ prebuilt/
 # Runtime state written by the Web UI
 webui/scan_history.json
 webui/memory_baseline.json
+# The clean-machine baseline of the network analysis, and a write of either that
+# did not finish (both are written by replacing a .tmp beside them)
+webui/memory_baseline.json.tmp
+webui/net_baseline.json
+webui/net_baseline.json.tmp
 # Hooks known on this host (syscall map), and the copy kept of one that could not be read
 webui/syscall_hook_allowlist.json
 webui/syscall_hook_allowlist.json.tmp
 webui/syscall_hook_allowlist.json.corrupt
 webui/memory_results/
+webui/net_results/
 webui/rizin_projects/
 # A write of submissions.json that did not finish (the file itself is in the repository)
 webui/submissions.json.tmp
