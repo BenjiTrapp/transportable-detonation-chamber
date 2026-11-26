@@ -902,7 +902,9 @@ routes['/api/binary-graph/query'] = queryRoute;
 def _explore_flow(script):
     consts = "\n".join(_const(c) for c in FLOW_CONSTS + EXPLORE_CONSTS)
     return _run_node(FLOW_FUNCTIONS + EXPLORE_FUNCTIONS, FLOW_DOM + EXPLORE_DOM + script,
-                     "const themeColor = (name, alpha) => alpha === undefined ? name : name + '/' + alpha;\n" + consts)
+                     "// a test that needs a variable to be missing sets globalThis.noColour to its name\n"
+                     "const themeColor = (name, alpha) => name === globalThis.noColour ? ''\n"
+                     "    : alpha === undefined ? name : name + '/' + alpha;\n" + consts)
 
 
 def _explore_markup():
@@ -2337,3 +2339,28 @@ def test_a_text_on_the_canvas_gets_a_strip_behind_it_so_it_never_crosses_the_dra
     assert opening, [t["text"][:30] for t in r["busy"]["placed"]]
     assert any(abs(s["y"] - opening["y"]) < 6 for s in r["busy"]["strips"]), \
         "Opening… lies on the drawing just as the caveat does"
+
+
+@needs_node
+def test_without_a_backdrop_colour_the_caveat_keeps_its_own_and_gets_no_strip():
+    """Found in review. `themeColor` gives '' for a variable that is not there, and a real canvas ignores an
+    invalid fillStyle: the strip would then be filled in the caveat's own colour and the text drawn orange on
+    orange - unreadable, and strictly worse than no strip at all. So an empty backdrop skips the fill, which is
+    the behaviour before the strip existed. Not reachable with the shipped CSS, where --bg-secondary is defined
+    in both themes; it is the direction of the failure that matters, because this caveat is the line that says a
+    count is only a lower bound."""
+    r = _explore_flow(r"""
+      (async () => {
+        GRAPH['ntdll.dll'] = { in_degree: 9, imports: { 'kernel32.dll': ['CloseHandle'] }, partial: true };
+        await binaryGraphExploreStart('ntdll.dll');
+        await binaryGraphExpand('ntdll.dll');
+        const withColour = frame();
+        globalThis.noColour = '--bg-secondary';
+        binaryGraphDraw();
+        const without = frame();
+        out({ withStrip: withColour.strips.length, withoutStrip: without.strips.length,
+              text: without.placed.filter(t => t.text.startsWith('Not the whole')).map(t => t.color) });""" + r"""
+      })();""")
+    assert r["withStrip"] >= 1, "the strip is there when the backdrop is"
+    assert r["withoutStrip"] == 0, "an empty backdrop fills nothing rather than filling in the text's colour"
+    assert r["text"] == ["--severity-medium"], f"and the caveat keeps its own colour: {r['text']}"

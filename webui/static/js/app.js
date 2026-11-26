@@ -29847,11 +29847,18 @@ function binaryGraphDraw() {
     // node labels (seen at 1920x1080 with 400 nodes, through the label of bi.dll). So each gets a strip of the
     // backdrop behind it first, as wide as it measures and no wider. Opaque on purpose: the caveat says a count is
     // a lower bound, and a reader who cannot read it is worse off than one who has to pan a little.
+    //
+    // Only correct for textAlign left and textBaseline top, which this block sets. Without a backdrop colour it
+    // fills nothing: a canvas ignores an invalid fillStyle, so the strip would take the text's own colour and the
+    // caveat would be drawn on itself - unreadable, and worse than no strip.
     const onCanvas = (text, x, y) => {
-        const colour = ctx.fillStyle;
-        ctx.fillStyle = themeColor('--bg-secondary');
-        ctx.fillRect(x - 4, y - 3, Math.ceil(ctx.measureText(text).width) + 8, 18);
-        ctx.fillStyle = colour;
+        const backdrop = themeColor('--bg-secondary');
+        if (backdrop) {
+            const colour = ctx.fillStyle;
+            ctx.fillStyle = backdrop;
+            ctx.fillRect(x - 4, y - 3, Math.ceil(ctx.measureText(text).width) + 8, 18);
+            ctx.fillStyle = colour;
+        }
         ctx.fillText(text, x, y);
     };
     if (cut.any) {

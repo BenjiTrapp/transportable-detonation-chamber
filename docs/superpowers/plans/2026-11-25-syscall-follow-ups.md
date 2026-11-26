@@ -27,13 +27,19 @@ und braucht eine eigene Runde.
 
 ## 2. Der Vorbehalt auf der Graph-Leinwand kreuzt die Zeichnung — behoben am 26.11.2026
 
-**Behoben.** Beide Texte, die auf der Leinwand liegen (der Vorbehalt und `Opening…`), bekommen
-zuerst einen Streifen in `--bg-secondary` hinter sich, so breit wie der Text misst und nicht
-breiter. In Chrome gegen die VM nachgemessen, 400 Knoten, beide Themes: die Zeile des Streifens
+**Behoben.** Beide Texte, die über der Zeichnung liegen (der Vorbehalt und `Opening…`), bekommen
+zuerst einen Streifen in `--bg-secondary` hinter sich: so breit wie der Text misst, plus 4 px auf
+jeder Seite, und 18 px hoch. Der dritte Text der Leinwand, die Zeile des leeren Zustands, bekommt
+keinen — dort ist keine Zeichnung, die er kreuzen könnte. In Chrome gegen die VM nachgemessen, 400 Knoten, beide Themes: die Zeile des Streifens
 ist über 1200 px **eine** flache Farbe (`20,13,36` in Cyberpunk, `18,21,40` in Classic), 40 px
 darunter sind es 42 bis 44 Farben — dort liegt die Zeichnung. Der Streifen ist absichtlich
 deckend: der Vorbehalt sagt, dass eine Zahl eine Untergrenze ist, und wer ihn nicht lesen kann,
 ist schlechter dran als wer ein Stück schwenken muss.
+
+**Noch offen, keine Entscheidung getroffen:** der HTML-Status über der Leinwand
+(`#binary-explore-status`) sagt denselben Vorbehalt noch einmal, in fünf Zeilen zu ~470 Zeichen.
+Die Dopplung ist gewollt (der HTML-Status kann aus dem Blick scrollen, der auf der Leinwand
+nicht), aber beide zusammen sind viel Text.
 
 Der Befund, wie er stand:
 
@@ -46,10 +52,6 @@ Richtung: ein Füllstreifen in Hintergrundfarbe hinter dem Text, bevor er gezeic
 Der Vorbehalt bleibt, die Kollision geht. Etwa zehn Zeilen in `binaryGraphDraw` plus ein
 Test, danach auf der VM in beiden Themes nachsehen.
 
-Dazu, falls es jemand anfasst: der HTML-Status über der Leinwand (`#binary-explore-status`)
-sagt dasselbe noch einmal, in fünf Zeilen zu ~470 Zeichen. Die Dopplung ist gewollt (der
-HTML-Status kann aus dem Blick scrollen, der auf der Leinwand nicht), aber beide zusammen
-sind viel Text. Keine Entscheidung dazu getroffen.
 
 ## 3. Drei zurückgestellte Minors aus dem Gesamt-Review des Binärgraphen
 
