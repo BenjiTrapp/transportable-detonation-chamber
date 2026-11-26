@@ -14,6 +14,12 @@
 #
 #     powershell -ExecutionPolicy Bypass -File measure-secondary-addresses.ps1
 #
+# Run it ON THE CONSOLE, not over WinRM. Two reasons, both learned the hard way: WinRM's read timeout is 30 s and
+# tears the shell down mid-run, which kills the script before its cleanup; and adding an address can make Windows
+# re-categorise the network, which closes every inbound firewall rule scoped to Private - WinRM among them - so the
+# session that started the script is gone before it can report. The script now records the profile and puts it back,
+# but on the console a run that goes wrong is still visible and fixable.
+#
 # What it reports, as one JSON object at the end:
 #   rounds[]                               per batch: median, min and max milliseconds per address, and three
 #                                          controls measured after the batch - how long the address list takes to
@@ -28,6 +34,11 @@
 #                                          still be the real one
 #   add_by_cmdlet_ms                       New-NetIPAddress once, for comparison with netsh
 #   remove_total_s, addresses_left_behind  what the cleanup cost and whether it was complete
+#   network_profile_moved                  the interfaces whose network category changed while addresses were
+#                                          being added, with what it changed from and to. Empty is the good
+#                                          answer. Anything in it is the most important result of the run: it
+#                                          means adding addresses cuts the chamber's own management access, and
+#                                          the fake internet has to carry that.
 #
 # Written for PowerShell 5.1, which is what Windows ships.
 
@@ -137,6 +148,23 @@ function Next-Address($n) {
 $added = New-Object System.Collections.Generic.List[string]
 $rounds = New-Object System.Collections.Generic.List[object]
 $result = [ordered]@{}
+
+# Adding an address makes Windows re-evaluate the network it is on (Network
+# Location Awareness). On a network it cannot identify the profile can land on
+# Public, and every inbound firewall rule scoped to Private closes with it -
+# WinRM, SMB and the chamber's own web UI among them. That happened: a run of
+# this script over WinRM left the VM answering on no port at all, with only its
+# MAC still in the host's ARP table, and it had to be recovered from the
+# console. So the profile is recorded before anything is added and put back in
+# the finally, and the result says whether it moved - which is a finding about
+# the design, not only about this script.
+$profilesBefore = @{}
+foreach ($p in @(Get-NetConnectionProfile -ErrorAction SilentlyContinue)) {
+    $profilesBefore[[string]$p.InterfaceIndex] = [string]$p.NetworkCategory
+}
+Write-Host ("profiles     : " + (($profilesBefore.GetEnumerator() |
+    ForEach-Object { "if" + $_.Key + "=" + $_.Value }) -join ", "))
+Write-Host ""
 
 try {
     # One address by the cmdlet, for comparison only.
@@ -260,6 +288,29 @@ finally {
             Write-Host "  netsh interface ipv4 delete address $ifIndex $($l.IPAddress)"
         }
     }
+
+    # The profile, before anything else is reported: if it moved, the machine is
+    # unreachable from outside right now and that is the first thing to fix.
+    $moved = @()
+    foreach ($p in @(Get-NetConnectionProfile -ErrorAction SilentlyContinue)) {
+        $was = $profilesBefore[[string]$p.InterfaceIndex]
+        $now = [string]$p.NetworkCategory
+        if ($was -and $was -ne $now) {
+            $moved += ("if" + $p.InterfaceIndex + ": " + $was + " -> " + $now)
+            try {
+                Set-NetConnectionProfile -InterfaceIndex $p.InterfaceIndex -NetworkCategory $was -ErrorAction Stop
+            } catch {
+                Write-Host ("could not put interface " + $p.InterfaceIndex + " back to " + $was +
+                            ": " + $_.Exception.Message) -ForegroundColor Red
+            }
+        }
+    }
+    $result["network_profile_moved"] = $moved
+    if ($moved.Count -gt 0) {
+        Write-Host ("NETWORK PROFILE MOVED: " + ($moved -join "; ") +
+                    " - put back. That is what closes WinRM, SMB and the web UI.") -ForegroundColor Yellow
+    }
+
     Write-Host ""
     Write-Host "----- paste this back -----"
     $result | ConvertTo-Json -Depth 6
