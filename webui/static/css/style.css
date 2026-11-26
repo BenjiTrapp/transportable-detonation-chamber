@@ -6403,6 +6403,7 @@ option.etw-ch-inactive { color: var(--text-secondary); }
 .det-verdict-malicious { background: rgba(var(--accent-red-rgb), 0.08); border-color: rgba(var(--accent-red-rgb), 0.35); }
 .det-verdict-malicious .det-verdict-badge { background: rgba(var(--accent-red-rgb), 0.2); color: var(--accent-red); }
 .det-verdict-reasons { font-size: 11px; color: var(--text-secondary); }
+.det-verdict-incomplete { font-weight: 800; font-size: 10px; letter-spacing: 0.5px; padding: 1px 8px; border-radius: 999px; white-space: nowrap; color: var(--accent-orange); border: 1px dashed rgba(var(--accent-orange-rgb), 0.6); }
 
 .det-ioc-badge {
     display: inline-block;

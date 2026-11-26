@@ -71,6 +71,12 @@ Regressions covered:
     events of a capture and of each flow have a budget (``decoded_capped``),
     so do its DNS answers (``dns_answers_capped``), and a body is no longer
     inflated past what the text budget can still keep (follow-up F1)
+  * the caps were first come: one flow of 20,001 GETs before a C2 left no
+    finding and no hit, 40 gzip bombs before a base64 PE lost its decoding;
+    a flow keeps ``MAX_EVENTS_PER_FLOW`` events and a share of the analysis
+    text, every flow keeps its connection event, the report's text budget
+    cuts only what the report keeps, and a cut capture says so in
+    ``incomplete`` (follow-up F2)
 """
 
 import base64
@@ -440,25 +446,27 @@ def _gzip_posts(count, body):
     return cap
 
 
-def test_one_text_budget_bounds_the_body_text_of_the_whole_capture(tmp_path, monkeypatch):
-    # 290 bytes of gzip are 256 KiB of text each; two hundred of them were 52.6 MB of JSON
+def test_one_text_budget_bounds_the_body_text_of_the_whole_report(tmp_path, monkeypatch):
+    # 290 bytes of gzip are 256 KiB of text each; two hundred of them were 52.6 MB of JSON.
+    # The report's budget cuts what is kept; the analysis read every body whole (F2).
     monkeypatch.setattr(net_analyze, "CAPTURE_TEXT_BUDGET", 1024 * 1024)
     r = net_analyze.analyze_pcap(_write(tmp_path, _gzip_posts(12, b"A" * (256 * 1024))))
     http = [e for e in r["events"] if e["type"] == "http"]
     assert len(http) == 12
     kept = sum(len(e["body_text"] or "") for e in http)
     assert kept == 1024 * 1024
-    assert sum(1 for e in http if e.get("text_budget_spent")) == 8
+    assert sum(1 for e in http if e.get("report_text_cut")) == 8
     assert all(e["body_capped"] for e in http[4:]) and http[-1]["body_text"] == ""
     assert all(e["body_bytes"] < 1000 for e in http)          # the size on the wire stays exact
-    assert r["text_budget_spent"] is True
+    assert r["report_text_cut"] is True and r["max_report_text"] == 1024 * 1024
+    assert r["text_budget_spent"] is False and r["incomplete"] == []
     assert len(json.dumps(r)) < 2 * 1024 * 1024
 
 
 def test_the_default_text_budget_keeps_a_bomb_capture_small(tmp_path):
     # the reviewer's probe: 77 KB of capture, 51 MiB of text, 52.6 MB of JSON before
     r = net_analyze.analyze_pcap(_write(tmp_path, _gzip_posts(200, b"A" * (256 * 1024))))
-    assert r["text_budget_spent"] is True
+    assert r["text_budget_spent"] is True       # the flow's share of the analysis text
     assert net_analyze.CAPTURE_TEXT_BUDGET <= 32 * 1024 * 1024
     assert len(json.dumps(r)) < 2 * net_analyze.CAPTURE_TEXT_BUDGET
 
@@ -467,7 +475,8 @@ def test_a_capture_past_the_event_cap_is_cut_and_says_so(tmp_path, monkeypatch):
     monkeypatch.setattr(net_analyze, "MAX_EVENTS", 50)
     req = b"GET / HTTP/1.1\r\nHost: a\r\n\r\n"
     cap = Capture()
-    cap.tcp(10.0, C2, 80, [("c", req * 5000)])
+    for i in range(5):
+        cap.tcp(1.0 + i, "198.51.100.%d" % (10 + i), 80, [("c", req * 5000)])
     for i in range(5):
         cap.tcp(20.0 + i, "203.0.113.%d" % (20 + i), 80, [("c", req)])
     calls = []
@@ -479,11 +488,15 @@ def test_a_capture_past_the_event_cap_is_cut_and_says_so(tmp_path, monkeypatch):
         return out
     monkeypatch.setattr(net_analyze.net_http, "_read_messages", counted)
     r = net_analyze.analyze_pcap(_write(tmp_path, cap))
-    parsed = [e for e in r["events"] if e["type"] not in net_analyze.BEHAVIOR_TYPES]
-    assert len(parsed) == 50
+    http = [e for e in r["events"] if e["type"] == "http"]
+    assert len(http) == 50
     assert r["events_capped"] is True and r["max_events"] == 50
-    assert max(calls) <= 50                 # the parser stopped reading, not only the report
-    assert not any(e.get("dest", "").startswith("203.0.113.2") for e in r["events"])
+    assert max(calls) <= 51                 # the parser stopped reading, not only the report
+    # every flow keeps its connection event, also those past the cap (F2)
+    conns = [e for e in r["events"] if e["type"] == "conn"]
+    assert len(conns) == 10 and r["flows_unparsed"] == 9
+    assert not any(e["dest"].startswith("203.0.113.2") for e in http)
+    assert any("parser events" in line for line in r["incomplete"])
 
 
 def _query_amplifier(cap, count, server=C2, values=4):
@@ -1085,3 +1098,77 @@ def test_ftp_commands_and_file_names_are_rendered(tmp_path):
     assert ftp["commands"] == ["USER b\\027ot\\233", "PASS ***", "STOR h\\000a rv.zip"]
     assert ftp["files"] == ["h\\000a rv.zip"] and ftp["user"] == "b\\027ot\\233"
     assert "\\u001b" not in json.dumps(r) and "\\u0000" not in json.dumps(r)
+
+
+# --- a padded flow cannot push the C2 out of the verdict (follow-up F2) -------------------------
+
+def _padded_c2(cap, pad_gets=20001):
+    if pad_gets:
+        req = b"GET / HTTP/1.1\r\nHost: www.msftconnecttest.com\r\n\r\n"
+        cap.tcp(1.0, "198.51.100.200", 80, [("c", req * pad_gets)])
+    for i in range(12):
+        cap.dns(100.0 + i * 60 - 0.4, "evil.top")
+        cap.web(100.0 + i * 60, "evil.top",
+                b"POST /gate.php HTTP/1.1\r\nHost: evil.top\r\nContent-Length: 4\r\n\r\nping",
+                b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+
+
+def test_one_padded_flow_keeps_only_its_share_of_the_events(tmp_path):
+    # the reviewer's probe: 20,001 GETs in one flow before the C2 left 0 findings, 0 hits
+    cap = Capture()
+    _padded_c2(cap)
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    assert [(f["kind"], f["dest"]) for f in r["evidence_findings"]] == [("c2_checkin", "evil.top")]
+    assert {"net.gate_post", "net.periodic_checkin"} <= {h["rule_id"] for h in r["rule_hits"]}
+    pad = [e for e in r["events"] if e["type"] == "http" and e["dest"] == "www.msftconnecttest.com"]
+    assert len(pad) == net_analyze.MAX_EVENTS_PER_FLOW
+    assert r["flows_capped"] == 1 and r["events_capped"] is False
+    assert r["incomplete"] and "2000 events" in r["incomplete"][0]
+
+
+def test_an_unpadded_capture_is_complete(tmp_path):
+    cap = Capture()
+    _padded_c2(cap, pad_gets=0)
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    assert r["flows_capped"] == 0 and r["incomplete"] == []
+    assert [(f["kind"], f["dest"]) for f in r["evidence_findings"]] == [("c2_checkin", "evil.top")]
+
+
+def _bomb_flow(cap, count=40):
+    import gzip
+    bomb = gzip.compress(b"A" * (256 * 1024), 9)
+    req = (b"POST /x HTTP/1.1\r\nHost: cdn.example\r\nContent-Encoding: gzip\r\n"
+           b"Content-Type: text/plain\r\nContent-Length: %d\r\n\r\n" % len(bomb)) + bomb
+    cap.tcp(1.0, "198.51.100.200", 80, [("c", req * count)])
+
+
+def test_a_bomb_flow_cannot_spend_the_text_the_analysis_of_another_flow_needs(tmp_path):
+    # the reviewer's probe: 40 gzip bombs first, and a later base64 PE was no longer decoded
+    pe = b"MZ" + b"\x90" * 58 + struct.pack("<I", 64) + b"PE\x00\x00" + os.urandom(2000)
+    b64 = base64.b64encode(pe)
+    for pad in (False, True):
+        cap = Capture()
+        if pad:
+            _bomb_flow(cap)
+        cap.web(50.0, "evil.top", b"GET /s HTTP/1.1\r\nHost: evil.top\r\n\r\n",
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: %d\r\n\r\n"
+                % len(b64) + b64)
+        r = net_analyze.analyze_pcap(_write(tmp_path, cap, "pe%d.pcap" % pad))
+        assert [e["kind"] for e in r["events"] if e["type"] == "decoded"] == ["pe"], pad
+        assert "net.exe_in_encoded_field" in {h["rule_id"] for h in r["rule_hits"]}, pad
+        assert r["text_budget_spent"] is pad
+
+
+def test_the_report_budget_cuts_the_report_not_the_analysis(tmp_path, monkeypatch):
+    # bodies past the report's budget are still read by the decoder and the rules
+    monkeypatch.setattr(net_analyze, "CAPTURE_TEXT_BUDGET", 1024)
+    pe = b"MZ" + b"\x90" * 58 + struct.pack("<I", 64) + b"PE\x00\x00" + os.urandom(2000)
+    cap = Capture()
+    cap.post(10.0, "cdn.example", "/a", b"x" * 4000, "text/plain")
+    cap.post(20.0, "evil.top", "/b", b"data=" + base64.b64encode(pe), "application/x-www-form-urlencoded")
+    r = net_analyze.analyze_pcap(_write(tmp_path, cap))
+    http = [e for e in r["events"] if e["type"] == "http" and e["dest"] == "evil.top"][0]
+    assert http["body_text"] == "" and http["report_text_cut"] is True
+    assert [e["kind"] for e in r["events"] if e["type"] == "decoded"] == ["pe"]
+    assert "net.exe_in_encoded_field" in {h["rule_id"] for h in r["rule_hits"]}
+    assert r["report_text_cut"] is True and r["incomplete"] == []

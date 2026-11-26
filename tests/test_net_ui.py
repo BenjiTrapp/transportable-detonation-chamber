@@ -11,6 +11,10 @@ Regressions covered:
     each need their own say in OVERVIEW; a capture without
     traffic is "not observed" with its note, never "nothing found"; a spent decoding budget
     (decoded_capped) and DNS answers cut by their budget (dns_answers_capped) too (follow-up F1)
+  * a verdict built on a cut capture read "No malicious indicators detected": both verdict
+    banners show INCOMPLETE and its reasons; a flow cut by the per-flow cap (flows_capped) is
+    "could not decide", a report that only keeps part of the text (report_text_cut) says so
+    without claiming the analysis missed it (follow-up F2)
   * a finding another finding absorbed (superseded_by) listed under "suppressed by the baseline",
     here and in the memory evidence block; baseline events and findings not marked
   * the evidence source `network` drawn as live memory (the verdict flow's default kind)
@@ -282,6 +286,7 @@ UNDECIDED = {
     "hash budget": ({"hash_budget_spent": True}, ["hash budget"]),
     "events capped": ({"events_capped": True, "max_events": 20000}, ["more than 20000 events", "report is cut"]),
     "text budget": ({"text_budget_spent": True}, ["text budget"]),
+    "flows capped": ({"flows_capped": 3, "max_events_per_flow": 2000}, ["3 flow(s)", "more than 2000 events"]),
     "decoded capped": ({"decoded_capped": True, "max_decoded": 5000}, ["decoding budget", "5000 decoded values"]),
     "dns answers capped": ({"dns_answers_capped": True, "max_dns_answers": 10000}, ["DNS answers were not kept", "10000"]),
     "truncated": ({"truncated": True}, ["capture was cut"]),
@@ -1052,3 +1057,37 @@ def test_a_failed_events_fetch_is_tried_again_after_a_while():
     assert r["early"] == 1, "tried again before the delay"
     assert r["retrying"] == ["loading", 2], "the retry was not made, or made twice"
     assert r["done"] == [None, ["a.top"], 2]
+
+
+# --- a verdict of a cut capture (follow-up F2) ------------------------------------------------
+
+VERDICT_FNS = ["verdictIncompleteHtml", "verdictReasonsText", "networkText", "escapeHtml"]
+
+
+@needs_node
+def test_an_incomplete_verdict_says_so_and_never_reads_nothing_found():
+    out = _run_node(VERDICT_FNS, "console.log(JSON.stringify([%s]))" % ", ".join(
+        "[verdictIncompleteHtml(%s), verdictReasonsText(%s)]" % (v, v) for v in (
+            json.dumps({"label": "CLEAN", "reasons": [], "incomplete": True, "incomplete_reasons": ["a <cut>"]}),
+            json.dumps({"label": "CLEAN", "reasons": ["Network capture only partly analysed"], "incomplete": True}),
+            json.dumps({"label": "CLEAN", "reasons": []}))), PRELUDE)
+    (badge, reasons), (badge2, reasons2), (none, clean) = out
+    assert "INCOMPLETE" in badge and "a &lt;cut&gt;" in badge and "<cut>" not in badge
+    assert "No malicious indicators detected" not in reasons and "incomplete" in reasons
+    assert "INCOMPLETE" in badge2 and reasons2 == "Network capture only partly analysed"
+    assert none == "" and clean == "No malicious indicators detected"
+
+
+def test_both_verdict_banners_show_the_incomplete_badge():
+    from test_frontend import SOURCE as src
+    assert src.count("${verdictIncompleteHtml(verdict)}") == 1 and src.count("${verdictIncompleteHtml(v)}") == 1
+    assert "'No malicious indicators detected'}</span>" not in src
+
+
+@needs_node
+def test_a_report_cut_only_in_its_text_says_so_without_could_not_decide():
+    html = _render(_empty_report(events=[{"type": "dns", "ts": 1, "dest": "a.example"}],
+                                 event_summary={"dns": 1}, report_text_cut=True, max_report_text=8388608))
+    overview = _pane(html, "overview")
+    assert "8388608 characters" in overview and "analysis read them whole" in overview
+    assert "COULD NOT DECIDE" not in overview and "NOTHING FOUND" in overview

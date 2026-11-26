@@ -490,7 +490,23 @@ class TextBudget(HashBudget):
     (``body_text`` and ``resp_text``, inflated or plain), shared like
     ``HashBudget``. A text that would go past it is cut to what is left, and
     once it is gone a body keeps "" ; ``body_capped`` / ``resp_capped`` say so
-    and the event carries ``text_budget_spent``."""
+    and the event carries ``text_budget_spent``. A budget with a ``parent``
+    (one flow's share of the capture's) is charged to both and has what both
+    have left, so that one flow cannot spend the text of all the others."""
+
+    def __init__(self, limit, parent=None):
+        super().__init__(limit)
+        self.parent = parent
+
+    @property
+    def left(self):
+        own = max(0, self.limit - self.spent)
+        return own if self.parent is None else min(own, self.parent.left)
+
+    def charge(self, amount):
+        self.spent += amount
+        if self.parent is not None:
+            self.parent.charge(amount)
 
 
 def _charge_text(text, budget):
@@ -500,9 +516,9 @@ def _charge_text(text, budget):
     left = budget.left
     if len(text) > left:
         text = text[:left]
-        budget.spent += left
+        budget.charge(left)
         return text, True
-    budget.spent += len(text)
+    budget.charge(len(text))
     return text, False
 
 

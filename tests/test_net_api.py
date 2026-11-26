@@ -21,6 +21,10 @@ Regressions covered:
     naming the fix and everything else works (final review I3)
   * ``flask>=3.0`` allowed a Flask whose ``request.max_content_length`` cannot
     be set, so every import was a 500; the requirement is 3.1 (final review I4)
+  * a capture cut by a cap or a budget gave a verdict that read like "nothing
+    found": 20,001 junk GETs before a C2 were CLEAN 0 with no word of the
+    cut; the verdict now carries ``incomplete`` and says what was cut
+    (follow-up F2)
 """
 
 import base64
@@ -615,6 +619,46 @@ def test_a_lone_check_in_without_a_second_signal_does_not_raise_the_verdict(clie
     ev = d["memory_evidence"]
     assert [f["kind"] for f in ev["findings"]] == ["c2_checkin"] and ev["score"] == 1.6
     assert ev["label"] == "CLEAN" and d["verdict"]["label"] == "CLEAN"
+
+
+def test_a_cut_capture_makes_the_verdict_visibly_incomplete(client, tdc, tmp_path, monkeypatch):
+    """Regressions covered (follow-up F2): the cut was only in the NETWORK tab;
+    the verdict and the Submit panel presented CLEAN as nothing found."""
+    # a small pad and a small per-flow cap: a large upload leaves the test client's temp file open
+    monkeypatch.setattr(na.net_analyze, "MAX_EVENTS_PER_FLOW", 50)
+    cap = Capture()
+    na._padded_c2(cap, pad_gets=200)
+    d = _verdict_with(client, tdc, tmp_path, monkeypatch, _write(tmp_path, cap, "pad.pcap"))
+    v = d["verdict"]
+    assert v["incomplete"] is True and v["label"] == "CLEAN"
+    assert any("more than 50 events" in line for line in v["incomplete_reasons"])
+    assert any("only partly analysed" in r and "not in this verdict" in r for r in v["reasons"])
+    assert d["memory_evidence"]["incomplete"] == v["incomplete_reasons"]
+    assert [f["kind"] for f in d["memory_evidence"]["findings"]] == ["c2_checkin"]
+
+
+def test_a_complete_capture_and_an_ordinary_hour_are_not_marked_incomplete(client, tdc, tmp_path, monkeypatch):
+    from test_net_default_rules import _benign_capture
+    d = _verdict_with(client, tdc, tmp_path, monkeypatch, _pcap_with_http_c2(tmp_path))
+    assert "incomplete" not in d["verdict"] and "incomplete" not in d["memory_evidence"]
+    monkeypatch.setattr(Capture, "read", lambda self: self)
+    d = _verdict_with(client, tdc, tmp_path, monkeypatch, _write(tmp_path, _benign_capture(), "hour.pcap"))
+    assert "incomplete" not in d["verdict"] and d["verdict"]["label"] == "CLEAN"
+
+
+def test_the_cut_is_read_from_the_flags_also_of_an_older_report(tdc):
+    import memory_evidence
+    assert memory_evidence.network_incomplete({"events_capped": True, "max_events": 20000}) == [
+        "more than 20000 parser events: the flows after them were not parsed"]
+    assert memory_evidence.network_incomplete({"report_text_cut": True, "iocs_capped": True}) == []
+    assert memory_evidence.network_incomplete(None) == []
+    for flag in ("truncated", "events_capped", "flows_capped", "text_budget_spent", "hash_budget_spent",
+                 "decoded_capped", "dns_answers_capped", "rule_budget_spent"):
+        assert len(memory_evidence.network_incomplete({flag: 1})) == 1, flag
+    assert memory_evidence.network_incomplete({"rule_unevaluated": [{}], "errors": ["x", "y"]}) == [
+        "1 rule(s) could not be decided for some events", "2 analysis step(s) failed"]
+    v = tdc._compute_verdict({"network": {"events_capped": True}}, [])
+    assert v["incomplete"] is True and v["label"] == "CLEAN"
 
 
 def test_scoring_does_not_write_into_the_stored_report(client, tdc, tmp_path, monkeypatch):

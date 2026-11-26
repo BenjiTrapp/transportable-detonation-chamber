@@ -4824,7 +4824,18 @@ def _compute_verdict(results, matching_alerts):
         label = "SUSPICIOUS"
     else:
         label = "CLEAN"
-    return {"label": label, "score": score, "reasons": reasons}
+    verdict = {"label": label, "score": score, "reasons": reasons}
+    # A capture cut by a cap or a budget may hold the C2 in what was not
+    # analysed: the verdict says so, and a CLEAN is then no "nothing found".
+    incomplete = memory_evidence.network_incomplete(results.get("network"))
+    if incomplete:
+        verdict["incomplete"] = True
+        verdict["incomplete_reasons"] = incomplete
+        reasons.append("Network capture only partly analysed (" + "; ".join(incomplete)
+                       + ") - what was cut is not in this verdict")
+        if isinstance(results.get("memory_evidence"), dict):
+            results["memory_evidence"]["incomplete"] = incomplete
+    return verdict
 
 
 def _add_hash_to_ioc(sha256_hash, filename=""):

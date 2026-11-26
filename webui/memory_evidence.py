@@ -1313,6 +1313,51 @@ def score(findings, baseline=None):
     }
 
 
+def network_incomplete(report):
+    """What a network report could not analyse, one line each; [] when nothing.
+
+    A capture cut by a cap or a budget (too many events, a flow padded with
+    junk, a spent text, hash or decoding budget, rules the regex budget could
+    not decide, a step that failed) may hold the C2 in the part that was not
+    looked at, so its findings are a lower bound, and a verdict built on them
+    must say so instead of presenting CLEAN as "nothing found". Read from the
+    report's flags, so a report stored before ``incomplete`` existed is read
+    the same way. What only the report leaves out (``report_text_cut``,
+    ``iocs_capped``) is not here: the analysis saw it.
+    """
+    if not isinstance(report, dict):
+        return []
+    out = []
+    if report.get("truncated"):
+        out.append("the capture file was cut")
+    if report.get("events_capped"):
+        out.append("more than %s parser events: the flows after them were not parsed"
+                   % report.get("max_events", "the maximum of"))
+    if report.get("flows_capped"):
+        out.append("%s flow(s) had more than %s events: the rest of each was not parsed"
+                   % (report["flows_capped"], report.get("max_events_per_flow", "the maximum of")))
+    if report.get("text_budget_spent"):
+        out.append("the analysis text budget was spent: some bodies were analysed in part")
+    if report.get("hash_budget_spent"):
+        out.append("the hash budget was spent: some files have no full hash")
+    if report.get("decoded_capped"):
+        out.append("the decoding budget was spent: some encoded values were not decoded")
+    if report.get("dns_answers_capped"):
+        out.append("some DNS answers were not kept")
+    if report.get("rule_budget_spent"):
+        out.append("the regex time budget was spent: some rules were not decided")
+    elif report.get("rule_unevaluated"):
+        out.append("%d rule(s) could not be decided for some events"
+                   % _count(report["rule_unevaluated"]))
+    if report.get("errors"):
+        out.append("%d analysis step(s) failed" % _count(report["errors"]))
+    return out
+
+
+def _count(value):
+    return len(value) if isinstance(value, (list, tuple)) else 1
+
+
 def collect(results, process="", network_process=None):
     """Pull every supported scanner result out of a detonation result dict.
 

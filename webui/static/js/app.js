@@ -7111,8 +7111,8 @@ async function viewDetonationResult(lbHash, sha256, pid, filename) {
     if (verdict && verdict.label) {
         const cls = verdict.label === 'MALICIOUS' ? 'malicious' : (verdict.label === 'SUSPICIOUS' ? 'suspicious' : 'clean');
         html += `<div class="det-verdict det-verdict-${cls}" style="margin:8px 0;">
-            <span class="det-verdict-badge">${escapeHtml(verdict.label)}</span>
-            <span class="det-verdict-reasons">${verdict.reasons && verdict.reasons.length ? escapeHtml(verdict.reasons.join(' · ')) : 'No malicious indicators detected'}</span>
+            <span class="det-verdict-badge">${escapeHtml(verdict.label)}</span>${verdictIncompleteHtml(verdict)}
+            <span class="det-verdict-reasons">${verdictReasonsText(verdict)}</span>
         </div>`;
     }
     if (iocFeed && iocFeed.status) {
@@ -8658,8 +8658,8 @@ function renderDetonationPanels(data) {
         const v = data.verdict;
         const cls = v.label === 'MALICIOUS' ? 'malicious' : (v.label === 'SUSPICIOUS' ? 'suspicious' : 'clean');
         html += `<div class="det-verdict det-verdict-${cls}">
-            <span class="det-verdict-badge">${escapeHtml(v.label)}</span>
-            <span class="det-verdict-reasons">${v.reasons && v.reasons.length ? escapeHtml(v.reasons.join(' · ')) : 'No malicious indicators detected'}</span>
+            <span class="det-verdict-badge">${escapeHtml(v.label)}</span>${verdictIncompleteHtml(v)}
+            <span class="det-verdict-reasons">${verdictReasonsText(v)}</span>
         </div>`;
     }
 
@@ -13090,6 +13090,20 @@ function logsTabShown() {
     runLogsSearch({ silent: true });
 }
 
+// A verdict built on a capture cut by a cap or a budget (verdict.incomplete): what was cut
+// may hold the C2, so the label is a lower bound and a CLEAN is no "nothing found".
+function verdictIncompleteHtml(v) {
+    if (!v || !v.incomplete) return '';
+    const why = Array.isArray(v.incomplete_reasons) ? v.incomplete_reasons.map(networkText).join('; ') : '';
+    return ` <span class="det-verdict-incomplete" title="${escapeHtml('The network capture was only partly analysed' + (why ? ': ' + why : '') + '. What was cut is not in this verdict.')}">INCOMPLETE</span>`;
+}
+
+// The reasons line of a verdict banner, escaped
+function verdictReasonsText(v) {
+    if (v && Array.isArray(v.reasons) && v.reasons.length) return escapeHtml(v.reasons.join(' · '));
+    return v && v.incomplete ? 'Nothing scored in what was analysed, but the analysis is incomplete' : 'No malicious indicators detected';
+}
+
 // ===== NETWORK =====
 // The NETWORK tab: the report of a pcap (/api/network/*). networkTabShown()
 // loads the stored reports the first time the tab opens, renderNetworkReport()
@@ -13353,8 +13367,9 @@ function networkUndecided(report) {
     });
     if (report.rule_budget_spent) out.push('The regex time budget was spent: the rules with a regex were left undecided from then on.');
     if (report.hash_budget_spent) out.push('The hash budget was spent: some files have no full hash.');
-    if (report.events_capped) out.push(`The capture held more than ${networkText(report.max_events)} events: the flows after that were not parsed, so the report is cut.`);
-    if (report.text_budget_spent) out.push('The text budget was spent: some bodies keep only part of their text, or none.');
+    if (report.events_capped) out.push(`The capture held more than ${networkText(report.max_events)} events: the flows after that were not parsed (only their connections are listed), so the report is cut.`);
+    if (report.flows_capped) out.push(`${networkText(report.flows_capped)} flow(s) held more than ${networkText(report.max_events_per_flow)} events each: the rest of each was not parsed.`);
+    if (report.text_budget_spent) out.push('The analysis text budget was spent: some bodies were analysed only in part, or not at all.');
     if (report.decoded_capped) out.push(`The decoding budget was spent (at most ${networkText(report.max_decoded)} decoded values per capture, and a share per flow, with a bound on their text and inflating): some encoded values were not decoded, or keep only part of their text.`);
     if (report.dns_answers_capped) out.push(`Some DNS answers were not kept (at most ${networkText(report.max_dns_answers)} per capture, and a few dozen per message).`);
     const errors = Array.isArray(report.errors) ? report.errors : [];
@@ -13382,6 +13397,9 @@ function networkStatusHtml(report, findings) {
             <div>${escapeHtml(report.note || 'The capture holds no traffic.')} This is not a clean result: nothing was seen.</div></div>`;
     } else if (report.note) {
         html += `<div class="net-banner"><div>${escapeHtml(report.note)}</div></div>`;
+    }
+    if (report.report_text_cut) {
+        html += `<div class="net-banner"><div>The report keeps at most ${escapeHtml(networkText(report.max_report_text))} characters of body text: some bodies are shown in part. The analysis read them whole.</div></div>`;
     }
     if (undecided.length) {
         html += `<div class="net-banner net-banner-undecided"><span class="net-banner-title">COULD NOT DECIDE</span>
