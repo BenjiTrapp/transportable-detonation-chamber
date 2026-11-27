@@ -2364,3 +2364,148 @@ def test_without_a_backdrop_colour_the_caveat_keeps_its_own_and_gets_no_strip():
     assert r["withStrip"] >= 1, "the strip is there when the backdrop is"
     assert r["withoutStrip"] == 0, "an empty backdrop fills nothing rather than filling in the text's colour"
     assert r["text"] == ["--severity-medium"], f"and the caveat keeps its own colour: {r['text']}"
+
+
+@needs_node
+def test_the_caveat_on_the_canvas_is_wrapped_to_lines_that_fit_it():
+    """Measured in Chrome on the VM, kernelbase.dll opened, 400 nodes drawn: the caveat measured 1,344px at 12px
+    monospace while the canvas was 1,250px wide at 1280x900 and 1,352px at 1920x1080. So 106px of it were painted
+    past the right edge at the smaller width and 4px at the larger - and what fell off was the end of the
+    sentence, "(the canvas holds 400 nodes)", the part that names the cap.
+
+    A caveat a reader cannot read is worse than none, which is the rule the strip behind it was added for; running
+    off the edge breaks it just as crossing a node label did. So the text is wrapped at word boundaries to as many
+    lines as it needs, each with its own strip, and a word longer than the canvas is still drawn rather than
+    dropped: a line that overflows says more than a line that is missing."""
+    r = _explore_flow(r"""
+      (async () => {
+        GRAPH['ntdll.dll'] = { in_degree: 9, partial: true,
+            imports: { 'kernel32.dll': ['CloseHandle'], 'user32.dll': ['MessageBoxW'] } };
+        await binaryGraphExploreStart('ntdll.dll');
+        await binaryGraphExpand('ntdll.dll');
+        const f = frame();
+        out({ width: els['binary-explore-canvas'].width, placed: f.placed, strips: f.strips });
+      })();""")
+    lines = [t for t in r["placed"] if t["text"].startswith("Not the whole") or t["y"] < 60]
+    caveat = [t for t in lines if "neighbourhood" in t["text"] or "canvas holds" in t["text"] or "not shown" in t["text"]]
+    assert caveat, [t["text"][:40] for t in r["placed"]]
+    assert len(caveat) > 1, f"a caveat this long is not one line on a {r['width']}px canvas: {caveat}"
+    for line in caveat:
+        assert line["x"] + len(line["text"]) * 6 <= r["width"], \
+            f"this line runs past the right edge: {line['text']!r} at x={line['x']} on {r['width']}px"
+        assert any(abs(s["y"] - line["y"]) < 6 for s in r["strips"]), f"no strip behind {line['text'][:30]!r}"
+    joined = " ".join(line["text"] for line in sorted(caveat, key=lambda t: t["y"]))
+    assert joined.startswith("Not the whole neighbourhood"), joined[:60]
+    assert "the canvas holds 400 nodes" in joined, "the end of the sentence is drawn, not lost over the edge"
+
+
+@needs_node
+def test_the_html_caveat_folds_to_a_bar_that_keeps_naming_what_is_missing():
+    """Measured on the VM at 1280x900: the status above the canvas was 731 characters over four lines and 73px
+    tall, while the canvas it sits over had 318px. The same facts were said three times - 731 characters above,
+    186 on the canvas, 432 under it - and the strip on the canvas already carries the short form.
+
+    So it folds, the way GRAPH folds the scan panels (syscallApplyLower): a bar names the claim and every count,
+    and the prose that explains them is one click away. Folded is not silent, and that is the whole point - the
+    claim "Not the whole neighbourhood" and the numbers stay in the bar, because a caveat whose counts are hidden
+    reads as no caveat. Only the sentences that explain what the numbers mean go behind the fold.
+
+    It starts folded because the strip carries the short form, and a fold or unfold by hand wins from then on -
+    the same rule as the figures' rows and the scan panels: a view that keeps reclosing what the reader opened is
+    worse than one that never folded."""
+    r = _explore_flow(r"""
+      (async () => {
+        GRAPH['ntdll.dll'] = { in_degree: 9, partial: true,
+            imports: { 'kernel32.dll': ['CloseHandle'], 'user32.dll': ['MessageBoxW'] } };
+        await binaryGraphExploreStart('ntdll.dll');
+        await binaryGraphExpand('ntdll.dll');
+        // the fake DOM holds innerHTML, not a tree: the bar, the body and the button are read out of the markup
+        const read = () => {
+          const html = els['binary-explore-status'].innerHTML || '';
+          const plain = h => (h || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+          const between = (open, close) => {
+            const a = html.indexOf(open); if (a < 0) return null;
+            const b = html.indexOf(close, a); return plain(html.slice(a + open.length, b < 0 ? undefined : b));
+          };
+          const button = (html.match(/<button[^>]*class="binary-explore-caveat-fold"[^>]*>/) || [''])[0];
+          const body = (html.match(/<div class="binary-explore-caveat-body"([^>]*)>([\s\S]*?)<\/div>/) || [null, '', '']);
+          return { bar: between('class="binary-explore-caveat-note binary-graph-cut">', '</span>'),
+                   body: plain(body[2]), bodyHidden: body[1].includes('hidden'),
+                   expanded: (button.match(/aria-expanded="(\w+)"/) || [null, null])[1],
+                   title: (button.match(/title="([^"]*)"/) || [null, ''])[1], whole: plain(html) };
+        };
+        const folded = read();
+        binaryGraphToggleCaveat();
+        const open = read();
+        // a redraw must not reclose what was opened by hand
+        await binaryGraphExpand('kernel32.dll');
+        const stillOpen = read();
+        out({ folded, open, stillOpen, byHand: !!binaryGraphState.caveatByHand });
+      })();""")
+    folded, open_, still = r["folded"], r["open"], r["stillOpen"]
+    assert folded["bodyHidden"] and folded["expanded"] == "false", "it starts folded: the strip carries the short form"
+    assert "Not the whole neighbourhood" in folded["bar"], folded["bar"]
+    # this scenario cuts no neighbours: ntdll's own table was cut short, which is also why its importers may be
+    # incomplete. Both of those are counts, and both are in the bar
+    assert "1 opened node has a table cut short" in folded["bar"], f"the counts stay in the bar: {folded['bar']}"
+    assert "importers may be incomplete" in folded["bar"], folded["bar"]
+    assert f"the canvas holds 400 nodes" in folded["bar"], "and the cap, which is what explains a dropped node"
+    assert folded["title"], "the button says what it does"
+    assert not open_["bodyHidden"] and open_["expanded"] == "true"
+    assert "does not mean it is not imported" in open_["body"], \
+        f"the sentence that says what a missing node means: {open_['body']}"
+    assert "does not mean it is not imported" not in folded["bar"], "the prose is what folds, not the claim"
+    assert not still["bodyHidden"] and r["byHand"], "a redraw after an unfold by hand leaves it open"
+
+
+@needs_node
+def test_the_strip_is_drawn_only_while_the_bar_that_says_the_same_is_out_of_view():
+    """Seen in Chrome on the VM after the caveat was folded to a bar: the bar and the strip then carried the same
+    186 characters, 20px apart - the bar directly above the canvas, the strip at the top of it. Reading the same
+    sentence twice in a row is worse than the prose it replaced.
+
+    The strip was added for one case, and it is the only case it is needed in: measured at 1280x640, scrolled to
+    the canvas, 14 of the status's 73px were left in view while the canvas was whole. So the strip is drawn while
+    the bar is not fully in view, and left out while it is. The rect read is of an element outside the canvas, so
+    a pan - which writes to the bitmap and not to the DOM - reads it from a layout that is already clean.
+
+    It fails towards saying it: no element, no rect, or anything the read throws, and the strip is drawn. A caveat
+    said twice is a nuisance; a caveat said nowhere is a measurement reading as something it is not."""
+    r = _explore_flow(r"""
+      (async () => {
+        GRAPH['ntdll.dll'] = { in_degree: 9, partial: true,
+            imports: { 'kernel32.dll': ['CloseHandle'], 'user32.dll': ['MessageBoxW'] } };
+        await binaryGraphExploreStart('ntdll.dll');
+        await binaryGraphExpand('ntdll.dll');
+        const host = els['binary-explore-status'];
+        const strip = () => frame().placed.some(t => t.text.startsWith('Not the whole'));
+        globalThis.innerHeight = 900;      // without a viewport there is no "in view": then it is always drawn
+        // the bar whole in view
+        host.getBoundingClientRect = () => ({ top: 100, bottom: 173, left: 0, right: 900, height: 73 });
+        binaryGraphDraw();
+        const inView = strip();
+        // scrolled away, as measured at 1280x640: 14 of its 73px left
+        host.getBoundingClientRect = () => ({ top: -59, bottom: 14, left: 0, right: 900, height: 73 });
+        binaryGraphDraw();
+        const scrolledOff = strip();
+        // and pushed off the bottom
+        host.getBoundingClientRect = () => ({ top: 1200, bottom: 1273, left: 0, right: 900, height: 73 });
+        binaryGraphDraw();
+        const below = strip();
+        host.getBoundingClientRect = () => { throw new Error('no layout'); };
+        binaryGraphDraw();
+        const threw = strip();
+        delete host.getBoundingClientRect;
+        binaryGraphDraw();
+        const noRect = strip();
+        host.getBoundingClientRect = () => ({ top: 100, bottom: 173, left: 0, right: 900, height: 73 });
+        delete globalThis.innerHeight;
+        binaryGraphDraw();
+        const noViewport = strip();
+        out({ inView, scrolledOff, below, threw, noRect, noViewport });
+      })();""")
+    assert not r["inView"], "the bar above the canvas already says it: the strip would be the same words twice"
+    assert r["scrolledOff"], "scrolled to the canvas, the strip is all the reader has"
+    assert r["below"], "and when the bar is below the fold too"
+    assert r["threw"] and r["noRect"] and r["noViewport"], \
+        "a read that cannot say leaves the caveat drawn, never swallowed"
