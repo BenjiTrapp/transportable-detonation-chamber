@@ -13,27 +13,50 @@ import net_divert
 import net_system
 
 
-class _RefusingAfter(net_system.FakeSystemOps):
-    """A machine whose adapter takes ``n`` addresses and refuses every one after that. The refused call is
-    recorded, as the base class does it, and then raises."""
+class _Adapter(net_system.FakeSystemOps):
+    """An adapter that remembers what is on it (``present``), takes ``refuse_walk_after`` addresses of the walk and
+    refuses every one after that, and refuses the addresses in ``refuse`` always. A refused call is recorded, as the
+    base class does it, and then raises. Removing an address that is not there fails, as netsh does."""
 
-    def __init__(self, n, **kw):
-        super().__init__(**kw)
-        self.n = n
+    def __init__(self, present=(), refuse=(), refuse_walk_after=None):
+        super().__init__()
+        self.present = set(present)
+        self.refuse = set(refuse)
+        self.refuse_walk_after = refuse_walk_after
+
+    @staticmethod
+    def _on_walk(address):
+        return not address.startswith("198.18.0.")          # the shared default is 198.18.0.1, before the walk
 
     def add_address(self, index, address, mask):
-        if len([c for c in self.calls if c[0] == "add_address"]) >= self.n:
-            self.fail["add_address"] = net_system.SystemOpsError("netsh add address failed (1): The pool is full")
+        refused = address in self.refuse
+        if self.refuse_walk_after is not None and self._on_walk(address):
+            tried = len([c for c in self.calls if c[0] == "add_address" and self._on_walk(c[2])])
+            refused = refused or tried >= self.refuse_walk_after
+        if refused:
+            self.calls.append(("add_address", index, address, mask))
+            raise net_system.SystemOpsError("netsh add address failed (1): The pool is full")
         super().add_address(index, address, mask)
+        self.present.add(address)
+
+    def remove_address(self, index, address):
+        super().remove_address(index, address)
+        if address not in self.present:
+            raise net_system.SystemOpsError("netsh delete address failed (1): The element was not found")
+        self.present.discard(address)
 
 
-def _diverter(fail_adds_after=None, fail_removes=False, index=7, **kw):
-    if fail_adds_after is None:
-        ops = net_system.FakeSystemOps()
-    else:
-        ops = _RefusingAfter(fail_adds_after)
+GUEST = "192.168.64.4"          # an address the machine has already, which is what a caller passes as ``shared``
+
+
+def _diverter(fail_adds_after=None, fail_removes=False, index=7, shared=GUEST, refuse=(), **kw):
+    """``shared=None`` is the default shared address, which the diverter has to put on the adapter itself; the
+    default of this helper is one that is there already."""
+    ops = _Adapter(present=[shared] if shared else [], refuse=refuse, refuse_walk_after=fail_adds_after)
     if fail_removes:
         ops.fail["remove_address"] = net_system.SystemOpsError("netsh delete address failed (1): not found")
+    if shared is not None:
+        kw["shared"] = shared
     return net_divert.GuestDiverter(ops, index, **kw)
 
 
@@ -76,6 +99,7 @@ def test_a_refused_address_falls_back_to_the_shared_one_and_says_so():   # Revie
     assert d.address_for("c.top") == d.shared
     assert "c.top" in d.state()["shared_names"]
     assert d.state()["shared_reason"] == net_divert.SHARED_FALLBACK_REASON
+    assert d.shared in d.ops.present            # the address that was handed out leads to this machine
 
 
 def test_stop_removes_exactly_what_was_added():
@@ -140,17 +164,6 @@ def test_a_name_that_fell_back_keeps_the_shared_address_and_is_not_tried_again()
     assert d.state()["shared_names"] == ["a.top"]
 
 
-def test_a_name_after_a_refusal_is_still_tried_for_its_own_address_and_leaves_no_gap():
-    ops = net_system.FakeSystemOps(fail={"add_address": net_system.SystemOpsError("busy")})
-    d = net_divert.GuestDiverter(ops, 7)
-    assert d.address_for("a.top") == d.shared
-    refused = _adds(d)[0][2]
-    del ops.fail["add_address"]
-    own = d.address_for("b.top")
-    assert own != d.shared and d.name_for(own) == "b.top"
-    assert own == refused                         # nothing was put on the adapter at that address, so it is free
-
-
 def test_a_call_the_machine_rejects_as_invalid_is_a_bug_and_not_a_refusal():
     d = _diverter(prefix="10.0")                 # not the fake internet: add_address raises ValueError
     with pytest.raises(ValueError):
@@ -159,8 +172,8 @@ def test_a_call_the_machine_rejects_as_invalid_is_a_bug_and_not_a_refusal():
 
 
 def test_the_shared_address_is_given_or_is_the_one_before_the_walk_begins():
-    assert _diverter().shared == "198.18.0.1"
-    assert _diverter(shared="192.168.64.4").shared == "192.168.64.4"
+    assert _diverter(shared=None).shared == "198.18.0.1"
+    assert _diverter(shared="192.168.64.9").shared == "192.168.64.9"
 
 
 def test_state_holds_a_copy_of_the_map():
@@ -230,3 +243,154 @@ def test_the_protocol_asks_to_be_implemented():
                  base.state):
         with pytest.raises(NotImplementedError):
             call()
+
+
+# --- the shared address has to exist (review of Task 2, Important 1) ---
+
+
+def _removes(d):
+    return [c[2] for c in d.ops.calls if c[0] == "remove_address"]
+
+
+def test_a_given_shared_address_is_neither_added_nor_removed():
+    d = _diverter(fail_adds_after=0)
+    d.address_for("a.top")
+    d.stop()
+    assert GUEST not in [c[2] for c in d.ops.calls if c[0] in ("add_address", "remove_address")]
+    assert GUEST in d.ops.present
+
+
+def test_the_default_shared_address_goes_on_the_adapter_together_with_the_first_name():
+    d = _diverter(shared=None)
+    d.start()
+    assert d.ops.calls == []                                # not at start: nothing is added before a name asks
+    own = d.address_for("a.top")
+    assert {own, d.shared} <= d.ops.present
+    assert d.state()["shared_on_adapter"] is True
+    adds = _adds(d)
+    d.address_for("b.top")
+    d.address_for("a.top")
+    assert len(_adds(d)) == len(adds) + 1                   # b only: the shared one is added once
+
+
+def test_a_refused_name_falls_back_to_a_shared_address_that_is_there_even_when_the_first_name_is_refused():
+    d = _diverter(shared=None, fail_adds_after=0)
+    assert d.address_for("a.top") == d.shared
+    assert d.shared in d.ops.present                        # established at that moment, not before
+    assert d.state()["shared_names"] == ["a.top"]
+    assert d.state()["unaddressed_names"] == []
+
+
+def test_the_default_shared_address_is_taken_off_again_with_the_rest():
+    d = _diverter(shared=None)
+    added = {d.address_for(n) for n in ("a.top", "b.top")}
+    d.stop()
+    assert set(_removes(d)) == added | {d.shared}
+    assert d.ops.present == set()
+
+
+def test_a_name_with_no_address_and_no_shared_address_is_listed_as_unaddressed():
+    d = _diverter(shared=None, refuse=["198.18.0.1"], fail_adds_after=0)
+    assert d.address_for("a.top") == d.shared               # still a value the DNS server can answer with
+    s = d.state()
+    assert s["unaddressed_names"] == ["a.top"]
+    assert s["unaddressed_reason"] == net_divert.UNADDRESSED_REASON
+    assert s["shared_names"] == [] and s["shared_reason"] is None
+    assert s["shared_on_adapter"] is False
+    assert d.shared not in d.ops.present
+
+
+def test_an_adapter_that_refuses_everything_is_not_asked_for_the_shared_address_forever():
+    d = _diverter(shared=None, refuse=["198.18.0.1"], fail_adds_after=0)
+    for i in range(30):
+        d.address_for("h%d.top" % i)
+    asked = [c for c in d.ops.calls if c[0] == "add_address" and c[2] == d.shared]
+    assert len(asked) == net_divert.SHARED_ATTEMPTS
+    assert len(d.state()["unaddressed_names"]) == 30
+
+
+def test_a_shared_address_that_could_not_be_added_with_the_first_name_is_tried_again_at_a_fallback():
+    d = _diverter(shared=None, refuse=["198.18.0.1"])
+    own = d.address_for("a.top")
+    assert own in d.ops.present and d.state()["shared_on_adapter"] is False
+    d.ops.refuse.clear()
+    d.ops.refuse_walk_after = 0                             # now the pool refuses the names
+    assert d.address_for("b.top") == d.shared
+    assert d.shared in d.ops.present
+    assert d.state()["shared_names"] == ["b.top"]
+
+
+# --- the walk moves past an address that failed (Important 2 and 3) ---
+
+
+def test_an_address_that_fails_is_skipped_for_the_rest_of_the_session():
+    d = _diverter(refuse=["198.18.1.1"])                    # a leftover of a crashed session, say
+    assert d.address_for("a.top") == d.shared               # that name paid the one failing call
+    others = [d.address_for(n) for n in ("b.top", "c.top", "d.top")]
+    assert others == ["198.18.1.2", "198.18.1.3", "198.18.1.4"]
+    assert len([c for c in d.ops.calls if c[0] == "add_address" and c[2] == "198.18.1.1"]) == 1
+
+
+def test_an_address_whose_add_failed_is_maybe_there_and_stop_asks_for_it_to_go():
+    d = _diverter(refuse=["198.18.1.1"])
+    d.address_for("a.top")
+    d.address_for("b.top")
+    assert d.state()["maybe_added"] == ["198.18.1.1"]
+    d.stop()                                                # the adapter says "not found": that is not an error
+    assert "198.18.1.1" in _removes(d)
+    assert d.state()["maybe_added"] == [] and d.state()["remove_failed"] == []
+
+
+def test_a_leftover_that_the_stop_does_remove_is_gone_afterwards():
+    d = _diverter(refuse=["198.18.1.1"])
+    d.ops.present.add("198.18.1.1")                         # the add failed because it is already there
+    d.address_for("a.top")
+    d.stop()
+    assert "198.18.1.1" not in d.ops.present
+
+
+def test_a_failing_removal_of_a_maybe_added_address_does_not_stop_the_rest():
+    d = _diverter(refuse=["198.18.1.1"])
+    d.address_for("a.top")
+    own = d.address_for("b.top")
+    d.stop()
+    assert own in _removes(d) and own not in d.ops.present
+
+
+# --- what ops may raise (Minor) ---
+
+
+@pytest.mark.parametrize("failure", [OSError("pipe closed"), RuntimeError("boom"), net_system.SystemOpsError("no"),
+                                     TimeoutError("netsh did not answer")])
+def test_whatever_the_machine_raises_other_than_a_rejected_call_is_a_refusal(failure):
+    d = _diverter()
+    d.ops.fail["add_address"] = failure
+    assert d.address_for("a.top") == d.shared               # and nothing escapes into the caller's thread
+    assert d.state()["shared_names"] == ["a.top"]
+
+
+# --- the shared address that is passed in, and name_for on what is not an address (Minor) ---
+
+
+@pytest.mark.parametrize("shared", ["198.18.1.1", "198.18.77.3", "198.18.255.254"])
+def test_a_shared_address_on_the_walk_is_refused(shared):
+    with pytest.raises(ValueError):
+        net_divert.GuestDiverter(net_system.FakeSystemOps(), 7, shared=shared)
+
+
+@pytest.mark.parametrize("shared", ["198.18.0.5", "198.19.1.1", "192.168.64.4"])
+def test_a_shared_address_off_the_walk_is_accepted(shared):
+    assert net_divert.GuestDiverter(net_system.FakeSystemOps(), 7, shared=shared).shared == shared
+
+
+@pytest.mark.parametrize("shared", ["not an address", 7, "::1", ""])
+def test_a_shared_address_that_is_not_ipv4_is_refused(shared):
+    with pytest.raises(ValueError):
+        net_divert.GuestDiverter(net_system.FakeSystemOps(), 7, shared=shared)
+
+
+@pytest.mark.parametrize("junk", [["x"], {"a": 1}, {"198.18.1.1"}, None, 7, b"198.18.1.1"])
+def test_name_for_answers_none_to_what_is_not_an_address(junk):
+    d = _diverter()
+    d.address_for("a.top")
+    assert d.name_for(junk) is None
