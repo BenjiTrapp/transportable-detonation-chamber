@@ -334,6 +334,7 @@ deploy:
 		vagrant upload webui/net_mail_ftp.py C:\\DetonationChamberUI\\net_mail_ftp.py; \
 		vagrant upload webui/net_pcap.py C:\\DetonationChamberUI\\net_pcap.py; \
 		vagrant upload webui/net_raw.py C:\\DetonationChamberUI\\net_raw.py; \
+		vagrant upload webui/net_resolve.py C:\\DetonationChamberUI\\net_resolve.py; \
 		vagrant upload webui/net_rules.py C:\\DetonationChamberUI\\net_rules.py; \
 		vagrant upload webui/net_system.py C:\\DetonationChamberUI\\net_system.py; \
 		vagrant upload webui/net_tls.py C:\\DetonationChamberUI\\net_tls.py; \
@@ -401,6 +402,7 @@ deploy-app:
 		vagrant upload webui/net_mail_ftp.py C:\\DetonationChamberUI\\net_mail_ftp.py; \
 		vagrant upload webui/net_pcap.py C:\\DetonationChamberUI\\net_pcap.py; \
 		vagrant upload webui/net_raw.py C:\\DetonationChamberUI\\net_raw.py; \
+		vagrant upload webui/net_resolve.py C:\\DetonationChamberUI\\net_resolve.py; \
 		vagrant upload webui/net_rules.py C:\\DetonationChamberUI\\net_rules.py; \
 		vagrant upload webui/net_system.py C:\\DetonationChamberUI\\net_system.py; \
 		vagrant upload webui/net_tls.py C:\\DetonationChamberUI\\net_tls.py; \

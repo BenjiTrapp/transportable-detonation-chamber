@@ -216,6 +216,7 @@ transportable-detonation-chamber/
 │   ├── net_mail_ftp.py            # NETWORK tab: FTP and SMTP control streams to ftp and smtp events
 │   ├── net_pcap.py                # Fake internet: the capture the fake servers write, and the context they are given
 │   ├── net_raw.py                 # NETWORK tab: traffic no other parser could name, profiled into raw events
+│   ├── net_resolve.py             # Fake internet: the DNS server, where a faked name gets its address
 │   ├── net_decode.py              # NETWORK tab: encoded values decoded when the result means something
 │   ├── net_behavior.py            # NETWORK tab: beacons, retries and fanout over time
 │   ├── net_rules.py               # NETWORK tab: YAML rules over network events (rules/network/default.yaml)
