@@ -10003,11 +10003,19 @@ def _binary_graph_build_job(build, arch):
 def _start_binary_graph_build(build, arch):
     """Build the graph of `build` and `arch` in a thread of its own. False when one is running already, one failed
     too recently to try again, BINARY_GRAPH_BUILD_ATTEMPTS failed in a row, or tools are being updated: an update
-    that swaps files in System32 or the web UI's Python under a build is the opposite of help."""
+    that swaps files in System32 or the web UI's Python under a build is the opposite of help.
+
+    The update flag is read under the same lock that marks `running`. Outside it, a build could read the flag
+    before an update set it and register afterwards, and both would run - which is what both checks exist to
+    prevent. The other direction is still open: the update's preconditions ask `_binary_graph_building()` before
+    the manager marks maintenance, so a build that registers in between slips past. Closing that needs one lock
+    over both subsystems. Measured on this image, the outcome is mild either way: no install script writes to
+    System32, and the graph reads only the .dll and .exe directly in it, so no update changes a file it reads;
+    a swapped web UI Python kills the build subprocess, which is recorded as a failure."""
     key = (build, arch)
-    if _updating_tools():
-        return False
     with _binary_graph_build_lock:
+        if _updating_tools():
+            return False
         state = _binary_graph_build_state
         failed = state["failed"].get(key)
         if (state["running"] or state["attempts"].get(key, 0) >= BINARY_GRAPH_BUILD_ATTEMPTS

@@ -4970,3 +4970,26 @@ def test_the_preload_is_started_with_the_other_background_threads(tdc):
     block = source[source.index("if not _background_disabled"):]
     start = block[:block.index("if __name__ ==")]
     assert "_binary_graph_preload()" in start, "the preload is started where the other background threads are"
+
+
+def test_the_update_check_happens_while_the_build_lock_is_held(tdc, monkeypatch):
+    """M4: the check for a running tool update sat outside `_binary_graph_build_lock` while `running` was marked
+    inside it, so a build could read the flag before an update set it and register afterwards - both running at
+    once, which is what both checks exist to prevent.
+
+    Measured before fixing it, because the note had the consequence wrong: no install script writes to System32
+    (the hits are Sysmon config rules that only name paths), and the graph reads only .dll and .exe directly in
+    System32, no subdirectory, so no update changes a file it reads and there is nothing to mix. A swapped web UI
+    Python kills the build subprocess, which is recorded as a failure. So the race is benign here - and the half of
+    it that costs two lines to close is closed, rather than left because the outcome happens to be mild.
+
+    The other direction remains: the update's preconditions ask `_binary_graph_building()` before the manager marks
+    maintenance, so a build registering in between still slips past. Closing that needs one lock over both
+    subsystems and is recorded, not invented here."""
+    held = []
+    monkeypatch.setattr(tdc, "_updating_tools",
+                        lambda: held.append(tdc._binary_graph_build_lock.locked()) or True)
+    assert tdc._start_binary_graph_build("26200.9974", "arm64") is False, "no build while tools are updated"
+    assert held == [True], "the flag is read under the lock that marks `running`"
+    with tdc._binary_graph_build_lock:
+        assert tdc._binary_graph_build_state["running"] == set(), "and nothing was registered"
