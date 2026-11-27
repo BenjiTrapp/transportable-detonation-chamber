@@ -157,7 +157,7 @@ def test_a_conversation_with_nothing_said_is_still_a_flow(tmp_path):
 
 def test_a_stream_that_crosses_the_wrap_of_the_sequence_numbers_is_whole(tmp_path):
     w, path = _writer(tmp_path)
-    w._isn = lambda: 0xFFFFFF00
+    w._isn = lambda *args: 0xFFFFFF00
     w.exchange(T0, "203.0.113.5", 80, 49200, GET * 20, OK * 20)
     w.close()
     flow = _flows(path)[0]
@@ -260,6 +260,184 @@ def test_a_file_cut_before_the_close_still_has_its_request_and_answer(tmp_path):
         for ts, eth in packets[:keep]:
             pw.writepkt(bytes(eth), ts=ts)
     assert net_analyze.analyze_pcap(out)["event_summary"].get("http") == 1
+
+
+# --- conversations that are not one request and one answer --------------------------------------------------------
+
+
+def _wire(path):
+    flow = _flows(path)[0]
+    return [(d, p) for _t, d, p in flow.packets]
+
+
+def test_a_server_that_speaks_first_is_written_server_first(tmp_path):
+    w, path = _writer(tmp_path)
+    w.conversation(T0, "198.18.0.9", 25, 49200, [
+        ("s", b"220 mail.example ESMTP\r\n"),
+        ("c", b"EHLO host\r\n"),
+        ("s", b"250 ok\r\n"),
+        ("c", b"QUIT\r\n"),
+        ("s", b"221 bye\r\n"),
+    ])
+    w.close()
+    assert [d for d, _p in _wire(path)] == ["s", "c", "s", "c", "s"]
+    flow = _flows(path)[0]
+    assert not flow.client_guessed
+    assert flow.client_stream() == b"EHLO host\r\nQUIT\r\n"
+    assert flow.server_stream() == b"220 mail.example ESMTP\r\n250 ok\r\n221 bye\r\n"
+    assert flow.gaps == []
+
+
+def test_a_banner_first_protocol_is_read_back_as_smtp(tmp_path):
+    w, path = _writer(tmp_path)
+    w.conversation(T0, "198.18.0.9", 25, 49200, [
+        ("s", b"220 mail.example ESMTP\r\n"),
+        ("c", b"EHLO host\r\n"),
+        ("s", b"250 ok\r\n"),
+        ("c", b"MAIL FROM:<a@b.example>\r\n"),
+        ("s", b"250 ok\r\n"),
+        ("c", b"QUIT\r\n"),
+        ("s", b"221 bye\r\n"),
+    ])
+    w.close()
+    report = net_analyze.analyze_pcap(path)
+    assert report["errors"] == []
+    assert report["event_summary"].get("smtp", 0) >= 1
+
+
+def test_a_handshake_and_what_was_inside_it_are_one_connection(tmp_path):
+    hello = b"\x16\x03\x01\x00\x05hello"
+    reply = b"\x16\x03\x03\x00\x05reply"
+    w, path = _writer(tmp_path)
+    w.conversation(T0, "198.18.0.9", 443, 49200, [("c", hello), ("s", reply), ("c", GET), ("s", OK)])
+    w.close()
+    flows = _flows(path)
+    assert len(flows) == 1
+    assert _wire(path) == [("c", hello), ("s", reply), ("c", GET), ("s", OK)]
+    assert flows[0].client_stream() == hello + GET and flows[0].server_stream() == reply + OK
+    assert flows[0].gaps == []
+
+
+def test_a_conversation_is_one_conn_for_the_analysis_however_many_turns_it_had(tmp_path):
+    w, path = _writer(tmp_path)
+    w.conversation(T0, "198.18.0.9", 80, 49200, [("c", GET), ("s", OK), ("c", GET), ("s", OK)])
+    w.close()
+    report = net_analyze.analyze_pcap(path)
+    assert report["event_summary"].get("conn") == 1
+    assert report["event_summary"].get("http") == 2
+
+
+def test_the_acknowledgement_after_a_change_of_speaker_covers_what_the_other_said(tmp_path):
+    w, path = _writer(tmp_path)
+    w.conversation(T0, "198.18.0.9", 80, 49200, [("s", b"A" * 3000), ("c", b"B" * 10)])
+    w.close()
+    tcp = [eth.data.data for _, eth in _packets(path)]
+    data = [t for t in tcp if t.data]
+    first_server, last_server = [t for t in data if t.sport == 80][0], [t for t in data if t.sport == 80][-1]
+    client = [t for t in data if t.sport == 49200][0]
+    assert client.ack == last_server.seq + len(last_server.data)
+    assert client.seq == first_server.ack
+
+
+def test_turns_of_one_direction_in_a_row_are_one_run_of_bytes(tmp_path):
+    w, path = _writer(tmp_path)
+    w.conversation(T0, "198.18.0.9", 80, 49200, [("c", b"GET / HT"), ("c", b"TP/1.1\r\n\r\n"), ("s", b""), ("s", OK)])
+    w.close()
+    flow = _flows(path)[0]
+    assert flow.client_stream() == b"GET / HTTP/1.1\r\n\r\n" and flow.server_stream() == OK
+    assert flow.gaps == []
+
+
+def test_a_conversation_with_no_turns_is_a_handshake_and_a_close(tmp_path):
+    w, path = _writer(tmp_path)
+    assert w.conversation(T0, "198.18.0.9", 4444, 49200, [])
+    w.close()
+    flow = _flows(path)[0]
+    assert flow.packets == [] and flow.answered and flow.gaps == []
+
+
+def test_turns_may_be_given_as_a_generator(tmp_path):
+    w, path = _writer(tmp_path)
+    w.conversation(T0, "198.18.0.9", 80, 49200, (t for t in [("c", GET), ("s", OK)]))
+    w.close()
+    assert _wire(path) == [("c", GET), ("s", OK)]
+
+
+@pytest.mark.parametrize("turns", [[("x", b"a")], [("c",)], ["cs"], [("c", "text")], 5])
+def test_turns_that_are_not_turns_are_refused(tmp_path, turns):
+    w, _ = _writer(tmp_path)
+    with pytest.raises((ValueError, TypeError)):
+        w.conversation(T0, "198.18.0.9", 80, 49200, turns)
+    assert w.exchanges == 0
+
+
+def test_the_cut_of_one_direction_leaves_the_other_whole(tmp_path, monkeypatch):
+    monkeypatch.setattr(net_pcap, "MAX_STREAM_BYTES", 100)
+    monkeypatch.setattr(net_pcap, "MSS", 50)
+    w, path = _writer(tmp_path)
+    w.conversation(T0, "198.18.0.9", 80, 49200, [("s", b"s" * 300), ("c", b"hello"), ("s", b"more"), ("c", b"bye")])
+    w.close()
+    assert w.truncated == 1
+    flow = _flows(path)[0]
+    assert flow.client_stream() == b"hellobye"
+
+
+def test_an_exchange_is_the_same_bytes_as_the_conversation_of_its_two_turns(tmp_path):
+    a, pa = _writer(tmp_path, "a.pcap")
+    b, pb = _writer(tmp_path, "b.pcap")
+    a.exchange(T0, "203.0.113.5", 80, 49200, GET, OK)
+    b.conversation(T0, "203.0.113.5", 80, 49200, [("c", GET), ("s", OK)])
+    a.close()
+    b.close()
+    with open(pa, "rb") as fa, open(pb, "rb") as fb:
+        assert fa.read() == fb.read()
+
+
+def test_a_request_that_was_never_answered_is_in_the_capture(tmp_path):
+    # a session stopped while a server waited: the server records what it has, with nothing as the answer
+    w, path = _writer(tmp_path)
+    assert w.exchange(T0, "203.0.113.5", 80, 49200, GET, b"")
+    w.close()
+    flow = _flows(path)[0]
+    assert flow.client_stream() == GET and flow.server_stream() == b"" and flow.gaps == []
+    report = net_analyze.analyze_pcap(path)
+    http = [e for e in report["events"] if e["type"] == "http"]
+    assert [(e["dest"], e["path"]) for e in http] == [("c2.evil", "/gate.php")]
+    assert report["errors"] == []
+
+
+def test_a_conversation_that_ends_with_the_guest_is_acknowledged_by_the_server(tmp_path):
+    w, path = _writer(tmp_path)
+    w.conversation(T0, "198.18.0.9", 80, 49200, [("s", b"banner\r\n"), ("c", b"hello\r\n")])
+    w.close()
+    tcp = [eth.data.data for _, eth in _packets(path)]
+    last_client = [t for t in tcp if t.sport == 49200 and t.data][-1]
+    acks = [t for t in tcp if t.sport == 80 and not t.data and t.flags == dpkt.tcp.TH_ACK
+            and t.ack == last_client.seq + len(last_client.data)]
+    assert acks
+
+
+def test_what_a_conversation_is_made_of_does_not_depend_on_which_thread_came_first(tmp_path):
+    calls = [(T0 + n, "203.0.113.%d" % (n + 1), 80, 40000 + n, GET + b"x" * n, OK) for n in range(6)]
+
+    def written(order, name):
+        w, path = _writer(tmp_path, name)
+        for n in order:
+            w.exchange(*calls[n])
+        w.close()
+        with open(path, "rb") as fh:
+            return sorted(buf for _ts, buf in dpkt.pcap.Reader(fh))
+
+    assert written(range(6), "a.pcap") == written(reversed(range(6)), "b.pcap")
+
+
+def test_a_port_that_comes_round_again_gets_numbers_of_its_own(tmp_path):
+    w, path = _writer(tmp_path)
+    w.exchange(T0, "203.0.113.5", 80, 49200, GET, OK)
+    w.exchange(T0, "203.0.113.5", 80, 49200, GET, OK)
+    w.close()
+    syns = [eth.data.data.seq for _, eth in _packets(path) if eth.data.data.flags == dpkt.tcp.TH_SYN]
+    assert len(syns) == 2 and syns[0] != syns[1]
 
 
 # --- what a server may rely on --------------------------------------------------------------------------------------
@@ -379,15 +557,74 @@ def test_a_failing_disk_stops_the_capture_and_does_not_reach_the_server(tmp_path
 # --- bounds ---------------------------------------------------------------------------------------------------------
 
 
-def test_a_payload_longer_than_a_reader_keeps_is_cut_there_and_counted(tmp_path, monkeypatch):
+def test_a_payload_longer_than_a_reader_keeps_is_cut_one_byte_past_it_and_counted(tmp_path, monkeypatch):
     monkeypatch.setattr(net_pcap, "MAX_STREAM_BYTES", 1000)
+    monkeypatch.setattr(net_pcap, "MSS", 100)
     w, path = _writer(tmp_path)
+    monkeypatch.setattr(net_flows, "MAX_STREAM_BYTES", 1000)
     w.exchange(T0, "203.0.113.5", 80, 49200, b"a" * 5000, b"b" * 1500)
     w.close()
     flow = _flows(path)[0]
     assert flow.client_stream() == b"a" * 1000 and flow.server_stream() == b"b" * 1000
-    assert flow.gaps == []
+    assert flow.capped and flow.gaps == []
     assert w.truncated == 2
+    assert w.payload_bytes == 2 * 1001
+
+
+def test_a_cut_is_in_the_file_for_a_reader_that_never_saw_the_writer(tmp_path):
+    # no content-length, no framing: a download of 5 MiB that says nothing about its own size
+    w, path = _writer(tmp_path)
+    w.exchange(T0, "203.0.113.5", 80, 49200, GET, b"\xa5" * (5 * 1024 * 1024))
+    w.close()
+    result = net_flows.read_pcap(path)
+    flow = result.flows[0]
+    assert flow.capped
+    assert "retention limit" in result.note
+    assert len(flow.server_stream()) <= net_flows.MAX_STREAM_BYTES
+    assert flow.gaps == []
+    assert w.truncated == 1
+
+
+def test_a_payload_that_just_fits_is_not_reported_cut(tmp_path, monkeypatch):
+    monkeypatch.setattr(net_pcap, "MAX_STREAM_BYTES", 1000)
+    monkeypatch.setattr(net_pcap, "MSS", 100)
+    monkeypatch.setattr(net_flows, "MAX_STREAM_BYTES", 1000)
+    w, path = _writer(tmp_path)
+    w.exchange(T0, "203.0.113.5", 80, 49200, b"a" * 1000, b"b")
+    w.close()
+    assert not _flows(path)[0].capped
+    assert w.truncated == 0
+
+
+def test_a_session_of_connections_that_carry_nothing_is_bounded_by_the_flows_the_reader_keeps(tmp_path,
+                                                                                              monkeypatch):
+    monkeypatch.setattr(net_pcap, "MAX_FLOWS", 5)
+    w, path = _writer(tmp_path)
+    results = [w.exchange(T0 + i, "203.0.113.5", 445, 40000 + i, b"", b"") for i in range(8)]
+    w.close()
+    assert results == [True] * 5 + [False] * 3
+    assert (w.flows, w.dropped, w.exchanges) == (5, 3, 5)
+    assert len(_flows(path)) == 5
+
+
+def test_a_new_udp_four_tuple_counts_as_a_flow_and_a_known_one_does_not(tmp_path, monkeypatch):
+    monkeypatch.setattr(net_pcap, "MAX_FLOWS", 2)
+    w, path = _writer(tmp_path)
+    assert w.datagram(T0, "10.0.2.3", 53, 51000, b"q1")
+    assert w.datagram(T0, "10.0.2.3", 53, 51000, b"a1", inbound=True)      # the same flow
+    assert w.datagram(T0, "10.0.2.3", 53, 51001, b"q2")
+    assert not w.datagram(T0, "10.0.2.3", 53, 51002, b"q3")                 # a third
+    assert w.datagram(T0, "10.0.2.3", 53, 51001, b"q2 again")              # but a known one still goes
+    assert not w.exchange(T0, "203.0.113.5", 80, 49200, GET, OK)            # and a TCP one is a new flow
+    w.close()
+    assert (w.flows, w.dropped) == (2, 2)
+    assert len(_flows(path)) == 2
+
+
+def test_the_limits_of_the_budget_are_the_readers(tmp_path):
+    assert net_pcap.MAX_STREAM_BYTES == net_flows.MAX_STREAM_BYTES
+    assert net_pcap.MAX_TOTAL_BYTES == net_flows.MAX_TOTAL_BYTES
+    assert net_pcap.MAX_FLOWS == net_flows.MAX_FLOWS
 
 
 def test_a_capture_that_has_reached_its_budget_drops_what_comes_after_and_says_so(tmp_path, monkeypatch):
@@ -400,11 +637,6 @@ def test_a_capture_that_has_reached_its_budget_drops_what_comes_after_and_says_s
     w.close()
     assert w.dropped == 2
     assert len(_flows(path)) == 2
-
-
-def test_the_constants_of_the_budget_are_the_readers(tmp_path):
-    assert net_pcap.MAX_STREAM_BYTES == net_flows.MAX_STREAM_BYTES
-    assert net_pcap.MAX_TOTAL_BYTES == net_flows.MAX_TOTAL_BYTES
 
 
 # --- the context every server is given ------------------------------------------------------------------------------
