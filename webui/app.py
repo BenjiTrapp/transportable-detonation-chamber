@@ -6713,14 +6713,21 @@ class _ResultStore:
     def lookup(self, tool, pid=None, sha256=None, max_pid_age=6 * 3600):
         """Newest matching result, or None.
 
-        With a SHA256, a PID entry from a different sample is ignored. With
-        only a PID, entries older than max_pid_age are ignored (the PID has
+        With a SHA256, a PID entry from a different sample is ignored, and a SHA256 entry of another PID likewise:
+        the hash key is shared by every run of the same file, so between one submit and the moment that run stores
+        anything the only entry under it is the run before. Measured on the chamber: injectsim.exe submitted as PID
+        5540 got the syscall stage's "the architecture of process 5092 is unknown", 5092 being the earlier run. An
+        entry whose PID is unknown still speaks for any run of that file (a scan of the file alone has no PID), and
+        a lookup without a PID is untouched - that is how the submission history finds a result at all.
+
+        With only a PID, entries older than max_pid_age are ignored (the PID has
         probably been reused since).
         """
         candidates = []
         if sha256:
             hit = self._entry(f"{tool}_{sha256}")
-            if hit:
+            # no PID asked: take it. A PID asked: only when the entry is that run's, or belongs to no run at all.
+            if hit and (not pid or hit[0].get("pid") in (None, str(pid))):
                 candidates.append(hit)
         if pid:
             hit = self._entry(f"{tool}_{pid}")

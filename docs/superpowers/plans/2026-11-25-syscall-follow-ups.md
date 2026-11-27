@@ -10,7 +10,26 @@ Speichern schlug fehl. Eine versionierte Datei überlebt das.
 Jeder Punkt nennt, was gemessen wurde, warum er liegen blieb, und die Richtung — keine
 Entscheidung ist getroffen.
 
-## 1. Der Ergebnis-Cache schlägt nach Datei-Hash vor PID nach
+## 1. Der Ergebnis-Cache schlägt nach Datei-Hash vor PID nach — behoben am 27.11.2026
+
+**Behoben, und schmaler als die Notiz annahm.** `lookup` bevorzugt den Hash nicht: es nimmt den
+**neueren** von Hash- und PID-Treffer. Mein Fall trat auf, weil der neue Lauf noch nichts
+gespeichert hatte — zwischen dem Absenden und dem Moment, in dem die Stufe schreibt, ist der
+einzige Eintrag unter diesem Hash der des vorigen Laufs, und die Detonationsansicht fragt nach
+einer bestimmten PID.
+
+Der Fix ist die Spiegelung der Prüfung, die es für die umgekehrte Richtung schon gab („mit einem
+SHA256 wird ein PID-Eintrag eines anderen Samples ignoriert"): ein Hash-Treffer darf nicht für
+eine PID sprechen, zu der er nicht gehört. Ein Eintrag ohne PID gilt weiter für jeden Lauf
+derselben Datei (ein Scan der Datei allein hat keine), und eine Abfrage **ohne** PID bleibt
+unberührt — so findet die Einsendungs-Historie überhaupt ein Ergebnis.
+
+Es war **keine** Entwurfsentscheidung: die Regel ist für alle sechs Werkzeuge dieselbe, und nur
+eine Route fragt mit PID und Hash zugleich (`/api/detonation/results`); die Evidenz-Route fragt
+nur mit PID. Die Änderung engt ein: wo vorher ein fremder Lauf antwortete, antwortet jetzt
+nichts — „noch nicht" statt einer falschen Zuordnung.
+
+Der Befund, wie er stand:
 
 `_beacon_results_cache.lookup` sucht zuerst `f"{tool}_{sha256}"`, dann die PID. Detoniert
 man dieselbe Datei erneut, zeigt die Ansicht darum das Ergebnis des **vorigen** Laufs, bis
