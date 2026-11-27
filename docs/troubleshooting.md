@@ -209,6 +209,7 @@ transportable-detonation-chamber/
 │   ├── net_analyze.py             # NETWORK tab: a pcap to one report (flows, parsers, decoding, behaviour, rules, evidence)
 │   ├── net_flows.py               # NETWORK tab: a pcap read into flows and reassembled TCP streams
 │   ├── net_events.py              # NETWORK tab: the network event schema
+│   ├── net_divert.py              # Fake internet: one address per faked name, handed out on demand
 │   ├── net_dns.py                 # NETWORK tab: DNS messages to dns events
 │   ├── net_http.py                # NETWORK tab: HTTP streams to http, download, upload and websocket events
 │   ├── net_tls.py                 # NETWORK tab: TLS handshakes to tls events, with JA3 and JA4

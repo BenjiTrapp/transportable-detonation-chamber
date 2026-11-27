@@ -389,6 +389,7 @@ switch ($Target) {
             Copy-Item 'webui\net_baseline.py' -Destination 'C:\DetonationChamberUI\net_baseline.py' -ToSession $s -Force
             Copy-Item 'webui\net_behavior.py' -Destination 'C:\DetonationChamberUI\net_behavior.py' -ToSession $s -Force
             Copy-Item 'webui\net_decode.py' -Destination 'C:\DetonationChamberUI\net_decode.py' -ToSession $s -Force
+            Copy-Item 'webui\net_divert.py' -Destination 'C:\DetonationChamberUI\net_divert.py' -ToSession $s -Force
             Copy-Item 'webui\net_dns.py' -Destination 'C:\DetonationChamberUI\net_dns.py' -ToSession $s -Force
             Copy-Item 'webui\net_events.py' -Destination 'C:\DetonationChamberUI\net_events.py' -ToSession $s -Force
             Copy-Item 'webui\net_evidence.py' -Destination 'C:\DetonationChamberUI\net_evidence.py' -ToSession $s -Force
@@ -468,6 +469,7 @@ switch ($Target) {
             Copy-Item 'webui\net_baseline.py' -Destination 'C:\DetonationChamberUI\net_baseline.py' -ToSession $s -Force
             Copy-Item 'webui\net_behavior.py' -Destination 'C:\DetonationChamberUI\net_behavior.py' -ToSession $s -Force
             Copy-Item 'webui\net_decode.py' -Destination 'C:\DetonationChamberUI\net_decode.py' -ToSession $s -Force
+            Copy-Item 'webui\net_divert.py' -Destination 'C:\DetonationChamberUI\net_divert.py' -ToSession $s -Force
             Copy-Item 'webui\net_dns.py' -Destination 'C:\DetonationChamberUI\net_dns.py' -ToSession $s -Force
             Copy-Item 'webui\net_events.py' -Destination 'C:\DetonationChamberUI\net_events.py' -ToSession $s -Force
             Copy-Item 'webui\net_evidence.py' -Destination 'C:\DetonationChamberUI\net_evidence.py' -ToSession $s -Force
