@@ -10125,6 +10125,29 @@ def _binary_graph_for(start_build=True):
     return loaded, None
 
 
+def _binary_graph_preload():
+    """Read the binary graph into `_binary_graph_held` in the background, and return the thread.
+
+    Measured on the chamber: the first call of the stubs route after a restart took 14.66 s, the next 0.4 to 0.6 s.
+    `_binary_graph_for` parses the 28.2 MB cache inside `_binary_graph_held_lock`, on the calling thread, so that
+    first request pays for all of it and every other request wanting the graph waits at the same lock. Doing it at
+    start moves that off whoever asks first.
+
+    It never builds: a start must not set minutes of reading System32 going, which is why the syscall scan passes
+    `start_build=False` too. And it swallows whatever it meets - a graph that cannot be read is the next request's
+    business to report, not a reason for the web UI not to come up.
+    """
+    def job():
+        try:
+            _binary_graph_for(start_build=False)
+        except Exception:
+            pass                                 # the request that needs it says why; a start must not fail here
+
+    thread = threading.Thread(target=job, name="binary-graph-preload", daemon=True)
+    thread.start()
+    return thread
+
+
 def _binary_graph_param(name):
     value = request.args.get(name) or ""
     if len(value) > BINARY_GRAPH_PARAM_MAX:
@@ -15610,6 +15633,7 @@ if not _background_disabled and (_is_reloader_child or not _reloader_active):
     _start_update_check_thread()
     _start_log_collector_thread()
     _start_firewall()
+    _binary_graph_preload()
 
 if __name__ == "__main__":
     print(f"[*] Detonation Chamber UI starting on http://0.0.0.0:{WEBUI_PORT}")
