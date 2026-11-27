@@ -46,15 +46,34 @@ nothing about what the adapter did), so ``stop`` tries to remove it and ignores 
 ``WindowsSystemOps`` refuse the same things), and a wrong call must not be turned into a session that quietly serves
 everything from one address. Anything else ``ops`` raises is the operating system saying no, whatever it is called,
 and must not escape into the caller's DNS thread.
+
+**The session around the addresses** (``start`` and ``stop``). Adding an address to a DHCP adapter takes it off DHCP and
+the leased address goes with it (measured, and it cost the test VM its network for over an hour), so ``start`` reads
+the adapter's addressing and makes it static *with its real address* before anything is added, on purpose instead of by
+accident, and ``stop`` hands the very dict it read back to ``restore_addressing``. In between the isolation rule
+``TDC-NET-ISOLATE`` stands: one outbound Block rule, because in Windows Firewall a Block beats every Allow and "block
+everything, allow a few" cannot be written as rules of both kinds. The few are therefore taken *out of the block*: it
+blocks every remote address except ``198.18.0.0/15`` and loopback, and every local port except TDC's own (the web UI
+and WinRM, which the host must keep reaching; they answer from those ports). What the rule cannot stop, and says so
+(``blocked_attempts``): a sample that connects to an address of its own choosing is seen and refused, never answered.
+
+``stop`` is a chain in which every step is tried whatever an earlier one did: the addresses, the rule, the addressing.
+The first error surfaces once all have been tried, and all of them are in ``state()["stop_errors"]``. A step that
+succeeded is not done again by a second ``stop``; one that failed is. The addresses step ends with a **sweep**: the
+adapter's address list is read once and every address of this prefix that is on it is removed, whether this session
+added it or not. An ``add_address`` that timed out and worked anyway, or a session that crashed, leaves addresses
+that nothing else would ever take away. The read costs 713 ms at 701 addresses, which is affordable once at the
+end and not in a loop, which is why the map stays in memory during the session.
 """
 
 from __future__ import annotations
 
 import ipaddress
 import threading
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Dict, List, Optional, Tuple
 
-from net_system import SystemOpsError
+from net_system import FAKE_INTERNET, SystemOpsError
 
 SHARED_FALLBACK_REASON = "address pool refused"
 UNADDRESSED_REASON = "no address could be added and the shared address is not on the adapter"
@@ -62,6 +81,51 @@ SHARED_ATTEMPTS = 3
 
 DEFAULT_PREFIX = "198.18"
 MASK = "255.255.0.0"        # what the measurement added the addresses with: the /16 of the prefix
+
+ISOLATION_RULE = "TDC-NET-ISOLATE"
+SERVICE_PORTS = (9000,)             # the web UI
+WINRM_PORTS = (5985, 5986)          # the host has to keep reaching these for the whole session
+DEFAULT_DNS = "127.0.0.1"           # where the DNS server is; the loopback is not filtered, so no rule has to let it out
+MAX_BLOCKED = 500                   # distinct attempts kept; a sample that tries every address must not grow the list
+
+
+def _complement(allowed: List[Any], version: int) -> List[str]:
+    """The ``a-b`` ranges of every address of ``version`` that lies in none of the ``allowed`` networks."""
+    top = (1 << (32 if version == 4 else 128)) - 1
+    make = ipaddress.IPv4Address if version == 4 else ipaddress.IPv6Address
+    spans = sorted((int(n.network_address), int(n.broadcast_address)) for n in allowed if n.version == version)
+    out, cursor = [], 0
+    for low, high in spans:
+        if low > cursor:
+            out.append((cursor, low - 1))
+        cursor = max(cursor, high + 1)
+    if cursor <= top:
+        out.append((cursor, top))
+    return ["%s-%s" % (make(low), make(high)) for low, high in out]
+
+
+def _ports_outside(ports: Any) -> List[str]:
+    out, cursor = [], 1
+    for port in sorted(set(ports)):
+        if port > cursor:
+            out.append((cursor, port - 1))
+        cursor = max(cursor, port + 1)
+    if cursor <= 65535:
+        out.append((cursor, 65535))
+    return [str(low) if low == high else "%d-%d" % (low, high) for low, high in out]
+
+
+def isolation_spec(service_ports: Any = SERVICE_PORTS + WINRM_PORTS) -> Dict[str, Any]:
+    """The firewall spec of the isolation rule (see the module): outbound Block, remote addresses outside the fake
+    internet and loopback, local ports outside ``service_ports``. A rule's conditions all have to hold for it to bite,
+    which is what turns "block" into "block, except". IPv6 is in it too: a sample that finds an AAAA or an ``[::]``
+    literal must not walk around an IPv4-only rule. ``::`` is an allowed span of its own only so that no range of the
+    rule starts at it; ``::1`` is left out of the block as 127.0.0.0/8 is."""
+    allowed = [FAKE_INTERNET, ipaddress.ip_network("127.0.0.0/8"), ipaddress.ip_network("::/128"),
+               ipaddress.ip_network("::1/128")]
+    return {"direction": "out", "action": "block",
+            "remote_address": _complement(allowed, 4) + _complement(allowed, 6),
+            "local_port": _ports_outside(service_ports)}
 
 
 class Diverter:
@@ -104,13 +168,22 @@ class GuestDiverter(Diverter):
     ``ops`` is a ``net_system.SystemOps``. ``prefix`` is the first two octets of the /16 the addresses come from.
     ``shared`` is the address that a name gets when its own could not be added; left out, it is ``<prefix>.0.1`` and
     this class adds it (see the module). One passed in must be an IPv4 address that is not on the walk.
+    ``service_ports`` are the local ports the isolation rule leaves alone besides WinRM's, ``dns_address`` is where
+    the guest's DNS is pointed (the DNS server of Task 6 listens there).
 
     Thread safety: the DNS server and the others ask from their own threads. Adding is serialised, so that two
     threads asking for one name get one address and one ``add_address``. Asking for a name that is already known
     takes no lock and no call."""
 
-    def __init__(self, ops, index, prefix=DEFAULT_PREFIX, shared=None):
+    def __init__(self, ops, index, prefix=DEFAULT_PREFIX, shared=None, service_ports=SERVICE_PORTS,
+                 dns_address=DEFAULT_DNS):
         ipaddress.IPv4Address(prefix + ".1.1")          # a prefix that is not two octets is the caller's bug
+        ipaddress.IPv4Address(dns_address)
+        ports = list(service_ports) + list(WINRM_PORTS)
+        if any(isinstance(p, bool) or not isinstance(p, int) or not 1 <= p <= 65535 for p in ports):
+            raise ValueError("service_ports are port numbers")
+        self._ports = ports
+        self.dns_address = dns_address
         self.ops = ops
         self.index = index
         self.prefix = prefix
@@ -136,6 +209,18 @@ class GuestDiverter(Diverter):
         self._started = False
         self._stopped = False
         self._lock = threading.Lock()
+        self._saved: Optional[Dict[str, Any]] = None    # the addressing as read, set just before it is first changed
+        self._rule_touched = False                      # the isolation rule may exist
+        self._rule_written = False
+        self._profiles_off: List[str] = []
+        self._addresses_done = False                    # the steps of stop that went through, so a second stop
+        self._rule_done = False                         # does what failed and nothing else
+        self._restore_done = False
+        self._stop_errors: List[str] = []
+        self._blocked: List[Dict[str, Any]] = []
+        self._blocked_index: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
+        self._blocked_overflow = 0
+        self._blocked_lock = threading.Lock()
 
     @staticmethod
     def _check_shared(shared: Any, prefix: str) -> None:
@@ -222,36 +307,168 @@ class GuestDiverter(Diverter):
 
     # -- the session --
 
+    def _ours(self, address: Any) -> bool:
+        """An address of this prefix inside the fake internet. The second condition is what keeps a ``prefix`` that
+        is not the fake internet's (and the adapter's own address with it) out of every removal."""
+        try:
+            value = ipaddress.IPv4Address(address)
+        except ValueError:
+            return False
+        if value not in FAKE_INTERNET or not str(value).startswith(self.prefix + "."):
+            return False
+        return self._own_shared or address != self.shared
+
     def start(self):
-        # Nothing is added here: an address is added when a name asks for it (see the module).
+        """Take the machine's addressing for the session, in this order: what an earlier session left (the rule and
+        the addresses), the adapter read, the adapter made static with its real address, the isolation rule, DNS.
+        The adapter is read once for both the leftovers and what ``stop`` gives back. A start that fails takes back
+        what it did and raises what went wrong. Starting twice is starting once; a stopped diverter does not start."""
+        if self._stopped:
+            raise RuntimeError("the diverter is stopped and cannot be started again")
+        if self._started:
+            return
         self._started = True
+        try:
+            self._begin()
+        except Exception:
+            try:
+                self.stop()
+            except Exception:
+                pass                    # it is in state()["stop_errors"]; what surfaces is what made start fail
+            raise
+
+    def _begin(self) -> None:
+        self._rule_touched = True
+        self.ops.remove_firewall_rules(ISOLATION_RULE)
+        current = self.ops.read_addressing(self.index)
+        mine = [e["address"] for e in current["addresses"] if self._ours(e["address"])]
+        for address in mine:
+            try:
+                self.ops.remove_address(self.index, address)
+            except Exception as e:      # stop tries it again and says so if it still stays
+                self._remove_failed[address] = str(e)[:300]
+        state = dict(current, addresses=[e for e in current["addresses"] if not self._ours(e["address"])])
+        primary = next((e for e in state["addresses"] if not e.get("skip_as_source")), None)
+        if primary is None:
+            raise SystemOpsError("adapter %s has no address of its own to keep: it cannot be made static" % self.index)
+        self._saved = state             # from here on the adapter may be changed, and stop gives this back
+        gateway = state.get("gateway")
+        self.ops.set_static(self.index, primary["address"], primary["mask"], gateway, None)
+        self._profiles_off = list(self.ops.add_firewall_rule(ISOLATION_RULE, isolation_spec(self._ports)) or [])
+        self._rule_written = True
+        self.ops.set_static(self.index, primary["address"], primary["mask"], gateway, [self.dns_address])
 
     def stop(self):
-        """Remove every address that was added, newest first, and try all of them whatever one of them does. What
-        could not be removed is in ``state()["remove_failed"]`` and in the ``SystemOpsError`` this raises; a second
-        ``stop`` tries those again and only those. An address that was only *maybe* added is asked to go too, and
-        that failing (it usually was never there) is not an error."""
+        """Take everything back: the addresses (what was added, then whatever of this prefix is still on the
+        adapter), the isolation rule, the addressing. Every step is tried whatever an earlier one did; the first
+        error is raised when all have been tried, and all of them are in ``state()["stop_errors"]``. A second
+        ``stop`` repeats only the steps that failed."""
+        errors: List[BaseException] = []
+
+        def attempt(step):
+            try:
+                step()
+            except Exception as e:
+                errors.append(e)
+
         with self._lock:
             self._stopped = True
-            for address in reversed(list(self._added)):
-                try:
-                    self.ops.remove_address(self.index, address)
-                except Exception as e:
-                    self._remove_failed[address] = str(e)[:300]
-                else:
-                    self._added.remove(address)
-                    self._remove_failed.pop(address, None)
-            for address in list(self._maybe):
-                try:
-                    self.ops.remove_address(self.index, address)
-                except Exception:
-                    pass
-                self._maybe.remove(address)
-            failed = dict(self._remove_failed)
-        if failed:
-            first = sorted(failed.items())[:5]
-            raise SystemOpsError("could not remove %d of the fake internet's addresses from adapter %s: %s"
-                                 % (len(failed), self.index, "; ".join("%s (%s)" % kv for kv in first)))
+            attempt(self._remove_addresses)
+        attempt(self._remove_rule)
+        attempt(self._restore)
+        self._stop_errors = [str(e)[:500] for e in errors]
+        if errors:
+            raise errors[0]
+
+    def _remove_addresses(self) -> None:
+        """Newest first, all of them whatever one does. An address that was only *maybe* added is asked to go too,
+        and that failing (it usually was never there) is not an error. Then the sweep: see the module."""
+        if self._addresses_done:
+            return
+        tried = set()
+        for address in reversed(list(self._added)):
+            tried.add(address)
+            try:
+                self.ops.remove_address(self.index, address)
+            except Exception as e:
+                self._remove_failed[address] = str(e)[:300]
+            else:
+                self._added.remove(address)
+                self._remove_failed.pop(address, None)
+        for address in list(self._maybe):
+            try:
+                self.ops.remove_address(self.index, address)
+            except Exception:
+                pass
+            self._maybe.remove(address)
+        unread = None
+        try:
+            on_adapter = [e.get("address") for e in self.ops.read_addressing(self.index).get("addresses") or []]
+        except Exception as e:
+            unread = str(e)[:300]
+            on_adapter = []
+        for address in on_adapter:
+            if address in tried or not self._ours(address):
+                continue
+            try:
+                self.ops.remove_address(self.index, address)
+            except Exception as e:
+                self._remove_failed[address] = str(e)[:300]
+            else:
+                self._remove_failed.pop(address, None)
+        problems = []
+        if self._remove_failed:
+            first = sorted(self._remove_failed.items())[:5]
+            problems.append("could not remove %d of the fake internet's addresses from adapter %s: %s"
+                            % (len(self._remove_failed), self.index, "; ".join("%s (%s)" % kv for kv in first)))
+        if unread is not None:
+            problems.append("could not read adapter %s to look for addresses that were left: %s" % (self.index, unread))
+        if problems:
+            raise SystemOpsError("; ".join(problems))
+        self._addresses_done = True
+
+    def _remove_rule(self) -> None:
+        if not self._rule_touched or self._rule_done:
+            return
+        self.ops.remove_firewall_rules(ISOLATION_RULE)
+        self._rule_done = True
+
+    def _restore(self) -> None:
+        if self._saved is None or self._restore_done:
+            return
+        self.ops.restore_addressing(self.index, self._saved)
+        self._restore_done = True
+
+    # -- what was seen and not answered --
+
+    def note_blocked(self, dest, port, pid=None, process=None, at=None):
+        """Record a connection that the isolation refused and nothing answered: a sample that went to an address of
+        its own choosing, with no DNS and no proxy. It is not silent: it is an indicator, and the report shows it.
+        The same (address, port, process) again is one entry whose ``count`` grows; ``MAX_BLOCKED`` distinct ones are
+        kept and the rest are counted in ``state()["blocked_overflow"]``."""
+        if not isinstance(dest, str) or not dest.strip():
+            raise ValueError("not a destination: %r" % (str(dest)[:40],))
+        if isinstance(port, bool) or not isinstance(port, int) or not 0 <= port <= 65535:
+            raise ValueError("not a port: %r" % (str(port)[:20],))
+        at = time.time() if at is None else at
+        key = (dest.strip(), port, pid, process)
+        with self._blocked_lock:
+            entry = self._blocked_index.get(key)
+            if entry is not None:
+                entry["count"] += 1
+                entry["last"] = at
+            elif len(self._blocked) >= MAX_BLOCKED:
+                self._blocked_overflow += 1
+            else:
+                entry = {"dest": key[0], "port": port, "pid": pid, "process": process, "answered": False,
+                         "count": 1, "first": at, "last": at}
+                self._blocked.append(entry)
+                self._blocked_index[key] = entry
+
+    def blocked_attempts(self):
+        """What was seen and not answered, in the order it was first seen, as copies."""
+        with self._blocked_lock:
+            return [dict(b) for b in self._blocked]
 
     def state(self):
         """What the report shows, as copies: ``names`` (name to its own address), ``shared`` (that address) and
@@ -259,9 +476,17 @@ class GuestDiverter(Diverter):
         they asked) and ``shared_reason`` (why, or None), ``unaddressed_names`` (the names that have no address
         that leads anywhere) and ``unaddressed_reason``, ``maybe_added`` (addresses whose add failed and that
         ``stop`` has not yet tried to remove), ``remove_failed`` (``[{"address", "error"}]``, empty unless ``stop``
-        could not take all away)."""
+        could not take all away), ``isolation`` (``rule``, whether it was ``written``, and the firewall
+        ``profiles_off``: on those the rule bites nothing, which the report must not hide), ``stop_errors``
+        (the errors of the last ``stop``), ``blocked`` (distinct attempts) and ``blocked_overflow``."""
+        with self._blocked_lock:
+            blocked, overflow = len(self._blocked), self._blocked_overflow
         with self._lock:
-            return {"names": dict(self._by_name), "shared": self.shared, "shared_on_adapter": self._shared_ready,
+            return {"isolation": {"rule": ISOLATION_RULE, "written": self._rule_written,
+                                  "profiles_off": list(self._profiles_off)},
+                    "stop_errors": list(self._stop_errors), "blocked": blocked, "blocked_overflow": overflow,
+                    "dns_address": self.dns_address,
+                    "names": dict(self._by_name), "shared": self.shared, "shared_on_adapter": self._shared_ready,
                     "shared_names": list(self._shared_names), "shared_reason": self._shared_reason,
                     "unaddressed_names": list(self._unaddressed),
                     "unaddressed_reason": UNADDRESSED_REASON if self._unaddressed else None,
