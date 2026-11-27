@@ -40,11 +40,13 @@ def win(monkeypatch):
 
 
 def test_the_fake_records_what_was_asked_of_it_and_answers_from_its_table():
-    ops = net_system.FakeSystemOps(tcp_owners={("198.18.1.1", 80, "10.0.0.5", 51000): 4242})
+    # the owner's end comes first: pid 4242 is the process at 10.0.0.5:51000 talking to 198.18.1.1:80
+    ops = net_system.FakeSystemOps(tcp_owners={("10.0.0.5", 51000, "198.18.1.1", 80): 4242})
     ops.add_address(7, "198.18.1.1", "255.255.0.0")
     assert ops.calls == [("add_address", 7, "198.18.1.1", "255.255.0.0")]
-    assert ops.tcp_owner("198.18.1.1", 80, "10.0.0.5", 51000) == 4242
-    assert ops.tcp_owner("198.18.1.2", 80, "10.0.0.5", 51000) is None
+    assert ops.tcp_owner("10.0.0.5", 51000, "198.18.1.1", 80) == 4242
+    assert ops.tcp_owner("10.0.0.6", 51000, "198.18.1.1", 80) is None
+    assert ops.tcp_owner("198.18.1.1", 80, "10.0.0.5", 51000) is None      # the server's end first is not the owner
 
 
 def test_the_windows_ops_are_not_importable_off_windows_but_the_module_is():
@@ -69,12 +71,92 @@ CALLS = [
     ("remove_ca", ("A" * 40,)),
     ("tcp_owner", ("10.0.0.5", 51000, "198.18.1.1", 80)),
 ]
+# what the fake and the Windows class both refuse: (method, arguments) that must raise ValueError
+REFUSED = [
+    ("add_address", ("7", "198.18.1.1", "255.255.0.0")),
+    ("add_address", (7, "198.18.1", "255.255.0.0")),
+    ("add_address", (7, "198.18.1.1", "255.0.255.0")),
+    ("add_address", (7, "203.0.113.9", "255.255.255.0")),
+    ("add_address", (7, "198.20.0.1", "255.255.0.0")),
+    ("remove_address", (0, "198.18.1.1")),
+    ("remove_address", (7, "::1")),
+    ("set_static", (True, "10.0.0.5", "255.255.255.0", None, None)),
+    ("set_static", (7, "10.0.0.5", "255.255.255.0", "gateway", None)),
+    ("set_static", (7, "10.0.0.5", "255.255.255.0", None, "127.0.0.1")),
+    ("read_addressing", (None,)),
+    ("restore_addressing", (7, None)),
+    ("restore_addressing", (7, {"dhcp": True, "address": "192.168.64.4"})),
+    ("restore_addressing", (7, {"index": 8, "dhcp": True, "addresses": [], "dns_static": []})),
+    ("add_firewall_rule", ("TDC-FW-abc", {"action": "block"})),
+    ("add_firewall_rule", ("isolate", {"action": "block"})),
+    ("add_firewall_rule", ("TDC-NET-X", {})),
+    ("add_firewall_rule", ("TDC-NET-X", {"action": "block", "colour": "red"})),
+    ("add_firewall_rule", ("TDC-NET-X", {"action": "block", "remote_address": "LocalSubnet"})),
+    ("add_firewall_rule", ("TDC-NET-X", {"action": "block", "remote_port": []})),
+    ("remove_firewall_rules", ("TDC-FW-",)),
+    ("remove_firewall_rules", ("TDC-F",)),
+    ("remove_firewall_rules", ("*",)),
+    ("install_ca", ("pem",)),
+    ("install_ca", ("",)),
+    ("remove_ca", ("AB",)),
+    ("remove_ca", ("G" * 40,)),
+    ("tcp_owner", ("not-an-ip", 51000, "198.18.1.1", 80)),
+    ("tcp_owner", ("10.0.0.5", "51000", "198.18.1.1", 80)),
+    ("tcp_owner", ("10.0.0.5", 70000, "198.18.1.1", 80)),
+]
 
 
 @pytest.mark.parametrize("method,args", CALLS, ids=[c[0] for c in CALLS])
 def test_the_base_class_is_a_protocol_with_nothing_behind_it(method, args):
     with pytest.raises(NotImplementedError):
         getattr(net_system.SystemOps(), method)(*args)
+
+
+@pytest.mark.parametrize("method,args", REFUSED, ids=lambda v: v if isinstance(v, str) else "")
+def test_the_fake_refuses_what_the_windows_ops_refuse(method, args):
+    # a call that raises ValueError on Windows must not pass against the fake, or the tests of every caller
+    # would be green for a mistake that fails in the guest
+    ops = net_system.FakeSystemOps()
+    with pytest.raises(ValueError):
+        getattr(ops, method)(*args)
+    assert ops.rules == {} and ops.cas == {}
+
+
+@pytest.mark.parametrize("method,args", [r for r in REFUSED if r[0] != "tcp_owner"],
+                         ids=lambda v: v if isinstance(v, str) else "")
+def test_a_call_the_fake_refuses_is_recorded_first_so_a_test_can_see_what_was_attempted(method, args):
+    ops = net_system.FakeSystemOps()
+    with pytest.raises(ValueError):
+        getattr(ops, method)(*args)
+    assert ops.calls == [(method,) + args]
+
+
+@pytest.mark.parametrize("method,args", REFUSED, ids=lambda v: v if isinstance(v, str) else "")
+def test_the_windows_ops_refuse_the_same_calls_and_run_nothing(win, method, args):
+    ops, run = _ops()
+    with pytest.raises(ValueError):
+        getattr(ops, method)(*args)
+    assert run.calls == []
+
+
+def test_the_fake_accepts_what_read_addressing_returned_and_nothing_else_for_a_restore():
+    ops = net_system.FakeSystemOps()
+    ops.restore_addressing(7, ops.read_addressing(7))
+    assert [c[0] for c in ops.calls] == ["read_addressing", "restore_addressing"]
+
+
+def test_the_fake_compares_a_thumbprint_without_regard_to_case():
+    ops = net_system.FakeSystemOps()
+    thumb = ops.install_ca(_pem_only())
+    assert ops.remove_ca(thumb.lower()) is True
+
+
+def test_a_failure_asked_for_at_tcp_owner_is_raised_though_the_call_is_not_recorded():
+    # the path on which a caller whose table cannot be read falls back to correlating by Sysmon
+    ops = net_system.FakeSystemOps(fail={"tcp_owner": net_system.SystemOpsError("the table cannot be read")})
+    with pytest.raises(net_system.SystemOpsError, match="cannot be read"):
+        ops.tcp_owner("10.0.0.5", 51000, "198.18.1.1", 80)
+    assert ops.calls == []
 
 
 def test_the_fake_is_a_system_ops_and_has_every_method_of_the_protocol():
@@ -124,9 +206,9 @@ def test_the_fake_keeps_the_rules_and_the_certificates_it_was_given_so_a_stop_ca
     ops = net_system.FakeSystemOps()
     ops.add_firewall_rule("TDC-NET-ISOLATE", {"action": "block"})
     ops.add_firewall_rule("TDC-NET-OTHER", {"action": "allow"})
-    ops.add_firewall_rule("TDC-FW-abc", {"action": "block"})
+    ops.add_firewall_rule("TDC-OTHER-abc", {"action": "block"})
     assert ops.remove_firewall_rules("TDC-NET-") == 2
-    assert sorted(ops.rules) == ["TDC-FW-abc"]
+    assert sorted(ops.rules) == ["TDC-OTHER-abc"]
 
     thumb = ops.install_ca(_pem_only())
     assert thumb in ops.cas
@@ -325,6 +407,16 @@ def test_an_address_or_mask_that_is_not_ipv4_runs_nothing(win, address, mask):
     assert run.calls == []
 
 
+def test_add_address_adds_only_the_fake_internets_own_addresses_but_a_restore_may_re_add_any(win):
+    ops, run = _ops()
+    for address in ("198.18.0.1", "198.19.255.254"):
+        ops.add_address(7, address, "255.254.0.0")
+    for address in ("198.17.255.255", "198.20.0.0", "10.0.0.6", "203.0.113.9"):
+        with pytest.raises(ValueError):
+            ops.add_address(7, address, "255.254.0.0")
+    assert len(run.netsh()) == 2           # the restore test below re-adds 10.0.0.6 through the private path
+
+
 def test_set_static_gives_the_real_address_and_the_gateway_then_the_dns_servers_in_order(win):
     ops, run = _ops()
     ops.set_static(7, "192.168.64.4", "255.255.255.0", "192.168.64.1", ["127.0.0.1", "9.9.9.9"])
@@ -467,6 +559,19 @@ def test_a_dhcp_adapter_that_was_taken_off_dhcp_goes_back_to_dhcp_before_anythin
         ["interface", "ipv4", "set", "dnsservers", "name=7", "source=dhcp"],
     ]
     assert "ipconfig.exe" in run.programs()
+
+
+def test_an_adapter_that_is_already_on_dhcp_is_not_told_to_switch_it_on_again(win):
+    # netsh refuses ("DHCP is already enabled"), and a restore that worked must not report that as a failure
+    adapter = dict(DHCP_ADAPTER, dns=["1.1.1.1"], dns_static=["1.1.1.1"])
+    ops, run = _ops({"powershell.exe": [_answer(adapter), _answer(DHCP_ADAPTER)],
+                     "netsh.exe": [(0, "", "")]})
+    state = ops.read_addressing(7)
+    run.calls.clear()
+    ops.restore_addressing(7, state)
+    assert run.netsh() == [["interface", "ipv4", "set", "dnsservers", "name=7", "source=static",
+                            "address=1.1.1.1", "validate=no"]]
+    assert "ipconfig.exe" not in run.programs()
 
 
 def test_a_dhcp_adapter_with_static_dns_gets_its_static_dns_back(win):

@@ -124,10 +124,12 @@ class SystemOps:
         """Remove the certificate with that thumbprint; True if one was there, False if not (not an error)."""
         raise NotImplementedError
 
-    def tcp_owner(self, local_ip, local_port, remote_ip, remote_port):
-        """The pid that owns the entry of the TCP table whose local end is ``local_ip:local_port`` and whose remote
-        end is ``remote_ip:remote_port``, or None. The ends are the entry's own: the server side of a connection and
-        the client side are two entries, each with the ends the other way round."""
+    def tcp_owner(self, owner_ip, owner_port, peer_ip, peer_port):
+        """The pid of the process whose end of a TCP connection is ``owner_ip:owner_port`` and whose peer is
+        ``peer_ip:peer_port``, or None. **The owner's end comes first.** A connection between two sockets of this
+        machine is two entries of the TCP table, one per process, each with the ends the other way round, and the
+        answer is the pid of the entry whose *local* end is the first pair. Asked with the server's end first, the
+        answer is the server's own pid, with no error: to find the process that connected, pass its end first."""
         raise NotImplementedError
 
 
@@ -151,11 +153,20 @@ class FakeSystemOps(SystemOps):
     however the call was spelled, in the order the calls came. Asking who owns a connection (``tcp_owner``) is not
     recorded: it is asked once per accepted connection and says nothing about what was done to the machine.
 
-    ``tcp_owners`` maps ``(local_ip, local_port, remote_ip, remote_port)`` to a pid. ``addressing`` is what
-    ``read_addressing`` answers (a copy; its shape is the caller's, the Windows class's is described at
-    ``WindowsSystemOps.read_addressing``). ``fail`` maps a method name to an exception that is raised by that method,
-    after the call is recorded and before it has any effect. ``profiles_off`` is what ``add_firewall_rule`` reports.
-    ``rules`` (name to spec) and ``cas`` (thumbprint to pem) hold what was written and not yet removed.
+    ``tcp_owners`` maps ``(owner_ip, owner_port, peer_ip, peer_port)`` to a pid, the owner's end first as at
+    ``SystemOps.tcp_owner``. ``addressing`` is what ``read_addressing`` answers (a copy; its shape is the caller's, the
+    Windows class's is described at ``WindowsSystemOps.read_addressing``, and ``restore_addressing`` insists on that
+    one). ``fail`` maps a method name to an exception that is raised by that method, after the call is recorded and
+    before it has any effect (``tcp_owner``, which is not recorded, raises it too). ``profiles_off`` is what
+    ``add_firewall_rule`` reports. ``rules`` (name to spec) and ``cas`` (thumbprint to pem) hold what was written and
+    not yet removed.
+
+    **It refuses what ``WindowsSystemOps`` refuses**, with the same ``ValueError`` and by the same functions: an
+    adapter index that is not a positive integer, an address that is not IPv4 or (for ``add_address``) not in
+    198.18.0.0/15, a rule name or prefix outside ``TDC-`` or inside ``TDC-FW-``, a spec that is not understood, a
+    state that is not what ``read_addressing`` returned, something that is not a PEM certificate, a thumbprint that is
+    not 40 hex digits. The call is recorded first, so a test can still see what was attempted. A fake that accepted
+    what Windows refuses would let a caller's mistake pass every test and fail in the guest.
     """
 
     def __init__(self, tcp_owners: Optional[Dict[Tuple[str, int, str, int], int]] = None,
@@ -177,29 +188,38 @@ class FakeSystemOps(SystemOps):
 
     def add_address(self, index, address, mask):
         self._did("add_address", index, address, mask)
+        _index(index), _fake_internet_address(address), _mask(mask)
 
     def remove_address(self, index, address):
         self._did("remove_address", index, address)
+        _index(index), _ipv4(address)
 
     def set_static(self, index, address, mask, gateway, dns):
         self._did("set_static", index, address, mask, gateway, dns)
+        _index(index), _ipv4(address), _mask(mask), _servers(dns)
+        if gateway is not None:
+            _ipv4(gateway, "gateway")
 
     def read_addressing(self, index):
         self._did("read_addressing", index)
+        _index(index)
         if self.addressing is not None:
             return copy.deepcopy(self.addressing)
         return dict(copy.deepcopy(_DEFAULT_ADDRESSING), index=index)
 
     def restore_addressing(self, index, state):
         self._did("restore_addressing", index, state)
+        _checked_state(_index(index), state)
 
     def add_firewall_rule(self, name, spec):
         self._did("add_firewall_rule", name, spec)
+        _rule_name(name), _rule_spec(spec)
         self.rules[name] = spec
         return list(self.profiles_off)
 
     def remove_firewall_rules(self, prefix):
         self._did("remove_firewall_rules", prefix)
+        _rule_prefix(prefix)
         gone = [n for n in self.rules if n.startswith(prefix)]
         for name in gone:
             del self.rules[name]
@@ -207,21 +227,22 @@ class FakeSystemOps(SystemOps):
 
     def install_ca(self, pem):
         self._did("install_ca", pem)
-        try:
-            thumbprint = thumbprint_of(pem)
-        except ValueError:
-            # a fake accepts what a test made up; only the real store has to be given a certificate
-            text = pem if isinstance(pem, str) else bytes(pem).decode("utf-8", "replace")
-            thumbprint = hashlib.sha1(text.encode("utf-8")).hexdigest().upper()
+        thumbprint = thumbprint_of(pem)
         self.cas[thumbprint] = pem
         return thumbprint
 
     def remove_ca(self, thumbprint):
         self._did("remove_ca", thumbprint)
-        return self.cas.pop(thumbprint, None) is not None
+        return self.cas.pop(_thumbprint(thumbprint), None) is not None
 
-    def tcp_owner(self, local_ip, local_port, remote_ip, remote_port):
-        return self.tcp_owners.get((local_ip, local_port, remote_ip, remote_port))
+    def tcp_owner(self, owner_ip, owner_port, peer_ip, peer_port):
+        # Not recorded (see the class), but a failure that was asked for is raised: it is the path on which a caller
+        # whose table cannot be read falls back to another way of finding the process.
+        failure = self.fail.get("tcp_owner")
+        if failure is not None:
+            raise failure
+        _tcp_ends(owner_ip, owner_port, peer_ip, peer_port)
+        return self.tcp_owners.get((owner_ip, owner_port, peer_ip, peer_port))
 
 
 # --------------------------------------------------------------------------------------------------
@@ -242,6 +263,33 @@ def _ipv4(value: Any, what: str = "address") -> str:
         return str(ipaddress.IPv4Address(value))
     except ValueError:
         raise ValueError(f"not an IPv4 {what}: {str(value)[:40]!r}") from None
+
+
+FAKE_INTERNET = ipaddress.IPv4Network("198.18.0.0/15")      # RFC 2544: routable nowhere
+
+
+def _fake_internet_address(value: Any) -> str:
+    """An address that may be added to the adapter by ``add_address``: one of the fake internet's own. A caller's
+    mistake must not be able to put a real address, a public one least of all, on the machine's adapter."""
+    address = _ipv4(value)
+    if ipaddress.IPv4Address(address) not in FAKE_INTERNET:
+        raise ValueError(f"{address} is not in {FAKE_INTERNET}: add_address only adds the fake internet's own addresses")
+    return address
+
+
+def _tcp_ends(owner_ip: Any, owner_port: Any, peer_ip: Any, peer_port: Any) -> Tuple[Any, Any]:
+    ips = []
+    for value in (owner_ip, peer_ip):
+        try:
+            if not isinstance(value, str):
+                raise ValueError
+            ips.append(ipaddress.ip_address(value))
+        except ValueError:
+            raise ValueError(f"not an IP address: {str(value)[:40]!r}") from None
+    for value in (owner_port, peer_port):
+        if isinstance(value, bool) or not isinstance(value, int) or not 0 <= value <= 65535:
+            raise ValueError(f"not a port: {str(value)[:20]!r}")
+    return ips[0], ips[1]
 
 
 def _mask(value: Any) -> str:
@@ -659,7 +707,12 @@ class WindowsSystemOps(SystemOps):
     # -- addresses --
 
     def add_address(self, index, address, mask):
-        self._netsh("interface", "ipv4", "add", "address", str(_index(index)), _ipv4(address), _mask(mask),
+        self._add_address(_index(index), _fake_internet_address(address), mask)
+
+    def _add_address(self, index, address, mask):
+        # without the range check of add_address: a restore re-adds the adapter's own secondary addresses, whatever
+        # they are
+        self._netsh("interface", "ipv4", "add", "address", str(index), _ipv4(address), _mask(mask),
                     "skipassource=true")
 
     def remove_address(self, index, address):
@@ -731,15 +784,20 @@ class WindowsSystemOps(SystemOps):
                 return None
 
         # The address first: without one the machine is off the network and nothing else matters until it is back.
+        # netsh refuses to switch on DHCP that is already on ("DHCP is already enabled"), and a restore that worked
+        # must not report that as a failure; its DNS may still differ, so the rest still runs.
+        renew = False
         if state["dhcp"]:
-            step(self._netsh, "interface", "ipv4", "set", "address", f"name={index}", "source=dhcp")
+            if current is None or not current["dhcp"]:
+                step(self._netsh, "interface", "ipv4", "set", "address", f"name={index}", "source=dhcp")
+                renew = True
         else:
             self._restore_static(index, state, failures, step)
         if state["dns_static"]:
             step(self._set_dns, index, list(state["dns_static"]))
         else:
             step(self._netsh, "interface", "ipv4", "set", "dnsservers", f"name={index}", "source=dhcp")
-        if state["dhcp"]:
+        if renew:
             # What the measurement script does after it has put DHCP back: ask for the lease now instead of
             # waiting for the client to notice. Best effort; the lease comes anyway.
             try:
@@ -774,7 +832,7 @@ class WindowsSystemOps(SystemOps):
             if (entry["address"], entry["mask"], entry["skip_as_source"]) in have:
                 continue
             if entry["skip_as_source"]:
-                step(self.add_address, index, entry["address"], entry["mask"])
+                step(self._add_address, index, entry["address"], entry["mask"])
             else:
                 step(self._netsh, "interface", "ipv4", "add", "address", str(index), entry["address"],
                      entry["mask"])
@@ -842,13 +900,13 @@ class WindowsSystemOps(SystemOps):
 
     # -- the TCP table --
 
-    def tcp_owner(self, local_ip, local_port, remote_ip, remote_port):
-        local, remote = ipaddress.ip_address(local_ip), ipaddress.ip_address(remote_ip)
-        if local.version != 4 or remote.version != 4:
+    def tcp_owner(self, owner_ip, owner_port, peer_ip, peer_port):
+        owner, peer = _tcp_ends(owner_ip, owner_port, peer_ip, peer_port)
+        if owner.version != 4 or peer.version != 4:
             return None                 # only the IPv4 table is read: the fake internet is IPv4
-        wanted = (str(local), local_port, str(remote), remote_port)
-        owner = None
+        wanted = (str(owner), owner_port, str(peer), peer_port)
+        found = None
         for _, laddr, lport, raddr, rport, pid in parse_tcp_table(self._read_table()):
             if (laddr, lport, raddr, rport) == wanted and pid != IDLE_PID:
-                owner = pid     # a TIME_WAIT leftover of the same four numbers has pid 0 and never wins
-        return owner
+                found = pid     # a TIME_WAIT leftover of the same four numbers has pid 0 and never wins
+        return found
