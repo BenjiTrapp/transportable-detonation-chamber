@@ -190,8 +190,21 @@ eingeordnet hat:
   deren eigener Hinweis „allowlist not applied" nicht.
 - Ein Verweigerungs-Hinweis „baseline could not be loaded" bleibt stehen, nachdem die
   Baseline doch geladen ist.
-- Die Liste der Messungen nennt den Build nicht, darum sieht eine Messung eines fremden
-  Builds wie jede andere aus, bis man sie öffnet.
+- ~~Die Liste der Messungen nennt den Build nicht, darum sieht eine Messung eines fremden
+  Builds wie jede andere aus, bis man sie öffnet.~~ **Behoben am 27.11.2026.**
+  `/api/syscalls/measurements` trug den `build` für jede Messung schon mit, und der Banner über
+  der Karte nannte ihn — nur das Steuerelement nannte Prozess, PID, Zeit und Sicht. Jetzt steht
+  der Build in der Beschriftung, und eine Messung, deren Build nicht der ist, den die Karte
+  zeigt, wird genau dort markiert, wo gewählt wird. Markiert wird nur, was bekannt ist: solange
+  keine Baseline geladen ist, gibt es keinen Build zum Vergleich, und dann wird nichts markiert
+  — eine Wahl auf Verdacht „fremd" zu nennen ist schlechter als eine unbenannte. Ein Build, den
+  niemand aufgeschrieben hat, heißt „build not recorded" und ist unbekannt, nicht fremd.
+  In Chrome gegen die VM geprüft, beide Themes, 1920 und 1280 px: die vier echten Messungen der
+  Historie nennen alle `26200.9974` und keine ist markiert; mit einem auf `26100.1742`
+  geänderten Eintrag erscheint „· another build", mit einem leeren „build not recorded". Keine
+  Konsolenmeldung. Nichts wurde dabei neu gebaut: die Karte rekonstruiert eine vergangene
+  Messung schon gegen die Baseline ihres **eigenen** Builds und ihrer Sicht, und eine fremde
+  Sicht legt `syscallDropForeignScan` weg.
 
 ## 5. Was gemessen und bewusst so gelassen wurde
 
