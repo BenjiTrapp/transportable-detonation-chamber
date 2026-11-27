@@ -24,10 +24,17 @@ class _Adapter(net_system.FakeSystemOps):
         self.present = set(present)
         self.refuse = set(refuse)
         self.refuse_walk_after = refuse_walk_after
+        self.hooks = {}                 # a method name to what runs inside that call, before it returns
 
     @staticmethod
     def _on_walk(address):
         return not address.startswith("198.18.0.")          # the shared default is 198.18.0.1, before the walk
+
+    def set_static(self, index, address, mask, gateway, dns):
+        super().set_static(index, address, mask, gateway, dns)
+        hook = self.hooks.get("set_static")
+        if hook:
+            hook()
 
     def add_address(self, index, address, mask):
         refused = address in self.refuse
@@ -49,9 +56,10 @@ class _Adapter(net_system.FakeSystemOps):
     def read_addressing(self, index):
         """What the adapter has: the addressing it was given, and the fake internet's addresses that are on it."""
         state = super().read_addressing(index)
+        known = {e["address"] for e in state["addresses"]}
         state["addresses"] = state["addresses"] + [
-            {"address": a, "mask": "255.255.0.0", "skip_as_source": True}
-            for a in sorted(self.present) if a.startswith("198.1")]
+            {"address": a, "mask": "255.255.0.0" if a.startswith("198.1") else "255.255.255.0", "skip_as_source": True}
+            for a in sorted(self.present) if a not in known]
         return state
 
 
@@ -65,17 +73,24 @@ DHCP = {"index": 7, "dhcp": True,
         "gateway": "192.168.64.1", "dns": ["192.168.64.1"], "dns_static": []}
 
 
-def _diverter(fail_adds_after=None, fail_removes=False, index=7, shared=GUEST, refuse=(), addressing=None, **kw):
+def _diverter(fail_adds_after=None, fail_removes=False, index=7, shared=GUEST, refuse=(), addressing=None,
+              started=True, **kw):
     """``shared=None`` is the default shared address, which the diverter has to put on the adapter itself; the
     default of this helper is one that is there already. ``addressing`` is what the adapter reads as (the fake's
-    own static default when left out)."""
+    own static default when left out). ``started`` (the default) has the diverter start, and forgets the calls of the
+    start: names are only given their own addresses once the adapter is static, so a test of the allocation runs on
+    a started diverter and a test of the session passes ``started=False`` and starts it itself."""
     ops = _Adapter(present=[shared] if shared else [], refuse=refuse, refuse_walk_after=fail_adds_after,
                    addressing=addressing)
     if fail_removes:
         ops.fail["remove_address"] = net_system.SystemOpsError("netsh delete address failed (1): not found")
     if shared is not None:
         kw["shared"] = shared
-    return net_divert.GuestDiverter(ops, index, **kw)
+    d = net_divert.GuestDiverter(ops, index, **kw)
+    if started:
+        d.start()
+        ops.calls.clear()
+    return d
 
 
 def _adds(d):
@@ -96,7 +111,7 @@ def test_two_names_never_share_an_address():          # Review Focus 4
 
 
 def test_nothing_is_assigned_before_a_name_asks():
-    d = _diverter()
+    d = _diverter(started=False)
     d.start()
     assert [c for c in d.ops.calls if c[0] == "add_address"] == []
 
@@ -279,7 +294,7 @@ def test_a_given_shared_address_is_neither_added_nor_removed():
 
 
 def test_the_default_shared_address_goes_on_the_adapter_together_with_the_first_name():
-    d = _diverter(shared=None)
+    d = _diverter(started=False, shared=None)
     d.start()
     assert _adds(d) == []                                   # not at start: nothing is added before a name asks
     own = d.address_for("a.top")
@@ -426,7 +441,7 @@ def _calls(d, method):
 
 
 def test_start_makes_the_adapter_static_before_the_first_address():
-    d = _diverter(addressing=DHCP)
+    d = _diverter(started=False, addressing=DHCP)
     d.start()
     kinds = _kinds(d)
     assert "set_static" in kinds
@@ -440,22 +455,24 @@ def test_start_makes_the_adapter_static_before_the_first_address():
 
 
 def test_start_goes_through_its_steps_in_the_order_that_keeps_the_machine_on_the_network():
-    d = _diverter(addressing=DHCP)
+    d = _diverter(started=False, addressing=DHCP)
     d.start()
-    assert _kinds(d) == ["remove_firewall_rules", "read_addressing", "set_static", "add_firewall_rule", "set_static"]
+    assert _kinds(d) == ["remove_firewall_rules", "read_addressing", "set_static", "add_firewall_rule",
+                         "set_dns"]
 
 
 def test_the_guests_dns_is_pointed_at_us_after_the_isolation_rule_stands():
-    d = _diverter(addressing=DHCP)
+    d = _diverter(started=False, addressing=DHCP)
     d.start()
-    assert _calls(d, "set_static")[-1][1:] == (7, GUEST, "255.255.255.0", "192.168.64.1", ["127.0.0.1"])
-    d = _diverter(addressing=DHCP, dns_address="192.168.64.4")
+    assert _calls(d, "set_dns") == [("set_dns", 7, ["127.0.0.1"])]
+    assert len(_calls(d, "set_static")) == 1                # the address is not set a second time
+    d = _diverter(started=False, addressing=DHCP, dns_address="192.168.64.4")
     d.start()
-    assert _calls(d, "set_static")[-1][5] == ["192.168.64.4"]
+    assert _calls(d, "set_dns") == [("set_dns", 7, ["192.168.64.4"])]
 
 
 def test_stop_puts_dhcp_back_even_when_removing_an_address_fails():
-    d = _diverter(addressing=DHCP, fail_removes=True)
+    d = _diverter(started=False, addressing=DHCP, fail_removes=True)
     d.start(); d.address_for("a.top")
     with pytest.raises(net_system.SystemOpsError):
         d.stop()
@@ -463,14 +480,14 @@ def test_stop_puts_dhcp_back_even_when_removing_an_address_fails():
 
 
 def test_stop_hands_back_exactly_what_it_read():
-    d = _diverter(addressing=DHCP)
+    d = _diverter(started=False, addressing=DHCP)
     d.start()
     d.stop()
     assert _calls(d, "restore_addressing")[0][1:] == (7, DHCP)
 
 
 def test_the_isolation_rule_is_named_and_is_removed_at_start_and_stop():
-    d = _diverter()
+    d = _diverter(started=False)
     d.start()
     assert ("add_firewall_rule", net_divert.ISOLATION_RULE) in [(c[0], c[1]) for c in d.ops.calls]
     assert [c for c in d.ops.calls if c[0] == "remove_firewall_rules"]
@@ -505,7 +522,7 @@ def _covered(spec_values, text):
 
 
 def _isolation_spec(**kw):
-    d = _diverter(**kw)
+    d = _diverter(started=False, **kw)
     d.start()
     return d.ops.rules[net_divert.ISOLATION_RULE]
 
@@ -521,28 +538,33 @@ def test_the_rule_blocks_what_goes_out_and_leaves_the_fake_internet_and_loopback
         assert not _covered(blocked, kept), kept
 
 
-def test_the_rule_does_not_catch_what_the_service_ports_and_winrm_answer_from():
+def test_the_rule_has_no_local_port_and_so_no_way_out_for_a_sample_that_binds_one():
+    # an exemption by local port lets through whatever is sent *from* 9000, 5985 or 5986, on any protocol, and
+    # nobody holds UDP 9000. Outbound rules are checked when the guest opens a connection; the replies on the
+    # connections the host opened to the web UI and WinRM are not checked again, so nothing has to be let out.
     spec = _isolation_spec()
-    for port in ("9000", "5985", "5986"):
-        assert not _covered(spec["local_port"], port), port
-    for port in ("1", "80", "8999", "9001", "49152", "65535"):
-        assert _covered(spec["local_port"], port), port
+    assert sorted(spec) == ["action", "direction", "remote_address"]
+    assert net_divert.isolation_spec() == spec
 
 
-def test_the_service_ports_can_be_given():
-    spec = _isolation_spec(service_ports=(9000, 9443))
-    assert not _covered(spec["local_port"], "9443") and _covered(spec["local_port"], "9442")
+def test_the_rule_is_a_spec_that_windows_takes():
+    # ports need a protocol (New-NetFirewallRule: "The protocol-specific options do not match the protocol"); a
+    # rule with neither is what is written, and the fake's validator has been run over it by add_firewall_rule
+    spec = _isolation_spec()
+    assert not {"local_port", "remote_port", "protocol"} & set(spec)
 
 
 def test_a_profile_that_is_off_is_reported_and_is_not_an_error():
-    d = _diverter()
+    d = _diverter(started=False)
     d.ops.profiles_off = ["Public"]
+    d.ops.profile = "Private"                               # not the one the adapter is on
     d.start()
-    assert d.state()["isolation"] == {"rule": net_divert.ISOLATION_RULE, "written": True, "profiles_off": ["Public"]}
+    iso = d.state()["isolation"]
+    assert iso["profiles_off"] == ["Public"] and iso["written"] is True and iso["effective"] is True
 
 
 def test_start_removes_what_an_earlier_session_left_before_it_changes_anything():
-    d = _diverter(addressing=DHCP)
+    d = _diverter(started=False, addressing=DHCP)
     d.ops.present.update({"198.18.1.1", "198.18.1.2", "198.18.0.1"})
     d.start()
     kinds = _kinds(d)
@@ -554,26 +576,51 @@ def test_start_removes_what_an_earlier_session_left_before_it_changes_anything()
     assert _calls(d, "restore_addressing")[0][2] == DHCP
 
 
-def test_start_leaves_an_address_of_the_adapter_alone_even_when_it_looks_like_a_leftover():
-    own = dict(DHCP, addresses=[{"address": "10.198.18.4", "mask": "255.0.0.0", "skip_as_source": False}])
-    d = _diverter(addressing=own)
+def test_an_adapter_whose_own_address_is_in_the_fake_internets_range_is_refused_before_anything_is_changed():
+    # Clash's fake-IP range is this one: the machine can really be there, and removing its only address ends it
+    own = dict(DHCP, addresses=[{"address": "198.18.5.4", "mask": "255.255.255.0", "skip_as_source": False}])
+    d = _diverter(started=False, addressing=own)
+    with pytest.raises(net_system.SystemOpsError, match="198.18.5.4"):
+        d.start()
+    assert _calls(d, "remove_address") == [] and _calls(d, "set_static") == []
+    assert _calls(d, "add_firewall_rule") == [] and _calls(d, "restore_addressing") == []
+
+
+def test_the_adapters_own_address_in_the_range_survives_the_sweep_of_the_teardown_too():
+    own = dict(DHCP, addresses=[{"address": "198.18.5.4", "mask": "255.255.255.0", "skip_as_source": False}])
+    d = _diverter(started=False, addressing=own)
+    d.ops.present.add("198.18.1.1")                         # a real leftover, which the teardown's sweep may take
+    with pytest.raises(net_system.SystemOpsError):
+        d.start()
+    assert [c[2] for c in _calls(d, "remove_address")] == ["198.18.1.1"]
+
+
+def test_a_secondary_address_of_the_adapter_that_is_not_skip_as_source_is_not_a_leftover():
+    own = dict(DHCP, addresses=[{"address": GUEST, "mask": "255.255.255.0", "skip_as_source": False},
+                                {"address": "10.198.18.4", "mask": "255.0.0.0", "skip_as_source": False}])
+    d = _diverter(started=False, addressing=own)
     d.start()
+    d.stop()
     assert _calls(d, "remove_address") == []
 
 
 def test_start_with_no_address_to_keep_changes_nothing_and_says_so():
-    d = _diverter(addressing=dict(DHCP, addresses=[]))
+    d = _diverter(started=False, addressing=dict(DHCP, addresses=[]))
     with pytest.raises(net_system.SystemOpsError):
         d.start()
     assert _calls(d, "set_static") == [] and _calls(d, "add_firewall_rule") == []
 
 
 @pytest.mark.parametrize("failing,after", [("set_static", ["restore_addressing"]),
-                                           ("add_firewall_rule", ["restore_addressing"])])
+                                           ("add_firewall_rule", ["restore_addressing"]),
+                                           ("network_profile", ["restore_addressing"]),
+                                           ("set_dns", ["restore_addressing"])])
 def test_a_start_that_fails_takes_back_what_it_had_done_and_raises_the_original(failing, after):
-    d = _diverter(addressing=DHCP)
+    d = _diverter(started=False, addressing=DHCP)
     boom = net_system.SystemOpsError("%s: access denied" % failing)
     d.ops.fail[failing] = boom
+    if failing == "network_profile":
+        d.ops.profiles_off = ["Public"]                         # it is only asked when something is off
     with pytest.raises(net_system.SystemOpsError) as e:
         d.start()
     assert e.value is boom
@@ -583,7 +630,7 @@ def test_a_start_that_fails_takes_back_what_it_had_done_and_raises_the_original(
 
 
 def test_a_start_that_cannot_even_read_the_adapter_restores_nothing():
-    d = _diverter(addressing=DHCP)
+    d = _diverter(started=False, addressing=DHCP)
     d.ops.fail["read_addressing"] = net_system.SystemOpsError("no adapter")
     with pytest.raises(net_system.SystemOpsError):
         d.start()
@@ -591,7 +638,7 @@ def test_a_start_that_cannot_even_read_the_adapter_restores_nothing():
 
 
 def test_start_twice_is_one_start_and_a_stopped_diverter_does_not_start_again():
-    d = _diverter(addressing=DHCP)
+    d = _diverter(started=False, addressing=DHCP)
     d.start()
     before = len(d.ops.calls)
     d.start()
@@ -606,7 +653,7 @@ def test_start_twice_is_one_start_and_a_stopped_diverter_does_not_start_again():
 
 @pytest.mark.parametrize("failing", ["remove_address", "remove_firewall_rules", "restore_addressing"])
 def test_a_step_of_stop_that_fails_does_not_skip_the_others_and_its_error_surfaces(failing):
-    d = _diverter(addressing=DHCP)
+    d = _diverter(started=False, addressing=DHCP)
     d.start()
     d.address_for("a.top")
     d.ops.calls.clear()
@@ -623,7 +670,7 @@ def test_a_step_of_stop_that_fails_does_not_skip_the_others_and_its_error_surfac
 
 
 def test_when_several_steps_fail_the_first_error_surfaces_and_the_others_are_in_the_state():
-    d = _diverter(addressing=DHCP)
+    d = _diverter(started=False, addressing=DHCP)
     d.start()
     d.address_for("a.top")
     d.ops.fail["remove_firewall_rules"] = net_system.SystemOpsError("rule gone wrong")
@@ -637,7 +684,7 @@ def test_when_several_steps_fail_the_first_error_surfaces_and_the_others_are_in_
 
 
 def test_a_second_stop_retries_only_the_step_that_failed():
-    d = _diverter(addressing=DHCP)
+    d = _diverter(started=False, addressing=DHCP)
     d.start()
     d.ops.fail["restore_addressing"] = net_system.SystemOpsError("netsh said no")
     with pytest.raises(net_system.SystemOpsError):
@@ -653,14 +700,52 @@ def test_a_second_stop_retries_only_the_step_that_failed():
 
 
 def test_a_diverter_that_never_started_has_nothing_of_the_firewall_or_the_adapter_to_take_back():
-    d = _diverter()
-    d.address_for("a.top")
+    d = _diverter(started=False)
     d.stop()
     assert _calls(d, "remove_firewall_rules") == [] and _calls(d, "restore_addressing") == []
 
 
+# --- no address before the adapter is static (review, Critical 1) ---
+
+
+def test_a_name_asked_before_start_gets_the_shared_address_and_no_add_address_ever_reaches_a_dhcp_adapter():
+    d = _diverter(started=False, addressing=DHCP)
+    assert d.address_for("a.top") == d.shared
+    assert d.address_for("b.top") == d.shared
+    assert _adds(d) == [] and d.ops.calls == []
+    assert d.state()["names"] == {} and d.state()["shared_names"] == []     # not remembered: not a refusal
+
+
+def test_a_name_asked_while_start_is_still_making_the_adapter_static_gets_no_add_address():
+    d = _diverter(started=False, addressing=DHCP)
+    seen = []
+    d.ops.hooks["set_static"] = lambda: seen.append(d.address_for("early.top"))
+    d.start()
+    assert seen == [d.shared]
+    assert d.address_for("early.top").startswith("198.18.1.")      # asked again later, it gets its own address
+    assert _kinds(d).index("set_static") < _kinds(d).index("add_address")
+
+
+def test_a_start_that_fails_before_the_adapter_is_static_never_opens_the_adapter_to_addresses():
+    d = _diverter(started=False, addressing=DHCP)
+    d.ops.fail["set_static"] = net_system.SystemOpsError("access denied")
+    with pytest.raises(net_system.SystemOpsError):
+        d.start()
+    assert _adds(d) == []
+
+
+def test_a_name_asked_after_a_failed_start_is_refused_like_after_a_stop():
+    d = _diverter(started=False, addressing=DHCP)
+    d.ops.fail["set_static"] = net_system.SystemOpsError("access denied")
+    with pytest.raises(net_system.SystemOpsError):
+        d.start()
+    with pytest.raises(RuntimeError):
+        d.address_for("a.top")
+    assert _adds(d) == []
+
+
 def test_stop_removes_an_address_that_it_never_added_when_it_lies_on_the_adapter():    # a timed-out add that worked
-    d = _diverter(addressing=DHCP)
+    d = _diverter(started=False, addressing=DHCP)
     d.start()
     d.address_for("a.top")
     d.ops.present.add("198.18.7.7")
@@ -670,7 +755,7 @@ def test_stop_removes_an_address_that_it_never_added_when_it_lies_on_the_adapter
 
 
 def test_the_sweep_reads_the_adapter_once_and_never_during_the_session():
-    d = _diverter(addressing=DHCP)
+    d = _diverter(started=False, addressing=DHCP)
     d.start()
     for i in range(30):
         d.address_for("h%d.top" % i)
@@ -681,7 +766,7 @@ def test_the_sweep_reads_the_adapter_once_and_never_during_the_session():
 
 
 def test_the_sweep_tries_an_address_once_even_when_it_is_also_one_that_was_recorded():
-    d = _diverter(addressing=DHCP, fail_removes=True)
+    d = _diverter(started=False, addressing=DHCP, fail_removes=True)
     d.start()
     d.address_for("a.top")
     with pytest.raises(net_system.SystemOpsError):
@@ -689,16 +774,33 @@ def test_the_sweep_tries_an_address_once_even_when_it_is_also_one_that_was_recor
     assert _removes(d) == ["198.18.1.1"]
 
 
-def test_the_sweep_leaves_alone_what_is_not_ours_and_what_the_adapter_has_of_its_own():
-    d = _diverter(addressing=DHCP, shared=GUEST)
+def test_the_sweep_leaves_alone_what_is_not_the_fake_internets_and_what_the_adapter_has_of_its_own():
+    d = _diverter(started=False, addressing=DHCP, shared=GUEST)
     d.start()
-    d.ops.present.update({"198.19.0.9", "192.168.64.77"})        # another prefix; and an address that is not the fake internet's
+    d.ops.present.update({"192.168.64.77", "198.20.0.9"})        # outside 198.18.0.0/15
     d.stop()
     assert _removes(d) == []
 
 
+def test_the_sweep_takes_every_skip_as_source_address_of_the_range_whatever_prefix_put_it_there():
+    d = _diverter(started=False, addressing=DHCP)
+    d.start()
+    d.ops.present.update({"198.19.0.9", "198.18.200.1"})          # a session with another prefix left the first
+    d.stop()
+    assert sorted(_removes(d)) == ["198.18.200.1", "198.19.0.9"]
+
+
+def test_the_sweep_does_not_take_an_address_that_is_not_skip_as_source_even_inside_the_range():
+    own = dict(DHCP, addresses=[{"address": GUEST, "mask": "255.255.255.0", "skip_as_source": False},
+                                {"address": "198.18.9.9", "mask": "255.255.0.0", "skip_as_source": False}])
+    d = _diverter(started=False, addressing=own)
+    with pytest.raises(net_system.SystemOpsError):
+        d.start()
+    assert _removes(d) == []
+
+
 def test_a_sweep_that_cannot_read_the_adapter_does_not_skip_the_rest_and_is_tried_again():
-    d = _diverter(addressing=DHCP)
+    d = _diverter(started=False, addressing=DHCP)
     d.start()
     d.address_for("a.top")
     d.ops.fail["read_addressing"] = net_system.SystemOpsError("powershell timed out")
@@ -713,7 +815,7 @@ def test_a_sweep_that_cannot_read_the_adapter_does_not_skip_the_rest_and_is_trie
 
 
 def test_the_default_shared_address_is_swept_with_the_rest():
-    d = _diverter(addressing=DHCP, shared=None)
+    d = _diverter(started=False, addressing=DHCP, shared=None)
     d.start()
     d.address_for("a.top")
     d.stop()
@@ -724,7 +826,7 @@ def test_the_default_shared_address_is_swept_with_the_rest():
 
 
 def test_a_hard_coded_address_is_recorded_as_blocked_not_dropped():    # Review Focus 1
-    d = _diverter()
+    d = _diverter(started=False)
     d.start()
     d.note_blocked("203.0.113.9", 4444, pid=4242, process="x.exe")
     b = d.blocked_attempts()[0]
@@ -762,10 +864,137 @@ def test_a_sample_that_tries_every_address_does_not_grow_the_list_without_end():
     assert d.blocked_attempts()[0]["count"] == 2
 
 
-@pytest.mark.parametrize("dest,port", [("", 80), (None, 80), ("203.0.113.9", -1), ("203.0.113.9", 70000),
+@pytest.mark.parametrize("dest,port", [("", 80), (None, 80), ("evil.example", 80), ("203.0.113.9:80", 80),
+                                       ("203.0.113", 80), ("http://203.0.113.9", 80), ("203.0.113.9", -1), ("203.0.113.9", 70000),
                                        ("203.0.113.9", "80"), ("203.0.113.9", True)])
 def test_a_blocked_attempt_that_is_not_one_is_refused(dest, port):
     d = _diverter()
     with pytest.raises(ValueError):
         d.note_blocked(dest, port)
     assert d.blocked_attempts() == []
+
+
+def test_a_blocked_destination_is_an_address_and_is_kept_in_its_canonical_form():
+    d = _diverter()
+    d.note_blocked(" 203.0.113.9 ", 80)
+    d.note_blocked("2001:DB8::0:1", 443)
+    assert [b["dest"] for b in d.blocked_attempts()] == ["203.0.113.9", "2001:db8::1"]
+
+
+# --- BaseException does not skip the rest of stop (review, Important 2) ---
+
+
+@pytest.mark.parametrize("interrupt", [KeyboardInterrupt(), SystemExit(1)])
+def test_an_interrupt_in_the_middle_of_the_addresses_still_removes_the_rule_and_restores_the_adapter(interrupt):
+    d = _diverter(started=False, addressing=DHCP)
+    d.start()
+    for n in ("a.top", "b.top", "c.top"):
+        d.address_for(n)
+    d.ops.calls.clear()
+    d.ops.fail["remove_address"] = interrupt
+    with pytest.raises(type(interrupt)):
+        d.stop()
+    assert len(_calls(d, "remove_address")) == 3                # the interrupt did not stop the other removals
+    assert _calls(d, "remove_firewall_rules") and _calls(d, "restore_addressing")
+    d.ops.fail.clear()
+    d.ops.calls.clear()
+    d.stop()                                                    # and what did not go through is done by the next one
+    assert d.state()["remove_failed"] == [] and d.ops.present == {GUEST}
+
+
+@pytest.mark.parametrize("failing", ["remove_firewall_rules", "restore_addressing", "read_addressing"])
+def test_an_interrupt_in_any_step_of_stop_is_raised_after_the_other_steps_have_run(failing):
+    d = _diverter(started=False, addressing=DHCP)
+    d.start()
+    d.address_for("a.top")
+    d.ops.calls.clear()
+    d.ops.fail[failing] = KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt):
+        d.stop()
+    for method in ("remove_address", "remove_firewall_rules", "restore_addressing"):
+        assert _calls(d, method), method
+
+
+def test_an_interrupt_during_start_takes_back_what_was_done_and_is_not_swallowed():
+    d = _diverter(started=False, addressing=DHCP)
+    d.ops.fail["add_firewall_rule"] = KeyboardInterrupt()
+    with pytest.raises(KeyboardInterrupt):
+        d.start()
+    assert _calls(d, "restore_addressing") and len(_calls(d, "remove_firewall_rules")) == 2
+
+
+# --- what the rule's count says (review, Important 3) and a profile that is off (Important 4) ---
+
+
+def test_the_rules_found_at_start_are_an_earlier_session_that_did_not_clean_up():
+    d = _diverter(started=False)
+    d.ops.rules[net_divert.ISOLATION_RULE] = {"action": "block"}
+    d.start()
+    assert d.state()["isolation"]["found_at_start"] == 1
+    assert _diverter(started=False).state()["isolation"]["found_at_start"] is None
+
+
+def test_a_rule_that_is_gone_at_stop_is_said_to_be_gone():                  # a sample with admin rights removed it
+    d = _diverter(started=False)
+    d.start()
+    assert d.state()["isolation"]["found_at_start"] == 0
+    del d.ops.rules[net_divert.ISOLATION_RULE]
+    d.stop()
+    iso = d.state()["isolation"]
+    assert iso["found_at_stop"] == 0 and iso["lost"] is True
+
+
+def test_a_rule_that_is_still_there_at_stop_is_not_lost():
+    d = _diverter(started=False)
+    d.start()
+    d.stop()
+    iso = d.state()["isolation"]
+    assert iso["found_at_stop"] == 1 and iso["lost"] is False
+
+
+def test_a_diverter_that_wrote_no_rule_has_not_lost_one():
+    d = _diverter(started=False)
+    d.stop()
+    assert d.state()["isolation"]["lost"] is None
+
+
+@pytest.mark.parametrize("off,profile", [(["Domain", "Private", "Public"], "Private"), (["Private"], "Private"),
+                                         (["Public"], "Public"), (["Public", "Private"], "Private")])
+def test_start_refuses_when_the_rule_would_bite_nothing(off, profile):
+    d = _diverter(started=False, addressing=DHCP)
+    d.ops.profiles_off = off
+    d.ops.profile = profile
+    with pytest.raises(net_system.SystemOpsError, match="firewall"):
+        d.start()
+    iso = d.state()["isolation"]
+    assert iso["effective"] is False and iso["profiles_off"] == off
+    assert _calls(d, "set_dns") == []                                       # DNS is not pointed at us
+    assert _calls(d, "restore_addressing") and len(_calls(d, "remove_firewall_rules")) == 2
+
+
+def test_start_refuses_when_every_profile_is_off_whatever_the_adapter_is_on():
+    d = _diverter(started=False)
+    d.ops.profiles_off = ["Domain", "Private", "Public"]
+    d.ops.profile = None
+    with pytest.raises(net_system.SystemOpsError):
+        d.start()
+
+
+def test_start_refuses_when_the_adapters_profile_cannot_be_told_and_any_profile_is_off():
+    d = _diverter(started=False)
+    d.ops.profiles_off = ["Public"]
+    d.ops.profile = None
+    with pytest.raises(net_system.SystemOpsError):
+        d.start()
+    d = _diverter(started=False)
+    d.ops.profile = None                                                    # nothing is off: it does not matter
+    d.start()
+    assert d.state()["isolation"]["effective"] is True
+
+
+def test_effective_is_true_when_the_profile_in_force_is_on():
+    d = _diverter(started=False)
+    d.ops.profiles_off = ["Domain"]
+    d.ops.profile = "Public"
+    d.start()
+    assert d.state()["isolation"]["effective"] is True
