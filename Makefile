@@ -323,6 +323,7 @@ deploy:
 		vagrant upload webui/net_analyze.py C:\\DetonationChamberUI\\net_analyze.py; \
 		vagrant upload webui/net_baseline.py C:\\DetonationChamberUI\\net_baseline.py; \
 		vagrant upload webui/net_behavior.py C:\\DetonationChamberUI\\net_behavior.py; \
+		vagrant upload webui/net_ca.py C:\\DetonationChamberUI\\net_ca.py; \
 		vagrant upload webui/net_decode.py C:\\DetonationChamberUI\\net_decode.py; \
 		vagrant upload webui/net_divert.py C:\\DetonationChamberUI\\net_divert.py; \
 		vagrant upload webui/net_dns.py C:\\DetonationChamberUI\\net_dns.py; \
@@ -388,6 +389,7 @@ deploy-app:
 		vagrant upload webui/net_analyze.py C:\\DetonationChamberUI\\net_analyze.py; \
 		vagrant upload webui/net_baseline.py C:\\DetonationChamberUI\\net_baseline.py; \
 		vagrant upload webui/net_behavior.py C:\\DetonationChamberUI\\net_behavior.py; \
+		vagrant upload webui/net_ca.py C:\\DetonationChamberUI\\net_ca.py; \
 		vagrant upload webui/net_decode.py C:\\DetonationChamberUI\\net_decode.py; \
 		vagrant upload webui/net_divert.py C:\\DetonationChamberUI\\net_divert.py; \
 		vagrant upload webui/net_dns.py C:\\DetonationChamberUI\\net_dns.py; \

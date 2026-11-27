@@ -75,3 +75,4 @@ webui/static/wiki.html.tmp
 # The documentation website, built by `make site` / `.\make.ps1 site` from
 # docs/ and README.md; the workflow builds it again and publishes that
 /site/
+webui/session_ca.json

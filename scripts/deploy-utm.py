@@ -42,6 +42,7 @@ FILES = {
     "webui/net_analyze.py": r"C:\DetonationChamberUI\net_analyze.py",
     "webui/net_baseline.py": r"C:\DetonationChamberUI\net_baseline.py",
     "webui/net_behavior.py": r"C:\DetonationChamberUI\net_behavior.py",
+    "webui/net_ca.py": r"C:\DetonationChamberUI\net_ca.py",
     "webui/net_decode.py": r"C:\DetonationChamberUI\net_decode.py",
     "webui/net_divert.py": r"C:\DetonationChamberUI\net_divert.py",
     "webui/net_dns.py": r"C:\DetonationChamberUI\net_dns.py",
