@@ -27715,14 +27715,23 @@ function syscallWhen(iso) {
 }
 
 // The choices of the past-measurement control: the measurements /api/syscalls/measurements names, newest first, each
-// as process · PID · time · view. `selected` is the id on the map; `error` a list that could not be read, which is
-// said instead of looking like an empty history.
+// as process · PID · time · view · build. `selected` is the id on the map; `error` a list that could not be read,
+// which is said instead of looking like an empty history.
+//
+// The build is in the label because the banner over the map named it and the control did not: a measurement of
+// another build read like any other until it was opened, so a reader looking for one of this system picked blind.
+// One that is not the build the map shows is marked here, where the choice is made. It marks only what it knows -
+// before the baseline is read there is no build to compare against, and then nothing is marked: an option called
+// foreign on a guess is worse than one left unnamed.
 function syscallPastOptionsHtml(list, selected, error) {
     let html = '<option value="">— a past measurement —</option>';
     if (error) html += `<option value="" disabled>the scan history could not be read: ${escapeHtml(error)}</option>`;
+    const here = syscallState.baseline && syscallState.baseline.build ? String(syscallState.baseline.build) : '';
     for (const m of Array.isArray(list) ? list : []) {
         if (!m || typeof m.id !== 'string' || !m.id) continue;
-        const label = `${m.process || 'unknown process'} · PID ${m.pid} · ${syscallWhen(m.at)} · ${m.view || 'unknown view'}`;
+        let label = `${m.process || 'unknown process'} · PID ${m.pid} · ${syscallWhen(m.at)} · ${m.view || 'unknown view'}`;
+        label += ` · ${m.build ? `build ${m.build}` : 'build not recorded'}`;
+        if (here && m.build && String(m.build) !== here) label += ' · another build';
         html += `<option value="${escapeHtml(m.id)}"${m.id === selected ? ' selected' : ''}>${escapeHtml(label)}</option>`;
     }
     return html;

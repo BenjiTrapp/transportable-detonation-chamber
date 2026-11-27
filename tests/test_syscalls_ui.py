@@ -2812,14 +2812,15 @@ def test_the_past_measurements_have_a_control_of_their_own_after_stubs():
 
 
 @needs_node
-def test_each_past_measurement_is_named_by_process_pid_time_and_view_and_escaped():
+def test_each_past_measurement_is_named_by_process_pid_time_view_and_build_and_escaped():
     r = _past(r"""
       (async () => { await shown(); out({ html: els['syscall-past'].innerHTML, urls: requests.map(q => q.url) }); })();""")
     assert "/api/syscalls/measurements" in r["urls"], "the list is read with the tab"
     options = re.findall(r'<option value="([^"]*)"[^>]*>([^<]*)</option>', r["html"])
     assert options[0] == ("", "— a past measurement —")
-    assert options[1] == ("a1b2c3d4e5f6", "sample.exe · PID 4242 · 2026-11-20 09:15:42 · arm64")
-    assert "<img" not in r["html"] and "&lt;img src=x&gt;.exe · PID 77 · 2026-11-19 18:01:02 · x64" in r["html"]
+    assert options[1] == ("a1b2c3d4e5f6", "sample.exe · PID 4242 · 2026-11-20 09:15:42 · arm64 · build 26220.5770")
+    assert "<img" not in r["html"] \
+        and "&lt;img src=x&gt;.exe · PID 77 · 2026-11-19 18:01:02 · x64 · build 26220.5770" in r["html"]
 
 
 @needs_node
@@ -3233,3 +3234,53 @@ def test_a_past_measurement_is_not_chosen_while_hooks_are_recorded_and_record_sa
     record = re.search(r'<button[^>]*syscallCaptureHooks\(\)[^>]*>', r["hooks"]).group(0)
     assert "disabled" in record and "Scan a process first" not in record
     assert "past measurement" in record.lower() and "back to live" in record.lower(), record
+
+
+@needs_node
+def test_a_measurement_of_another_build_says_so_where_it_is_chosen():
+    """The last point a reviewer judged as lost information rather than false: /api/syscalls/measurements carries a
+    `build` for every measurement and the banner over the map names it, but the control named only process, PID,
+    time and view. So a measurement of another build read like any other until it was opened - and a reader looking
+    for one of this system picked blind.
+
+    Nothing was false and nothing is now rebuilt: the map already reconstructs a past measurement against the
+    baseline of its own build and view, and a foreign view is put away by syscallDropForeignScan. The build goes
+    into the label, and the one that is not this system's is marked there, where the choice is made.
+
+    It only marks what it knows. Before the baseline is loaded there is no build to compare against, and then no
+    option is marked: a choice called foreign on a guess is worse than one left unnamed."""
+    r = _panels(PAST + r"""
+      (async () => {
+        await shown();
+        const loaded = els['syscall-past'].innerHTML;
+        // the baseline of this system, as syscallLoadBaseline writes it
+        syscallState.baseline = { view: 'arm64', build: '26220.5770', symbols: true, items: [] };
+        renderSyscallPastList();
+        const own = els['syscall-past'].innerHTML;
+        syscallState.baseline = { view: 'arm64', build: '26200.9974', symbols: true, items: [] };
+        renderSyscallPastList();
+        const other = els['syscall-past'].innerHTML;
+        syscallState.baseline = null;
+        renderSyscallPastList();
+        const noBaseline = els['syscall-past'].innerHTML;
+        // a measurement the history kept without a build: the route answers "" for it
+        syscallState.baseline = { view: 'arm64', build: '26200.9974', symbols: true, items: [] };
+        syscallState.pastList = [{ ...PAST_LIST.measurements[0], build: '' }];
+        renderSyscallPastList();
+        out({ loaded, own, other, unknown: noBaseline, noBuild: els['syscall-past'].innerHTML });
+      })();""")
+    label = lambda html, id: next((t for i, t in re.findall(r'<option value="([^"]*)"[^>]*>([^<]*)</option>', html)
+                                   if i == id), None)
+    assert "build 26220.5770" in label(r["own"], "a1b2c3d4e5f6"), label(r["own"], "a1b2c3d4e5f6")
+    assert "PID 4242" in label(r["own"], "a1b2c3d4e5f6") and "arm64" in label(r["own"], "a1b2c3d4e5f6"), \
+        "what it already said stays"
+    assert "another build" not in label(r["own"], "a1b2c3d4e5f6"), "this measurement is of the build the map shows"
+    assert "another build" in label(r["other"], "a1b2c3d4e5f6"), \
+        f"a measurement of 26220.5770 while the map shows 26200.9974: {label(r['other'], 'a1b2c3d4e5f6')}"
+    assert "build 26220.5770" in label(r["other"], "a1b2c3d4e5f6"), "and it still names which build"
+    for html, what in ((r["unknown"], "no baseline"), (r["loaded"], "before the baseline is read")):
+        assert "another build" not in html, f"nothing is called foreign without a build to compare against ({what})"
+        assert "build 26220.5770" in label(html, "a1b2c3d4e5f6"), f"the build is named either way ({what})"
+    # and the other way round: a measurement the history kept without a build is not called foreign either
+    assert "build not recorded" in label(r["noBuild"], "a1b2c3d4e5f6"), label(r["noBuild"], "a1b2c3d4e5f6")
+    assert "another build" not in r["noBuild"], "a build nobody recorded is unknown, not foreign"
