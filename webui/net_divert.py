@@ -69,13 +69,15 @@ which it was.
 ``stop`` is a chain in which every step is tried whatever an earlier one did: the addresses, the rule, the addressing.
 The first error surfaces once all have been tried, and all of them are in ``state()["stop_errors"]``. That includes
 ``KeyboardInterrupt`` and ``SystemExit``: removing 700 addresses takes about a minute, and being killed in that
-minute is the case this chain is for. A step that
-succeeded is not done again by a second ``stop``; one that failed is. The addresses step ends with a **sweep**: the
-adapter's address list is read once and every address of this prefix that is on it is removed, whether this session
-added it or not (every ``skip_as_source`` address of ``198.18.0.0/15``: a session with another prefix is covered, the
-adapter's own address is never). An ``add_address`` that timed out and worked anyway, or a session that crashed,
-leaves addresses that nothing else would ever take away. The read costs 713 ms at 701 addresses, which is affordable once at the
-end and not in a loop, which is why the map stays in memory during the session.
+minute is the case this chain is for. A step that succeeded is not done again by a second ``stop``; one that failed
+is. The addresses step ends with a **sweep**: the adapter's address list is read once and every ``skip_as_source``
+address of ``198.18.0.0/15`` that is on it is removed, whether this session added it or not (so a session with another
+prefix is covered, and the adapter's own address, which is not ``skip_as_source``, never is). An ``add_address`` that
+timed out and worked anyway, or a session that crashed, leaves addresses that nothing else would ever take away. The
+sweep only runs once the adapter's state has been saved: a ``start`` that refused because the machine legitimately
+uses the range (a fake-IP VPN does) never got that far, nothing of ours can be there, and what is there is not ours to
+remove. The read costs 713 ms at 701 addresses, which is affordable once at the end and not in a loop, which is why
+the map stays in memory during the session.
 """
 
 from __future__ import annotations
@@ -440,8 +442,10 @@ class GuestDiverter(Diverter):
                 interrupt = interrupt or failure
             self._maybe.remove(address)
         unread = None
+        on_adapter: List[Any] = []
         try:
-            on_adapter = list(self.ops.read_addressing(self.index).get("addresses") or [])
+            if self._saved is not None:         # see the module: before the state is saved, nothing here is ours
+                on_adapter = list(self.ops.read_addressing(self.index).get("addresses") or [])
         except BaseException as e:
             if not isinstance(e, Exception):
                 interrupt = interrupt or e

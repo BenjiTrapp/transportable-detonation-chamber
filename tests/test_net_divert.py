@@ -547,11 +547,20 @@ def test_the_rule_has_no_local_port_and_so_no_way_out_for_a_sample_that_binds_on
     assert net_divert.isolation_spec() == spec
 
 
-def test_the_rule_is_a_spec_that_windows_takes():
-    # ports need a protocol (New-NetFirewallRule: "The protocol-specific options do not match the protocol"); a
-    # rule with neither is what is written, and the fake's validator has been run over it by add_firewall_rule
+def test_the_rules_ranges_are_what_a_remote_address_may_be_and_none_covers_what_windows_refuses():
+    # Windows refuses ::1 as a rule's RemoteAddress (firewall_rules), and takes a range only as low-high of one
+    # family; ranges that overlap or run backwards are not what was meant. _rule_spec is the fake's and the Windows
+    # class's one validator.
     spec = _isolation_spec()
-    assert not {"local_port", "remote_port", "protocol"} & set(spec)
+    net_system._rule_spec(spec)
+    for family in (4, 6):
+        ranges = [tuple(ipaddress.ip_address(x) for x in r.split("-")) for r in spec["remote_address"]
+                  if ipaddress.ip_address(r.split("-")[0]).version == family]
+        assert ranges
+        assert all(low <= high and low.version == high.version == family for low, high in ranges)
+        assert all(a[1] < b[0] for a, b in zip(ranges, ranges[1:]))            # in order, none overlapping
+    assert not _covered(spec["remote_address"], "::1")
+    assert not _covered(spec["remote_address"], "::")
 
 
 def test_a_profile_that_is_off_is_reported_and_is_not_an_error():
@@ -586,13 +595,26 @@ def test_an_adapter_whose_own_address_is_in_the_fake_internets_range_is_refused_
     assert _calls(d, "add_firewall_rule") == [] and _calls(d, "restore_addressing") == []
 
 
-def test_the_adapters_own_address_in_the_range_survives_the_sweep_of_the_teardown_too():
+def test_a_refused_start_takes_nothing_of_the_range_off_an_adapter_that_legitimately_uses_it():
+    # such an address cannot be told apart from one of ours, and nothing of ours can be there: the state was never saved
     own = dict(DHCP, addresses=[{"address": "198.18.5.4", "mask": "255.255.255.0", "skip_as_source": False}])
     d = _diverter(started=False, addressing=own)
-    d.ops.present.add("198.18.1.1")                         # a real leftover, which the teardown's sweep may take
+    d.ops.present.update({"198.18.1.1", "198.19.0.9"})      # skip_as_source addresses of the machine's own VPN, say
     with pytest.raises(net_system.SystemOpsError):
         d.start()
-    assert [c[2] for c in _calls(d, "remove_address")] == ["198.18.1.1"]
+    assert _calls(d, "remove_address") == []
+    assert d.ops.present >= {"198.18.1.1", "198.19.0.9"}
+    assert len(_calls(d, "read_addressing")) == 1            # the start's; the teardown does not read the adapter again
+
+
+def test_a_start_that_failed_after_saving_the_state_does_sweep():
+    d = _diverter(started=False, addressing=DHCP)
+    d.ops.fail["add_firewall_rule"] = net_system.SystemOpsError("access denied")
+    d.ops.hooks["set_static"] = lambda: d.ops.present.add("198.18.2.2")     # something added during the start
+    with pytest.raises(net_system.SystemOpsError):
+        d.start()
+    assert _removes(d) == ["198.18.2.2"]
+    assert len(_calls(d, "read_addressing")) == 2
 
 
 def test_a_secondary_address_of_the_adapter_that_is_not_skip_as_source_is_not_a_leftover():
