@@ -120,8 +120,26 @@ Streuung ist die der Maschine, aber jede Runde liegt niedriger. Die 6,49 s der e
 *mit* Vorladen sind kein Fehler: der Aufruf kam mitten hinein und wartete am Lock, statt
 selbst zu laden. Die verbleibenden rund 2 s sind die eigene Arbeit der Route.
 
-**M4 — Prüfung „laufen Tool-Updates?" und Start des Baus sind nicht atomar.** Ein Update
-kann dazwischen beginnen. Folge ist ein verworfener Bau, keine falsche Aussage.
+**M4 — Prüfung „laufen Tool-Updates?" und Start des Baus sind nicht atomar: halb behoben am
+27.11.2026, und die Folge war anders notiert als sie ist.**
+
+„Folge ist ein verworfener Bau" war **falsch**: `_binary_graph_build_job` prüft am Ende nicht
+erneut, und `state["built"]` steuert nur die Bremse gegen Dauerbauen, nicht das Laden. Ein
+während eines Updates gebauter Cache würde also benutzt — und ein Importdatensatz aus einer
+halb getauschten System32 könnte eine Tür verlieren, was `false` heißt, also Fehlbeschuldigung.
+
+Gemessen, bevor etwas geändert wurde: **kein Install-Skript schreibt in System32** (die Treffer
+sind Sysmon-Konfigurationsregeln, die Pfade nur nennen, und ein Brave-Pfad), und der Graph liest
+ausschließlich `.dll` und `.exe` **direkt** in System32, keinen Unterordner — ein Sysmon-Treiber
+in `System32\drivers` ist beides nicht. Es gibt also nichts zu mischen. Wird die Python der
+Web-UI mitten im Bau getauscht, stirbt der Unterprozess und das wird als Fehlschlag vermerkt.
+Die Folge ist auf diesem Abbild mild, aber aus diesem Grund, nicht aus dem notierten.
+
+Geschlossen ist die Hälfte, die zwei Zeilen kostet: die Update-Prüfung liegt jetzt **unter**
+demselben Lock, das `running` setzt. **Noch offen:** die andere Richtung — die Vorbedingungen
+des Updates fragen `_binary_graph_building()`, bevor der Manager `maintenance` setzt, also
+schlüpft ein Bau, der sich dazwischen einträgt, weiterhin durch. Das braucht ein Lock über
+beide Subsysteme und ist hier nicht erfunden worden.
 
 ## 4. Vom Review der vergangenen Messung angenommen, nicht behoben
 
