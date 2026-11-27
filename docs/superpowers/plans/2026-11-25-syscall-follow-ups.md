@@ -65,9 +65,33 @@ sind viel Text. Keine Entscheidung dazu getroffen.
 Alle drei wurden dort als „safe to follow the merge" eingeordnet.
 
 **M2 — ein umbenennender Forwarder auf eine Tür ist für die namensbasierte Türmenge
-unsichtbar.** Exportiert `a.dll` den Namen `Foo` als Forwarder auf `b.dll!NtBar`, so sieht
-die Türmenge nur `Foo`. Ob System32 so einen Fall hat, wurde auf der VM **nicht** gemessen.
-Verwandt: Entscheidung 33 löst den Ordinal-Fall über `doors_complete=false`.
+unsichtbar: gemessen und behoben am 27.11.2026.**
+
+Auf `26200.9974` (arm64) gemessen: von 4.944 System32-Forwardern benennen 1.538 um, und 234
+davon zeigen auf eine Tür — einen `Nt`/`Zw`-Namen der Baseline oder einen kuratierten
+Win32-Namen. 229 sind nur über ein Ordinal exportiert; **fünf tragen einen echten Namen**
+(`gdi32` dreimal `D3DKMT…` auf `WIN32U.NtGdiDdDDI…`, und `kernel32` wie `kernelbase`
+`FlushProcessWriteBuffers` auf `NTDLL.NtFlushProcessWriteBuffers`), und acht System32-Binaries
+importieren genau die.
+
+**Null** davon führen zu einem Syscall, den die kuratierte Tabelle abdeckt — nur für die darf
+sie über eine Abwesenheit sprechen. Eine Fehlbeschuldigung war also heute nicht möglich; sie
+wäre es in dem Moment, in dem jemand eine Zeile für einen dieser Syscalls hinzufügt.
+
+Behoben wurde es trotzdem, weil die Richtung stimmt: eine unvollständige Türmenge heißt eine
+fehlende Tür, und eine fehlende Tür heißt `false`. Und der Fix war keine Erfindung — der
+**Ordinal**-Pfad löste schon auf (`_add_ordinal` ruft `resolve_export` und nimmt jeden Sprung
+mit); nur der benannte tat es nicht. Jetzt tun beide dasselbe.
+
+Die Kosten wurden gegen den alten Code auf derselben VM gemessen, drei Prozesse, je drei Läufe,
+Minimum: **0,34–0,41 s vorher**. Jeden benannten Import aufzulösen hätte 1,05–1,64 s gekostet,
+und 3.551 von 3.671 Auflösungen über zwölf Module galten Namen hinter einem API-Set, die dessen
+Host selbst definiert. Da ein Umbenennen nur an einem Forwarder-Sprung passieren kann, genügt
+die Frage an den Host, den der Loader nimmt — **0,39–0,56 s** bei gleichem Türbestand (4.817),
+und 358 statt 3.671 Auflösungen.
+
+Entscheidung 33 bleibt daneben bestehen: ein Ordinal, das der Graph nicht benennen kann, lässt
+die Vereinigung weiterhin unvollständig.
 
 **M3 — das erste Laden des Cache läuft auf dem Request-Thread.** 28,2 MB JSON: die erste
 Abfrage nach einem Neustart blockiert ihren Worker. Richtung: beim Start vorladen oder an

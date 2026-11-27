@@ -1047,17 +1047,48 @@ def name_ordinal_imports(graph, imports, *, view, importer="the file") -> tuple[
     return names, ""
 
 
+def _door_record(graph, module):
+    """The record the loader reaches for `module` at module level: an api set's default host, or the module itself.
+    None when the graph holds neither, and then there is nothing to follow."""
+    info = graph.binaries.get(module)
+    if info is not None:
+        return info
+    hosts = binary_graph.api_set_hosts(graph.api_sets, module) or ()
+    return graph.binaries.get(hosts[0].lower()) if hosts else None
+
+
 def _record_doors(graph, info, names):
     """Add the names `info` imports to `names`; the reason the record cannot speak for its imports, or "".
 
-    An import by ordinal is named by the cache (_add_ordinal); one it cannot name may be a door, so it leaves the
-    union incomplete."""
+    A named import is followed through the exporting module's forwarders and api sets, the way `_add_ordinal`
+    already follows what it names: a module importing `FlushProcessWriteBuffers` of kernel32 really reaches
+    `NtFlushProcessWriteBuffers`, and a set holding only the imported name is an incomplete union - which means a
+    missing door, which means a `false` nobody earned. Measured on build 26200.9974: of 4,944 System32 forwarders
+    1,538 rename, 234 of those point at a door, and five of those carry a real name (three D3DKMT… of gdi32 and
+    `FlushProcessWriteBuffers` of kernel32 and kernelbase), imported by eight System32 binaries.
+
+    Only a name the record it lands on actually forwards is resolved. A rename can happen at no other hop, so the
+    check is exact, and it is what keeps the cost down: resolving every named import took the stubs route from
+    0.34s to 1.64s on the chamber, and of 3,671 resolutions over twelve modules 3,551 were names behind an api set
+    that the host defines itself.
+
+    Unlike an ordinal, a named import that cannot be resolved leaves the union complete: its own name is recorded
+    either way, so a failed resolution loses a possible second name and nothing that was there before. For an
+    ordinal the name itself is unknown, so one that cannot be named may be any door and the union is incomplete.
+    """
     if info.partial:
         return f"a table (import, delay-load or export) of {info.name} was cut short when it was read"
     for module, functions in info.imports.items():
+        record = _door_record(graph, module)
+        forwards = record.forwarders if record is not None else {}
         for function in functions:
             if not function.startswith("#"):
                 names.add(function)
+                if function in forwards:
+                    resolution = binary_graph.resolve_export(graph.binaries, graph.api_sets, module, function)
+                    if resolution.reason == "defined" and not resolution.partial:
+                        names.update(hop.function for hop in resolution.hops)
+                        names.add(resolution.function)
                 continue
             why = _add_ordinal(graph, info.name, module, function, names)
             if why:
