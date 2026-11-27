@@ -98,6 +98,17 @@ class SystemOps:
         ``dns`` servers (None: leave them, an empty list: none). The caller does this before it adds an address."""
         raise NotImplementedError
 
+    def set_dns(self, index, servers):
+        """Point adapter ``index`` at ``servers`` (a list; empty: none) and touch nothing else. It is what
+        ``set_static`` does for DNS, without repeating the address: a second ``set address`` with the address the
+        adapter has can answer "The object already exists" or briefly drop the address."""
+        raise NotImplementedError
+
+    def network_profile(self, index):
+        """The firewall profile in force on adapter ``index`` (``"Domain"``, ``"Private"`` or ``"Public"``), or
+        None when it cannot be told. A rule written while that profile is switched off bites nothing."""
+        raise NotImplementedError
+
     def read_addressing(self, index):
         """The adapter's addressing as a dict that ``restore_addressing`` takes as it is, DHCP state included."""
         raise NotImplementedError
@@ -158,7 +169,7 @@ class FakeSystemOps(SystemOps):
     Windows class's is described at ``WindowsSystemOps.read_addressing``, and ``restore_addressing`` insists on that
     one). ``fail`` maps a method name to an exception that is raised by that method, after the call is recorded and
     before it has any effect (``tcp_owner``, which is not recorded, raises it too). ``profiles_off`` is what
-    ``add_firewall_rule`` reports. ``rules`` (name to spec) and ``cas`` (thumbprint to pem) hold what was written and
+    ``add_firewall_rule`` reports and ``profile`` what ``network_profile`` answers. ``rules`` (name to spec) and ``cas`` (thumbprint to pem) hold what was written and
     not yet removed.
 
     **It refuses what ``WindowsSystemOps`` refuses**, with the same ``ValueError`` and by the same functions: an
@@ -171,12 +182,13 @@ class FakeSystemOps(SystemOps):
 
     def __init__(self, tcp_owners: Optional[Dict[Tuple[str, int, str, int], int]] = None,
                  addressing: Optional[Dict[str, Any]] = None, fail: Optional[Dict[str, BaseException]] = None,
-                 profiles_off: Optional[List[str]] = None):
+                 profiles_off: Optional[List[str]] = None, profile: Optional[str] = "Private"):
         self.calls: List[tuple] = []
         self.tcp_owners = dict(tcp_owners or {})
         self.addressing = addressing
         self.fail = dict(fail or {})
         self.profiles_off = list(profiles_off or [])
+        self.profile = profile
         self.rules: Dict[str, Any] = {}
         self.cas: Dict[str, str] = {}
 
@@ -199,6 +211,15 @@ class FakeSystemOps(SystemOps):
         _index(index), _ipv4(address), _mask(mask), _servers(dns)
         if gateway is not None:
             _ipv4(gateway, "gateway")
+
+    def set_dns(self, index, servers):
+        self._did("set_dns", index, servers)
+        _index(index), _dns_list(servers)
+
+    def network_profile(self, index):
+        self._did("network_profile", index)
+        _index(index)
+        return self.profile
 
     def read_addressing(self, index):
         self._did("read_addressing", index)
@@ -307,6 +328,15 @@ def _servers(value: Any) -> Optional[List[str]]:
     if isinstance(value, str) or not hasattr(value, "__iter__"):
         raise ValueError("dns must be a list of addresses")
     return [_ipv4(v, "dns server") for v in value]
+
+
+def _dns_list(value: Any) -> List[str]:
+    """The servers of ``set_dns``: a list, possibly empty. ``None`` means "leave them" for ``set_static`` and is not
+    a thing to set here."""
+    servers = _servers(value)
+    if servers is None:
+        raise ValueError("dns must be a list of addresses")
+    return servers
 
 
 def _rule_name(value: Any) -> str:
@@ -578,6 +608,13 @@ try {
                 ForEach-Object { [string]$_.Name })
             ConvertTo-Json -Compress -InputObject ([ordered]@{ profiles_off = $off })
         }
+        'profile' {
+            $c = @(Get-NetConnectionProfile -InterfaceIndex ([int]$p.index) -ErrorAction SilentlyContinue) |
+                Select-Object -First 1
+            $category = $null
+            if ($c) { $category = [string]$c.NetworkCategory }
+            ConvertTo-Json -Compress -InputObject ([ordered]@{ category = $category })
+        }
         'remove_rules' {
             $found = @(Get-NetFirewallRule -Name (([string]$p.prefix) + '*') -ErrorAction SilentlyContinue)
             if ($found.Count -gt 0) { $found | Remove-NetFirewallRule }
@@ -728,6 +765,16 @@ class WindowsSystemOps(SystemOps):
         for position, server in enumerate(servers[1:], start=2):
             self._netsh("interface", "ipv4", "add", "dnsservers", name, "address=" + server,
                         f"index={position}", "validate=no")
+
+    def set_dns(self, index, servers):
+        self._set_dns(_index(index), _dns_list(servers))
+
+    def network_profile(self, index):
+        answer = self._powershell({"op": "profile", "index": _index(index)}, "reading the network profile")
+        # Get-NetConnectionProfile says DomainAuthenticated where Get-NetFirewallProfile says Domain
+        names = {"Public": "Public", "Private": "Private", "DomainAuthenticated": "Domain"}
+        category = answer.get("category")
+        return names.get(category) if isinstance(category, str) else None
 
     def set_static(self, index, address, mask, gateway, dns):
         index = _index(index)

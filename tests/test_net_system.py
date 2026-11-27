@@ -64,6 +64,8 @@ CALLS = [
     ("remove_address", (7, "198.18.1.1")),
     ("set_static", (7, "10.0.0.5", "255.255.255.0", "10.0.0.1", ["10.0.0.2"])),
     ("restore_addressing", (7, {})),
+    ("set_dns", (7, ["127.0.0.1"])),
+    ("network_profile", (7,)),
     ("read_addressing", (7,)),
     ("add_firewall_rule", ("TDC-NET-ISOLATE", {"action": "block"})),
     ("remove_firewall_rules", ("TDC-NET-",)),
@@ -83,6 +85,11 @@ REFUSED = [
     ("set_static", (True, "10.0.0.5", "255.255.255.0", None, None)),
     ("set_static", (7, "10.0.0.5", "255.255.255.0", "gateway", None)),
     ("set_static", (7, "10.0.0.5", "255.255.255.0", None, "127.0.0.1")),
+    ("set_dns", (7, None)),
+    ("set_dns", (7, "127.0.0.1")),
+    ("set_dns", (7, ["localhost"])),
+    ("set_dns", (0, ["127.0.0.1"])),
+    ("network_profile", (None,)),
     ("read_addressing", (None,)),
     ("restore_addressing", (7, None)),
     ("restore_addressing", (7, {"dhcp": True, "address": "192.168.64.4"})),
@@ -441,6 +448,40 @@ def test_set_static_with_an_empty_dns_list_clears_the_servers(win):
     ops.set_static(7, "192.168.64.4", "255.255.255.0", None, [])
     assert run.netsh()[-1] == ["interface", "ipv4", "set", "dnsservers", "name=7", "source=static",
                                "address=none"]
+
+
+def test_set_dns_sets_the_servers_and_touches_no_address(win):
+    ops, run = _ops()
+    ops.set_dns(7, ["127.0.0.1", "9.9.9.9"])
+    assert run.netsh() == [
+        ["interface", "ipv4", "set", "dnsservers", "name=7", "source=static", "address=127.0.0.1", "validate=no"],
+        ["interface", "ipv4", "add", "dnsservers", "name=7", "address=9.9.9.9", "index=2", "validate=no"],
+    ]
+
+
+def test_set_dns_with_an_empty_list_clears_the_servers_and_a_failure_is_an_error(win):
+    ops, run = _ops()
+    ops.set_dns(7, [])
+    assert run.netsh() == [["interface", "ipv4", "set", "dnsservers", "name=7", "source=static", "address=none"]]
+    ops, _ = _ops({"netsh.exe": [(1, "Access is denied.", "")]})
+    with pytest.raises(net_system.SystemOpsError, match="Access is denied"):
+        ops.set_dns(7, ["127.0.0.1"])
+
+
+def test_the_fake_records_set_dns_and_answers_the_profile_it_was_given():
+    ops = net_system.FakeSystemOps(profile="Public")
+    ops.set_dns(7, ["127.0.0.1"])
+    assert ops.network_profile(7) == "Public"
+    assert ops.calls == [("set_dns", 7, ["127.0.0.1"]), ("network_profile", 7)]
+
+
+@pytest.mark.parametrize("category,profile", [("Public", "Public"), ("Private", "Private"),
+                                              ("DomainAuthenticated", "Domain"), (None, None), ("Other", None)])
+def test_the_network_profile_is_named_the_way_the_firewall_profiles_are(win, category, profile):
+    ops, run = _ops({"powershell.exe": [(0, json.dumps({"category": category}), "")]})
+    assert ops.network_profile(7) == profile
+    assert _payload_of(run.calls[0]) == {"op": "profile", "index": 7}
+    assert "Get-NetConnectionProfile" in _script_of(run.calls[0])
 
 
 def test_set_static_stops_at_the_first_command_that_fails(win):
