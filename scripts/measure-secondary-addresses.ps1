@@ -30,8 +30,13 @@
 #   skipassource_honoured                  whether every added address kept SkipAsSource. If this is false the
 #                                          design does not hold: outbound connections could leave the guest with a
 #                                          198.18 source address.
-#   source_address_for_public_destination  which source the routing table picks for a public destination - it must
-#                                          still be the real one
+#   source_before, source_while_added,     which source the routing table picks for a public destination, before
+#   source_after_restore                   the run, during it and after the restore. On a DHCP adapter the
+#                                          middle one cannot answer: adding addresses took DHCP off and the real
+#                                          address with it, so there is no route to pick a source from. That is
+#                                          the finding, not a defect of the measurement - approach A needs the
+#                                          adapter configured statically, with the real address set by the
+#                                          chamber, if the real address is to survive alongside the faked ones.
 #   add_by_cmdlet_ms                       New-NetIPAddress once, for comparison with netsh
 #   remove_total_s, addresses_left_behind  what the cleanup cost and whether it was complete
 #   dhcp_before, dhcp_after_adding         whether adding addresses took the adapter off DHCP. If it did, the
@@ -182,6 +187,23 @@ Write-Host ("profiles     : " + (($profilesBefore.GetEnumerator() |
 # address is added.
 $dhcpBefore = [string](Get-NetIPInterface -InterfaceIndex $ifIndex -AddressFamily IPv4).Dhcp
 Write-Host "dhcp         : $dhcpBefore"
+
+# Which source the routing table picks for a public destination, while the real address is still there. Asking
+# this in the middle of the run is useless on a DHCP adapter: by then DHCP is off and the real address is gone,
+# so there is no route and no source to pick. Measured here and again after the restore.
+function Get-ChosenSource {
+    try {
+        $found = @(Find-NetRoute -RemoteIPAddress "9.9.9.9" -ErrorAction Stop |
+            Where-Object { $_.IPAddress } | Select-Object -First 1)
+        if ($found.Count -gt 0) { return [string]$found[0].IPAddress }
+        return "none"
+    } catch {
+        return "unknown: " + $_.Exception.Message.Trim()
+    }
+}
+$sourceBefore = Get-ChosenSource
+Write-Host "source       : $sourceBefore (for a public destination)"
+
 if ($dhcpBefore -eq "Enabled") {
     Write-Host ""
     Write-Host "WARNING: this adapter gets its address by DHCP. Adding a static address takes it off DHCP, and the" -ForegroundColor Yellow
@@ -273,17 +295,11 @@ try {
         Where-Object { $_.IPAddress -like "$Prefix.*" })
     $notSkipped = @($ours | Where-Object { -not $_.SkipAsSource })
 
-    # And does the real address still win as the source? Asking the routing
-    # table which source it would choose for a public destination is the
-    # cheapest honest check, and needs no traffic.
-    $chosen = "unknown"
-    try {
-        $found = @(Find-NetRoute -RemoteIPAddress "9.9.9.9" -ErrorAction Stop |
-            Where-Object { $_.IPAddress } | Select-Object -First 1)
-        if ($found.Count -gt 0) { $chosen = $found[0].IPAddress }
-    } catch {
-        $chosen = "unknown: $($_.Exception.Message)"
-    }
+    # And does the real address still win as the source? On a DHCP adapter this cannot
+    # be answered while the extra addresses exist, because adding them took DHCP off
+    # and the real address with it - which is itself the finding, so it is recorded
+    # rather than hidden.
+    $chosen = Get-ChosenSource
 
     $result["adapter"] = $adapter.Name
     $result["real_address"] = @($real | ForEach-Object { $_.IPAddress })
@@ -292,7 +308,8 @@ try {
     $result["addresses_carried"] = $added.Count
     $result["skipassource_honoured"] = ($notSkipped.Count -eq 0)
     $result["addresses_without_skipassource"] = $notSkipped.Count
-    $result["source_address_for_public_destination"] = $chosen
+    $result["source_before"] = $sourceBefore
+    $result["source_while_added"] = $chosen
 }
 finally {
     Write-Host ""
@@ -335,6 +352,7 @@ finally {
     }
     $result["addresses_after_cleanup"] = @(Get-NetIPAddress -InterfaceIndex $ifIndex -AddressFamily IPv4 `
         -ErrorAction SilentlyContinue | ForEach-Object { $_.IPAddress })
+    $result["source_after_restore"] = Get-ChosenSource
 
     # The profile, before anything else is reported: if it moved, the machine is
     # unreachable from outside right now and that is the first thing to fix.

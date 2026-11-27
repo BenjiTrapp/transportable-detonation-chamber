@@ -131,6 +131,29 @@ System-Proxy gesetzt, dem WinINet- und WinHTTP-Malware folgt.
   `Host`-Header — dann entfällt der Nebengewinn für rohe Protokolle ohne Namen
   im Protokoll, und der Catch-all weiß nicht mehr, wer gemeint war.
 
+  > **Gemessen (27.11., ARM64/UTM, Windows 11 Build 26100,
+  > `scripts/measure-secondary-addresses.ps1`):** Eine Adresse pro Name ist
+  > praktikabel, aber nur **bedarfsweise**.
+  >
+  > | Frage | Antwort |
+  > |---|---|
+  > | Wie viele trägt der Adapter? | **1001**, null Fehlschläge auf jeder Stufe |
+  > | Kosten je Adresse | 108–151 ms (`netsh`); `New-NetIPAddress` 197 ms, also langsamer |
+  > | Kosten je Entfernung | 135 ms (135 s für 1001) |
+  > | `skipassource=true` | hält, alle 1001 |
+  > | Bremst es den Stack? | Sockets ~1 ms und DNS ~3 ms unberührt; **die Adressliste zu lesen wächst von 20 ms auf 713 ms** |
+  > | Netzprofil | unberührt |
+  >
+  > Daraus drei Festlegungen: Adressen werden **pro Name beim ersten Lookup**
+  > vergeben, nicht als Vorrat (ein Vorrat von 500 Namen kostet über eine
+  > Minute des 300-s-Startbudgets, bedarfsweise 110 ms im DNS-Pfad eines
+  > Namens). Der Diverter hält die Zuordnung Name→Adresse **selbst im
+  > Speicher** und fragt den Adapter nicht ab. Und der Adapter muss
+  > **statisch** konfiguriert sein: `netsh ... add address` nimmt einen
+  > DHCP-Adapter von DHCP, womit die echte Adresse verschwindet — gemessen
+  > (`dhcp_before` Enabled → `dhcp_after_adding` Disabled), und es hat die
+  > Test-VM einmal vom Netz getrennt.
+
 ### B — Eigenes Gateway außerhalb der VM *(mitgeplant, nicht gebaut)*
 
 Eine zweite, kleine Linux-VM hängt als Gateway im isolierten Netz und lenkt
@@ -685,6 +708,12 @@ Ohne dass danach gefragt wurde, als Vorschlag erkennbar:
 - Evidence-Arten entstehen in Python, YAML-Regeln annotieren und ordnen zu.
 - Sekundäre Adressen auf dem echten Adapter mit `skipassource=true`; eine
   Adresse pro Name steht unter Spike-Vorbehalt.
+  > **Nachtrag (27.11.):** Der Spike ist gelaufen, der Vorbehalt ist
+  > aufgelöst: der Adapter trägt 1001 Adressen ohne einen Fehlschlag und
+  > `skipassource` hält. Dazugekommen sind drei Bedingungen, die die Spec nicht
+  > vorhersah — bedarfsweise Vergabe statt Vorrat, eine eigene Zuordnung im
+  > Speicher statt Abfragen des Adapters, und ein **statisch** konfigurierter
+  > Adapter. Die Zahlen stehen beim offenen Risiko unter *Ansätze*.
 - UDP nur auf vorab gebundenen Ports.
 - Eigene YAML-Regeln nur für Netzwerk-Events, Host-Verhalten bleibt bei Sigma.
 - Die Regelsprache lehnt sich an Sigma an, nicht an NetLens — weil aus
