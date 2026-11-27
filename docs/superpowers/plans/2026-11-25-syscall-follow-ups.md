@@ -55,10 +55,47 @@ darunter sind es 42 bis 44 Farben — dort liegt die Zeichnung. Der Streifen ist
 deckend: der Vorbehalt sagt, dass eine Zahl eine Untergrenze ist, und wer ihn nicht lesen kann,
 ist schlechter dran als wer ein Stück schwenken muss.
 
-**Noch offen, keine Entscheidung getroffen:** der HTML-Status über der Leinwand
-(`#binary-explore-status`) sagt denselben Vorbehalt noch einmal, in fünf Zeilen zu ~470 Zeichen.
-Die Dopplung ist gewollt (der HTML-Status kann aus dem Blick scrollen, der auf der Leinwand
-nicht), aber beide zusammen sind viel Text.
+**Die Dopplung ist entschieden und behoben am 27.11.2026 — und die Notiz war in den Zahlen
+falsch.** „Fünf Zeilen zu ~470 Zeichen" war geraten; gemessen in Chrome gegen die laufende VM,
+`kernelbase.dll` geöffnet, 400 Knoten, 1280×900:
+
+| Wo | Zeichen | Höhe |
+|---|---|---|
+| HTML-Status über der Leinwand | **731** | 73 px, vier Zeilen |
+| Streifen auf der Leinwand | 186 | 18 px |
+| Zeile unter der Leinwand | 432 | 55 px |
+
+Die Leinwand hatte dabei 318 px — der Status nahm 23 % davon zusätzlich weg.
+
+Beim Messen fiel ein Fehler auf, der nicht in der Notiz stand: **der Streifen war abgeschnitten.**
+Er maß 1.344 px bei 12 px Monospace, die Leinwand ist 1.250 px breit bei 1280×900 und 1.352 px
+bei 1920×1080 — also fehlten 106 px beziehungsweise 4 px, und was wegfiel war das Satzende
+„(the canvas holds 400 nodes)", die Stelle, die die Obergrenze nennt. Ein Vorbehalt, den man
+nicht lesen kann, ist schlechter als keiner — dieselbe Regel, für die der Streifen überhaupt
+eingeführt wurde. Er wird jetzt an Wortgrenzen auf so viele Zeilen umgebrochen, wie die Leinwand
+trägt; ein Wort, das breiter als die Leinwand ist, wird trotzdem gezeichnet.
+
+Der Status **faltet** sich jetzt wie GRAPH die Scan-Panels faltet (`syscallApplyLower`): ein
+Balken nennt die Behauptung und **jede** Zahl, die Prosa darunter ist einen Klick entfernt.
+Gefaltet ist nicht still, und darauf kommt es an — ein Vorbehalt, dessen Zahlen verborgen sind,
+liest sich wie kein Vorbehalt. Gemessen: 73 px → **32 px**, Leinwand 318 → **359 px**; von Hand
+geöffnet 96 px, und ein Neuzeichnen schließt das nicht wieder (Entscheidung 78).
+
+Dadurch entstand ein neues Problem, das erst der Screenshot zeigte: Balken und Streifen sagten
+**wortgleich** dieselben 186 Zeichen, 20 px auseinander. Denselben Satz zweimal zu lesen ist
+schlechter als die Prosa, die er ersetzt hat. Also wird der Streifen nur gezeichnet, solange der
+Balken **nicht ganz** im Blick ist — der einzige Fall, für den er je da war. Die Grenze wurde
+über Fensterhöhen und alle Scrollpositionen hinweg gemessen: ab 420 px Höhe (gefaltet) und ab
+480 px (offen) gibt es eine Scrollposition, in der die **ganze** 240-px-Leinwand sichtbar ist und
+der Balken nicht; darüber bleibt der Balken immer im Blick, wenn die Leinwand es ist. Die
+Rect-Lesung kostet 0,0002–0,0006 ms gegen 2,3 ms für ein ganzes Zeichnen, und sie gilt einem
+Element außerhalb der Leinwand — ein Schwenk schreibt in die Bitmap, nicht ins DOM, das Layout
+ist also schon sauber. Sie scheitert in Richtung Sagen: kein Element, kein Rect, keine
+Fensterhöhe oder ein Fehler beim Lesen, und der Streifen wird gezeichnet.
+
+Geprüft in Chrome gegen die VM, beide Themes, 1920 und 1280 px: keine Konsolenmeldung, der
+Streifen passt überall, der Status startet gefaltet und bleibt offen, sobald er von Hand
+geöffnet wurde.
 
 Der Befund, wie er stand:
 

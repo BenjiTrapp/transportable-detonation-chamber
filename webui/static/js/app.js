@@ -29564,7 +29564,8 @@ function binaryGraphOrigin(edge) {
 // `module` is what the start field holds, whichever parameter the query sends it as; `function` the second field's
 // figures: the table of the whole stock (null until it was read), figuresNote why it could not be; metric: the list of a figure the detail panel shows
 const binaryGraphState = { answer: null, query: 'path-to-syscall', module: '', function: '', depth: 1, loading: false, selected: null, note: '', nodes: [], edges: [],
-    figures: null, figuresNote: '', figuresLoading: false, metric: null, maxed: false, maxedByHand: false };
+    figures: null, figuresNote: '', figuresLoading: false, metric: null, maxed: false, maxedByHand: false,
+    caveatFolded: true, caveatByHand: false };
 // numbers the queries, of which only the last answer counts
 const binaryGraphRequests = { seq: 0, metric: 0 };
 
@@ -30288,6 +30289,20 @@ function binaryGraphExploreCut(st) {
 }
 
 // The line above the canvas: that the picture is cut, in words, and the note of the last step. { tone, html }
+// The short form of the caveat, in one place because two readers draw it: the strip on the canvas and the bar over
+// the folded prose. `hidden` is the whole count, the one that did not fit included, and the cap at the end is what
+// explains that one - so this names every number the long form does.
+function binaryGraphCutShort(cut) {
+    const pieces = [];
+    if (cut.hidden) pieces.push(`${cut.hidden.toLocaleString('en-US')} not shown`);
+    if (cut.functions) pieces.push(`${cut.functions.toLocaleString('en-US')} imported functions not shown`);
+    if (cut.tables) {
+        pieces.push(`${cut.tables.toLocaleString('en-US')} ${cut.tables === 1 ? 'opened node has' : 'opened nodes have'} a table cut short`);
+    }
+    if (cut.importers) pieces.push('importers may be incomplete (some tables cut short, the figures say how many)');
+    return `Not the whole neighbourhood: ${pieces.join(', ')} (the canvas holds ${BINARY_GRAPH_EXPLORE.cap} nodes)`;
+}
+
 function binaryGraphExploreStatus(st) {
     if (st.loading) return { tone: 'info', html: '' };
     const cut = binaryGraphExploreCut(st);
@@ -30310,9 +30325,22 @@ function binaryGraphExploreStatus(st) {
                 + 'and a binary whose table was cut may be one that imports it; the figures say how many');
         }
         if (cut.dropped) why.push(`${n(cut.dropped, 'did', 'did')} not fit on this canvas, which holds at most ${escapeHtml(String(BINARY_GRAPH_EXPLORE.cap))} nodes`);
-        html += `<strong class="binary-graph-cut">Not the whole neighbourhood${cut.hidden ? `: ${n(cut.hidden, 'neighbour is', 'neighbours are')} not shown, ` : ', '}`
+        // Measured on the VM at 1280x900: this prose was 731 characters over four lines and 73px tall, above a
+        // canvas that had 318px, and the strip painted on the canvas already carries the short form. So it folds
+        // the way GRAPH folds the scan panels. The bar keeps the claim and every count - a caveat whose numbers
+        // are hidden reads as no caveat - and only the sentences that say what the numbers mean go behind it.
+        const folded = !!binaryGraphState.caveatFolded;
+        const title = folded ? 'Say what is missing and what that means' : 'Fold away what the counts mean';
+        html += '<div class="binary-explore-caveat-bar">'
+            + `<button type="button" class="binary-explore-caveat-fold" aria-expanded="${!folded}"`
+            + ` title="${escapeHtml(title)}" aria-label="${escapeHtml(title)}"`
+            + ' onclick="binaryGraphToggleCaveat()">\u25be</button>'
+            + `<span class="binary-explore-caveat-note binary-graph-cut">${escapeHtml(binaryGraphCutShort(cut))}</span>`
+            + '</div>'
+            + `<div class="binary-explore-caveat-body"${folded ? ' hidden' : ''}>`
+            + `<strong class="binary-graph-cut">Not the whole neighbourhood${cut.hidden ? `: ${n(cut.hidden, 'neighbour is', 'neighbours are')} not shown, ` : ', '}`
             + `of ${n(cut.parents, 'opened node', 'opened nodes')}: ${why.join(' and ')}. Whole neighbours were dropped, in name order: `
-            + 'a node that is missing here is not shown, which does not mean it is not imported.</strong> ';
+            + 'a node that is missing here is not shown, which does not mean it is not imported.</strong></div>';
     }
     if (st.note) html += `<span class="binary-graph-note">${escapeHtml(st.note)}</span>`;
     return { tone: cut.any ? 'warn' : 'info', html };
@@ -30603,6 +30631,15 @@ function binaryGraphToggleMax() {
     return binaryGraphApplyMax();
 }
 
+// The prose under the caveat's bar, by the same rule: it starts folded because the strip on the canvas carries the
+// short form, and once the reader has opened it a redraw leaves it open.
+function binaryGraphToggleCaveat() {
+    binaryGraphState.caveatFolded = !binaryGraphState.caveatFolded;
+    binaryGraphState.caveatByHand = true;
+    binaryGraphExploreRender();
+    return true;
+}
+
 function binaryGraphSetMode(mode) {
     if (mode !== 'path' && mode !== 'explore') return false;
     binaryGraphExplore.mode = mode;
@@ -30662,6 +30699,27 @@ function binaryGraphExploreRender() {
     const zoom = el('binary-explore-zoom');
     if (zoom) zoom.textContent = `${Math.round(st.camera.zoom * 100)}%`;
     binaryGraphDraw();
+}
+
+// Whether the canvas has to carry the caveat itself. The bar above it says the same words, so drawing both put the
+// same sentence on the screen twice, 20px apart - seen in Chrome on the VM. The strip was added for one case and
+// this is it: measured at 1280x640, scrolled to the canvas, 14 of the status's 73px were left in view while the
+// canvas was whole. The rect is of an element outside the canvas, so a pan, which writes to the bitmap and not to
+// the DOM, reads it from a layout that is already clean.
+//
+// It fails towards saying it: no element, no rect, or a read that throws, and the strip is drawn. A caveat said
+// twice is a nuisance; a caveat said nowhere is a measurement reading as something it is not.
+function binaryGraphCaveatNeedsStrip() {
+    const host = document.getElementById('binary-explore-status');
+    if (!host || host.hidden || typeof host.getBoundingClientRect !== 'function') return true;
+    try {
+        const box = host.getBoundingClientRect();
+        const height = typeof window !== 'undefined' ? window.innerHeight : 0;
+        if (!height || !box || typeof box.top !== 'number') return true;
+        return !(box.top >= 0 && box.bottom <= height);
+    } catch (e) {
+        return true;
+    }
 }
 
 function binaryGraphDraw() {
@@ -30774,14 +30832,32 @@ function binaryGraphDraw() {
         }
         ctx.fillText(text, x, y);
     };
-    if (cut.any) {
-        const pieces = [];
-        if (cut.hidden) pieces.push(`${cut.hidden.toLocaleString('en-US')} not shown`);
-        if (cut.functions) pieces.push(`${cut.functions.toLocaleString('en-US')} imported functions not shown`);
-        if (cut.tables) pieces.push(`${cut.tables.toLocaleString('en-US')} ${cut.tables === 1 ? 'opened node has' : 'opened nodes have'} a table cut short`);
-        if (cut.importers) pieces.push('importers may be incomplete (some tables cut short, the figures say how many)');
+    // Measured in Chrome on the VM with kernelbase.dll opened and 400 nodes drawn: the caveat measured 1,344px
+    // while the canvas was 1,250px wide at 1280x900 and 1,352px at 1920x1080. So its end - "(the canvas holds 400
+    // nodes)", the part that names the cap - was painted past the right edge, 106px of it at the smaller width.
+    // A caveat a reader cannot read is worse than none, which is the rule the strip itself was added for. So it is
+    // wrapped at word boundaries to lines the canvas holds; a word wider than the canvas is still drawn, because a
+    // line that overflows says more than a line that is missing.
+    const onCanvasWrapped = (text, x, y, step) => {
+        const room = canvas.width - x - 12;
+        const lines = [];
+        let line = '';
+        for (const word of String(text).split(' ')) {
+            const grown = line ? `${line} ${word}` : word;
+            if (line && ctx.measureText(grown).width > room) {
+                lines.push(line);
+                line = word;
+            } else {
+                line = grown;
+            }
+        }
+        if (line) lines.push(line);
+        lines.forEach((one, i) => onCanvas(one, x, y + i * step));
+        return lines.length;
+    };
+    if (cut.any && binaryGraphCaveatNeedsStrip()) {
         ctx.fillStyle = themeColor('--severity-medium');
-        onCanvas(`Not the whole neighbourhood: ${pieces.join(', ')} (the canvas holds ${BINARY_GRAPH_EXPLORE.cap} nodes)`, 12, 10);
+        onCanvasWrapped(binaryGraphCutShort(cut), 12, 10, 18);
     }
     if (st.loading) {
         ctx.fillStyle = themeColor('--text-muted');
