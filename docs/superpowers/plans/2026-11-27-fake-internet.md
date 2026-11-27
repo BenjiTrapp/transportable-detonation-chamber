@@ -51,17 +51,17 @@ Five things the spec implies that no task's tests exercise on their own. Each li
 - Test: `tests/test_net_system.py`
 
 **Interfaces:**
-- Produces: `class SystemOps` with `add_address(index, address, mask)`, `remove_address(index, address)`, `set_static(index, address, mask, gateway, dns)`, `restore_addressing(index, state)`, `read_addressing(index) -> dict`, `add_firewall_rule(name, spec)`, `remove_firewall_rules(prefix)`, `install_ca(pem)`, `remove_ca(thumbprint)`, `tcp_owner(local_ip, local_port, remote_ip, remote_port) -> int | None`. `class FakeSystemOps(SystemOps)` records calls and answers from a dict, for every later task's tests. `WindowsSystemOps` runs the real thing.
+- Produces: `class SystemOps` with `add_address(index, address, mask)`, `remove_address(index, address)`, `set_static(index, address, mask, gateway, dns)`, `restore_addressing(index, state)`, `read_addressing(index) -> dict`, `add_firewall_rule(name, spec)`, `remove_firewall_rules(prefix)`, `install_ca(pem)`, `remove_ca(thumbprint)`, `tcp_owner(owner_ip, owner_port, peer_ip, peer_port) -> int | None` — the owner's end comes first: asked the other way round Windows finds TDC's own listening row and returns TDC's own pid, pinning the connection on the wrong process with no error. `class FakeSystemOps(SystemOps)` records calls and answers from a dict, for every later task's tests. `WindowsSystemOps` runs the real thing.
 
 - [ ] **Step 1: Write the failing test**
 
 ```python
 def test_the_fake_records_what_was_asked_of_it_and_answers_from_its_table():
-    ops = net_system.FakeSystemOps(tcp_owners={("198.18.1.1", 80, "10.0.0.5", 51000): 4242})
+    ops = net_system.FakeSystemOps(tcp_owners={("10.0.0.5", 51000, "198.18.1.1", 80): 4242})
     ops.add_address(7, "198.18.1.1", "255.255.0.0")
     assert ops.calls == [("add_address", 7, "198.18.1.1", "255.255.0.0")]
-    assert ops.tcp_owner("198.18.1.1", 80, "10.0.0.5", 51000) == 4242
-    assert ops.tcp_owner("198.18.1.2", 80, "10.0.0.5", 51000) is None
+    assert ops.tcp_owner("10.0.0.5", 51000, "198.18.1.1", 80) == 4242
+    assert ops.tcp_owner("10.0.0.6", 51000, "198.18.1.1", 80) is None
 
 
 def test_the_windows_ops_are_not_importable_off_windows_but_the_module_is():
