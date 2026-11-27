@@ -51,6 +51,7 @@ FILES = {
     "webui/net_flows.py": r"C:\DetonationChamberUI\net_flows.py",
     "webui/net_http.py": r"C:\DetonationChamberUI\net_http.py",
     "webui/net_mail_ftp.py": r"C:\DetonationChamberUI\net_mail_ftp.py",
+    "webui/net_pcap.py": r"C:\DetonationChamberUI\net_pcap.py",
     "webui/net_raw.py": r"C:\DetonationChamberUI\net_raw.py",
     "webui/net_rules.py": r"C:\DetonationChamberUI\net_rules.py",
     "webui/net_system.py": r"C:\DetonationChamberUI\net_system.py",

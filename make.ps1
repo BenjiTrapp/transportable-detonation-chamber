@@ -397,6 +397,7 @@ switch ($Target) {
             Copy-Item 'webui\net_flows.py' -Destination 'C:\DetonationChamberUI\net_flows.py' -ToSession $s -Force
             Copy-Item 'webui\net_http.py' -Destination 'C:\DetonationChamberUI\net_http.py' -ToSession $s -Force
             Copy-Item 'webui\net_mail_ftp.py' -Destination 'C:\DetonationChamberUI\net_mail_ftp.py' -ToSession $s -Force
+            Copy-Item 'webui\net_pcap.py' -Destination 'C:\DetonationChamberUI\net_pcap.py' -ToSession $s -Force
             Copy-Item 'webui\net_raw.py' -Destination 'C:\DetonationChamberUI\net_raw.py' -ToSession $s -Force
             Copy-Item 'webui\net_rules.py' -Destination 'C:\DetonationChamberUI\net_rules.py' -ToSession $s -Force
             Copy-Item 'webui\net_system.py' -Destination 'C:\DetonationChamberUI\net_system.py' -ToSession $s -Force
@@ -478,6 +479,7 @@ switch ($Target) {
             Copy-Item 'webui\net_flows.py' -Destination 'C:\DetonationChamberUI\net_flows.py' -ToSession $s -Force
             Copy-Item 'webui\net_http.py' -Destination 'C:\DetonationChamberUI\net_http.py' -ToSession $s -Force
             Copy-Item 'webui\net_mail_ftp.py' -Destination 'C:\DetonationChamberUI\net_mail_ftp.py' -ToSession $s -Force
+            Copy-Item 'webui\net_pcap.py' -Destination 'C:\DetonationChamberUI\net_pcap.py' -ToSession $s -Force
             Copy-Item 'webui\net_raw.py' -Destination 'C:\DetonationChamberUI\net_raw.py' -ToSession $s -Force
             Copy-Item 'webui\net_rules.py' -Destination 'C:\DetonationChamberUI\net_rules.py' -ToSession $s -Force
             Copy-Item 'webui\net_system.py' -Destination 'C:\DetonationChamberUI\net_system.py' -ToSession $s -Force

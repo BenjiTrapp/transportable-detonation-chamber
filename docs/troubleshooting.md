@@ -214,6 +214,7 @@ transportable-detonation-chamber/
 │   ├── net_http.py                # NETWORK tab: HTTP streams to http, download, upload and websocket events
 │   ├── net_tls.py                 # NETWORK tab: TLS handshakes to tls events, with JA3 and JA4
 │   ├── net_mail_ftp.py            # NETWORK tab: FTP and SMTP control streams to ftp and smtp events
+│   ├── net_pcap.py                # Fake internet: the capture the fake servers write, and the context they are given
 │   ├── net_raw.py                 # NETWORK tab: traffic no other parser could name, profiled into raw events
 │   ├── net_decode.py              # NETWORK tab: encoded values decoded when the result means something
 │   ├── net_behavior.py            # NETWORK tab: beacons, retries and fanout over time
