@@ -30755,6 +30755,25 @@ function binaryGraphDraw() {
     ctx.font = '12px monospace';
     ctx.textAlign = 'left';
     ctx.textBaseline = 'top';
+    // These two lines are painted on the canvas, not above it, so panning and zooming cannot scroll them out of
+    // sight. That puts them over the drawing: once the surface grew from 240px to 661px the caveat ran through the
+    // node labels (seen at 1920x1080 with 400 nodes, through the label of bi.dll). So each gets a strip of the
+    // backdrop behind it first, as wide as it measures and no wider. Opaque on purpose: the caveat says a count is
+    // a lower bound, and a reader who cannot read it is worse off than one who has to pan a little.
+    //
+    // Only correct for textAlign left and textBaseline top, which this block sets. Without a backdrop colour it
+    // fills nothing: a canvas ignores an invalid fillStyle, so the strip would take the text's own colour and the
+    // caveat would be drawn on itself - unreadable, and worse than no strip.
+    const onCanvas = (text, x, y) => {
+        const backdrop = themeColor('--bg-secondary');
+        if (backdrop) {
+            const colour = ctx.fillStyle;
+            ctx.fillStyle = backdrop;
+            ctx.fillRect(x - 4, y - 3, Math.ceil(ctx.measureText(text).width) + 8, 18);
+            ctx.fillStyle = colour;
+        }
+        ctx.fillText(text, x, y);
+    };
     if (cut.any) {
         const pieces = [];
         if (cut.hidden) pieces.push(`${cut.hidden.toLocaleString('en-US')} not shown`);
@@ -30762,11 +30781,11 @@ function binaryGraphDraw() {
         if (cut.tables) pieces.push(`${cut.tables.toLocaleString('en-US')} ${cut.tables === 1 ? 'opened node has' : 'opened nodes have'} a table cut short`);
         if (cut.importers) pieces.push('importers may be incomplete (some tables cut short, the figures say how many)');
         ctx.fillStyle = themeColor('--severity-medium');
-        ctx.fillText(`Not the whole neighbourhood: ${pieces.join(', ')} (the canvas holds ${BINARY_GRAPH_EXPLORE.cap} nodes)`, 12, 10);
+        onCanvas(`Not the whole neighbourhood: ${pieces.join(', ')} (the canvas holds ${BINARY_GRAPH_EXPLORE.cap} nodes)`, 12, 10);
     }
     if (st.loading) {
         ctx.fillStyle = themeColor('--text-muted');
-        ctx.fillText('Opening…', 12, canvas.height - 22);
+        onCanvas('Opening…', 12, canvas.height - 22);
     }
     ctx.restore();
     return true;
