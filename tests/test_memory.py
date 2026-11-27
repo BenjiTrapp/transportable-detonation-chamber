@@ -39,6 +39,38 @@ def test_pid_entry_of_another_sample_is_ignored(tdc, tmp_path):
     assert store.lookup("aether", pid=4072, sha256="11" * 32) == {"sample": "old"}
 
 
+def test_the_hash_entry_of_another_run_does_not_speak_for_this_pid(tdc, tmp_path):
+    """The mirror of the test above. A result is stored under tool+PID and under tool+SHA256, so the hash key is
+    shared by every run of the same file and the newest run owns it. Detonate a file twice and, between the submit
+    and the moment the new run stores anything, the only entry under that hash is the previous run's - and the
+    detonation view asks for a specific pid.
+
+    Measured on the chamber: injectsim.exe was submitted as PID 5540 and the syscall stage answered "the
+    architecture of process 5092 is unknown", 5092 being the pid of the run before. It showed only because that
+    text happens to name a pid; a tool whose result names none would have read as this run's.
+
+    So a hash hit may not be used for a pid it does not belong to. An entry whose pid is unknown still counts, and
+    a lookup without a pid is unchanged: that is how a result is found from the submission history, where only the
+    hash is known."""
+    store = tdc._ResultStore(str(tmp_path / "s"))
+    store.put("syscalls", {"run": "first"}, pid=5092, sha256="ab" * 32)
+    assert store.lookup("syscalls", pid=5092, sha256="ab" * 32) == {"run": "first"}
+    assert store.lookup("syscalls", sha256="ab" * 32) == {"run": "first"}, \
+        "without a pid the hash still finds it: the submission history knows no pid"
+    assert store.lookup("syscalls", pid=5540, sha256="ab" * 32) is None, \
+        "the first run's result may not be handed out as the second run's"
+    store.put("syscalls", {"run": "second"}, pid=5540, sha256="ab" * 32)
+    assert store.lookup("syscalls", pid=5540, sha256="ab" * 32) == {"run": "second"}
+    assert store.lookup("syscalls", sha256="ab" * 32) == {"run": "second"}, "the newest run owns the hash"
+
+
+def test_a_hash_entry_without_a_pid_still_answers_a_pid_lookup(tdc, tmp_path):
+    """Not every result knows a pid - a file scan has none - and such an entry speaks for any run of that file."""
+    store = tdc._ResultStore(str(tmp_path / "s"))
+    store.put("capa", {"of": "the file"}, sha256="cd" * 32)
+    assert store.lookup("capa", pid=1234, sha256="cd" * 32) == {"of": "the file"}
+
+
 def test_old_pid_only_entries_expire(tdc, tmp_path, monkeypatch):
     store = tdc._ResultStore(str(tmp_path / "s"))
     store.put("hsb", {"x": 1}, pid=10)

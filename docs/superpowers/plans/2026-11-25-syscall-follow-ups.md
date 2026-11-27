@@ -10,7 +10,26 @@ Speichern schlug fehl. Eine versionierte Datei überlebt das.
 Jeder Punkt nennt, was gemessen wurde, warum er liegen blieb, und die Richtung — keine
 Entscheidung ist getroffen.
 
-## 1. Der Ergebnis-Cache schlägt nach Datei-Hash vor PID nach
+## 1. Der Ergebnis-Cache schlägt nach Datei-Hash vor PID nach — behoben am 27.11.2026
+
+**Behoben, und schmaler als die Notiz annahm.** `lookup` bevorzugt den Hash nicht: es nimmt den
+**neueren** von Hash- und PID-Treffer. Mein Fall trat auf, weil der neue Lauf noch nichts
+gespeichert hatte — zwischen dem Absenden und dem Moment, in dem die Stufe schreibt, ist der
+einzige Eintrag unter diesem Hash der des vorigen Laufs, und die Detonationsansicht fragt nach
+einer bestimmten PID.
+
+Der Fix ist die Spiegelung der Prüfung, die es für die umgekehrte Richtung schon gab („mit einem
+SHA256 wird ein PID-Eintrag eines anderen Samples ignoriert"): ein Hash-Treffer darf nicht für
+eine PID sprechen, zu der er nicht gehört. Ein Eintrag ohne PID gilt weiter für jeden Lauf
+derselben Datei (ein Scan der Datei allein hat keine), und eine Abfrage **ohne** PID bleibt
+unberührt — so findet die Einsendungs-Historie überhaupt ein Ergebnis.
+
+Es war **keine** Entwurfsentscheidung: die Regel ist für alle sechs Werkzeuge dieselbe, und nur
+eine Route fragt mit PID und Hash zugleich (`/api/detonation/results`); die Evidenz-Route fragt
+nur mit PID. Die Änderung engt ein: wo vorher ein fremder Lauf antwortete, antwortet jetzt
+nichts — „noch nicht" statt einer falschen Zuordnung.
+
+Der Befund, wie er stand:
 
 `_beacon_results_cache.lookup` sucht zuerst `f"{tool}_{sha256}"`, dann die PID. Detoniert
 man dieselbe Datei erneut, zeigt die Ansicht darum das Ergebnis des **vorigen** Laufs, bis
@@ -58,9 +77,33 @@ Test, danach auf der VM in beiden Themes nachsehen.
 Alle drei wurden dort als „safe to follow the merge" eingeordnet.
 
 **M2 — ein umbenennender Forwarder auf eine Tür ist für die namensbasierte Türmenge
-unsichtbar.** Exportiert `a.dll` den Namen `Foo` als Forwarder auf `b.dll!NtBar`, so sieht
-die Türmenge nur `Foo`. Ob System32 so einen Fall hat, wurde auf der VM **nicht** gemessen.
-Verwandt: Entscheidung 33 löst den Ordinal-Fall über `doors_complete=false`.
+unsichtbar: gemessen und behoben am 27.11.2026.**
+
+Auf `26200.9974` (arm64) gemessen: von 4.944 System32-Forwardern benennen 1.538 um, und 234
+davon zeigen auf eine Tür — einen `Nt`/`Zw`-Namen der Baseline oder einen kuratierten
+Win32-Namen. 229 sind nur über ein Ordinal exportiert; **fünf tragen einen echten Namen**
+(`gdi32` dreimal `D3DKMT…` auf `WIN32U.NtGdiDdDDI…`, und `kernel32` wie `kernelbase`
+`FlushProcessWriteBuffers` auf `NTDLL.NtFlushProcessWriteBuffers`), und acht System32-Binaries
+importieren genau die.
+
+**Null** davon führen zu einem Syscall, den die kuratierte Tabelle abdeckt — nur für die darf
+sie über eine Abwesenheit sprechen. Eine Fehlbeschuldigung war also heute nicht möglich; sie
+wäre es in dem Moment, in dem jemand eine Zeile für einen dieser Syscalls hinzufügt.
+
+Behoben wurde es trotzdem, weil die Richtung stimmt: eine unvollständige Türmenge heißt eine
+fehlende Tür, und eine fehlende Tür heißt `false`. Und der Fix war keine Erfindung — der
+**Ordinal**-Pfad löste schon auf (`_add_ordinal` ruft `resolve_export` und nimmt jeden Sprung
+mit); nur der benannte tat es nicht. Jetzt tun beide dasselbe.
+
+Die Kosten wurden gegen den alten Code auf derselben VM gemessen, drei Prozesse, je drei Läufe,
+Minimum: **0,34–0,41 s vorher**. Jeden benannten Import aufzulösen hätte 1,05–1,64 s gekostet,
+und 3.551 von 3.671 Auflösungen über zwölf Module galten Namen hinter einem API-Set, die dessen
+Host selbst definiert. Da ein Umbenennen nur an einem Forwarder-Sprung passieren kann, genügt
+die Frage an den Host, den der Loader nimmt — **0,39–0,56 s** bei gleichem Türbestand (4.817),
+und 358 statt 3.671 Auflösungen.
+
+Entscheidung 33 bleibt daneben bestehen: ein Ordinal, das der Graph nicht benennen kann, lässt
+die Vereinigung weiterhin unvollständig.
 
 **M3 — das erste Laden des Cache läuft auf dem Request-Thread.** 28,2 MB JSON: die erste
 Abfrage nach einem Neustart blockiert ihren Worker. Richtung: beim Start vorladen oder an

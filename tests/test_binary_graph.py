@@ -3564,7 +3564,7 @@ _KERNELBASE_NT = ("NtAllocateVirtualMemory", "NtProtectVirtualMemory", "NtWriteV
                   "NtSetContextThread", "NtOpenProcessToken", "NtAdjustPrivilegesToken")
 
 
-def _doors_graph(*extra, arch="x64"):
+def _doors_graph(*extra, arch="x64", api_sets=None):
     """kernelbase exports the Win32 doors and imports the Nt functions it implements them with (_KERNELBASE_NT), so a
     stub of any of those reads as imported in every process that loads it, as on a real system.
 
@@ -3581,7 +3581,7 @@ def _doors_graph(*extra, arch="x64"):
                           forwarders={"WriteProcessMemory": "kernelbase.WriteProcessMemory",
                                       "QueueUserAPC": "kernelbase.QueueUserAPC"}),
                        {157: "WriteProcessMemory", 158: "CloseHandle", 159: "QueueUserAPC"}),
-        *extra, arch=arch)
+        *extra, arch=arch, api_sets=api_sets)
 
 
 def _image(*functions):
@@ -4864,3 +4864,73 @@ def test_a_list_of_pairs_and_a_list_of_the_isolated_read_the_imports_once(monkey
         del calls[:]
         assert _members(graph, name).total
         assert len(calls) == 1, f"{name} read every import {len(calls)} times"
+
+
+def test_a_door_a_renaming_forwarder_hides_still_counts(apc_baseline):
+    """Measured on build 26200.9974: of 4,944 System32 forwarders, 1,538 rename, and 234 of those point at a door -
+    an Nt name of the baseline or a curated Win32 name. 229 are exported by ordinal alone, where ruling 33 already
+    forbids a `false`, and five carry a real name: gdi32 exports three D3DKMT… names onto WIN32U.NtGdiDdDDI…, and
+    kernel32 and kernelbase both export FlushProcessWriteBuffers onto NTDLL.NtFlushProcessWriteBuffers. Eight
+    System32 binaries import exactly those.
+
+    A door is what a module imports, and the set took the imported name alone. So a module importing
+    FlushProcessWriteBuffers was recorded without NtFlushProcessWriteBuffers, the name it really reaches - an
+    incomplete union, which means a missing door, which means a `false`: a false accusation. None of the 234 leads
+    to a syscall the curated table covers, so it cannot accuse anyone today; it would the day a row is added for
+    one of them. The import is a real path to that function, so the set now holds what the forwarder resolves to,
+    chains and api sets included, the way every other answer follows them.
+
+    Best-effort on purpose: a name that cannot be resolved leaves the set as it was, which is what it was before
+    this. Making a failed resolution incomplete would switch proofs off far more widely and needs its own
+    measurement."""
+    graph = _doors_graph(
+        _q("win32u.dll", exports=["NtGdiDdDDICreateDCFromMemory"]),
+        _q("gdi32.dll", exports=["GdiFlush"],
+           forwarders={"D3DKMTCreateDCFromMemory": "win32u.NtGdiDdDDICreateDCFromMemory"}),
+        _q("user32.dll", imports={"gdi32.dll": ("D3DKMTCreateDCFromMemory",)}))
+    doors = _doors(graph, _loaded(_IMAGE, *_SYSTEM_MODULES, "C:\\Windows\\System32\\gdi32.dll",
+                                  "C:\\Windows\\System32\\win32u.dll", "C:\\Windows\\System32\\user32.dll"))
+    assert doors is not None, "the union is complete: every module is one the graph holds"
+    assert "D3DKMTCreateDCFromMemory" in doors, "the name that was imported"
+    assert "NtGdiDdDDICreateDCFromMemory" in doors, \
+        "and the name it reaches: without it a stub for that syscall would read as a proven bypass"
+
+
+def test_a_forwarder_that_does_not_rename_adds_nothing_and_an_unresolvable_one_is_no_loss(apc_baseline):
+    """kernel32 forwards WriteProcessMemory to kernelbase under the same name, so there is nothing to add; a
+    forwarder onto a module the graph does not hold leaves the set as the imported name alone, which is where it
+    stood before. Neither makes the union incomplete."""
+    same = _doors_graph(
+        _q("target.dll", exports=["Door"]),
+        _q("front.dll", exports=["Other"], forwarders={"Door": "target.Door"}),
+        _q("user.dll", imports={"front.dll": ("Door",)}))
+    plain = _doors(same, _loaded(_IMAGE, *_SYSTEM_MODULES, "C:\\Windows\\System32\\target.dll",
+                                 "C:\\Windows\\System32\\front.dll", "C:\\Windows\\System32\\user.dll"))
+    assert plain is not None and "Door" in plain, plain
+    graph = _doors_graph(
+        _q("odd.dll", exports=["Other"], forwarders={"Door": "nowhere.Target"}),
+        _q("caller.dll", imports={"odd.dll": ("Door",)}))
+    doors = _doors(graph, _loaded(_IMAGE, *_SYSTEM_MODULES, "C:\\Windows\\System32\\odd.dll",
+                                  "C:\\Windows\\System32\\caller.dll"))
+    assert doors is not None and "Door" in doors and "Target" not in doors
+
+
+def test_a_door_behind_an_api_set_is_followed_through_its_host(apc_baseline):
+    """The branch that carries almost all of the cost. A name imported from an api set is not in `binaries` at all,
+    so the check asks the host the map names - the same host resolve_export would take at module level - and only a
+    name that host forwards is resolved. Of 3,671 resolutions over twelve modules, 3,551 were names behind an api
+    set that its host defines itself; asking the host first took the stubs route from 1.64s back to 0.56s on the
+    chamber, with the same 4,817 doors.
+
+    A rename can happen at no hop but a forwarder, so the check loses nothing: a host that defines the name under
+    that name renames nothing."""
+    graph = _doors_graph(
+        _q("win32u.dll", exports=["NtGdiFoo"]),
+        _q("hostdll.dll", exports=["Plain"], forwarders={"Renamed": "win32u.NtGdiFoo"}),
+        _q("caller.dll", imports={"api-ms-win-gdi-x-l1-1-0.dll": ("Renamed", "Plain")}),
+        api_sets={"api-ms-win-gdi-x-l1-1-0": ("hostdll.dll",)})
+    doors = _doors(graph, _loaded(_IMAGE, *_SYSTEM_MODULES, "C:\\Windows\\System32\\win32u.dll",
+                                  "C:\\Windows\\System32\\hostdll.dll", "C:\\Windows\\System32\\caller.dll"))
+    assert doors is not None, "every loaded module is one the graph holds"
+    assert {"Renamed", "Plain"} <= doors, "both names were imported"
+    assert "NtGdiFoo" in doors, "and the one the host forwards to, reached through the api set"
