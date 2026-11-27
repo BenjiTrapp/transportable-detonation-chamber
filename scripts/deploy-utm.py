@@ -51,6 +51,7 @@ FILES = {
     "webui/net_mail_ftp.py": r"C:\DetonationChamberUI\net_mail_ftp.py",
     "webui/net_raw.py": r"C:\DetonationChamberUI\net_raw.py",
     "webui/net_rules.py": r"C:\DetonationChamberUI\net_rules.py",
+    "webui/net_system.py": r"C:\DetonationChamberUI\net_system.py",
     "webui/net_tls.py": r"C:\DetonationChamberUI\net_tls.py",
     "webui/syscall_baseline.py": r"C:\DetonationChamberUI\syscall_baseline.py",
     "webui/syscall_scan.py": r"C:\DetonationChamberUI\syscall_scan.py",

@@ -219,6 +219,7 @@ transportable-detonation-chamber/
 │   ├── net_rules.py               # NETWORK tab: YAML rules over network events (rules/network/default.yaml)
 │   ├── net_evidence.py            # NETWORK tab: network findings in the shared evidence model
 │   ├── net_baseline.py            # NETWORK tab: what a clean machine does on the wire
+│   ├── net_system.py              # Fake internet: addresses, firewall rule, CA and TCP table behind one seam
 │   ├── data/                      # Offline geo index (iptoasn.com, CC0) and country centroids; `make geoip` refreshes it
 │   ├── memory_baseline.json       # Host memory baseline (git-ignored)
 │   ├── dev_server.py              # Dev server with live-reload
