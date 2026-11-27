@@ -69,10 +69,14 @@ webui/tool_updates_state.json
 webui/tool_updates_state.json.tmp
 webui/tool-updates.log
 
+# Fake internet: the thumbprint of the session CA while it may be in the machine store, and a write of it
+# that did not finish (written by replacing a .tmp beside it)
+webui/session_ca.json
+webui/session_ca.json.tmp
+
 # The offline wiki, built by `make docs` / `.\make.ps1 docs` from docs/
 webui/static/wiki.html
 webui/static/wiki.html.tmp
 # The documentation website, built by `make site` / `.\make.ps1 site` from
 # docs/ and README.md; the workflow builds it again and publishes that
 /site/
-webui/session_ca.json

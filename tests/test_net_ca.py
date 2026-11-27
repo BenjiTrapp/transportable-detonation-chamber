@@ -9,12 +9,15 @@ right thumbprint is asked to go, and that a CA left by an earlier session is not
 import datetime
 import ipaddress
 import json
+import os
 import ssl
 import threading
 
 import pytest
 from cryptography import x509
+from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.asymmetric import padding
 
 import net_ca
 import net_system
@@ -160,14 +163,40 @@ def test_remove_without_an_install_asks_for_nothing(state):
     assert ops.calls == []
 
 
-def test_remove_after_an_install_that_failed_still_asks_for_the_certificate_to_go(state):
+def test_a_failed_install_takes_the_certificate_back_and_forgets_it(state):
     ops = net_system.FakeSystemOps(fail={"install_ca": net_system.SystemOpsError("timed out")})
     ca = net_ca.SessionCA(ops, state_path=state)
     with pytest.raises(net_system.SystemOpsError, match="timed out"):
         ca.install()
-    # the failed install already tried to take it back, and it was not there
     assert ("remove_ca", ca.thumbprint) in ops.calls
+    assert not os.path.exists(state)
+    ops.calls.clear()
     assert ca.remove() is False
+    assert ops.calls == []
+
+
+def test_remove_after_an_install_that_failed_and_could_not_be_taken_back_asks_again(state):
+    """certutil timing out says nothing about whether it added the certificate, and when the attempt to take it back
+    fails as well the note is all that is left of it."""
+    ops = net_system.FakeSystemOps()
+    ops.fail["install_ca"] = net_system.SystemOpsError("timed out")
+    ops.fail["remove_ca"] = net_system.SystemOpsError("busy")
+    ca = net_ca.SessionCA(ops, state_path=state)
+    with pytest.raises(net_system.SystemOpsError, match="timed out"):
+        ca.install()
+    assert _noted(state) == [ca.thumbprint]
+
+    ops.calls.clear()
+    with pytest.raises(net_system.SystemOpsError, match="busy"):
+        ca.remove()
+    assert ops.calls == [("remove_ca", ca.thumbprint)]
+    assert _noted(state) == [ca.thumbprint]
+
+    del ops.fail["remove_ca"]
+    ops.calls.clear()
+    assert ca.remove() is False                      # nothing was in the store, which is not an error
+    assert ops.calls == [("remove_ca", ca.thumbprint)]
+    assert not os.path.exists(state)
 
 
 def test_installing_twice_is_one_install(state):
@@ -243,15 +272,24 @@ def test_a_certificate_for_another_name_is_refused(shared_ca):
 
 
 def test_another_sessions_ca_does_not_vouch_for_this_ones_certificates(shared_ca, state):
+    """The signature is what is checked, not the issuer's name (a different CA has a different name, which would
+    fail first and say nothing about the key)."""
     stranger = net_ca.SessionCA(net_system.FakeSystemOps(), state_path=state)
     cert = _parse(shared_ca.cert_for("x.example.org")[0])
-    with pytest.raises(Exception):
-        cert.verify_directly_issued_by(_parse(stranger.pem))
+
+    def verify_with(ca):
+        ca_cert = _parse(ca.pem)
+        ca_cert.public_key().verify(cert.signature, cert.tbs_certificate_bytes, padding.PKCS1v15(),
+                                    cert.signature_hash_algorithm)
+
+    verify_with(shared_ca)
+    with pytest.raises(InvalidSignature):
+        verify_with(stranger)
     assert stranger.thumbprint != shared_ca.thumbprint
 
 
 @pytest.mark.parametrize("bad", ["", " ", ".", "*.example.org", "a b.example.org", "a..b", "x" * 64 + ".org",
-                                 "a/b", 5, None, b"\xff"])
+                                 "a/b", 5, None, b"\xff", "198.18.3.7.", "300.1.1.1", "1234", "1.2.3"])
 def test_what_is_not_a_name_is_refused(shared_ca, bad):
     with pytest.raises(ValueError):
         shared_ca.cert_for(bad)
@@ -299,3 +337,77 @@ def test_a_certificate_needs_no_new_key(shared_ca, monkeypatch):
         raise AssertionError("a key was generated")
     monkeypatch.setattr(net_ca.rsa, "generate_private_key", no_key)
     shared_ca.cert_for("first-connection.example.org")
+
+
+def test_a_dotted_number_that_is_not_an_ip_does_not_get_a_certificate_a_client_dialling_the_ip_would_refuse(shared_ca):
+    with pytest.raises(ValueError):
+        shared_ca.cert_for("198.18.3.7.")
+    san = _san(_parse(shared_ca.cert_for("198.18.3.7")[0]))
+    assert san.get_values_for_type(x509.IPAddress) == [ipaddress.ip_address("198.18.3.7")]
+    assert san.get_values_for_type(x509.DNSName) == []
+
+
+EARLIER = "E5F9" + "0" * 36
+
+
+@pytest.mark.parametrize("content", [
+    "",                                                  # what a hard kill can leave of a rename
+    '{"thumbprints": ["E5F9' + "0" * 20,                 # truncated
+    "not json",
+    '["E5F9' + "0" * 36 + '"]',                          # not the shape of a note
+    '{"thumbprints": "E5F9' + "0" * 36 + '"}',
+    '{"thumbprints": ["E5F9' + "0" * 36 + '", "not a thumbprint"]}',    # one entry that is not one
+    '{"thumbprints": [5]}',
+])
+def test_a_note_that_cannot_be_read_stops_the_install_and_is_left_as_it_is(state, content):
+    """Reading it as empty would have the next write replace it, and the CA of the session that wrote it would be
+    in the machine store with nothing left that names it."""
+    ops = net_system.FakeSystemOps()
+    ops.cas[EARLIER] = "leftover"
+    with open(state, "w") as f:
+        f.write(content)
+
+    with pytest.raises(net_system.SystemOpsError, match="cannot be read"):
+        net_ca.SessionCA(ops, state_path=state).install()
+
+    assert ops.calls == []
+    assert list(ops.cas) == [EARLIER]
+    with open(state) as f:
+        assert f.read() == content
+
+
+def test_a_note_that_is_a_directory_stops_the_install_too(state):
+    os.mkdir(state)
+    ops = net_system.FakeSystemOps()
+    with pytest.raises(net_system.SystemOpsError, match="cannot be read"):
+        net_ca.SessionCA(ops, state_path=state).install()
+    assert ops.calls == []
+
+
+def test_a_note_that_cannot_be_written_is_a_system_ops_error_and_nothing_is_installed(tmp_path):
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    ops = net_system.FakeSystemOps()
+    with pytest.raises(net_system.SystemOpsError, match="cannot write the note"):
+        net_ca.SessionCA(ops, state_path=str(blocker / "session_ca.json")).install()
+    assert ops.calls == []
+
+
+def test_the_note_is_on_disk_before_it_replaces_the_old_one(state, monkeypatch):
+    events = []
+    real_fsync, real_replace = os.fsync, os.replace
+    monkeypatch.setattr(net_ca.os, "fsync", lambda fd: (events.append("fsync"), real_fsync(fd))[1])
+    monkeypatch.setattr(net_ca.os, "replace", lambda a, b: (events.append("replace"), real_replace(a, b))[1])
+
+    net_ca.SessionCA(net_system.FakeSystemOps(), state_path=state).install()
+
+    assert events[0] == "fsync" and "replace" in events                # the data is synced before the rename
+    assert events.index("fsync") < events.index("replace")
+    assert "fsync" in events[events.index("replace"):] or os.name == "nt"      # and the directory after it
+
+
+def test_the_temporary_of_the_note_is_ignored_by_git():
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    with open(os.path.join(root, ".gitignore")) as f:
+        lines = [line.strip() for line in f]
+    assert "webui/session_ca.json" in lines and "webui/session_ca.json.tmp" in lines

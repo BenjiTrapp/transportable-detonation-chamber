@@ -61,6 +61,7 @@ BACKDATE = datetime.timedelta(hours=1)
 # when it comes back, which costs a signature.
 MAX_CERTS = 2048
 
+_THUMBPRINT = re.compile(r"[0-9A-Fa-f]{40}")
 _LABEL = re.compile(r"[a-z0-9_-]{1,63}")
 _MAX_NAME = 253
 _MAX_CN = 64              # an X.509 common name is at most 64 characters; the SAN is what clients read anyway
@@ -95,8 +96,14 @@ def normalize_name(name: Any) -> Tuple[str, bool]:
         except UnicodeError:
             raise ValueError(f"not a host name: {name[:40]!r}") from None
     text = text.lower()
-    if not text or len(text) > _MAX_NAME or not all(_LABEL.fullmatch(label) for label in text.split(".")):
+    labels = text.split(".")
+    if not text or len(text) > _MAX_NAME or not all(_LABEL.fullmatch(label) for label in labels):
         raise ValueError(f"not a host name: {name[:40]!r}")
+    # "198.18.3.7." is not an IP literal and would pass as a DNS name made of digits; a certificate with that as a
+    # DNSName is cached under the key of the IP and then served to a client that dials the IP, which refuses it. No
+    # real name is all digits (a top-level domain never is), so a DNS SAN that reads like an address is never right.
+    if all(label.isdigit() for label in labels):
+        raise ValueError(f"not a host name or an IP address: {name[:40]!r}")
     return text, False
 
 
@@ -206,8 +213,9 @@ class SessionCA:
 
     def install(self) -> str:
         """Clear what an earlier session left, then put this CA into the machine's trusted roots. Returns the
-        thumbprint. Installing twice is one install. Raises ``SystemOpsError`` when a leftover cannot be removed
-        (nothing is installed then) or the certificate cannot be added."""
+        thumbprint. Installing twice is one install. Raises ``SystemOpsError`` when the note of earlier sessions cannot
+        be read or written, when a leftover cannot be removed (nothing is installed in any of these cases) or when the
+        certificate cannot be added."""
         with self._lock:
             if self._installed is not None:
                 return self._installed
@@ -263,15 +271,28 @@ class SessionCA:
     # -- the note of what may be in the store --
 
     def _read_note(self) -> List[str]:
+        """The thumbprints that may be in the store. No file is "none". A file that is there and cannot be read as
+        a note is an error: it may be the note of a session that died, and reading it as empty would have the next
+        write replace it, leaving a CA in the machine store that nothing names any more. A zero-length file is what
+        a hard kill of the VM can leave behind, so that case is not rare."""
         try:
             with open(self._state_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-        except (OSError, ValueError):
+        except (FileNotFoundError, NotADirectoryError):      # no file, or no directory it could be in
             return []
+        except (OSError, ValueError) as e:
+            raise self._unreadable(f"{type(e).__name__}: {e}") from e
         items = data.get("thumbprints") if isinstance(data, dict) else None
-        if not isinstance(items, list):
-            return []
-        return [t.upper() for t in items if isinstance(t, str) and re.fullmatch(r"[0-9A-Fa-f]{40}", t)]
+        if not isinstance(items, list) or not all(isinstance(t, str) and _THUMBPRINT.fullmatch(t) for t in items):
+            raise self._unreadable("it is not a list of thumbprints")
+        return [t.upper() for t in items]
+
+    def _unreadable(self, why: str) -> SystemOpsError:
+        return SystemOpsError(
+            f"the note of the session CA ({self._state_path}) cannot be read: {why}. A CA of an earlier session may "
+            f"still be in the machine's trusted roots: look for 'TDC fake internet, session CA' with "
+            f"'certutil -store Root', delete it with 'certutil -delstore Root <thumbprint>', then delete the note. "
+            f"Nothing was installed.")
 
     def _note(self, add: Optional[str] = None, drop: Optional[str] = None) -> None:
         current = self._read_note()
@@ -280,13 +301,11 @@ class SessionCA:
             wanted.append(add)
         if wanted != current or (add and not os.path.exists(self._state_path)):
             if wanted:
-                directory = os.path.dirname(self._state_path)
-                if directory:
-                    os.makedirs(directory, exist_ok=True)
-                temporary = self._state_path + ".tmp"
-                with open(temporary, "w", encoding="utf-8") as f:
-                    json.dump({"thumbprints": wanted}, f)
-                os.replace(temporary, self._state_path)
+                try:
+                    self._write_note(wanted)
+                except OSError as e:
+                    raise SystemOpsError(f"cannot write the note of the session CA ({self._state_path}): "
+                                         f"{type(e).__name__}: {e}") from e
             else:
                 try:
                     os.unlink(self._state_path)
@@ -296,3 +315,22 @@ class SessionCA:
             self._noted = True
         if drop == self.thumbprint:
             self._noted = False
+
+    def _write_note(self, thumbprints: List[str]) -> None:
+        """Replace the note whole, and on disk before this returns: the note is written because a crash may follow
+        at once, and after a hard kill NTFS can keep a rename without the data behind it."""
+        directory = os.path.dirname(self._state_path)
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        temporary = self._state_path + ".tmp"
+        with open(temporary, "w", encoding="utf-8") as f:
+            json.dump({"thumbprints": thumbprints}, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, self._state_path)
+        if os.name != "nt":                 # a directory cannot be opened on Windows; there the rename is the journal's
+            fd = os.open(directory or ".", os.O_RDONLY)
+            try:
+                os.fsync(fd)
+            finally:
+                os.close(fd)
