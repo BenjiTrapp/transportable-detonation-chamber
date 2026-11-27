@@ -4934,3 +4934,39 @@ def test_a_door_behind_an_api_set_is_followed_through_its_host(apc_baseline):
     assert doors is not None, "every loaded module is one the graph holds"
     assert {"Renamed", "Plain"} <= doors, "both names were imported"
     assert "NtGdiFoo" in doors, "and the one the host forwards to, reached through the api set"
+
+
+# --- M3: the first load of the cache does not fall on a request ------------------------------------------------------
+
+def test_the_graph_is_preloaded_so_the_first_request_does_not_pay_for_it(tdc, monkeypatch):
+    """Measured on the chamber: the first call of the stubs route after a restart took 14.66s, the next 0.4-0.6s.
+    `_binary_graph_for` parses the 28.2 MB cache inside `_binary_graph_held_lock`, on the calling thread, so that
+    first request pays for all of it - and every other request wanting the graph waits at the same lock.
+
+    So a daemon thread does it at start, as the update check, the log collector and the firewall are started. It
+    never builds: a start must not set minutes of reading System32 going, and `start_build=False` is what the
+    syscall scan already uses for the same reason. It swallows whatever it meets: a graph that cannot be read is
+    the request's business to report, not a reason for the web UI not to come up."""
+    calls = []
+    monkeypatch.setattr(tdc, "_binary_graph_for", lambda start_build=True: calls.append(start_build) or (None, {}))
+    thread = tdc._binary_graph_preload()
+    thread.join(10)
+    assert calls == [False], "once, and it builds nothing"
+    assert thread.daemon and "binary-graph" in thread.name
+
+    boom = []
+    monkeypatch.setattr(tdc, "_binary_graph_for", lambda start_build=True: boom.append(1) or (_ for _ in ()).throw(
+        RuntimeError("the cache is a directory")))
+    second = tdc._binary_graph_preload()
+    second.join(10)
+    assert boom == [1] and not second.is_alive(), "it does not take the web UI down with it"
+
+
+def test_the_preload_is_started_with_the_other_background_threads(tdc):
+    """Wiring, read from the source: it belongs in the block that TDC_NO_BACKGROUND switches off, so the suite does
+    not read a 28.2 MB cache on every import."""
+    import inspect
+    source = inspect.getsource(tdc)
+    block = source[source.index("if not _background_disabled"):]
+    start = block[:block.index("if __name__ ==")]
+    assert "_binary_graph_preload()" in start, "the preload is started where the other background threads are"

@@ -105,9 +105,20 @@ und 358 statt 3.671 Auflösungen.
 Entscheidung 33 bleibt daneben bestehen: ein Ordinal, das der Graph nicht benennen kann, lässt
 die Vereinigung weiterhin unvollständig.
 
-**M3 — das erste Laden des Cache läuft auf dem Request-Thread.** 28,2 MB JSON: die erste
-Abfrage nach einem Neustart blockiert ihren Worker. Richtung: beim Start vorladen oder an
-die bestehende Hintergrund-Bau-Zustandsmaschine hängen.
+**M3 — das erste Laden des Cache läuft auf dem Request-Thread: behoben am 27.11.2026.**
+`_binary_graph_for` parst die 28,2 MB **innerhalb** von `_binary_graph_held_lock`, auf dem
+aufrufenden Thread — die erste Anfrage zahlt alles, und jede weitere, die den Graphen will,
+wartet am selben Lock. Ein Daemon-Thread lädt ihn jetzt beim Start, dort wo auch die
+Update-Prüfung, der Log-Sammler und die Firewall starten (und wo `TDC_NO_BACKGROUND=1` ihn
+für die Suite abschaltet). Er baut nie (`start_build=False`, wie der Syscall-Scan es aus
+demselben Grund tut) und verschluckt jeden Fehler: ein unlesbarer Graph ist die Sache der
+nächsten Anfrage, kein Grund, dass die Web-UI nicht hochkommt.
+
+A/B auf derselben VM, erster Aufruf der Stub-Route nach einem Neustart, je drei Runden:
+**ohne** 12,14 / 6,42 / 3,67 s (Median 6,42), **mit** 6,49 / 1,81 / 2,11 s (Median 2,11). Die
+Streuung ist die der Maschine, aber jede Runde liegt niedriger. Die 6,49 s der ersten Runde
+*mit* Vorladen sind kein Fehler: der Aufruf kam mitten hinein und wartete am Lock, statt
+selbst zu laden. Die verbleibenden rund 2 s sind die eigene Arbeit der Route.
 
 **M4 — Prüfung „laufen Tool-Updates?" und Start des Baus sind nicht atomar.** Ein Update
 kann dazwischen beginnen. Folge ist ein verworfener Bau, keine falsche Aussage.
