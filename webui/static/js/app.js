@@ -28281,8 +28281,52 @@ async function syscallLoadBaseline(view) {
     syscallState.bands = syscallBands(items);
     syscallState.bandsKey++;
     if (syscallState.selected && !items.some(item => item.name === syscallState.selected)) syscallState.selected = '';
+    // In this order, and ruling 3 is why: a measurement that was placed and loses its view is put away, while one
+    // that was already refused stays (it draws no cell on any baseline). So drop-foreign decides on the refusal as
+    // it stood, and only then is the refusal asked again against the baseline that just arrived.
     syscallDropForeignScan();
+    syscallRecheckPast();
     return { ok: true };
+}
+
+// Why a past measurement's cells may not be drawn, or "". Two kinds of ground, and only one of them can go stale:
+// `problem` is the server's own and is about the measurement, while the rest is a verdict about the baseline the
+// map holds - whether it is there, whether it is the measurement's view, whether it is its build - and the map's
+// baseline changes. Recorded once, that part outlived its cause: "the x64 baseline of this system could not be
+// loaded" stayed on the banner after that baseline had been loaded, and a refusal that outlives its cause reads as
+// a refusal of now. So it is asked again whenever a baseline is loaded (syscallRecheckPast).
+//
+// `unloaded` is the error of the read that failed, kept as the reason it names; it is dropped once a baseline of
+// that view is there, because then nothing failed any more.
+function syscallPastVerdict(data, baseline, unloaded) {
+    const view = String(data.view || '');
+    if (data.problem) return String(data.problem);
+    if (!data.states || typeof data.states !== 'object') return 'the server sent no map of it';
+    if (!baseline || baseline.view !== view) {
+        return `the ${view} baseline of this system could not be loaded${unloaded ? ` (${unloaded})` : ''}`;
+    }
+    if (String(baseline.build) !== String(data.build)) {
+        return `it was measured on build ${data.build}, and the map holds only this system's baseline, build ${baseline.build} ` +
+               `(${baseline.view}): its cells are not drawn on the baseline of another build`;
+    }
+    return '';
+}
+
+// Ask the open past measurement again against the baseline the map now holds, and let its cells follow: one that
+// may be drawn is drawn, one that may not is not. Called where a baseline was loaded, beside syscallDropForeignScan,
+// which is there for the same kind of reason.
+function syscallRecheckPast() {
+    const past = syscallState.past;
+    if (!past || !past.data) return false;
+    const baseline = syscallState.baseline;
+    const unloaded = baseline && baseline.view === String(past.data.view || '') ? '' : past.unloaded;
+    const refusal = syscallPastVerdict(past.data, baseline, unloaded);
+    if (refusal === past.refusal) return false;
+    past.refusal = refusal;
+    syscallState.states = refusal || !past.data.states ? null
+        : new Map(Object.entries(past.data.states).map(([name, s]) => [name, s && s.state]));
+    syscallApplyFilter();
+    return true;
 }
 
 // The states of a scan belong to the view it measured. When the baseline on the map is another one (or none), the
@@ -28923,15 +28967,8 @@ async function syscallOpenMeasurement(id) {
         }
     }
     const baseline = syscallState.baseline;
-    let refusal = '';
-    if (data.problem) refusal = String(data.problem);
-    else if (!data.states || typeof data.states !== 'object') refusal = 'the server sent no map of it';
-    else if (!baseline || baseline.view !== view) refusal = `the ${view} baseline of this system could not be loaded${unloaded ? ` (${unloaded})` : ''}`;
-    else if (String(baseline.build) !== String(data.build)) {
-        refusal = `it was measured on build ${data.build}, and the map holds only this system's baseline, build ${baseline.build} ` +
-                  `(${baseline.view}): its cells are not drawn on the baseline of another build`;
-    }
-    syscallState.past = { id: wanted, data, refusal };
+    const refusal = syscallPastVerdict(data, baseline, unloaded);
+    syscallState.past = { id: wanted, data, refusal, unloaded };
     syscallState.scan = data;
     syscallState.states = refusal ? null : new Map(Object.entries(data.states).map(([name, s]) => [name, s && s.state]));
     syscallApplyFilter();

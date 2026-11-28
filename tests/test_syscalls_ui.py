@@ -451,7 +451,7 @@ FLOW_FUNCTIONS = [
     "syscallHookKey", "syscallHookPairs", "syscallHookDifference", "syscallHookDrift", "syscallWin32uMissing", "syscallSyncModuleFilter",
     "syscallToggleLower", "syscallApplyLower", "syscallLowerNote",
     # a past measurement on the map
-    "syscallWhen", "syscallPastOptionsHtml", "syscallPastBannerHtml", "syscallPastRefusal", "syscallLoadPastList", "renderSyscallPastList",
+    "syscallWhen", "syscallPastOptionsHtml", "syscallPastBannerHtml", "syscallPastRefusal", "syscallPastVerdict", "syscallRecheckPast", "syscallLoadPastList", "renderSyscallPastList",
     "renderSyscallPast", "syscallOnPast", "syscallOpenMeasurement", "syscallBackToLive",
     # the GRAPH surface (tests/test_binary_graph_ui.py): the map's choice and filter reach it
     "binaryGraphLayout", "binaryGraphEdgeLook", "binaryGraphNodeLook", "binaryGraphTones", "binaryGraphMatches", "binaryGraphCut",
@@ -3284,3 +3284,64 @@ def test_a_measurement_of_another_build_says_so_where_it_is_chosen():
     # and the other way round: a measurement the history kept without a build is not called foreign either
     assert "build not recorded" in label(r["noBuild"], "a1b2c3d4e5f6"), label(r["noBuild"], "a1b2c3d4e5f6")
     assert "another build" not in r["noBuild"], "a build nobody recorded is unknown, not foreign"
+
+
+@needs_node
+def test_a_refusal_that_named_an_unloaded_baseline_goes_when_that_baseline_is_loaded():
+    """The third point a reviewer judged as lost information: a past measurement's refusal was computed once, when
+    it was opened, and then kept. "the x64 baseline of this system could not be loaded" stayed on the banner after
+    that baseline had been loaded - and a refusal that outlives its cause reads as a refusal of now, which is the
+    same fault as a hedge that outlives its measurement.
+
+    A refusal has two kinds of ground. `problem` is the server's own and cannot go stale: it is about the
+    measurement, not about the map. The rest is a verdict about the baseline the map holds - whether it is there,
+    whether it is the measurement's view, whether it is the measurement's build - and the map's baseline changes.
+    So that part is asked again whenever a baseline is loaded, where syscallDropForeignScan is already asked for
+    the same kind of reason, and the cells follow: a measurement that may be drawn is drawn.
+
+    The order matters, and ruling 3 is why: a measurement that was placed and loses its view is put away, while
+    one that was already refused stays, because it draws no cell on any baseline. So syscallDropForeignScan
+    decides on the refusal as it stood, and only then is the refusal asked again against the baseline that just
+    arrived. Once the refusal is gone the measurement is placed, and a baseline of another view then puts it away
+    with the sentence that says so - not back into a refusal."""
+    r = _panels(PAST + r"""
+      (async () => {
+        await shown();
+        // the measurement is of the x64 view, and reading that baseline fails
+        routes['/api/syscalls/measurement'] = { body: pastBody({ view: 'x64', build: '26220.5770' }) };
+        const failing = { status: 503, body: { error: 'the baseline file is locked', view: 'x64' } };
+        const kept = routes['/api/syscalls/baseline'];
+        routes['/api/syscalls/baseline'] = failing;
+        await choosePast('a1b2c3d4e5f6');
+        const cells = () => { const c = ntdll(); return c ? colours(c.calls) : null; };
+        const refused = { refusal: syscallPastRefusal(), banner: banner().html, states: syscallState.states === null,
+                          cells: cells() };
+        // now the x64 baseline reads: the same measurement may be drawn, and the refusal has no ground left
+        const ALL_X64 = ALL.map(a => ({ ...a }));
+        routes['/api/syscalls/baseline'] = url => { const q = new URL(url, 'http://x').searchParams,
+              offset = +q.get('offset') || 0, limit = +q.get('limit') || 200;
+            return { body: { items: ALL_X64.slice(offset, offset + limit), total: ALL_X64.length, offset, limit,
+                             build: '26220.5770', view: 'x64', symbols: true } }; };
+        await syscallLoadBaseline('x64'); await settle();
+        syscallRenderAll();
+        const loaded = { refusal: syscallPastRefusal(), banner: banner().html, states: syscallState.states === null,
+                         cells: cells() };
+        // placed now, so a baseline of another view puts it away, as it does any placed measurement
+        routes['/api/syscalls/baseline'] = kept;
+        await syscallLoadBaseline('arm64'); await settle();
+        syscallRenderAll();
+        const away = { past: !!syscallState.past, states: syscallState.states === null,
+                       note: els['syscall-scan-result'].textContent };
+        out({ refused, loaded, away });
+      })();""")
+    assert "x64 baseline of this system could not be loaded" in r["refused"]["refusal"], r["refused"]["refusal"]
+    assert "the baseline file is locked" in r["refused"]["refusal"], "and why it could not be"
+    assert "No map:" in r["refused"]["banner"] and r["refused"]["states"], "nothing is drawn while it is refused"
+    assert r["refused"]["cells"] is None, "a refused measurement gets no canvas at all, only the empty text"
+    assert r["loaded"]["refusal"] == "", f"the ground is gone, so the refusal is: {r['loaded']['refusal']}"
+    assert "No map:" not in r["loaded"]["banner"], r["loaded"]["banner"]
+    assert not r["loaded"]["states"], "and the measurement it refused is drawn"
+    assert r["loaded"]["cells"].get("--syscall-patched") == 1, r["loaded"]["cells"]
+    assert not r["away"]["past"] and r["away"]["states"], \
+        "placed, it is put away by a baseline of another view - ruling 3, not a refusal again"
+    assert "measured the x64 view" in r["away"]["note"] and "put away" in r["away"]["note"], r["away"]["note"]
