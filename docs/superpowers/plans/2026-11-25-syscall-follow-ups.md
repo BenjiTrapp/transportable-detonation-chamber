@@ -188,8 +188,22 @@ eingeordnet hat:
   etikettierte Ansicht oder ein Hinweis.
 - Das Known-Hooks-Modell setzt `scan: null` für eine vergangene Messung, darum erscheint
   deren eigener Hinweis „allowlist not applied" nicht.
-- Ein Verweigerungs-Hinweis „baseline could not be loaded" bleibt stehen, nachdem die
-  Baseline doch geladen ist.
+- ~~Ein Verweigerungs-Hinweis „baseline could not be loaded" bleibt stehen, nachdem die
+  Baseline doch geladen ist.~~ **Behoben am 27.11.2026.** Eine Verweigerung hat zwei Arten von
+  Grund, und nur eine davon kann veralten: `problem` ist der des Servers und handelt von der
+  **Messung**, der Rest ist ein Urteil über die Baseline, die die Karte gerade hält — ob sie da
+  ist, ob sie die Sicht der Messung hat, ob sie ihren Build hat — und die Baseline der Karte
+  ändert sich. Einmal gespeichert überlebte dieser Teil seine Ursache, und eine Verweigerung,
+  die ihre Ursache überlebt, liest sich wie eine Verweigerung von jetzt — derselbe Fehler wie
+  eine Absicherung, die ihre Messung überlebt. Das Urteil wird jetzt aus einer Quelle gebildet
+  (`syscallPastVerdict`) und bei jedem geladenen Baseline erneut gestellt
+  (`syscallRecheckPast`), dort wo schon `syscallDropForeignScan` aus demselben Grund gefragt
+  wird; die Zellen folgen, eine Messung, die gezeichnet werden darf, wird gezeichnet.
+  Die Reihenfolge ist Entscheidung 3: erst `syscallDropForeignScan` — eine **platzierte**
+  Messung, die ihre Sicht verliert, wird weggelegt, eine schon **verweigerte** bleibt, weil sie
+  auf keiner Baseline eine Zelle zeichnet — und erst danach das neue Urteil. Beim Schreiben des
+  Tests war meine erste Erwartung falsch: ich nahm an, eine platzierte Messung werde bei einer
+  fremden Sicht wieder verweigert; sie wird weggelegt, mit dem Satz, der das sagt.
 - ~~Die Liste der Messungen nennt den Build nicht, darum sieht eine Messung eines fremden
   Builds wie jede andere aus, bis man sie öffnet.~~ **Behoben am 27.11.2026.**
   `/api/syscalls/measurements` trug den `build` für jede Messung schon mit, und der Banner über
