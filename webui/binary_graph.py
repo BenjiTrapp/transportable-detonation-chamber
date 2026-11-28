@@ -541,6 +541,30 @@ def _step(binaries, api_sets, module, function, cut_short, exports):
     return Hop(target, target_function, "forwards_to"), None, None
 
 
+def forwards_name(binaries: dict[str, BinaryInfo], api_sets: dict[str, tuple[str, ...]],
+                  module: str, function: str) -> bool:
+    """Whether the chain from `(module, function)` begins at a forwarder, so that following it can land on another
+    name. For a caller that only wants to know whether there is a rename to follow, and must not pay for the walk
+    when there is not.
+
+    It answers by taking `_step`, the walk's own step, rather than by a second reading of the api-set map: a gate
+    narrower than the resolver it guards refuses to ask where the resolver would have found something. An api-set
+    hop keeps the name (`resolves_to`), so it is stepped over; the first `forwards_to` is the answer. The ring
+    guard is the walk's, so a map that points at itself ends here too.
+    """
+    module, exports, seen = module.lower(), {}, {(module.lower(), function)}
+    while True:
+        hop, _reason, _key = _step(binaries, api_sets, module, function, [], exports)
+        if hop is None:
+            return False
+        if hop.via == "forwards_to":
+            return True
+        module, function = hop.module, hop.function
+        if (module, function) in seen:
+            return False
+        seen.add((module, function))
+
+
 def resolve_export(binaries: dict[str, BinaryInfo], api_sets: dict[str, tuple[str, ...]],
                    module: str, function: str) -> Resolution:
     """Follow `function` of `module` through forwarders and api-set aliases to the module that defines it.

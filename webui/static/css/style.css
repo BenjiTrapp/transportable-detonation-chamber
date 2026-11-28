@@ -13384,6 +13384,7 @@ button.logs-trunc:hover { color: var(--accent-orange); text-decoration: underlin
     color: var(--accent-cyan);
     background: none;
     border: 1px solid transparent;
+    border-radius: 3px;        /* as .syscall-lower-fold has it: the hover border is square without this */
     cursor: pointer;
 }
 .binary-explore-caveat-fold:hover {

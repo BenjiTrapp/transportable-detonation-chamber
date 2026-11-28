@@ -4906,7 +4906,15 @@ def test_a_forwarder_that_does_not_rename_adds_nothing_and_an_unresolvable_one_i
         _q("user.dll", imports={"front.dll": ("Door",)}))
     plain = _doors(same, _loaded(_IMAGE, *_SYSTEM_MODULES, "C:\\Windows\\System32\\target.dll",
                                  "C:\\Windows\\System32\\front.dll", "C:\\Windows\\System32\\user.dll"))
+    # the imported name is added unconditionally, so "Door" in plain cannot fail and says nothing about adding
+    # nothing. An adversarial review found that; the set is pinned whole instead
     assert plain is not None and "Door" in plain, plain
+    assert "Target" not in plain and not [n for n in plain if n.startswith("#")], \
+        f"a forwarder under the same name adds no second name: {sorted(plain)}"
+    without = _doors(_doors_graph(), _loaded(_IMAGE, *_SYSTEM_MODULES))
+    assert plain - (without or set()) == {"Door"}, \
+        ("exactly the one name the extra modules import - a door is what a module imports, so the exported "
+         f"\"Plain\" is none: {sorted(plain - (without or set()))}")
     graph = _doors_graph(
         _q("odd.dll", exports=["Other"], forwarders={"Door": "nowhere.Target"}),
         _q("caller.dll", imports={"odd.dll": ("Door",)}))
@@ -4917,13 +4925,16 @@ def test_a_forwarder_that_does_not_rename_adds_nothing_and_an_unresolvable_one_i
 
 def test_a_door_behind_an_api_set_is_followed_through_its_host(apc_baseline):
     """The branch that carries almost all of the cost. A name imported from an api set is not in `binaries` at all,
-    so the check asks the host the map names - the same host resolve_export would take at module level - and only a
-    name that host forwards is resolved. Of 3,671 resolutions over twelve modules, 3,551 were names behind an api
-    set that its host defines itself; asking the host first took the stubs route from 1.64s back to 0.56s on the
-    chamber, with the same 4,817 doors.
+    and the gate asks the walk's own step where the chain starts (binary_graph.forwards_name), so only a name that
+    is really forwarded there is resolved. Of 3,671 resolutions over twelve modules, 3,551 were names behind an api
+    set that its host defines itself; measured on the chamber, three processes, three runs each, minimum per
+    process: 0.34-0.41s before the widening, 1.05-1.64s resolving everything, 0.39-0.56s with the gate - with the
+    same 4,817 doors.
 
-    A rename can happen at no hop but a forwarder, so the check loses nothing: a host that defines the name under
-    that name renames nothing."""
+    A rename can happen at no hop but a forwarder, so the gate loses nothing: a host that defines the name under
+    that name renames nothing. Which host that is, is the walk's decision and not a second reading of the map -
+    see test_a_door_behind_an_api_set_whose_first_host_is_not_the_loaders_is_still_followed, the false-accusation
+    path an adversarial review found in the first version of this gate."""
     graph = _doors_graph(
         _q("win32u.dll", exports=["NtGdiFoo"]),
         _q("hostdll.dll", exports=["Plain"], forwarders={"Renamed": "win32u.NtGdiFoo"}),
@@ -4952,7 +4963,8 @@ def test_the_graph_is_preloaded_so_the_first_request_does_not_pay_for_it(tdc, mo
     thread = tdc._binary_graph_preload()
     thread.join(10)
     assert calls == [False], "once, and it builds nothing"
-    assert thread.daemon and "binary-graph" in thread.name
+    assert thread.daemon and thread.name == "binary-graph-preload", \
+        "its own name: \"binary-graph\" is the build thread's and would match either"
 
     boom = []
     monkeypatch.setattr(tdc, "_binary_graph_for", lambda start_build=True: boom.append(1) or (_ for _ in ()).throw(
@@ -4962,14 +4974,35 @@ def test_the_graph_is_preloaded_so_the_first_request_does_not_pay_for_it(tdc, mo
     assert boom == [1] and not second.is_alive(), "it does not take the web UI down with it"
 
 
-def test_the_preload_is_started_with_the_other_background_threads(tdc):
-    """Wiring, read from the source: it belongs in the block that TDC_NO_BACKGROUND switches off, so the suite does
-    not read a 28.2 MB cache on every import."""
+def test_the_preload_is_started_with_the_other_background_threads(tdc, monkeypatch):
+    """Wiring, and it has to be run rather than read. An adversarial review replaced the call with a comment of the
+    same text and both preload tests stayed green: a substring search over source is satisfied by a comment, a
+    string, a line under `if False:` or a call in a function nobody invokes, so the whole point of the change
+    could return unnoticed.
+
+    So the block TDC_NO_BACKGROUND governs is executed, with every starter in it replaced by one that records
+    being called. It belongs in that block, and not outside it: the suite must not read a 28.2 MB cache on every
+    import."""
     import inspect
     source = inspect.getsource(tdc)
     block = source[source.index("if not _background_disabled"):]
     start = block[:block.index("if __name__ ==")]
-    assert "_binary_graph_preload()" in start, "the preload is started where the other background threads are"
+
+    called = []
+    names = ("alert_loader_thread", "_start_update_check_thread", "_start_log_collector_thread", "_start_firewall",
+             "_binary_graph_preload")
+    scope = {"os": os, "threading": threading, "_background_disabled": False,
+             "_is_reloader_child": True, "_reloader_active": False}
+    for name in names:
+        scope[name] = (lambda n: lambda *a, **k: called.append(n) or _Recorded())(name)
+    exec(compile(start, "<the background block>", "exec"), scope)
+    assert "_binary_graph_preload" in called, f"the preload is not started with the others: {called}"
+
+    # and it is inside the guard, not beside it
+    called.clear()
+    scope["_background_disabled"] = True
+    exec(compile(start, "<the background block>", "exec"), scope)
+    assert called == [], f"TDC_NO_BACKGROUND must switch it off with the rest: {called}"
 
 
 def test_the_update_check_happens_while_the_build_lock_is_held(tdc, monkeypatch):
@@ -4993,3 +5026,124 @@ def test_the_update_check_happens_while_the_build_lock_is_held(tdc, monkeypatch)
     assert held == [True], "the flag is read under the lock that marks `running`"
     with tdc._binary_graph_build_lock:
         assert tdc._binary_graph_build_state["running"] == set(), "and nothing was registered"
+
+
+def test_a_door_behind_an_api_set_whose_first_host_is_not_the_loaders_is_still_followed(apc_baseline):
+    """Found in an adversarial review of the door-set widening, and it is a false-accusation path.
+
+    The gate in front of resolve_export asked whether "the record the loader lands on" forwards the name, and
+    _door_record built that record with its own rule: `binaries` first, else `hosts[0]` of the api set. The walk's
+    rule (binary_graph._step) is a different one - it reads the api-set map FIRST, and then takes the first host
+    that is in the graph AND offers the function, which is the importer-independent reading parse_api_set_map
+    describes. So a gate narrower than the resolver it guards refused to ask, the set kept only the imported name,
+    and `why` was "" - the union reported complete while a door was missing. A missing door means `false`, and a
+    `false` nobody earned is a false accusation.
+
+    Three shapes diverge, and all three are live: the map's first host is a module extract_tree did not keep
+    (it could not be opened, was malformed, or is not directly in System32); the first host is in the graph but
+    does not offer the name, so the loader walks on to the next; and the module is both a real file and a map
+    entry, where the walk reads the map and the gate read the file.
+
+    The claim "the check is exact, not a heuristic" was therefore not true of the code. It is now true because
+    both sides ask one function for where the chain starts (binary_graph.forwards_name)."""
+    # the map names two hosts: the first is not in the graph at all, the second renames onto a door
+    graph = _doors_graph(
+        _q("hostdll.dll", exports=["Plain"], forwarders={"Door": "ntdll.NtQueueApcThread"}),
+        _q("caller.dll", imports={"api-ms-win-core-x-l1-1-0.dll": ("Door",)}),
+        api_sets={"api-ms-win-core-x-l1-1-0": ("absent.dll", "hostdll.dll")})
+    doors = _doors(graph, _loaded(_IMAGE, *_SYSTEM_MODULES, "C:\\Windows\\System32\\hostdll.dll",
+                                  "C:\\Windows\\System32\\caller.dll"))
+    assert doors is not None, "every loaded module is one the graph holds: the union is complete"
+    assert "Door" in doors, "the name that was imported"
+    assert "NtQueueApcThread" in doors, \
+        "and the door it really reaches: the loader passes over a host that is not there"
+
+    # the first host is in the graph but does not offer the name: the loader walks on, so the gate must too
+    graph = _doors_graph(
+        _q("firsthost.dll", exports=["Other"]),
+        _q("secondhost.dll", exports=["Plain"], forwarders={"Door": "ntdll.NtQueueApcThread"}),
+        _q("caller.dll", imports={"api-ms-win-core-y-l1-1-0.dll": ("Door",)}),
+        api_sets={"api-ms-win-core-y-l1-1-0": ("firsthost.dll", "secondhost.dll")})
+    doors = _doors(graph, _loaded(_IMAGE, *_SYSTEM_MODULES, "C:\\Windows\\System32\\firsthost.dll",
+                                  "C:\\Windows\\System32\\secondhost.dll", "C:\\Windows\\System32\\caller.dll"))
+    assert doors is not None and "NtQueueApcThread" in doors, \
+        "the first host offers nothing, so the name is the second host's forwarder"
+
+    # a module that is both a real file and a map entry: the walk reads the map, so the gate may not read the file
+    graph = _doors_graph(
+        _q("api-ms-win-core-z-l1-1-0.dll", exports=["Door"]),               # the file defines it itself
+        _q("realhost.dll", exports=["Plain"], forwarders={"Door": "ntdll.NtQueueApcThread"}),
+        _q("caller.dll", imports={"api-ms-win-core-z-l1-1-0.dll": ("Door",)}),
+        api_sets={"api-ms-win-core-z-l1-1-0": ("realhost.dll",)})
+    doors = _doors(graph, _loaded(_IMAGE, *_SYSTEM_MODULES,
+                                  "C:\\Windows\\System32\\api-ms-win-core-z-l1-1-0.dll",
+                                  "C:\\Windows\\System32\\realhost.dll", "C:\\Windows\\System32\\caller.dll"))
+    assert doors is not None and "NtQueueApcThread" in doors, \
+        "the map wins over the file of the same name, as the loader reads it"
+
+
+def test_the_gate_in_front_of_the_resolver_is_the_walks_own_rule(apc_baseline):
+    """The gate and the walk must not be able to drift apart again: both ask binary_graph.forwards_name, and it is
+    answered by taking binary_graph._step - the walk's own step - rather than by a second reading of the map.
+
+    So for every (module, function) a graph can offer, "the gate would resolve" and "the resolution renames" agree.
+    Checked over every import of every binary of the fixture, with the three api-set shapes of the test above in
+    it: no name on which the gate refuses while the walk would have found another name."""
+    graph = _doors_graph(
+        _q("hostdll.dll", exports=["Plain"], forwarders={"Door": "ntdll.NtQueueApcThread"}),
+        _q("firsthost.dll", exports=["Other"]),
+        _q("api-ms-win-core-z-l1-1-0.dll", exports=["Door"]),
+        _q("caller.dll", imports={"api-ms-win-core-x-l1-1-0.dll": ("Door",),
+                                  "api-ms-win-core-z-l1-1-0.dll": ("Door",),
+                                  "hostdll.dll": ("Plain", "Door")}),
+        api_sets={"api-ms-win-core-x-l1-1-0": ("absent.dll", "hostdll.dll"),
+                  "api-ms-win-core-z-l1-1-0": ("hostdll.dll",)})
+    disagree = []
+    for info in graph.binaries.values():
+        for module, functions in info.imports.items():
+            for function in functions:
+                if function.startswith("#"):
+                    continue
+                gate = binary_graph.forwards_name(graph.binaries, graph.api_sets, module, function)
+                walk = binary_graph.resolve_export(graph.binaries, graph.api_sets, module, function)
+                renames = walk.reason == "defined" and not walk.partial and (
+                    walk.function != function or any(hop.function != function for hop in walk.hops))
+                if renames and not gate:
+                    disagree.append((info.name, module, function, walk.function))
+    assert not disagree, f"the gate refuses to ask where the walk finds another name: {disagree}"
+
+
+def test_a_forwarder_onto_a_nameless_export_leaves_the_union_incomplete(apc_baseline):
+    """Found in an adversarial review: a hole of ruling 33's shape on the named path.
+
+    `names.update(hop.function …)` and `resolution.function` can both be an ordinal ("#42"), because a forwarder
+    string may name its target by number. The door the import really reaches is then a function the graph cannot
+    name - exactly the condition ruling 33 answers with "incomplete" for an ordinal import - and the set got the
+    literal "#42", a token that can never match a syscall name, while the union was reported complete.
+
+    So the named path now says the same thing the ordinal path says: a name it cannot follow to a name leaves the
+    union incomplete, and whoever asks must not claim an absence. The import's own name is still recorded, as
+    before; what changes is that nobody may read a `false` out of that set.
+
+    Not measured on the VM: whether any System32 forwarder points at a nameless export on 26200.9974. The mirror
+    case was measured (229 of 234 renaming forwarders onto a door are exported by ordinal alone); this direction
+    was not, and the fix is the conservative one either way."""
+    graph = _doors_graph(
+        _q("nameless.dll", exports=["Other", "#42"]),      # ordinal 42 is exported with no name of its own
+        _q("front.dll", exports=["Plain"], forwarders={"Door": "nameless.#42"}),
+        _q("caller.dll", imports={"front.dll": ("Door",)}))
+    doors, why = binary_graph_query.doors_of_process(
+        graph, _loaded(_IMAGE, *_SYSTEM_MODULES, "C:\\Windows\\System32\\nameless.dll",
+                       "C:\\Windows\\System32\\front.dll", "C:\\Windows\\System32\\caller.dll"),
+        win32_to_nt.load_table(), view="x64", image_path=_IMAGE, image=_image())
+    assert doors is None, "a door the graph cannot name may be any door: no absence may be claimed"
+    assert "#42" in why and "front.dll" in why, why
+
+
+class _Recorded:
+    """Stands in for a thread the background block starts: it is only ever stored or ignored."""
+    daemon = True
+    name = "recorded"
+
+    def start(self):
+        return None

@@ -76,10 +76,17 @@ eingeführt wurde. Er wird jetzt an Wortgrenzen auf so viele Zeilen umgebrochen,
 trägt; ein Wort, das breiter als die Leinwand ist, wird trotzdem gezeichnet.
 
 Der Status **faltet** sich jetzt wie GRAPH die Scan-Panels faltet (`syscallApplyLower`): ein
-Balken nennt die Behauptung und **jede** Zahl, die Prosa darunter ist einen Klick entfernt.
-Gefaltet ist nicht still, und darauf kommt es an — ein Vorbehalt, dessen Zahlen verborgen sind,
-liest sich wie kein Vorbehalt. Gemessen: 73 px → **32 px**, Leinwand 318 → **359 px**; von Hand
-geöffnet 96 px, und ein Neuzeichnen schließt das nicht wieder (Entscheidung 78).
+Balken nennt die Behauptung, um wie viele geöffnete Knoten es geht und die Zahlen dessen, was
+fehlt; die Prosa darunter ist einen Klick entfernt. Gefaltet ist nicht still, und darauf kommt
+es an — ein Vorbehalt, dessen Zahlen verborgen sind, liest sich wie kein Vorbehalt. Gemessen:
+73 px → **32 px**, Leinwand 318 → **359 px**; von Hand geöffnet 96 px, und ein Neuzeichnen
+schließt das nicht wieder.
+
+Zwei Behauptungen dieser Notiz waren falsch und sind korrigiert: „jede Zahl" stimmte nicht (es
+gab einen erreichbaren Zustand, in dem die einzige Zahl im Balken die Konstante 400 war), und
+der Verweis auf Entscheidung 78 war falsch — die regelt Abschnittshöhen und das Scrollen des
+Panels, nicht das Überleben einer Faltung. Für die By-Hand-Regel gibt es keine Entscheidung,
+und hier braucht es auch keine: nichts außer dem Leser schreibt `caveatFolded`.
 
 Dadurch entstand ein neues Problem, das erst der Screenshot zeigte: Balken und Streifen sagten
 **wortgleich** dieselben 186 Zeichen, 20 px auseinander. Denselben Satz zweimal zu lesen ist
@@ -94,8 +101,25 @@ ist also schon sauber. Sie scheitert in Richtung Sagen: kein Element, kein Rect,
 Fensterhöhe oder ein Fehler beim Lesen, und der Streifen wird gezeichnet.
 
 Geprüft in Chrome gegen die VM, beide Themes, 1920 und 1280 px: keine Konsolenmeldung, der
-Streifen passt überall, der Status startet gefaltet und bleibt offen, sobald er von Hand
-geöffnet wurde.
+Status startet gefaltet und bleibt offen, sobald er von Hand geöffnet wurde.
+
+**Korrektur zur Prüfung:** „der Streifen passt überall" war bei 1920 und 1280 px *gerechnet*,
+nicht beobachtet — bei diesen Fensterhöhen wird er nach der obigen Regel gar nicht gezeichnet.
+Ein Review hat diesen Widerspruch im Text gefunden. Nachgemessen bei Höhen, in denen er wirklich
+gezeichnet wird: der Umbruch stimmt bei 1280/900/700/520/400 px Breite (kein Überlauf, der Text
+unverändert), aber er kostet Fläche — 2 Zeilen bei 1280 px, 5 bei 400 px, also 14 % bis 42 % der
+Leinwandhöhe, und zwar deckend über der Zeichnung. Das ist der Preis, den die bestehende Regel
+ausdrücklich akzeptiert („wer ihn nicht lesen kann, ist schlechter dran als wer ein Stück
+schwenken muss"), aber er war nicht aufgeschrieben. Wie oft ein Leser diese Kombination trifft,
+kann ich nicht sagen: mein Sichtbarkeitsmaß über `getBoundingClientRect` ignoriert einen
+klippenden Vorfahren, was der Screenshot bei 400×380 zeigte.
+
+Ebenfalls aus dem Review und behoben: der Faltknopf wurde beim Klick mitsamt dem Status neu
+geschrieben, also verlor ein Tastaturnutzer den Fokus — jetzt wird er dem neuen Knopf übergeben,
+wie `setDashboardRangeChip` und die Drill-Leiste der Alerts es tun. `aria-controls` und eine Id
+fehlten ihm auch. Und die Kostenzahl 0,0002–0,0006 ms gilt dem Schwenken; beim Rendern liegt das
+Rect-Lesen hinter einem `innerHTML`-Schreiben, ist dort also ein erzwungenes Layout und nicht von
+dieser Messung gedeckt.
 
 Der Befund, wie er stand:
 

@@ -1047,16 +1047,6 @@ def name_ordinal_imports(graph, imports, *, view, importer="the file") -> tuple[
     return names, ""
 
 
-def _door_record(graph, module):
-    """The record the loader reaches for `module` at module level: an api set's default host, or the module itself.
-    None when the graph holds neither, and then there is nothing to follow."""
-    info = graph.binaries.get(module)
-    if info is not None:
-        return info
-    hosts = binary_graph.api_set_hosts(graph.api_sets, module) or ()
-    return graph.binaries.get(hosts[0].lower()) if hosts else None
-
-
 def _record_doors(graph, info, names):
     """Add the names `info` imports to `names`; the reason the record cannot speak for its imports, or "".
 
@@ -1067,28 +1057,44 @@ def _record_doors(graph, info, names):
     1,538 rename, 234 of those point at a door, and five of those carry a real name (three D3DKMT… of gdi32 and
     `FlushProcessWriteBuffers` of kernel32 and kernelbase), imported by eight System32 binaries.
 
-    Only a name the record it lands on actually forwards is resolved. A rename can happen at no other hop, so the
-    check is exact, and it is what keeps the cost down: resolving every named import took the stubs route from
-    0.34s to 1.64s on the chamber, and of 3,671 resolutions over twelve modules 3,551 were names behind an api set
-    that the host defines itself.
+    Only a name whose chain begins at a forwarder is resolved, and whether it does is `binary_graph.forwards_name`,
+    which answers by taking the walk's own step. That matters: an earlier version of this gate read the api-set map
+    itself and took `hosts[0]`, which is not the loader's rule - the walk reads the map before `binaries` and takes
+    the first host that is in the graph AND offers the name. A gate narrower than the resolver it guards refuses to
+    ask where the resolver would have found another name, and then the union is reported complete with a door
+    missing. An adversarial review found three live shapes of that.
+
+    The gate is what keeps the cost down. Measured on the chamber, three processes, three runs each, the minimum
+    per process: 0.34-0.41s before, 1.05-1.64s resolving every named import, 0.39-0.56s with the gate - and of
+    3,671 resolutions over twelve modules, 3,551 were names behind an api set that the host defines itself. (An
+    earlier version of this docstring paired the best case before with the worst case after; the ranges are the
+    measurement.)
 
     Unlike an ordinal, a named import that cannot be resolved leaves the union complete: its own name is recorded
     either way, so a failed resolution loses a possible second name and nothing that was there before. For an
     ordinal the name itself is unknown, so one that cannot be named may be any door and the union is incomplete.
+    That difference is deliberate, not an oversight: making a failed resolution incomplete would switch proofs off
+    far more widely and needs its own measurement. A table cut short on the chain is one such failure, so the two
+    paths do not behave alike in the failure direction - the commit that introduced this said they did, which was
+    wrong.
     """
     if info.partial:
         return f"a table (import, delay-load or export) of {info.name} was cut short when it was read"
     for module, functions in info.imports.items():
-        record = _door_record(graph, module)
-        forwards = record.forwarders if record is not None else {}
         for function in functions:
             if not function.startswith("#"):
                 names.add(function)
-                if function in forwards:
+                if binary_graph.forwards_name(graph.binaries, graph.api_sets, module, function):
                     resolution = binary_graph.resolve_export(graph.binaries, graph.api_sets, module, function)
                     if resolution.reason == "defined" and not resolution.partial:
-                        names.update(hop.function for hop in resolution.hops)
-                        names.add(resolution.function)
+                        reached = [hop.function for hop in resolution.hops] + [resolution.function]
+                        # a forwarder may name its target by number, and then the door the import really reaches is
+                        # one the graph cannot name: ruling 33's case, on the named path
+                        nameless = next((one for one in reached if one.startswith("#")), "")
+                        if nameless:
+                            return (f"{info.name} imports {function} of {module}, which is forwarded to "
+                                    f"{nameless}, a function the binary graph cannot name")
+                        names.update(reached)
                 continue
             why = _add_ordinal(graph, info.name, module, function, names)
             if why:

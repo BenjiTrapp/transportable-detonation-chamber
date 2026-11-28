@@ -673,3 +673,32 @@ def test_crossing_the_search_cap_with_one_more_component_does_not_lower_this_sha
     ten = _components_of(me, 10)
     eleven = _components_of(me, 11)
     assert me.score(eleven)["score"] >= me.score(ten)["score"]
+
+
+def test_a_recycled_pid_does_not_let_one_run_speak_for_another(tdc, tmp_path):
+    """Found in an adversarial review of the per-run guard. With a PID *and* a hash neither branch applied
+    max_pid_age, so the equality checks passed and a month-old result of the same file under the same, since
+    recycled, PID was handed to the new run - the very symptom the guard was written for. Adding the hash made the
+    lookup more permissive than leaving it out, which is the opposite of what it claimed.
+
+    Windows recycles PIDs freely, and the route that asks with both is the one this matters for
+    (/api/detonation/results). So the age applies whenever a PID was asked, by either key."""
+    import time
+    store = tdc._ResultStore(str(tmp_path))
+    real = time.time
+    try:                                           # stored a month ago, as a month of uptime would leave it
+        tdc.time.time = lambda: real() - 40 * 24 * 3600
+        store.put("syscalls", {"run": "a month ago"}, pid=5540, sha256="H")
+    finally:
+        tdc.time.time = real
+    assert store.lookup("syscalls", 5540, "H", max_pid_age=3600) is None, \
+        "the pid was recycled long ago: that run cannot speak for this one"
+    assert store.lookup("syscalls", 5540, max_pid_age=3600) is None, \
+        "and the weaker question already refused it"
+    assert store.lookup("syscalls", None, "H") == {"run": "a month ago"}, \
+        "without a pid there is no run to confuse: the file's own result is the file's"
+
+    # and a fresh entry of this run is still found, by either key
+    store.put("syscalls", {"run": "now"}, pid=7000, sha256="J")
+    assert store.lookup("syscalls", 7000, "J", max_pid_age=3600) == {"run": "now"}
+    assert store.lookup("syscalls", 7000, max_pid_age=3600) == {"run": "now"}

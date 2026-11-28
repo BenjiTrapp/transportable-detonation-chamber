@@ -6721,22 +6721,24 @@ class _ResultStore:
         a lookup without a PID is untouched - that is how the submission history finds a result at all.
 
         With only a PID, entries older than max_pid_age are ignored (the PID has
-        probably been reused since).
+        probably been reused since) - and that holds for the hash key too whenever a PID was asked. It did not:
+        with a PID and a hash neither branch applied the age, so a month-old result of the same file under the
+        same, since recycled, PID was handed to the new run. Adding the hash made the lookup more permissive than
+        leaving it out, which is the opposite of what this is for. Found in an adversarial review; Windows
+        recycles PIDs freely, and /api/detonation/results is the route that asks with both.
         """
         candidates = []
+        fresh = lambda meta: not pid or time.time() - meta.get("stored_at", 0) <= max_pid_age
         if sha256:
             hit = self._entry(f"{tool}_{sha256}")
-            # no PID asked: take it. A PID asked: only when the entry is that run's, or belongs to no run at all.
-            if hit and (not pid or hit[0].get("pid") in (None, str(pid))):
+            # no PID asked: take it. A PID asked: only when the entry is that run's, or belongs to no run at all
+            if hit and (not pid or hit[0].get("pid") in (None, str(pid))) and fresh(hit[0]):
                 candidates.append(hit)
         if pid:
             hit = self._entry(f"{tool}_{pid}")
-            if hit:
+            if hit and fresh(hit[0]):
                 meta = hit[0]
-                if sha256:
-                    if meta.get("sha256") in (None, sha256):
-                        candidates.append(hit)
-                elif time.time() - meta.get("stored_at", 0) <= max_pid_age:
+                if not sha256 or meta.get("sha256") in (None, sha256):
                     candidates.append(hit)
         if not candidates:
             return None
@@ -10009,9 +10011,21 @@ def _start_binary_graph_build(build, arch):
     before an update set it and register afterwards, and both would run - which is what both checks exist to
     prevent. The other direction is still open: the update's preconditions ask `_binary_graph_building()` before
     the manager marks maintenance, so a build that registers in between slips past. Closing that needs one lock
-    over both subsystems. Measured on this image, the outcome is mild either way: no install script writes to
-    System32, and the graph reads only the .dll and .exe directly in it, so no update changes a file it reads;
-    a swapped web UI Python kills the build subprocess, which is recorded as a failure."""
+    over both subsystems.
+
+    What the graph reads is measured and narrow: only the .dll and .exe directly in System32, no subdirectory
+    (binary_graph.extract_tree), so a driver under System32's drivers folder is out of scope either way. What an update
+    writes is NOT established: TDC's own scripts write no PE into System32, but the catalog is built from
+    `choco outdated` at run time, and a chocolatey package that carries a VC++ or UCRT payload does write
+    .dll files there. So an update can change a file the graph reads, and how often was not measured - an
+    adversarial review found this claim resting on a grep of TDC's own scripts, which cannot see that. A swapped
+    web UI Python kills the build subprocess, which is recorded as a failure.
+
+    Lock order, for whoever touches this next: this now runs inside `_binary_graph_build_lock` and reaches
+    UpdateManager's own RLock through the `maintenance` property. The reverse order does not exist today -
+    `_update_preconditions`, the only path from the update side into the build lock, is called outside that RLock
+    on purpose (tool_updates.py: "The callback may probe other services; do not hold the lock for it"). No test
+    pins that, so moving the call inside the lock would make an AB-BA deadlock with a green suite."""
     key = (build, arch)
     with _binary_graph_build_lock:
         if _updating_tools():
@@ -10144,6 +10158,10 @@ def _binary_graph_preload():
     It never builds: a start must not set minutes of reading System32 going, which is why the syscall scan passes
     `start_build=False` too. And it swallows whatever it meets - a graph that cannot be read is the next request's
     business to report, not a reason for the web UI not to come up.
+
+    The cost it moves, named because the latency win was measured and this was not: the held graph is 40 to 90 MB
+    resident (see `_binary_graph_held`), and it is now held on every start rather than on the first request that
+    wants it - including on a chamber where nobody opens the syscall tab.
     """
     def job():
         try:
