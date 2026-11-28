@@ -917,6 +917,14 @@ def _plain(html):
     return " ".join(re.sub(r"<[^>]+>", " ", html).split())
 
 
+def _strip_text(placed):
+    """The caveat on the canvas, joined: it is wrapped to as many lines as the canvas holds, so no single drawn
+    text carries the whole sentence any more. Its lines are the ones at x 12 on the 18px ladder from y 10."""
+    lines = [t for t in placed if t.get("x") == 12 and (t.get("y", 0) - 10) % 18 == 0 and t.get("y", 0) >= 10
+             and not str(t.get("text", "")).startswith("Opening")]
+    return " ".join(str(t["text"]) for t in sorted(lines, key=lambda t: t["y"]))
+
+
 def test_the_explore_view_is_in_the_page_with_its_canvas_and_its_depth_control():
     tab = _tab_markup("syscalls")
     for needed in ("binary-graph-path", "binary-explore", "binary-explore-start", "binary-explore-status", "binary-explore-stage",
@@ -1224,7 +1232,10 @@ def test_an_answer_that_hit_the_node_cap_says_so_on_the_canvas():
     assert cut["count"] == 400 and cut["edges"] == 399 and cut["discs"] == 400
     assert cut["has398"] and not cut["has399"] and cut["last"] == "c398.dll", "the first parts in name order are kept"
     banner = [t for t in cut["texts"] if "not shown" in t]
-    assert len(banner) == 1 and "400" in banner[0] and "51" in banner[0], banner
+    # the cap is the canvas's own reason, and this canvas dropped nothing yet - see the assertion three lines down.
+    # It was named here whatever the cause, which blamed the canvas for the server's cut
+    assert len(banner) == 1 and "51" in banner[0] and "400" not in banner[0], banner
+    assert "of 1 opened node" in banner[0], banner
     status = _plain(cut["status"])
     assert cut["hidden"] is False and "51 neighbours are not shown" in status and "cut by the server" in status, status
     assert "does not mean" in status and "not shown" in status and "did not fit" not in status, "nothing of this canvas's own was dropped yet"
@@ -1557,11 +1568,13 @@ def test_an_edge_that_could_not_be_drawn_because_its_head_is_drawn_but_its_alias
         await binaryGraphExploreStart('hub.dll'); await binaryGraphExpand('hub.dll');
         await binaryGraphExpand('c007.dll');
         out({ count: st.nodes.length, alias: !!at('api-ms-x-l1-1-0.dll'), edge: st.edges.some(e => e.source === 'c003.dll' && e.target === 'api-ms-x-l1-1-0.dll'),
-              status: els['binary-explore-status'].innerHTML, texts: frame().texts });
+              status: els['binary-explore-status'].innerHTML, texts: frame().texts, placed: frame().placed });
       })();""")
     assert r["count"] == 400 and not r["alias"] and not r["edge"]
     assert "1 did not fit" in _plain(r["status"]), "c003 is drawn, but its path to c007 is not: that is said, not hidden"
-    assert "Not the whole neighbourhood: 52 not shown (the canvas holds 400 nodes)" in r["texts"], "the server's 51 and the one path that did not fit"
+    strip = _strip_text(r["placed"])
+    assert "52 not shown" in strip and "the canvas holds 400 nodes" in strip, \
+        f"the server's 51 and the one path that did not fit, and the cap because one was dropped: {strip}"
 
 
 @needs_node
@@ -1580,12 +1593,14 @@ def test_held_parts_whose_heads_are_drawn_count_the_one_alias_they_miss_not_thei
         await binaryGraphExploreStart('hub.dll'); await binaryGraphExpand('hub.dll');
         await binaryGraphExpand('c007.dll');
         out({ count: st.nodes.length, heads: !!at('c003.dll') && !!at('c004.dll'), alias: !!at('api-ms-x-l1-1-0.dll'),
-              status: els['binary-explore-status'].innerHTML, texts: frame().texts });
+              status: els['binary-explore-status'].innerHTML, texts: frame().texts, placed: frame().placed });
       })();""")
     assert r["count"] == 400 and r["heads"] and not r["alias"]
     status = _plain(r["status"])
     assert "1 did not fit" in status and "2 did not fit" not in status, status
-    assert "Not the whole neighbourhood: 52 not shown (the canvas holds 400 nodes)" in r["texts"], "the server's 51 and the one api set"
+    strip = _strip_text(r["placed"])
+    assert "52 not shown" in strip and "the canvas holds 400 nodes" in strip, \
+        f"the server's 51 and the one api set, and the cap because one was dropped: {strip}"
 
 
 @needs_node
@@ -1703,7 +1718,7 @@ def test_importers_that_may_be_missing_because_a_table_was_cut_are_said_so():
         GRAPH['odd.dll'] = { in_degree: 1, partial: true, imports: {} };
         await binaryGraphExploreStart('ntdll.dll'); await binaryGraphExpand('ntdll.dll');
         out({ whole, status: els['binary-explore-status'].innerHTML, info: els['binary-explore-info'].innerHTML, texts: frame().texts,
-              ids: drawnIds(), labels: st.edges.map(e => e.label) });
+              placed: frame().placed, ids: drawnIds(), labels: st.edges.map(e => e.label) });
       })();""")
     assert r["whole"]["status"] == "" and not any("cut short" in t for t in r["whole"]["texts"])
     status = _plain(r["status"])
@@ -1714,7 +1729,8 @@ def test_importers_that_may_be_missing_because_a_table_was_cut_are_said_so():
     assert "does not mean" in status
     assert "importers may be incomplete" in r["info"] and "the figures say how many" in r["info"]
     assert "some tables (import, delay-load or export) were cut short when the graph was read" in r["info"] and "import tables" not in r["info"]
-    assert any("importers" in t and "cut short" in t and "figures" in t for t in r["texts"])
+    strip = _strip_text(r["placed"])
+    assert "importers" in strip and "cut short" in strip and "figures" in strip, strip
     assert r["ids"] == ["app.exe", "kernel32.dll", "kernelbase.dll", "ntdll.dll", "win32u.dll"], "the importers that are known are still drawn"
 
 
@@ -2307,8 +2323,8 @@ def test_a_text_on_the_canvas_gets_a_strip_behind_it_so_it_never_crosses_the_dra
     that panning and zooming cannot scroll it out of sight - and since the surface grew from 240px to 661px it has
     the whole neighbourhood under it. The orange text crossed the drawing and ran through the label of bi.dll.
 
-    So each of the two texts the canvas carries - the caveat and "Opening…" - gets a strip of the backdrop filled
-    behind it first, as wide as the text measures and no wider. The strip is opaque on purpose: the caveat says a
+    So each text the canvas carries - the caveat, on as many lines as the canvas holds, and "Opening…" - gets a
+    strip of the backdrop filled behind it first, as wide as the text measures and no wider. The strip is opaque on purpose: the caveat says a
     count is a lower bound, and a reader who cannot read it is worse off than one who has to pan a little. It is
     drawn before its text, or it would cover what it is there to protect."""
     r = _explore_flow(r"""
@@ -2386,17 +2402,18 @@ def test_the_caveat_on_the_canvas_is_wrapped_to_lines_that_fit_it():
         const f = frame();
         out({ width: els['binary-explore-canvas'].width, placed: f.placed, strips: f.strips });
       })();""")
-    lines = [t for t in r["placed"] if t["text"].startswith("Not the whole") or t["y"] < 60]
-    caveat = [t for t in lines if "neighbourhood" in t["text"] or "canvas holds" in t["text"] or "not shown" in t["text"]]
+    caveat = [t for t in r["placed"] if t.get("x") == 12 and (t.get("y", 0) - 10) % 18 == 0
+              and not str(t["text"]).startswith("Opening")]
     assert caveat, [t["text"][:40] for t in r["placed"]]
     assert len(caveat) > 1, f"a caveat this long is not one line on a {r['width']}px canvas: {caveat}"
     for line in caveat:
         assert line["x"] + len(line["text"]) * 6 <= r["width"], \
             f"this line runs past the right edge: {line['text']!r} at x={line['x']} on {r['width']}px"
         assert any(abs(s["y"] - line["y"]) < 6 for s in r["strips"]), f"no strip behind {line['text'][:30]!r}"
-    joined = " ".join(line["text"] for line in sorted(caveat, key=lambda t: t["y"]))
+    joined = _strip_text(r["placed"])
     assert joined.startswith("Not the whole neighbourhood"), joined[:60]
-    assert "the canvas holds 400 nodes" in joined, "the end of the sentence is drawn, not lost over the edge"
+    assert joined.endswith("the figures say how many)"), \
+        f"the end of the sentence is drawn, not lost over the edge: {joined[-40:]!r}"
 
 
 @needs_node
@@ -2410,9 +2427,11 @@ def test_the_html_caveat_folds_to_a_bar_that_keeps_naming_what_is_missing():
     claim "Not the whole neighbourhood" and the numbers stay in the bar, because a caveat whose counts are hidden
     reads as no caveat. Only the sentences that explain what the numbers mean go behind the fold.
 
-    It starts folded because the strip carries the short form, and a fold or unfold by hand wins from then on -
-    the same rule as the figures' rows and the scan panels: a view that keeps reclosing what the reader opened is
-    worse than one that never folded."""
+    It starts folded because the strip carries the short form, and the reader's choice holds from then on: a view
+    that keeps reclosing what the reader opened is worse than one that never folded. Unlike the figures' rows,
+    which need a flag to hold out against a default the view sets per mode, nothing else writes `caveatFolded` -
+    there is no default to defend it from, which an adversarial review of this change established after the first
+    version of it carried a `caveatByHand` flag that was written and never read."""
     r = _explore_flow(r"""
       (async () => {
         GRAPH['ntdll.dll'] = { in_degree: 9, partial: true,
@@ -2440,7 +2459,7 @@ def test_the_html_caveat_folds_to_a_bar_that_keeps_naming_what_is_missing():
         // a redraw must not reclose what was opened by hand
         await binaryGraphExpand('kernel32.dll');
         const stillOpen = read();
-        out({ folded, open, stillOpen, byHand: !!binaryGraphState.caveatByHand });
+        out({ folded, open, stillOpen });
       })();""")
     folded, open_, still = r["folded"], r["open"], r["stillOpen"]
     assert folded["bodyHidden"] and folded["expanded"] == "false", "it starts folded: the strip carries the short form"
@@ -2449,13 +2468,17 @@ def test_the_html_caveat_folds_to_a_bar_that_keeps_naming_what_is_missing():
     # incomplete. Both of those are counts, and both are in the bar
     assert "1 opened node has a table cut short" in folded["bar"], f"the counts stay in the bar: {folded['bar']}"
     assert "importers may be incomplete" in folded["bar"], folded["bar"]
-    assert f"the canvas holds 400 nodes" in folded["bar"], "and the cap, which is what explains a dropped node"
+    assert "of 1 opened node" in folded["bar"], "and how many opened nodes it is about: the count every state has"
+    assert "canvas holds" not in folded["bar"], \
+        "this canvas dropped nothing, so its cap is not the reason for anything here"
     assert folded["title"], "the button says what it does"
     assert not open_["bodyHidden"] and open_["expanded"] == "true"
     assert "does not mean it is not imported" in open_["body"], \
         f"the sentence that says what a missing node means: {open_['body']}"
     assert "does not mean it is not imported" not in folded["bar"], "the prose is what folds, not the claim"
-    assert not still["bodyHidden"] and r["byHand"], "a redraw after an unfold by hand leaves it open"
+    # what keeps it open is pinned by test_the_caveat_stays_open_once_opened_because_nothing_resets_it; the flag
+    # this once asserted enforced nothing and is gone
+    assert not still["bodyHidden"], "a redraw after an unfold by hand leaves it open"
 
 
 @needs_node
@@ -2495,17 +2518,173 @@ def test_the_strip_is_drawn_only_while_the_bar_that_says_the_same_is_out_of_view
         host.getBoundingClientRect = () => { throw new Error('no layout'); };
         binaryGraphDraw();
         const threw = strip();
-        delete host.getBoundingClientRect;
+        // `delete` leaves Node.prototype's, so the "not a function" branch was never entered and the assertion
+        // passed on an undefined-comparison accident - found in an adversarial review. Stubbed, not deleted.
+        host.getBoundingClientRect = undefined;
         binaryGraphDraw();
         const noRect = strip();
+        host.getBoundingClientRect = () => ({ top: 100, bottom: 173, left: 0, right: 900, height: 73 });
+        host.hidden = true;
+        binaryGraphDraw();
+        const hiddenHost = strip();
+        host.hidden = false;
         host.getBoundingClientRect = () => ({ top: 100, bottom: 173, left: 0, right: 900, height: 73 });
         delete globalThis.innerHeight;
         binaryGraphDraw();
         const noViewport = strip();
-        out({ inView, scrolledOff, below, threw, noRect, noViewport });
+        out({ inView, scrolledOff, below, threw, noRect, hiddenHost, noViewport });
       })();""")
     assert not r["inView"], "the bar above the canvas already says it: the strip would be the same words twice"
     assert r["scrolledOff"], "scrolled to the canvas, the strip is all the reader has"
     assert r["below"], "and when the bar is below the fold too"
-    assert r["threw"] and r["noRect"] and r["noViewport"], \
-        "a read that cannot say leaves the caveat drawn, never swallowed"
+    assert r["threw"] and r["noRect"] and r["noViewport"] and r["hiddenHost"], \
+        "every way the bar can say nothing leaves the caveat drawn, never swallowed"
+
+
+@needs_node
+def test_a_status_without_a_box_is_not_in_view_and_the_canvas_carries_the_caveat():
+    """Found in an adversarial review of my own change. `binaryGraphCaveatNeedsStrip` asked whether the bar is
+    wholly in view as `top >= 0 && bottom <= innerHeight`, and an element with no box at all answers 0 and 0 -
+    which passes that test and reads as "in view". Measured in Chrome on the VM in PATH mode, where the EXPLORE
+    view is hidden: the status rect was [0, 0, 0] and the function said no strip was needed.
+
+    Nothing is visible there today, because the canvas is hidden too. But the rule the strip exists for is that a
+    caveat said nowhere is worse than one said twice, and an element with no box says nothing - so it is not in
+    view, and the canvas carries the caveat. This is the same direction every other branch of that function takes.
+    """
+    r = _explore_flow(r"""
+      (async () => {
+        GRAPH['ntdll.dll'] = { in_degree: 9, partial: true,
+            imports: { 'kernel32.dll': ['CloseHandle'], 'user32.dll': ['MessageBoxW'] } };
+        await binaryGraphExploreStart('ntdll.dll');
+        await binaryGraphExpand('ntdll.dll');
+        const host = els['binary-explore-status'];
+        const strip = () => frame().placed.some(t => t.text.startsWith('Not the whole'));
+        globalThis.innerHeight = 900;
+        // the box of an element that is not laid out, as a hidden view gives it
+        host.getBoundingClientRect = () => ({ top: 0, bottom: 0, left: 0, right: 0, height: 0 });
+        binaryGraphDraw();
+        const noBox = strip();
+        // and one that is laid out but has no height, which says just as little
+        host.getBoundingClientRect = () => ({ top: 300, bottom: 300, left: 0, right: 900, height: 0 });
+        binaryGraphDraw();
+        const noHeight = strip();
+        host.getBoundingClientRect = () => ({ top: 100, bottom: 173, left: 0, right: 900, height: 73 });
+        binaryGraphDraw();
+        const real = strip();
+        delete globalThis.innerHeight;
+        out({ noBox, noHeight, real });
+      })();""")
+    assert r["noBox"], "an element with no box is not in view: the canvas carries the caveat"
+    assert r["noHeight"], "nor is one with no height"
+    assert not r["real"], "a bar that is really there still spares the canvas the same words"
+
+
+@needs_node
+def test_the_caveat_stays_open_once_opened_because_nothing_resets_it():
+    """Found in an adversarial review of my own change: `binaryGraphState.caveatByHand` was written by
+    binaryGraphToggleCaveat and never read anywhere. The comment beside it claimed "a fold or unfold by hand wins
+    from then on", the rule `maxedByHand` really does enforce - there the view sets `maxed` per mode, so a flag is
+    needed to keep a reader's choice. Nothing sets `caveatFolded` but the reader, so the flag enforced nothing and
+    the claim was a false one about the code.
+
+    The behaviour it claimed is the behaviour there is, and this pins it so that a later default cannot take it
+    away unnoticed: an unfold survives a redraw, an expansion, a mode switch and a whole new exploration."""
+    r = _explore_flow(r"""
+      (async () => {
+        GRAPH['ntdll.dll'] = { in_degree: 9, partial: true,
+            imports: { 'kernel32.dll': ['CloseHandle'], 'user32.dll': ['MessageBoxW'] } };
+        await binaryGraphExploreStart('ntdll.dll');
+        await binaryGraphExpand('ntdll.dll');
+        const open = () => {
+          const m = (els['binary-explore-status'].innerHTML || '')
+              .match(/<div class="binary-explore-caveat-body"([^>]*)>/);
+          return m ? !m[1].includes('hidden') : null;
+        };
+        const folded = open();
+        binaryGraphToggleCaveat();
+        const byHand = open();
+        binaryGraphExploreRender();
+        const redrawn = open();
+        await binaryGraphExpand('kernel32.dll');
+        const expanded = open();
+        binaryGraphSetMode('path'); binaryGraphSetMode('explore');
+        const switched = open();
+        await binaryGraphExploreStart('ntdll.dll');
+        await binaryGraphExpand('ntdll.dll');
+        const restarted = open();
+        out({ folded, byHand, redrawn, expanded, switched, restarted,
+              noDeadFlag: !('caveatByHand' in binaryGraphState) });
+      })();""")
+    assert r["folded"] is False and r["byHand"] is True, "it starts folded and the hand opens it"
+    for step in ("redrawn", "expanded", "switched", "restarted"):
+        assert r[step] is True, f"{step} reclosed what the reader opened"
+    assert r["noDeadFlag"], "the flag that enforced nothing is gone, with the claim it carried"
+
+
+@needs_node
+def test_the_caveat_names_the_canvas_only_for_what_the_canvas_dropped():
+    """Found in an adversarial review, and it is rule 1: the short form ended every sentence with "(the canvas
+    holds 400 nodes)" whatever the cause, so a reader whose 105 neighbours were cut by the SERVER read that the
+    400-node cap was why. The sentence naming the real cause sat in the prose, behind a fold that starts closed -
+    so the change that folded the prose promoted a misattribution to the only thing a reader sees.
+
+    The cap explains one thing, the node that did not fit, so it is said when there is one and not otherwise. The
+    same holds for the prose: "Whole neighbours were dropped, in name order" was printed with nothing dropped,
+    which has been true since the guard widened from `cut.hidden` to `cut.any` and this is the first test to catch
+    it.
+
+    And the claim "the bar keeps every count" was false in a reachable state: a node whose own table is whole but
+    whose importers were read while some other table of the graph was cut gives `importers: 1` and nothing else, so
+    the bar held exactly one number - 400, a constant. The count it does have, how many opened nodes the caveat is
+    about, is now in the bar too, so no state leaves it with none."""
+    r = _explore_flow(r"""
+      (async () => {
+        // the server cuts its own answer at 400 nodes: 450 importers, so 51 never reach the canvas, and the
+        // canvas itself drops nothing because every node the server sent fits
+        GRAPH['hub.dll'] = { in_degree: 450, imports: {} };
+        for (let i = 0; i < 450; i++) GRAPH['c' + String(i).padStart(3, '0') + '.dll'] = { in_degree: 1, imports: { 'hub.dll': ['F'] } };
+        await binaryGraphExploreStart('hub.dll');
+        await binaryGraphExpand('hub.dll');
+        const cut = binaryGraphExploreCut(st);
+        const html = els['binary-explore-status'].innerHTML;
+        const plain = h => (h || '').replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ').trim();
+        const bar = (html.match(/class="binary-explore-caveat-note binary-graph-cut">([^<]*)</) || [null, ''])[1];
+        const body = plain((html.match(/<div class="binary-explore-caveat-body"[^>]*>([\s\S]*?)<\/div>/) || [null, ''])[1]);
+        out({ cut: { hidden: cut.hidden, server: cut.server, dropped: cut.dropped, parents: cut.parents },
+              bar: plain(bar), body, short: binaryGraphCutShort(cut) });
+      })();""")
+    assert r["cut"]["dropped"] == 0 and r["cut"]["server"] > 0, r["cut"]
+    assert "canvas holds" not in r["bar"], \
+        f"the canvas dropped nothing: naming its cap blames it for the server's cut: {r['bar']}"
+    assert "canvas holds" not in r["body"], r["body"]
+    assert "Whole neighbours were dropped" not in r["body"], \
+        f"nothing was dropped, so that sentence is a statement about nothing: {r['body']}"
+    assert "does not mean it is not imported" in r["body"], "what a missing node means is said either way"
+    assert "opened node" in r["bar"], f"the bar names how many opened nodes it is about: {r['bar']}"
+    assert str(r["cut"]["server"]) in r["bar"], "and the count"
+
+
+@needs_node
+def test_the_caveat_bar_always_carries_a_measured_count():
+    """The reachable state the review found: `importers` alone, where the only number is how many opened nodes the
+    caveat is about. A bar whose numbers are all constants reads as no caveat."""
+    r = _explore_flow(r"""
+      (async () => {
+        GRAPH['lonely.dll'] = { in_degree: 0, imports: { 'kernel32.dll': ['A'] } };
+        GRAPH['cutbin.exe'] = { in_degree: 0, partial: true, imports: { 'kernel32.dll': ['B'] } };
+        await binaryGraphExploreStart('lonely.dll');
+        await binaryGraphExpand('lonely.dll');
+        const cut = binaryGraphExploreCut(st);
+        out({ cut: { hidden: cut.hidden, functions: cut.functions, tables: cut.tables,
+                     importers: cut.importers, dropped: cut.dropped, parents: cut.parents, any: cut.any },
+              short: cut.any ? binaryGraphCutShort(cut) : '' });
+      })();""")
+    if not r["cut"]["any"]:
+        import pytest
+        pytest.skip(f"this fixture draws no cut: {r['cut']}")
+    counts = [v for k, v in r["cut"].items() if k not in ("any", "parents") and v]
+    assert r["short"], r["cut"]
+    digits = [p for p in r["short"].replace(",", "").split() if p.strip("(),.").isdigit()]
+    assert [d for d in digits if d != "400"], \
+        f"every number in the bar is a constant, so it says nothing measured: {r['short']} ({r['cut']})"

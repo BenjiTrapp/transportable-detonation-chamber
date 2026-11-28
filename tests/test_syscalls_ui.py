@@ -3248,7 +3248,11 @@ def test_a_measurement_of_another_build_says_so_where_it_is_chosen():
     into the label, and the one that is not this system's is marked there, where the choice is made.
 
     It only marks what it knows. Before the baseline is loaded there is no build to compare against, and then no
-    option is marked: a choice called foreign on a guess is worse than one left unnamed."""
+    option is marked: a choice called foreign on a guess is worse than one left unnamed.
+
+    The measurement on the map gets its entry from its own data when the list does not hold it yet, and that
+    carries the build too - see
+    test_the_entry_the_control_invents_for_the_measurement_on_the_map_carries_its_build."""
     r = _panels(PAST + r"""
       (async () => {
         await shown();
@@ -3278,8 +3282,10 @@ def test_a_measurement_of_another_build_says_so_where_it_is_chosen():
     assert "another build" in label(r["other"], "a1b2c3d4e5f6"), \
         f"a measurement of 26220.5770 while the map shows 26200.9974: {label(r['other'], 'a1b2c3d4e5f6')}"
     assert "build 26220.5770" in label(r["other"], "a1b2c3d4e5f6"), "and it still names which build"
-    for html, what in ((r["unknown"], "no baseline"), (r["loaded"], "before the baseline is read")):
-        assert "another build" not in html, f"nothing is called foreign without a build to compare against ({what})"
+    # `loaded` is captured after the baseline is read, so it is the own-build case again under another name - an
+    # adversarial review found that. The state before the baseline is read is `unknown`, which is the real one
+    assert "another build" not in r["unknown"], "nothing is called foreign without a build to compare against"
+    for html, what in ((r["unknown"], "no baseline"), (r["loaded"], "the baseline of this very build")):
         assert "build 26220.5770" in label(html, "a1b2c3d4e5f6"), f"the build is named either way ({what})"
     # and the other way round: a measurement the history kept without a build is not called foreign either
     assert "build not recorded" in label(r["noBuild"], "a1b2c3d4e5f6"), label(r["noBuild"], "a1b2c3d4e5f6")
@@ -3345,3 +3351,131 @@ def test_a_refusal_that_named_an_unloaded_baseline_goes_when_that_baseline_is_lo
     assert not r["away"]["past"] and r["away"]["states"], \
         "placed, it is put away by a baseline of another view - ruling 3, not a refusal again"
     assert "measured the x64 view" in r["away"]["note"] and "put away" in r["away"]["note"], r["away"]["note"]
+
+
+@needs_node
+def test_the_entry_the_control_invents_for_the_measurement_on_the_map_carries_its_build():
+    """Found in an adversarial review of the build label. When the list read before a measurement was made does not
+    hold it, the control invents an entry from the measurement's own data - and that entry had no `build`, so the
+    label read "build not recorded" while the banner two centimetres above named the build. An absence asserted
+    from a field the client chose not to copy, which is rule 1 and rule 2 at once.
+
+    Reachable without any editing: open a measurement from a detonation's Syscalls card, where the list read races
+    the open, and permanently whenever the history read fails."""
+    r = _past(r"""
+      (async () => {
+        await shown();
+        routes['/api/syscalls/measurements'] = { status: 500, body: { error: 'the scan history could not be read' } };
+        routes['/api/syscalls/measurement'] = { body: pastBody({ id: 'newnewnew123' }) };
+        await syscallLoadPastList();
+        await syscallOpenMeasurement('newnewnew123');
+        await settle();
+        out({ options: els['syscall-past'].innerHTML, banner: banner().html,
+              build: (syscallState.past.data || {}).build });
+      })();""")
+    label = next((t for i, t in re.findall(r'<option value="([^"]*)"[^>]*>([^<]*)</option>', r["options"])
+                  if i == "newnewnew123"), None)
+    assert label, r["options"]
+    assert r["build"], "the measurement itself names a build"
+    assert f"build {r['build']}" in label, f"so the entry invented for it must carry it: {label}"
+    assert "build not recorded" not in label, "nothing may claim an absence it did not measure"
+
+
+@needs_node
+def test_a_measurement_the_map_cannot_place_says_which_view_the_map_holds_not_that_a_read_failed():
+    """Found in an adversarial review, and it is rule 1: `syscallPastVerdict` said "the x64 baseline of this system
+    could not be loaded" for two different facts - a read that failed, and a map that simply holds another view's
+    baseline right now. Two actions produced the second with nothing having failed: choose an x64 measurement of
+    another build (refused for the build, after the x64 baseline loaded fine), then press REFRESH, which loads the
+    host's own view. The verdict then claimed a failed read of a baseline the page had read seconds earlier.
+
+    So the two facts get two sentences. The one for a read that failed keeps its reason; the one for a map holding
+    another view says that, the way syscallDropForeignScan says it for a measurement it puts away."""
+    r = _panels(PAST + r"""
+      (async () => {
+        await shown();
+        routes['/api/syscalls/measurement'] = { body: pastBody({ view: 'x64', build: '26100.1742' }) };
+        const ALL_X64 = ALL.map(a => ({ ...a }));
+        const x64 = url => { const q = new URL(url, 'http://x').searchParams, offset = +q.get('offset') || 0,
+              limit = +q.get('limit') || 200;
+            return { body: { items: ALL_X64.slice(offset, offset + limit), total: ALL_X64.length, offset, limit,
+                             build: '26220.5770', view: 'x64', symbols: true } }; };
+        const kept = routes['/api/syscalls/baseline'];
+        routes['/api/syscalls/baseline'] = url =>
+            (new URL(url, 'http://x').searchParams.get('view') === 'x64' ? x64(url) : kept);
+        await choosePast('a1b2c3d4e5f6');
+        const onBuild = syscallPastRefusal();
+        routes['/api/syscalls/baseline'] = kept;
+        await syscallRefresh(true); await settle();
+        const afterRefresh = { refusal: syscallPastRefusal(), banner: banner().html,
+                               baseline: syscallState.baseline ? syscallState.baseline.view : null };
+        out({ onBuild, afterRefresh });
+      })();""")
+    assert "measured on build 26100.1742" in r["onBuild"], r["onBuild"]
+    after = r["afterRefresh"]["refusal"]
+    assert after, "it still cannot be placed on an arm64 baseline"
+    assert "could not be loaded" not in after, f"nothing failed to load: {after}"
+    assert "arm64" in after and "x64" in after, f"it says which view it measured and which the map holds: {after}"
+
+
+@needs_node
+def test_a_refusal_that_named_the_maps_baseline_is_asked_again_when_the_map_loses_it():
+    """Found in an adversarial review: `syscallState.baseline` is written in two places, the load and the drop, and
+    the recheck was added to the load only. So a refusal naming "this system's baseline, build X (arm64)" stayed on
+    the banner after a failed read had left the map with no baseline at all - a statement about a baseline that is
+    not there."""
+    r = _panels(PAST + r"""
+      (async () => {
+        await shown();
+        routes['/api/syscalls/measurement'] = { body: pastBody({ build: '26100.1742' }) };
+        await choosePast('a1b2c3d4e5f6');
+        const placed = { refusal: syscallPastRefusal(), baseline: !!syscallState.baseline };
+        routes['/api/syscalls/baseline'] = { status: 503, body: { error: 'the baseline file is locked' } };
+        await syscallRefresh(true); await settle();
+        out({ placed, after: { refusal: syscallPastRefusal(), baseline: syscallState.baseline,
+                               banner: banner().html } });
+      })();""")
+    assert "26100.1742" in r["placed"]["refusal"] and r["placed"]["baseline"], r["placed"]
+    after = r["after"]
+    assert after["baseline"] is None, "the read failed, so the map holds no baseline"
+    assert "build 26220.5770" not in after["refusal"], \
+        f"it may not say the map holds a baseline it does not hold: {after['refusal']}"
+    assert after["refusal"], "it still cannot be drawn, and says so"
+
+
+@needs_node
+def test_a_past_measurement_overtaken_while_its_baseline_loads_leaves_no_half_drawn_map():
+    """Found in an adversarial review. `syscallOpenMeasurement` returns without rendering when another action has
+    overtaken it - and by then it has already replaced the baseline, the bands and bandsKey. The canvases on the
+    screen were painted from the old baseline and their cells are read against the new one, so the same pixel named
+    one syscall before and another after: a cell drawn against one reference, read against another.
+
+    Reachable by pressing BACK TO LIVE or picking another measurement while the paging read runs, both of which the
+    page allows. The render now happens on that path too, before it gives up."""
+    r = _panels(PAST + r"""
+      (async () => {
+        await shown();
+        routes['/api/syscalls/measurement'] = { body: pastBody({ view: 'x64' }) };
+        const ALL_X64 = ALL.slice(0, 300).map(a => ({ ...a, name: 'X' + a.number }));
+        let served = 0;
+        routes['/api/syscalls/baseline'] = url => { const q = new URL(url, 'http://x').searchParams;
+            if (q.get('view') !== 'x64') return { body: { items: ALL, total: ALL.length, offset: 0, limit: 1000,
+                                                          build: '26220.5770', view: 'arm64', symbols: true } };
+            served++;
+            if (served === 1) syscallBackToLive();          // overtaken mid-read, as the enabled control allows
+            return { body: { items: ALL_X64, total: ALL_X64.length, offset: 0, limit: 1000,
+                             build: '26220.5770', view: 'x64', symbols: true } }; };
+        await syscallOpenMeasurement('a1b2c3d4e5f6');
+        await settle();
+        const drawn = canvases().map(c => [c.dataset.module, c.calls.length]);
+        out({ baseline: syscallState.baseline ? [syscallState.baseline.view, syscallState.baseline.items.length] : null,
+              bands: syscallState.bands.map(b => [b.module, b.items.length]), drawn,
+              subtitle: els['syscalls-subtitle'].textContent });
+    })();""")
+    assert r["baseline"] and r["baseline"][0] == "x64", r["baseline"]
+    assert r["bands"] and r["bands"][0][1] == r["baseline"][1], "the bands are the baseline's"
+    total = sum(n for _m, n in r["drawn"])
+    assert total == r["baseline"][1], \
+        f"the canvases hold {total} cells for a baseline of {r['baseline'][1]}: painted from one, read against another"
+    assert str(r["baseline"][1]) in r["subtitle"].replace(",", ""), \
+        f"and the subtitle is the baseline's too: {r['subtitle']}"

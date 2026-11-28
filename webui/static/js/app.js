@@ -27729,7 +27729,10 @@ function syscallPastOptionsHtml(list, selected, error) {
     const here = syscallState.baseline && syscallState.baseline.build ? String(syscallState.baseline.build) : '';
     for (const m of Array.isArray(list) ? list : []) {
         if (!m || typeof m.id !== 'string' || !m.id) continue;
-        let label = `${m.process || 'unknown process'} · PID ${m.pid} · ${syscallWhen(m.at)} · ${m.view || 'unknown view'}`;
+        // every field has a fallback: a history entry an older version wrote may name no pid, and "PID null" is
+        // not a reading of anything
+        let label = `${m.process || 'unknown process'} · PID ${m.pid || m.pid === 0 ? m.pid : 'not recorded'}`
+            + ` · ${syscallWhen(m.at)} · ${m.view || 'unknown view'}`;
         label += ` · ${m.build ? `build ${m.build}` : 'build not recorded'}`;
         if (here && m.build && String(m.build) !== here) label += ' · another build';
         html += `<option value="${escapeHtml(m.id)}"${m.id === selected ? ' selected' : ''}>${escapeHtml(label)}</option>`;
@@ -28294,16 +28297,22 @@ async function syscallLoadBaseline(view) {
 // map holds - whether it is there, whether it is the measurement's view, whether it is its build - and the map's
 // baseline changes. Recorded once, that part outlived its cause: "the x64 baseline of this system could not be
 // loaded" stayed on the banner after that baseline had been loaded, and a refusal that outlives its cause reads as
-// a refusal of now. So it is asked again whenever a baseline is loaded (syscallRecheckPast).
+// a refusal of now. So it is asked again whenever a baseline is loaded or dropped (syscallRecheckPast).
 //
-// `unloaded` is the error of the read that failed, kept as the reason it names; it is dropped once a baseline of
-// that view is there, because then nothing failed any more.
+// Three grounds, three sentences. An adversarial review found one sentence carrying two different facts: a read
+// that failed, and a map that simply holds another view's baseline right now. Two clicks produced the second with
+// nothing having failed - choose an x64 measurement of another build, then REFRESH, which loads the host's own
+// view - and the page then claimed a failed read of a baseline it had read seconds earlier. The reason of a failed
+// read (`unloaded`) belongs only to the sentence about a read.
 function syscallPastVerdict(data, baseline, unloaded) {
     const view = String(data.view || '');
     if (data.problem) return String(data.problem);
     if (!data.states || typeof data.states !== 'object') return 'the server sent no map of it';
-    if (!baseline || baseline.view !== view) {
-        return `the ${view} baseline of this system could not be loaded${unloaded ? ` (${unloaded})` : ''}`;
+    if (unloaded) return `the ${view} baseline of this system could not be loaded (${unloaded})`;
+    if (!baseline) return `the map holds no baseline to draw its ${view} cells on`;
+    if (baseline.view !== view) {
+        return `it measured the ${view} view, and the map shows the ${baseline.view} baseline: ` +
+               'its cells are not drawn on the baseline of another view';
     }
     if (String(baseline.build) !== String(data.build)) {
         return `it was measured on build ${data.build}, and the map holds only this system's baseline, build ${baseline.build} ` +
@@ -28313,14 +28322,18 @@ function syscallPastVerdict(data, baseline, unloaded) {
 }
 
 // Ask the open past measurement again against the baseline the map now holds, and let its cells follow: one that
-// may be drawn is drawn, one that may not is not. Called where a baseline was loaded, beside syscallDropForeignScan,
-// which is there for the same kind of reason.
+// may be drawn is drawn, one that may not is not. Called where a baseline was loaded or dropped, beside
+// syscallDropForeignScan, which is there for the same kind of reason.
+//
+// A reason that was disproved is written back, not dropped locally: `past.unloaded` survived a later successful
+// read of that very baseline and came back as the reason of now, which is the fault this whole function exists to
+// prevent. An adversarial review found that; it took one call site that does not exist yet to reach it.
 function syscallRecheckPast() {
     const past = syscallState.past;
     if (!past || !past.data) return false;
     const baseline = syscallState.baseline;
-    const unloaded = baseline && baseline.view === String(past.data.view || '') ? '' : past.unloaded;
-    const refusal = syscallPastVerdict(past.data, baseline, unloaded);
+    if (past.unloaded && baseline && baseline.view === String(past.data.view || '')) past.unloaded = '';
+    const refusal = syscallPastVerdict(past.data, baseline, past.unloaded);
     if (refusal === past.refusal) return false;
     past.refusal = refusal;
     syscallState.states = refusal || !past.data.states ? null
@@ -28372,6 +28385,7 @@ async function syscallRefresh(force) {
                 syscallState.bandsKey++;
                 syscallState.baselineError = loaded.error;
                 syscallDropForeignScan();
+                syscallRecheckPast();       // the map lost its baseline: a verdict naming it has no ground left
             }
         }
     } finally {
@@ -28902,7 +28916,8 @@ function renderSyscallPastList() {
     const past = syscallState.past, list = syscallState.pastList.slice();
     if (past && past.data && !list.some(m => m && m.id === past.id)) {
         const d = past.data;
-        list.unshift({ id: past.id, at: d.measured_at, pid: d.pid, process: String(d.process || '').split(/[\\/]/).pop(), view: d.view });
+        list.unshift({ id: past.id, at: d.measured_at, pid: d.pid, process: String(d.process || '').split(/[\\/]/).pop(),
+                       view: d.view, build: d.build });
     }
     select.innerHTML = syscallPastOptionsHtml(list, past ? past.id : '', syscallState.pastListError);
     select.value = past ? past.id : '';
@@ -28960,7 +28975,17 @@ async function syscallOpenMeasurement(id) {
     // decides nothing: it is read again
     for (let tries = 0; !data.problem && view && tries < 3 && !(syscallState.baseline && syscallState.baseline.view === view); tries++) {
         const loaded = await syscallLoadBaseline(view);
-        if (seq !== syscallState.pastSeq) return false;
+        if (seq !== syscallState.pastSeq) {
+            // Overtaken - by BACK TO LIVE or another measurement, both of which the page allows while this reads.
+            // The load has already replaced the baseline, the bands and bandsKey, and the action that overtook us
+            // rendered before that swap: the canvases on the screen were painted from the baseline before it and
+            // their cells would be read against the one after. A cell drawn against one reference and read against
+            // another is a false statement, so the screen is brought to the state that is, and only then do we
+            // give up. Found in an adversarial review, with the two tooltips of the same pixel to prove it.
+            syscallApplyFilter();
+            syscallRenderAll();
+            return false;
+        }
         if (!loaded.ok && !loaded.superseded) {
             unloaded = loaded.error;
             break;
@@ -29611,7 +29636,7 @@ function binaryGraphOrigin(edge) {
 // figures: the table of the whole stock (null until it was read), figuresNote why it could not be; metric: the list of a figure the detail panel shows
 const binaryGraphState = { answer: null, query: 'path-to-syscall', module: '', function: '', depth: 1, loading: false, selected: null, note: '', nodes: [], edges: [],
     figures: null, figuresNote: '', figuresLoading: false, metric: null, maxed: false, maxedByHand: false,
-    caveatFolded: true, caveatByHand: false };
+    caveatFolded: true };
 // numbers the queries, of which only the last answer counts
 const binaryGraphRequests = { seq: 0, metric: 0 };
 
@@ -30336,8 +30361,13 @@ function binaryGraphExploreCut(st) {
 
 // The line above the canvas: that the picture is cut, in words, and the note of the last step. { tone, html }
 // The short form of the caveat, in one place because two readers draw it: the strip on the canvas and the bar over
-// the folded prose. `hidden` is the whole count, the one that did not fit included, and the cap at the end is what
-// explains that one - so this names every number the long form does.
+// the folded prose.
+//
+// The cap is named only when the canvas really dropped something. It was appended to every sentence, so a reader
+// whose neighbours were cut by the SERVER read that the 400-node cap was why - the canvas blamed for a cut it did
+// not make, which is rule 1. Found in an adversarial review, which also found the state that forced `parents` in
+// here: `importers` alone leaves every other count at zero, and a bar whose only number is a constant reads as no
+// caveat. `hidden` is the whole count, the dropped one included, so the breakdown stays in the prose.
 function binaryGraphCutShort(cut) {
     const pieces = [];
     if (cut.hidden) pieces.push(`${cut.hidden.toLocaleString('en-US')} not shown`);
@@ -30346,7 +30376,9 @@ function binaryGraphCutShort(cut) {
         pieces.push(`${cut.tables.toLocaleString('en-US')} ${cut.tables === 1 ? 'opened node has' : 'opened nodes have'} a table cut short`);
     }
     if (cut.importers) pieces.push('importers may be incomplete (some tables cut short, the figures say how many)');
-    return `Not the whole neighbourhood: ${pieces.join(', ')} (the canvas holds ${BINARY_GRAPH_EXPLORE.cap} nodes)`;
+    const of = `of ${cut.parents.toLocaleString('en-US')} opened node${cut.parents === 1 ? '' : 's'}`;
+    const cap = cut.dropped ? `, and the canvas holds ${BINARY_GRAPH_EXPLORE.cap} nodes` : '';
+    return `Not the whole neighbourhood, ${of}: ${pieces.join(', ')}${cap}`;
 }
 
 function binaryGraphExploreStatus(st) {
@@ -30373,19 +30405,25 @@ function binaryGraphExploreStatus(st) {
         if (cut.dropped) why.push(`${n(cut.dropped, 'did', 'did')} not fit on this canvas, which holds at most ${escapeHtml(String(BINARY_GRAPH_EXPLORE.cap))} nodes`);
         // Measured on the VM at 1280x900: this prose was 731 characters over four lines and 73px tall, above a
         // canvas that had 318px, and the strip painted on the canvas already carries the short form. So it folds
-        // the way GRAPH folds the scan panels. The bar keeps the claim and every count - a caveat whose numbers
-        // are hidden reads as no caveat - and only the sentences that say what the numbers mean go behind it.
+        // the way GRAPH folds the scan panels. The bar keeps the claim, how many opened nodes it is about and the
+        // counts of what is missing - a caveat whose numbers are hidden reads as no caveat - while the prose says
+        // what each number means and which part of it was the server's and which the canvas's. The breakdown of
+        // `hidden` into the server's cut and the dropped nodes lives there, not in the bar.
         const folded = !!binaryGraphState.caveatFolded;
         const title = folded ? 'Say what is missing and what that means' : 'Fold away what the counts mean';
         html += '<div class="binary-explore-caveat-bar">'
-            + `<button type="button" class="binary-explore-caveat-fold" aria-expanded="${!folded}"`
+            + '<button type="button" class="binary-explore-caveat-fold" id="binary-explore-caveat-fold"'
+            + ` aria-expanded="${!folded}" aria-controls="binary-explore-caveat-body"`
             + ` title="${escapeHtml(title)}" aria-label="${escapeHtml(title)}"`
             + ' onclick="binaryGraphToggleCaveat()">\u25be</button>'
             + `<span class="binary-explore-caveat-note binary-graph-cut">${escapeHtml(binaryGraphCutShort(cut))}</span>`
             + '</div>'
-            + `<div class="binary-explore-caveat-body"${folded ? ' hidden' : ''}>`
+            + `<div class="binary-explore-caveat-body" id="binary-explore-caveat-body"${folded ? ' hidden' : ''}>`
             + `<strong class="binary-graph-cut">Not the whole neighbourhood${cut.hidden ? `: ${n(cut.hidden, 'neighbour is', 'neighbours are')} not shown, ` : ', '}`
-            + `of ${n(cut.parents, 'opened node', 'opened nodes')}: ${why.join(' and ')}. Whole neighbours were dropped, in name order: `
+            + `of ${n(cut.parents, 'opened node', 'opened nodes')}: ${why.join(' and ')}.`
+            // only when the canvas really dropped one: it was said with nothing dropped, ever since the guard
+            // widened from `cut.hidden` (which was the dropped count) to `cut.any`
+            + `${cut.dropped ? ' Whole neighbours were dropped, in name order:' : ''} `
             + 'a node that is missing here is not shown, which does not mean it is not imported.</strong></div>';
     }
     if (st.note) html += `<span class="binary-graph-note">${escapeHtml(st.note)}</span>`;
@@ -30677,12 +30715,20 @@ function binaryGraphToggleMax() {
     return binaryGraphApplyMax();
 }
 
-// The prose under the caveat's bar, by the same rule: it starts folded because the strip on the canvas carries the
-// short form, and once the reader has opened it a redraw leaves it open.
+// The prose under the caveat's bar. It starts folded because the strip on the canvas carries the short form, and
+// the reader's choice holds from then on - not through a flag, as `maxedByHand` keeps `maxed` against a default the
+// view sets per mode, but because nothing else ever writes `caveatFolded`. There is no default to defend it from.
+//
+// The render rewrites the whole status, button included, as every list and panel of this view does - so the
+// element that was just clicked is gone and a keyboard user would land on the body. Found in an adversarial
+// review. The focus is handed to the new button, the way setDashboardRangeChip and the alerts drill bar do it.
+// Unlike `syscallApplyLower`, which this follows in looks, the mechanism here is a rewrite, not a mutation.
 function binaryGraphToggleCaveat() {
+    const had = typeof document !== 'undefined' && document.activeElement
+        && document.activeElement.id === 'binary-explore-caveat-fold';
     binaryGraphState.caveatFolded = !binaryGraphState.caveatFolded;
-    binaryGraphState.caveatByHand = true;
     binaryGraphExploreRender();
+    if (had) document.getElementById('binary-explore-caveat-fold')?.focus();
     return true;
 }
 
@@ -30750,10 +30796,14 @@ function binaryGraphExploreRender() {
 // Whether the canvas has to carry the caveat itself. The bar above it says the same words, so drawing both put the
 // same sentence on the screen twice, 20px apart - seen in Chrome on the VM. The strip was added for one case and
 // this is it: measured at 1280x640, scrolled to the canvas, 14 of the status's 73px were left in view while the
-// canvas was whole. The rect is of an element outside the canvas, so a pan, which writes to the bitmap and not to
-// the DOM, reads it from a layout that is already clean.
+// canvas was whole. The rect is of an element outside the canvas, so a pan - binaryGraphOnCanvasMove, which calls
+// binaryGraphDraw directly - writes to the bitmap and not to the DOM and reads a layout that is already clean;
+// the 0.0002 to 0.0006 ms measured on the chamber is that call site. A render is not: binaryGraphExploreRender
+// writes the status's innerHTML and then draws, so there the read is a forced layout, and the wheel goes through
+// it. An adversarial review pointed that out; the number covers the pan, not the render.
 //
-// It fails towards saying it: no element, no rect, or a read that throws, and the strip is drawn. A caveat said
+// It fails towards saying it: no element, no rect, no box at all (a hidden view answers 0 and 0, which would pass
+// a bare top/bottom test and read as "in view"), or a read that throws, and the strip is drawn. A caveat said
 // twice is a nuisance; a caveat said nowhere is a measurement reading as something it is not.
 function binaryGraphCaveatNeedsStrip() {
     const host = document.getElementById('binary-explore-status');
@@ -30762,6 +30812,7 @@ function binaryGraphCaveatNeedsStrip() {
         const box = host.getBoundingClientRect();
         const height = typeof window !== 'undefined' ? window.innerHeight : 0;
         if (!height || !box || typeof box.top !== 'number') return true;
+        if (!(box.bottom > box.top)) return true;          // no box, so it says nothing: the canvas says it
         return !(box.top >= 0 && box.bottom <= height);
     } catch (e) {
         return true;
@@ -30859,8 +30910,8 @@ function binaryGraphDraw() {
     ctx.font = '12px monospace';
     ctx.textAlign = 'left';
     ctx.textBaseline = 'top';
-    // These two lines are painted on the canvas, not above it, so panning and zooming cannot scroll them out of
-    // sight. That puts them over the drawing: once the surface grew from 240px to 661px the caveat ran through the
+    // The texts the canvas carries are painted on it, not above it, so panning and zooming cannot scroll them out
+    // of sight. The caveat is wrapped to as many lines as the canvas holds, so "two lines" is no longer the count. That puts them over the drawing: once the surface grew from 240px to 661px the caveat ran through the
     // node labels (seen at 1920x1080 with 400 nodes, through the label of bi.dll). So each gets a strip of the
     // backdrop behind it first, as wide as it measures and no wider. Opaque on purpose: the caveat says a count is
     // a lower bound, and a reader who cannot read it is worse off than one who has to pan a little.
